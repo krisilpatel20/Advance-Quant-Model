@@ -720,9 +720,13 @@ if df_main is not None:
             axes[2].set_ylabel("Expected Return (%)")
             
             # Format dates for ALL axes and ensure labels are visible
-            for ax in axes:
-                format_plot_dates(ax, model_data.index)
-                ax.tick_params(labelbottom=True)
+            # Format dates: Only for the last axis to avoid overlap
+            format_plot_dates(axes[-1], model_data.index)
+            axes[-1].tick_params(labelbottom=True)
+            
+            # Ensure other axes don't show labels (redundant with sharex but safe)
+            for ax in axes[:-1]:
+                ax.tick_params(labelbottom=False)
                 
             st.pyplot(fig_m)
             
