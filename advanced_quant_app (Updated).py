@@ -62,7 +62,7 @@ def format_plot_dates(ax, dates):
         ax.xaxis.set_major_locator(mdates.MonthLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%y'))
         
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center', fontsize=8)
 
 class Calibrator:
     @staticmethod
