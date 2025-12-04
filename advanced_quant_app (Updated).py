@@ -62,7 +62,7 @@ def format_plot_dates(ax, dates):
         ax.xaxis.set_major_locator(mdates.MonthLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%y'))
         
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center', fontsize=8)
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
 class Calibrator:
     @staticmethod
@@ -895,8 +895,7 @@ if df_main is not None:
                     xaxis_title="Date",
                     yaxis_title="Price",
                     template="plotly_dark",
-                    hovermode="x unified",
-                    xaxis=dict(tickangle=-90)
+                    hovermode="x unified"
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1006,8 +1005,7 @@ if df_main is not None:
                     xaxis_title="Date",
                     yaxis_title="Price",
                     template="plotly_dark",
-                    hovermode="x unified",
-                    xaxis=dict(tickangle=-90)
+                    hovermode="x unified"
                 )
                 st.plotly_chart(fig_h, use_container_width=True)
                 
@@ -1027,8 +1025,7 @@ if df_main is not None:
                     xaxis_title="Date",
                     yaxis_title="Volatility",
                     template="plotly_dark",
-                    height=300,
-                    xaxis=dict(tickangle=-90)
+                    height=300
                 )
                 st.plotly_chart(fig_v, use_container_width=True)
 
