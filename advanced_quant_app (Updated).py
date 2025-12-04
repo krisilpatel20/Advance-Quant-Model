@@ -895,7 +895,8 @@ if df_main is not None:
                     xaxis_title="Date",
                     yaxis_title="Price",
                     template="plotly_dark",
-                    hovermode="x unified"
+                    hovermode="x unified",
+                    xaxis=dict(tickangle=-90)
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1005,7 +1006,8 @@ if df_main is not None:
                     xaxis_title="Date",
                     yaxis_title="Price",
                     template="plotly_dark",
-                    hovermode="x unified"
+                    hovermode="x unified",
+                    xaxis=dict(tickangle=-90)
                 )
                 st.plotly_chart(fig_h, use_container_width=True)
                 
@@ -1025,7 +1027,8 @@ if df_main is not None:
                     xaxis_title="Date",
                     yaxis_title="Volatility",
                     template="plotly_dark",
-                    height=300
+                    height=300,
+                    xaxis=dict(tickangle=-90)
                 )
                 st.plotly_chart(fig_v, use_container_width=True)
 
