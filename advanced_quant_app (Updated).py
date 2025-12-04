@@ -55,14 +55,14 @@ def format_plot_dates(ax, dates):
     if span_days < 90: # Less than 3 months -> Weekly
         ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-    elif span_days < 365: # Less than 1 year -> Monthly
+    else: 
+        # User requested granular monthly ticks even for long periods
+        # We use MonthLocator. For very long periods, matplotlib might auto-hide some,
+        # but we set the locator explicitly.
         ax.xaxis.set_major_locator(mdates.MonthLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
-    else: # Long term -> Years/Quarters
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%y'))
         
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center', fontsize=8)
 
 class Calibrator:
     @staticmethod
@@ -430,7 +430,7 @@ if df_main is not None:
         "Volatility (GARCH)", 
         "Regime Switching", 
         "Stochastic (Heston/Jump)", 
-        "Kalman Filter",
+        "Kalman Filter", 
         "Macro Factors",
         "Structural"
     ])
@@ -757,7 +757,7 @@ if df_main is not None:
             """)
 
     # ==========================================
-    # TAB 3: STOCHASTIC MODELS (Heston / Jump)
+    # TAB 3: STOCHASTIC MODELS (Heston/Jump)
     # ==========================================
     with tab3:
         st.write("### Advanced Stochastic Simulations")
