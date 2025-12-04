@@ -21,13 +21,13 @@ except ImportError:
 # ==========================================
 # 1. CONFIGURATION & STYLING
 # ==========================================
-st.set_page_config(page_title="Quant Thesis: Advanced Models", layout="wide")
+st.set_page_config(page_title="Quant Thesis: Advanced Models (Filtered)", layout="wide")
 plt.style.use('ggplot')
 
-st.title("Results of Advanced Quantitative Thesis")
+st.title("Results of Advanced Quantitative Thesis (Filtered Probabilities)")
 st.markdown("""
 **Robust Financial Modeling Dashboard** incorporating:
-GARCH/EGARCH | Regime Switching | Jump Diffusion | Heston Stochastic Vol | Kalman Filter Pairs | Macro Factors
+GARCH/EGARCH | Regime Switching (Filtered) | Jump Diffusion | Heston Stochastic Vol | Kalman Filter Pairs | Macro Factors
 """)
 
 if not ARCH_AVAILABLE:
@@ -639,7 +639,7 @@ if df_main is not None:
             """)
             
             # ===== VISUALIZATION =====
-            st.write("### 📈 Regime Analysis")
+            st.write("### 📈 Regime Analysis (Real-time / Filtered)")
             
             fig_m, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
             
@@ -648,7 +648,8 @@ if df_main is not None:
             
             for i, regime in enumerate(regime_stats):
                 # Use .iloc for robust column access
-                probs = res_markov.smoothed_marginal_probabilities.iloc[:, regime['regime']]
+                # CHANGED: Use filtered probabilities to avoid look-ahead bias
+                probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
                 # Invert color map: i=0 (Bull) -> 1.0 (Green), i=N (Bear) -> 0.0 (Red)
                 color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
                 color = plt.cm.RdYlGn(color_idx)
@@ -671,7 +672,8 @@ if df_main is not None:
                 color = plt.cm.RdYlGn(color_idx)
                 
                 # Get raw probabilities
-                raw_probs = res_markov.smoothed_marginal_probabilities.iloc[:, regime['regime']]
+                # CHANGED: Use filtered probabilities
+                raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
                 
                 # Apply smoothing if requested
                 if smooth_probs:
@@ -686,7 +688,7 @@ if df_main is not None:
 
             axes[1].axhline(1/n_regimes, color='gray', linestyle='--', alpha=0.4, 
                             label='Equal probability')
-            axes[1].set_title("Regime Probabilities (Smoothed)")
+            axes[1].set_title("Regime Probabilities (Filtered/Real-time)")
             axes[1].set_ylabel("Probability")
             axes[1].set_ylim([0, 1])
             axes[1].legend()
@@ -704,7 +706,8 @@ if df_main is not None:
             expected_ret = pd.Series(0.0, index=model_data.index)
             
             for i in range(n_regimes):
-                prob = res_markov.smoothed_marginal_probabilities.iloc[:, i]
+                # CHANGED: Use filtered probabilities
+                prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
                 const_val = get_const(i)
                 expected_ret += prob * const_val
             
