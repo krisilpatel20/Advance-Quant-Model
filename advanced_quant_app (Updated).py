@@ -1428,15 +1428,18 @@ if df_main is not None:
             st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
             
             # Regime Parameters
-            col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+            col_r1, col_r2, col_r3 = st.columns(3)
             with col_r1:
                 bt_n_regimes = st.slider("Number of Regimes", 2, 4, 2, key="bt_n_regimes")
             with col_r2:
                 bt_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 3, key="bt_stability")
             with col_r3:
                 bt_freq = st.selectbox("Frequency", ["Daily", "Weekly"], key="bt_freq")
+            
+            col_r4, col_r5 = st.columns(2)
             with col_r4:
                 bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
+            with col_r5:
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
             # Resample if Weekly
