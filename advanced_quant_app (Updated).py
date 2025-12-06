@@ -1422,25 +1422,39 @@ if df_main is not None:
         model_data_bt = returns_bt.dropna() * 100
         
         signals = None
+        strat_prices = prices_bt
         
         if strategy_type == "Regime Switching (Trend Following)":
             st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
             
             # Regime Parameters
-            col_r1, col_r2, col_r3 = st.columns(3)
+            col_r1, col_r2, col_r3, col_r4 = st.columns(4)
             with col_r1:
                 bt_n_regimes = st.slider("Number of Regimes", 2, 4, 2, key="bt_n_regimes")
             with col_r2:
                 bt_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 3, key="bt_stability")
             with col_r3:
+                bt_freq = st.selectbox("Frequency", ["Daily", "Weekly"], key="bt_freq")
+            with col_r4:
                 bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
+            # Resample if Weekly
+            if bt_freq == "Weekly":
+                # Resample Prices to Weekly (Last Close)
+                prices_bt_resampled = prices_bt.resample('W').last().dropna()
+                # Recalculate Returns from resampled prices
+                returns_bt_resampled = prices_bt_resampled.pct_change().dropna()
+                strat_prices = prices_bt_resampled
+            else:
+                prices_bt_resampled = prices_bt
+                returns_bt_resampled = returns_bt
+
             # Apply Smoothing if requested
             if bt_stability > 0:
-                model_data_bt = returns_bt.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
+                model_data_bt = returns_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
             else:
-                model_data_bt = returns_bt.dropna() * 100
+                model_data_bt = returns_bt_resampled.dropna() * 100
 
             with st.spinner("Fitting Regime Model..."):
                 # Fit Model
@@ -1464,7 +1478,7 @@ if df_main is not None:
                         expected_ret += prob * mean_val
                     
                     # Align indices
-                    common_idx = prices_bt.index.intersection(expected_ret.index)
+                    common_idx = strat_prices.index.intersection(expected_ret.index)
                     expected_ret = expected_ret.loc[common_idx]
                     
                     # Generate Signals (1 = Long if Exp Ret > 0, else 0)
@@ -1546,11 +1560,11 @@ if df_main is not None:
 
         # Run Backtest Engine if signals exist
         if signals is not None:
-            bt_results = BacktestEngine.run_strategy(prices_bt, signals, initial_cap)
+            bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap)
             
             # Metrics
             strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
-            bench_metrics = BacktestEngine.calculate_metrics(prices_bt.pct_change().dropna(), rf_rate)
+            bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
             
             # Display Metrics
             st.write("#### 📊 Performance Metrics")
