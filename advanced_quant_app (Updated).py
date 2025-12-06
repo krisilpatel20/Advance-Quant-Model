@@ -1451,11 +1451,13 @@ if df_main is not None:
             with col_r3:
                 bt_freq = st.selectbox("Frequency", ["Daily", "Weekly"], key="bt_freq")
             
-            col_r4, col_r5 = st.columns(2)
+            col_r4, col_r5, col_r6 = st.columns(3)
             with col_r4:
                 bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
             with col_r5:
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
+            with col_r6:
+                bt_signal_logic = st.selectbox("Signal Logic", ["Level (Trend)", "Change (Catch Tops/Bottoms)"], key="bt_signal_logic")
 
             # Resample if Weekly
             if bt_freq == "Weekly":
@@ -1499,8 +1501,16 @@ if df_main is not None:
                     common_idx = strat_prices.index.intersection(expected_ret.index)
                     expected_ret = expected_ret.loc[common_idx]
                     
-                    # Generate Signals (1 = Long if Exp Ret > 0, else 0)
-                    signals = (expected_ret > 0).astype(int)
+                    # Generate Signals
+                    if bt_signal_logic == "Level (Trend)":
+                        # 1 = Long if Exp Ret > 0, else 0
+                        signals = (expected_ret > 0).astype(int)
+                    else:
+                        # Change (Catch Tops/Bottoms)
+                        # Long if Exp Ret is Rising (Derivative > 0)
+                        # Sell if Exp Ret is Falling (Derivative < 0)
+                        exp_ret_change = expected_ret.diff().fillna(0)
+                        signals = (exp_ret_change > 0).astype(int)
                     
                     # Debug Dataframe
                     with st.expander("🔍 Debug: Signal Details"):
@@ -1508,10 +1518,17 @@ if df_main is not None:
                             "Price": strat_prices,
                             "Expected Return": expected_ret,
                             "Signal": signals
-                        }).dropna()
+                        })
+                        
+                        if bt_signal_logic == "Change (Catch Tops/Bottoms)":
+                            debug_df["Exp Ret Change"] = expected_ret.diff()
+                        
+                        debug_df = debug_df.dropna()
+                        
                         st.dataframe(debug_df.style.format({
                             "Price": "{:.2f}",
                             "Expected Return": "{:.4f}",
+                            "Exp Ret Change": "{:.4f}",
                             "Signal": "{:.0f}"
                         }), use_container_width=True)
 
