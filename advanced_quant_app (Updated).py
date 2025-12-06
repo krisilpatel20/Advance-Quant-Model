@@ -348,10 +348,11 @@ class BacktestEngine:
                 exit_price = price
                 pnl = (exit_price - entry_price) / entry_price
                 trades.append({
+                    'Side': 'Long',
                     'Entry Date': entry_date,
                     'Exit Date': date,
-                    'Entry Price': entry_price,
-                    'Exit Price': exit_price,
+                    'Buy Price': entry_price,
+                    'Sell Price': exit_price,
                     'PnL (%)': pnl * 100
                 })
                 
@@ -1452,9 +1453,12 @@ if df_main is not None:
         elif strategy_type == "Kalman Filter (Trend Crossover)":
             st.markdown("**Strategy:** Long when Price crosses **ABOVE** Kalman Trend. Sell when Price crosses **BELOW**.")
             
-            with col_b3:
+            col_k1, col_k2 = st.columns(2)
+            with col_k1:
                 kf_noise = st.select_slider("Trend Sensitivity", options=[1e-5, 1e-4, 1e-3], value=1e-4, 
                                             format_func=lambda x: f"{x} (Standard)" if x==1e-4 else str(x))
+            with col_k2:
+                confirm_days = st.slider("Signal Confirmation (Days)", 1, 5, 1, help="Consecutive days required to confirm a trend change.")
 
             with st.spinner("Running Kalman Filter..."):
                 # Run Kalman Filter (Standard/Causal to avoid lookahead)
@@ -1462,12 +1466,33 @@ if df_main is not None:
                 trend_est, _ = kf.filter(prices_bt.values)
                 trend_series = pd.Series(trend_est, index=prices_bt.index)
                 
-                # Generate Signals
-                # Logic: 
-                # Long (1) if Price > Trend
-                # Cash (0) if Price <= Trend
+                # Generate Signals with Confirmation Logic
+                sig_list = []
+                position = 0
                 
-                signals = (prices_bt > trend_series).astype(int)
+                # Counters for consecutive days
+                days_above = 0
+                days_below = 0
+                
+                for price, trend in zip(prices_bt, trend_series):
+                    if price > trend:
+                        days_above += 1
+                        days_below = 0
+                    else:
+                        days_below += 1
+                        days_above = 0
+                    
+                    # Trading Logic
+                    if position == 0:
+                        if days_above >= confirm_days:
+                            position = 1 # Buy
+                    elif position == 1:
+                        if days_below >= confirm_days:
+                            position = 0 # Sell
+                            
+                    sig_list.append(position)
+                
+                signals = pd.Series(sig_list, index=prices_bt.index)
                 
                 # Plot Strategy Context
                 with st.expander("See Strategy Context"):
@@ -1523,8 +1548,8 @@ if df_main is not None:
                 trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).dt.date
                 
                 st.dataframe(trades_df.style.format({
-                    "Entry Price": "{:.2f}",
-                    "Exit Price": "{:.2f}",
+                    "Buy Price": "{:.2f}",
+                    "Sell Price": "{:.2f}",
                     "PnL (%)": "{:.2f}%"
                 }), use_container_width=True)
             else:
