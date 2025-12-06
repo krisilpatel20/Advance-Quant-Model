@@ -692,6 +692,7 @@ if df_main is not None:
             st.error("⛔ Model did not converge. Try longer history or simpler model.")
             st.stop()
             
+        try:
             trans_matrix = res_markov.regime_transition
             
             # Check for degenerate regimes
