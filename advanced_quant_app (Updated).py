@@ -1487,6 +1487,19 @@ if df_main is not None:
                     # Generate Signals (1 = Long if Exp Ret > 0, else 0)
                     signals = (expected_ret > 0).astype(int)
                     
+                    # Debug Dataframe
+                    with st.expander("🔍 Debug: Signal Details"):
+                        debug_df = pd.DataFrame({
+                            "Price": strat_prices,
+                            "Expected Return": expected_ret,
+                            "Signal": signals
+                        }).dropna()
+                        st.dataframe(debug_df.style.format({
+                            "Price": "{:.2f}",
+                            "Expected Return": "{:.4f}",
+                            "Signal": "{:.0f}"
+                        }), use_container_width=True)
+
                     # Plot Strategy Context
                     with st.expander("See Strategy Context"):
                         fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
