@@ -733,23 +733,49 @@ if df_main is not None:
                 
             st.pyplot(fig_m)
             
-            # ===== PARAMETERS TABLE =====
-            with st.expander("📋 Technical Parameters"):
-                summary_data = {
-                    "Parameter": res_markov.params.index,
-                    "Value": res_markov.params.values.astype(float),
-                    "Std Error": res_markov.bse.values.astype(float),
-                    "P-Value": res_markov.pvalues.values.astype(float)
-                }
-                df_summary = pd.DataFrame(summary_data)
-                # Format only numeric columns to avoid error with "Parameter" string column
-                st.dataframe(df_summary.style.format({
-                    "Value": "{:.4f}",
-                    "Std Error": "{:.4f}",
-                    "P-Value": "{:.4f}"
-                }))
+            # ===== PARAMETERS INTERPRETATION =====
+            with st.expander("📋 Model Interpretation (Human Readable)"):
+                st.write("### What do these numbers mean?")
                 
-                st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
+                params = res_markov.params
+                pvalues = res_markov.pvalues
+                
+                for param_name, value in params.items():
+                    pval = pvalues.get(param_name, 1.0)
+                    
+                    # Determine Significance
+                    if pval < 0.01: sig_label = "✅ Highly Significant (Strong Evidence)"
+                    elif pval < 0.05: sig_label = "✅ Significant (Good Evidence)"
+                    elif pval < 0.10: sig_label = "⚠️ Weakly Significant"
+                    else: sig_label = "❌ Not Significant (Likely Noise)"
+                    
+                    # Interpret Parameter Type
+                    interpretation = ""
+                    if "p[" in param_name:
+                        # Transition Probability
+                        from_reg = param_name.split("[")[1].split("->")[0]
+                        to_reg = param_name.split("->")[1].split("]")[0]
+                        if from_reg == to_reg:
+                            interpretation = f"**Stability of Regime {from_reg}:** {value:.1%} chance of staying in this regime tomorrow."
+                        else:
+                            interpretation = f"**Switching Chance:** {value:.1%} chance of switching from Regime {from_reg} to {to_reg}."
+                            
+                    elif "sigma2" in param_name:
+                        reg_idx = param_name.split("[")[1].split("]")[0] if "[" in param_name else "Global"
+                        interpretation = f"**Volatility (Regime {reg_idx}):** Market variance is {value:.4f}."
+                        
+                    elif "const" in param_name:
+                        reg_idx = param_name.split("[")[1].split("]")[0] if "[" in param_name else "Global"
+                        interpretation = f"**Avg Return (Regime {reg_idx}):** Daily return is approx {value:.4f}%."
+                        
+                    st.markdown(f"""
+                    **{param_name}**: {value:.4f}  
+                    _{interpretation}_  
+                    Confidence: {sig_label}
+                    """)
+                    st.divider()
+                
+                st.caption(f"Model Fit Quality (AIC): {res_markov.aic:.2f} (Lower is better)")
             
         except Exception as e:
             st.error(f"❌ Model fitting failed: {str(e)}")
