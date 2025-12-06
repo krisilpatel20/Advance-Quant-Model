@@ -353,8 +353,23 @@ class BacktestEngine:
                     'Exit Date': date,
                     'Buy Price': entry_price,
                     'Sell Price': exit_price,
-                    'PnL (%)': pnl * 100
+                    'PnL (%)': pnl * 100,
+                    'Status': 'Closed'
                 })
+                
+        # Capture Open Position
+        if position == 1:
+            current_price = prices.iloc[-1]
+            pnl = (current_price - entry_price) / entry_price
+            trades.append({
+                'Side': 'Long',
+                'Entry Date': entry_date,
+                'Exit Date': None, # Open
+                'Buy Price': entry_price,
+                'Sell Price': current_price, # Mark-to-Market
+                'PnL (%)': pnl * 100,
+                'Status': 'Open'
+            })
                 
         return {
             'equity_curve': equity_curve,
@@ -1611,7 +1626,7 @@ if df_main is not None:
             if not trades_df.empty:
                 # Format dates
                 trades_df['Entry Date'] = pd.to_datetime(trades_df['Entry Date']).dt.date
-                trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).dt.date
+                trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).apply(lambda x: x.date() if pd.notnull(x) else "Open")
                 
                 st.dataframe(trades_df.style.format({
                     "Buy Price": "{:.2f}",
