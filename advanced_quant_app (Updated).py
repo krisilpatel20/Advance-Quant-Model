@@ -1389,112 +1389,163 @@ if df_main is not None:
     # TAB 7: BACKTEST
     # ==========================================
     with tab7:
-        st.write("### 🛠️ Strategy Backtest (Regime-Based)")
-        st.markdown("Backtest a simple strategy: **Long when Bull Regime Probability > Threshold**, otherwise Cash.")
+        st.write("### 🛠️ Strategy Backtest")
         
-        # Ensure we have the model fitted (Reuse logic or warn)
-        # Ideally, we should move the fitting to a shared section or check if it's done.
-        # For now, we'll re-run the fit using the cached function (it will be instant).
+        # Strategy Selector
+        strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Mean Reversion)"], horizontal=True)
         
-        # Re-gather params from sidebar/Tab2 state if possible, or provide local overrides
+        # Common Backtest Params
         col_b1, col_b2, col_b3 = st.columns(3)
-        with col_b1:
-            bt_threshold = st.slider("Bull Probability Threshold", 0.1, 0.9, 0.5, step=0.05)
         with col_b2:
             initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000)
+        
+        # Date Selection
         with col_b3:
-            # User selects which regime is 'Bull' (usually highest return)
-            # We need to fit first to know.
-            pass
+            default_start = datetime.now() - timedelta(days=365*2)
+            bt_start_date = st.date_input("Backtest Start", default_start)
+            bt_end_date = st.date_input("Backtest End", datetime.now())
 
-        # Re-prepare data (same as Tab 2 default logic)
-        # Note: This relies on the same 'df_main' and default params if user hasn't changed Tab 2.
-        # To be robust, we duplicate the minimal data prep here.
-        
-        # Default params for backtest (can be exposed if needed)
-        bt_lookback = 5
-        bt_freq = "Daily" 
-        bt_n_regimes = 2
-        
-        start_dt_bt = datetime.now() - timedelta(days=bt_lookback*365)
-        df_bt = load_data(TICKER, start_dt_bt, end_date)
-        
-        if df_bt is not None:
-            returns_bt = df_bt['Returns']
-            model_data_bt = returns_bt.dropna() * 100
+        # Data Prep
+        if bt_start_date >= bt_end_date:
+            st.error("Start date must be before end date.")
+            st.stop()
             
-            with st.spinner("Running Backtest..."):
+        df_bt = load_data(TICKER, bt_start_date, bt_end_date)
+        
+        if df_bt is None or df_bt.empty:
+            st.error("Could not load data for backtest. Check dates and ticker.")
+            st.stop()
+            
+        returns_bt = df_bt['Returns']
+        prices_bt = df_bt['Close']
+        model_data_bt = returns_bt.dropna() * 100
+        
+        signals = None
+        
+        if strategy_type == "Regime Switching (Trend Following)":
+            st.markdown("**Strategy:** Long when Bull Regime Probability > Threshold.")
+            
+            with col_b1:
+                bt_threshold = st.slider("Bull Probability Threshold", 0.1, 0.9, 0.5, step=0.05)
+            
+            with st.spinner("Fitting Regime Model..."):
                 # Fit Model
-                res_bt = fit_regime_model(model_data_bt, bt_n_regimes, True, True)
+                res_bt = fit_regime_model(model_data_bt, 2, True, True) # Default 2 regimes
                 
                 if res_bt:
                     # Identify Bull Regime (Highest Mean)
-                    regime_means = []
-                    for i in range(bt_n_regimes):
-                        if f'const[{i}]' in res_bt.params:
-                            regime_means.append(res_bt.params[f'const[{i}]'])
-                        else:
-                            regime_means.append(res_bt.params.get('const', 0.0))
-                    
+                    regime_means = [res_bt.params.get(f'const[{i}]', res_bt.params.get('const', 0.0)) for i in range(2)]
                     bull_regime_idx = np.argmax(regime_means)
                     
-                    # Get Probabilities
+                    # Get Probabilities (Filtered to avoid lookahead)
                     bull_probs = res_bt.filtered_marginal_probabilities.iloc[:, bull_regime_idx]
                     
-                    # Generate Signals
+                    # Align indices
+                    common_idx = prices_bt.index.intersection(bull_probs.index)
+                    bull_probs = bull_probs.loc[common_idx]
+                    
+                    # Generate Signals (1 = Long, 0 = Cash)
                     signals = (bull_probs > bt_threshold).astype(int)
-                    
-                    # Run Strategy
-                    # Align prices with signals
-                    prices_bt = df_bt['Close'].loc[model_data_bt.index]
-                    
-                    bt_results = BacktestEngine.run_strategy(prices_bt, signals, initial_cap)
-                    
-                    # Metrics
-                    strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
-                    bench_metrics = BacktestEngine.calculate_metrics(prices_bt.pct_change().dropna(), rf_rate)
-                    
-                    # Display Metrics
-                    st.write("#### 📊 Performance Metrics")
-                    met_col1, met_col2, met_col3, met_col4 = st.columns(4)
-                    
-                    with met_col1:
-                        st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
-                    with met_col2:
-                        st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
-                    with met_col3:
-                        st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
-                    with met_col4:
-                        st.metric("Benchmark Return", f"{(bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
-                        
-                    # Equity Curve Plot
-                    st.write("#### 📈 Equity Curve")
-                    fig_bt, ax_bt = plt.subplots(figsize=(12, 6))
-                    ax_bt.plot(bt_results['equity_curve'], label='Strategy (Regime Switching)', color='green', linewidth=2)
-                    ax_bt.plot(bt_results['benchmark_curve'], label='Buy & Hold (Benchmark)', color='gray', linestyle='--', alpha=0.7)
-                    ax_bt.set_title(f"Strategy Performance: {TICKER}")
-                    ax_bt.legend()
-                    format_plot_dates(ax_bt, bt_results['equity_curve'].index)
-                    st.pyplot(fig_bt)
-                    
-                    # Trade Log
-                    st.write("#### 📝 Trade Log")
-                    trades_df = bt_results['trades']
-                    if not trades_df.empty:
-                        # Format dates
-                        trades_df['Entry Date'] = trades_df['Entry Date'].dt.date
-                        trades_df['Exit Date'] = trades_df['Exit Date'].dt.date
-                        
-                        st.dataframe(trades_df.style.format({
-                            "Entry Price": "{:.2f}",
-                            "Exit Price": "{:.2f}",
-                            "PnL (%)": "{:.2f}%"
-                        }), use_container_width=True)
-                    else:
-                        st.info("No closed trades generated by the strategy.")
-                        
                 else:
-                    st.error("Model fitting failed for backtest.")
+                    st.error("Regime model fitting failed.")
+
+        elif strategy_type == "Kalman Filter (Mean Reversion)":
+            st.markdown("**Strategy:** Long when Price is significantly BELOW Trend (Oversold). Exit when Price reverts to Trend.")
+            
+            with col_b1:
+                kf_threshold = st.slider("Deviation Threshold (%)", 0.5, 10.0, 2.0, step=0.5) / 100
+            with col_b3:
+                kf_noise = st.select_slider("Trend Sensitivity", options=[1e-5, 1e-4, 1e-3], value=1e-4, 
+                                            format_func=lambda x: f"{x} (Standard)" if x==1e-4 else str(x))
+
+            with st.spinner("Running Kalman Filter..."):
+                # Run Kalman Filter (Standard/Causal to avoid lookahead)
+                kf = KalmanFilterTrend(process_noise=kf_noise, measurement_noise=1e-2)
+                trend_est, _ = kf.filter(prices_bt.values)
+                trend_series = pd.Series(trend_est, index=prices_bt.index)
+                
+                # Generate Signals
+                # Logic: 
+                # Enter Long (1) if Price < Trend * (1 - Threshold)
+                # Exit (0) if Price >= Trend (Mean Reversion Complete)
+                # Hold previous state otherwise
+                
+                sig_list = []
+                position = 0
+                
+                for price, trend in zip(prices_bt, trend_series):
+                    if position == 0:
+                        if price < trend * (1 - kf_threshold):
+                            position = 1 # Buy
+                    elif position == 1:
+                        if price >= trend:
+                            position = 0 # Sell
+                    sig_list.append(position)
+                
+                signals = pd.Series(sig_list, index=prices_bt.index)
+                
+                # Plot Strategy Context
+                with st.expander("See Strategy Context"):
+                    fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                    ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
+                    ax_ctx.plot(trend_series.index, trend_series, color='blue', label='Kalman Trend')
+                    
+                    # Plot Buy/Sell zones roughly
+                    ax_ctx.fill_between(trend_series.index, 
+                                        trend_series * (1 - kf_threshold), 
+                                        trend_series * (1 + kf_threshold), 
+                                        color='gray', alpha=0.1, label='Neutral Zone')
+                    
+                    format_plot_dates(ax_ctx, prices_bt.index)
+                    ax_ctx.legend()
+                    st.pyplot(fig_ctx)
+
+        # Run Backtest Engine if signals exist
+        if signals is not None:
+            bt_results = BacktestEngine.run_strategy(prices_bt, signals, initial_cap)
+            
+            # Metrics
+            strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
+            bench_metrics = BacktestEngine.calculate_metrics(prices_bt.pct_change().dropna(), rf_rate)
+            
+            # Display Metrics
+            st.write("#### 📊 Performance Metrics")
+            met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+            
+            with met_col1:
+                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+            with met_col2:
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+            with met_col3:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col4:
+                st.metric("Benchmark Return", f"{(bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+                
+            # Equity Curve Plot
+            st.write("#### 📈 Equity Curve")
+            fig_bt, ax_bt = plt.subplots(figsize=(12, 6))
+            ax_bt.plot(bt_results['equity_curve'], label=f'Strategy ({strategy_type})', color='green', linewidth=2)
+            ax_bt.plot(bt_results['benchmark_curve'], label='Buy & Hold (Benchmark)', color='gray', linestyle='--', alpha=0.7)
+            ax_bt.set_title(f"Strategy Performance: {TICKER}")
+            ax_bt.legend()
+            format_plot_dates(ax_bt, bt_results['equity_curve'].index)
+            st.pyplot(fig_bt)
+            
+            # Trade Log
+            st.write("#### 📝 Trade Log")
+            trades_df = bt_results['trades']
+            if not trades_df.empty:
+                # Format dates
+                trades_df['Entry Date'] = pd.to_datetime(trades_df['Entry Date']).dt.date
+                trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).dt.date
+                
+                st.dataframe(trades_df.style.format({
+                    "Entry Price": "{:.2f}",
+                    "Exit Price": "{:.2f}",
+                    "PnL (%)": "{:.2f}%"
+                }), use_container_width=True)
+            else:
+                st.info("No closed trades generated by the strategy.")
 
 
 else:
