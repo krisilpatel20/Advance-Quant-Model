@@ -1424,29 +1424,65 @@ if df_main is not None:
         signals = None
         
         if strategy_type == "Regime Switching (Trend Following)":
-            st.markdown("**Strategy:** Long when Bull Regime Probability > Threshold.")
+            st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
             
-            with col_b1:
-                bt_threshold = st.slider("Bull Probability Threshold", 0.1, 0.9, 0.5, step=0.05)
-            
+            # Regime Parameters
+            col_r1, col_r2, col_r3 = st.columns(3)
+            with col_r1:
+                bt_n_regimes = st.slider("Number of Regimes", 2, 4, 2, key="bt_n_regimes")
+            with col_r2:
+                bt_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 3, key="bt_stability")
+            with col_r3:
+                bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
+                bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
+
+            # Apply Smoothing if requested
+            if bt_stability > 0:
+                model_data_bt = returns_bt.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
+            else:
+                model_data_bt = returns_bt.dropna() * 100
+
             with st.spinner("Fitting Regime Model..."):
                 # Fit Model
-                res_bt = fit_regime_model(model_data_bt, 2, True, True) # Default 2 regimes
+                res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
                 
                 if res_bt:
-                    # Identify Bull Regime (Highest Mean)
-                    regime_means = [res_bt.params.get(f'const[{i}]', res_bt.params.get('const', 0.0)) for i in range(2)]
-                    bull_regime_idx = np.argmax(regime_means)
+                    # Calculate Expected Return
+                    # E[R] = Sum(Prob_i * Mean_i)
+                    expected_ret = pd.Series(0.0, index=model_data_bt.index)
                     
-                    # Get Probabilities (Filtered to avoid lookahead)
-                    bull_probs = res_bt.filtered_marginal_probabilities.iloc[:, bull_regime_idx]
+                    for i in range(bt_n_regimes):
+                        # Get Regime Mean
+                        if f'const[{i}]' in res_bt.params:
+                            mean_val = res_bt.params[f'const[{i}]']
+                        else:
+                            mean_val = res_bt.params.get('const', 0.0)
+                            
+                        # Get Filtered Probability (No Lookahead)
+                        prob = res_bt.filtered_marginal_probabilities.iloc[:, i]
+                        
+                        expected_ret += prob * mean_val
                     
                     # Align indices
-                    common_idx = prices_bt.index.intersection(bull_probs.index)
-                    bull_probs = bull_probs.loc[common_idx]
+                    common_idx = prices_bt.index.intersection(expected_ret.index)
+                    expected_ret = expected_ret.loc[common_idx]
                     
-                    # Generate Signals (1 = Long, 0 = Cash)
-                    signals = (bull_probs > bt_threshold).astype(int)
+                    # Generate Signals (1 = Long if Exp Ret > 0, else 0)
+                    signals = (expected_ret > 0).astype(int)
+                    
+                    # Plot Strategy Context
+                    with st.expander("See Strategy Context"):
+                        fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                        ax_ctx.plot(expected_ret.index, expected_ret, color='purple', label='Expected Return')
+                        ax_ctx.axhline(0, color='black', linestyle='--', linewidth=1)
+                        ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret>0), color='green', alpha=0.3, label='Long Zone')
+                        ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret<0), color='red', alpha=0.3, label='Cash/Short Zone')
+                        
+                        format_plot_dates(ax_ctx, expected_ret.index)
+                        ax_ctx.set_title("Regime-Weighted Expected Return")
+                        ax_ctx.legend()
+                        st.pyplot(fig_ctx)
+                        
                 else:
                     st.error("Regime model fitting failed.")
 
