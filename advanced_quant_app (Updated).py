@@ -518,17 +518,17 @@ with st.sidebar:
     # Ticker Inputs
     col_t1, col_t2 = st.columns(2)
     with col_t1:
-        raw_ticker = st.text_input("Main Ticker", "RELIANCE" if market_region == "Indian Market (INR)" else "BTC-USD").upper()
+        raw_ticker = st.text_input("Main Ticker", "RELIANCE" if market_region == "Indian Market (INR)" else "AAPL").upper()
     with col_t2:
-        raw_pair = st.text_input("Pair Ticker", "INFY" if market_region == "Indian Market (INR)" else "ETH-USD").upper()
+        raw_pair = st.text_input("Pair Ticker", "").upper()
     
     # Auto-append suffix if needed
     TICKER = raw_ticker + SUFFIX if (SUFFIX and not raw_ticker.endswith(SUFFIX)) else raw_ticker
-    PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and not raw_pair.endswith(SUFFIX)) else raw_pair
+    PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
     
-    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365*2))
+    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
