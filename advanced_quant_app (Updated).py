@@ -1392,7 +1392,7 @@ if df_main is not None:
         st.write("### 🛠️ Strategy Backtest")
         
         # Strategy Selector
-        strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Mean Reversion)"], horizontal=True)
+        strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)"], horizontal=True)
         
         # Common Backtest Params
         col_b1, col_b2, col_b3 = st.columns(3)
@@ -1449,11 +1449,9 @@ if df_main is not None:
                 else:
                     st.error("Regime model fitting failed.")
 
-        elif strategy_type == "Kalman Filter (Mean Reversion)":
-            st.markdown("**Strategy:** Long when Price is significantly BELOW Trend (Oversold). Exit when Price reverts to Trend.")
+        elif strategy_type == "Kalman Filter (Trend Crossover)":
+            st.markdown("**Strategy:** Long when Price crosses **ABOVE** Kalman Trend. Sell when Price crosses **BELOW**.")
             
-            with col_b1:
-                kf_threshold = st.slider("Deviation Threshold (%)", 0.5, 10.0, 2.0, step=0.5) / 100
             with col_b3:
                 kf_noise = st.select_slider("Trend Sensitivity", options=[1e-5, 1e-4, 1e-3], value=1e-4, 
                                             format_func=lambda x: f"{x} (Standard)" if x==1e-4 else str(x))
@@ -1466,23 +1464,10 @@ if df_main is not None:
                 
                 # Generate Signals
                 # Logic: 
-                # Enter Long (1) if Price < Trend * (1 - Threshold)
-                # Exit (0) if Price >= Trend (Mean Reversion Complete)
-                # Hold previous state otherwise
+                # Long (1) if Price > Trend
+                # Cash (0) if Price <= Trend
                 
-                sig_list = []
-                position = 0
-                
-                for price, trend in zip(prices_bt, trend_series):
-                    if position == 0:
-                        if price < trend * (1 - kf_threshold):
-                            position = 1 # Buy
-                    elif position == 1:
-                        if price >= trend:
-                            position = 0 # Sell
-                    sig_list.append(position)
-                
-                signals = pd.Series(sig_list, index=prices_bt.index)
+                signals = (prices_bt > trend_series).astype(int)
                 
                 # Plot Strategy Context
                 with st.expander("See Strategy Context"):
@@ -1490,11 +1475,9 @@ if df_main is not None:
                     ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
                     ax_ctx.plot(trend_series.index, trend_series, color='blue', label='Kalman Trend')
                     
-                    # Plot Buy/Sell zones roughly
-                    ax_ctx.fill_between(trend_series.index, 
-                                        trend_series * (1 - kf_threshold), 
-                                        trend_series * (1 + kf_threshold), 
-                                        color='gray', alpha=0.1, label='Neutral Zone')
+                    # Highlight Long Zones
+                    ax_ctx.fill_between(trend_series.index, prices_bt.min(), prices_bt.max(), 
+                                        where=(signals==1), color='green', alpha=0.1, label='Long Zone')
                     
                     format_plot_dates(ax_ctx, prices_bt.index)
                     ax_ctx.legend()
