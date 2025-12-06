@@ -301,6 +301,124 @@ def merton_jump_diffusion(S0, T, r, sigma, lam, mu_j, sigma_j, steps, paths):
         
     return prices
 
+class BacktestEngine:
+    """
+    Handles simple vectorised backtesting for regime-based strategies.
+    """
+    @staticmethod
+    def run_strategy(prices, signals, initial_capital=10000.0):
+        """
+        prices: Series of asset prices
+        signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
+        """
+        # Align
+        common_idx = prices.index.intersection(signals.index)
+        prices = prices.loc[common_idx]
+        signals = signals.loc[common_idx]
+        
+        # Calculate Returns
+        returns = prices.pct_change().fillna(0)
+        
+        # Strategy Returns (Lagged signal to avoid lookahead)
+        # Signal at t determines position for t+1 return
+        strat_returns = signals.shift(1).fillna(0) * returns
+        
+        # Equity Curves
+        cum_returns = (1 + returns).cumprod()
+        strat_cum_returns = (1 + strat_returns).cumprod()
+        
+        equity_curve = initial_capital * strat_cum_returns
+        benchmark_curve = initial_capital * cum_returns
+        
+        # Trade Log
+        trades = []
+        position = 0 # 0: Cash, 1: Long
+        entry_price = 0
+        entry_date = None
+        
+        for date, price, signal in zip(prices.index, prices, signals):
+            if position == 0 and signal == 1:
+                # Buy
+                position = 1
+                entry_price = price
+                entry_date = date
+            elif position == 1 and signal == 0:
+                # Sell
+                position = 0
+                exit_price = price
+                pnl = (exit_price - entry_price) / entry_price
+                trades.append({
+                    'Entry Date': entry_date,
+                    'Exit Date': date,
+                    'Entry Price': entry_price,
+                    'Exit Price': exit_price,
+                    'PnL (%)': pnl * 100
+                })
+                
+        return {
+            'equity_curve': equity_curve,
+            'benchmark_curve': benchmark_curve,
+            'trades': pd.DataFrame(trades),
+            'returns': strat_returns
+        }
+
+    @staticmethod
+    def calculate_metrics(returns, risk_free_rate=0.0):
+        """
+        Calculates Sharpe, Sortino, Max Drawdown
+        """
+        if len(returns) < 2: return {}
+        
+        # Annualization factor
+        ann_factor = 252
+        
+        # Excess Returns
+        excess_ret = returns - (risk_free_rate / 252)
+        
+        # Sharpe
+        sharpe = np.sqrt(ann_factor) * excess_ret.mean() / (returns.std() + 1e-9)
+        
+        # Sortino (Downside Deviation)
+        downside = returns[returns < 0]
+        sortino = np.sqrt(ann_factor) * excess_ret.mean() / (downside.std() + 1e-9)
+        
+        # Max Drawdown
+        cum_ret = (1 + returns).cumprod()
+        peak = cum_ret.cummax()
+        drawdown = (cum_ret - peak) / peak
+        max_dd = drawdown.min()
+        
+        # CAGR
+        total_ret = (1 + returns).prod()
+        n_years = len(returns) / 252
+        cagr = (total_ret ** (1/n_years)) - 1 if n_years > 0 else 0
+        
+        return {
+            'Sharpe Ratio': sharpe,
+            'Sortino Ratio': sortino,
+            'Max Drawdown': max_dd,
+            'CAGR': cagr
+        }
+
+@st.cache_resource
+def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
+    """
+    Cached helper to fit Markov Regression.
+    Returns the fitted result object.
+    """
+    try:
+        mod_markov = MarkovRegression(
+            model_data,
+            k_regimes=n_regimes,
+            trend='c',
+            switching_variance=switch_vol,
+            switching_trend=switch_trend
+        )
+        res_markov = mod_markov.fit(search_reps=50, disp=False)
+        return res_markov
+    except Exception as e:
+        return None
+
 @st.cache_data
 def load_data(ticker, start, end):
     try:
@@ -431,8 +549,10 @@ if df_main is not None:
         "Regime Switching", 
         "Stochastic (Heston/Jump)", 
         "Kalman Filter", 
+        "Kalman Filter", 
         "Macro Factors",
-        "Structural"
+        "Structural",
+        "Backtest"
     ])
 
     # ==========================================
@@ -560,22 +680,17 @@ if df_main is not None:
         st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {start_dt_regime.date()}")
         
         # ===== MODEL FITTING =====
-        try:
-            mod_markov = MarkovRegression(
-                model_data,
-                k_regimes=n_regimes,
-                trend='c',
-                switching_variance=switch_vol,
-                switching_trend=switch_trend
-            )
-            
-            with st.spinner(f"Fitting {n_regimes}-regime model..."):
-                res_markov = mod_markov.fit(search_reps=50, disp=False)
-            
-            # ===== CONVERGENCE CHECKS =====
-            if not res_markov.mle_retvals['converged']:
-                st.error("⛔ Model did not converge. Try longer history or simpler model.")
-                st.stop()
+        # ===== MODEL FITTING =====
+        res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
+        
+        if res_markov is None:
+             st.error("❌ Model fitting failed. Try different parameters.")
+             st.stop()
+        
+        # ===== CONVERGENCE CHECKS =====
+        if not res_markov.mle_retvals['converged']:
+            st.error("⛔ Model did not converge. Try longer history or simpler model.")
+            st.stop()
             
             trans_matrix = res_markov.regime_transition
             
@@ -777,8 +892,9 @@ if df_main is not None:
                 
                 st.caption(f"Model Fit Quality (AIC): {res_markov.aic:.2f} (Lower is better)")
             
+            
         except Exception as e:
-            st.error(f"❌ Model fitting failed: {str(e)}")
+            st.error(f"❌ Error in Regime Analysis: {str(e)}")
             
             st.write("**💡 Troubleshooting:**")
             st.info("""
@@ -1267,6 +1383,118 @@ if df_main is not None:
             st.pyplot(fig_dec)
         else:
             st.warning("Insufficient data for decomposition with selected period.")
+
+    # ==========================================
+    # TAB 7: BACKTEST
+    # ==========================================
+    with tab7:
+        st.write("### 🛠️ Strategy Backtest (Regime-Based)")
+        st.markdown("Backtest a simple strategy: **Long when Bull Regime Probability > Threshold**, otherwise Cash.")
+        
+        # Ensure we have the model fitted (Reuse logic or warn)
+        # Ideally, we should move the fitting to a shared section or check if it's done.
+        # For now, we'll re-run the fit using the cached function (it will be instant).
+        
+        # Re-gather params from sidebar/Tab2 state if possible, or provide local overrides
+        col_b1, col_b2, col_b3 = st.columns(3)
+        with col_b1:
+            bt_threshold = st.slider("Bull Probability Threshold", 0.1, 0.9, 0.5, step=0.05)
+        with col_b2:
+            initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000)
+        with col_b3:
+            # User selects which regime is 'Bull' (usually highest return)
+            # We need to fit first to know.
+            pass
+
+        # Re-prepare data (same as Tab 2 default logic)
+        # Note: This relies on the same 'df_main' and default params if user hasn't changed Tab 2.
+        # To be robust, we duplicate the minimal data prep here.
+        
+        # Default params for backtest (can be exposed if needed)
+        bt_lookback = 5
+        bt_freq = "Daily" 
+        bt_n_regimes = 2
+        
+        start_dt_bt = datetime.now() - timedelta(days=bt_lookback*365)
+        df_bt = load_data(TICKER, start_dt_bt, end_date)
+        
+        if df_bt is not None:
+            returns_bt = df_bt['Returns']
+            model_data_bt = returns_bt.dropna() * 100
+            
+            with st.spinner("Running Backtest..."):
+                # Fit Model
+                res_bt = fit_regime_model(model_data_bt, bt_n_regimes, True, True)
+                
+                if res_bt:
+                    # Identify Bull Regime (Highest Mean)
+                    regime_means = []
+                    for i in range(bt_n_regimes):
+                        if f'const[{i}]' in res_bt.params:
+                            regime_means.append(res_bt.params[f'const[{i}]'])
+                        else:
+                            regime_means.append(res_bt.params.get('const', 0.0))
+                    
+                    bull_regime_idx = np.argmax(regime_means)
+                    
+                    # Get Probabilities
+                    bull_probs = res_bt.filtered_marginal_probabilities.iloc[:, bull_regime_idx]
+                    
+                    # Generate Signals
+                    signals = (bull_probs > bt_threshold).astype(int)
+                    
+                    # Run Strategy
+                    # Align prices with signals
+                    prices_bt = df_bt['Close'].loc[model_data_bt.index]
+                    
+                    bt_results = BacktestEngine.run_strategy(prices_bt, signals, initial_cap)
+                    
+                    # Metrics
+                    strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
+                    bench_metrics = BacktestEngine.calculate_metrics(prices_bt.pct_change().dropna(), rf_rate)
+                    
+                    # Display Metrics
+                    st.write("#### 📊 Performance Metrics")
+                    met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+                    
+                    with met_col1:
+                        st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+                    with met_col2:
+                        st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                    with met_col3:
+                        st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                    with met_col4:
+                        st.metric("Benchmark Return", f"{(bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+                        
+                    # Equity Curve Plot
+                    st.write("#### 📈 Equity Curve")
+                    fig_bt, ax_bt = plt.subplots(figsize=(12, 6))
+                    ax_bt.plot(bt_results['equity_curve'], label='Strategy (Regime Switching)', color='green', linewidth=2)
+                    ax_bt.plot(bt_results['benchmark_curve'], label='Buy & Hold (Benchmark)', color='gray', linestyle='--', alpha=0.7)
+                    ax_bt.set_title(f"Strategy Performance: {TICKER}")
+                    ax_bt.legend()
+                    format_plot_dates(ax_bt, bt_results['equity_curve'].index)
+                    st.pyplot(fig_bt)
+                    
+                    # Trade Log
+                    st.write("#### 📝 Trade Log")
+                    trades_df = bt_results['trades']
+                    if not trades_df.empty:
+                        # Format dates
+                        trades_df['Entry Date'] = trades_df['Entry Date'].dt.date
+                        trades_df['Exit Date'] = trades_df['Exit Date'].dt.date
+                        
+                        st.dataframe(trades_df.style.format({
+                            "Entry Price": "{:.2f}",
+                            "Exit Price": "{:.2f}",
+                            "PnL (%)": "{:.2f}%"
+                        }), use_container_width=True)
+                    else:
+                        st.info("No closed trades generated by the strategy.")
+                        
+                else:
+                    st.error("Model fitting failed for backtest.")
+
 
 else:
     st.info("Enter a ticker and ensure data is loaded to begin analysis.")
