@@ -306,10 +306,11 @@ class BacktestEngine:
     Handles simple vectorised backtesting for regime-based strategies.
     """
     @staticmethod
-    def run_strategy(prices, signals, initial_capital=10000.0):
+    def run_strategy(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0):
         """
         prices: Series of asset prices
         signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
+        trailing_stop_pct: Float (e.g., 0.05 for 5%). If > 0, applies trailing stop.
         """
         # Align
         common_idx = prices.index.intersection(signals.index)
@@ -319,33 +320,68 @@ class BacktestEngine:
         # Calculate Returns
         returns = prices.pct_change().fillna(0)
         
-        # Strategy Returns (Lagged signal to avoid lookahead)
-        # Signal at t determines position for t+1 return
-        strat_returns = signals.shift(1).fillna(0) * returns
+        # Note: Vectorized approach is hard with path-dependent trailing stop.
+        # We will use the loop for everything to be consistent and accurate with stops.
         
-        # Equity Curves
-        cum_returns = (1 + returns).cumprod()
-        strat_cum_returns = (1 + strat_returns).cumprod()
-        
-        equity_curve = initial_capital * strat_cum_returns
-        benchmark_curve = initial_capital * cum_returns
-        
-        # Trade Log
+        equity_curve = [initial_capital]
         trades = []
         position = 0 # 0: Cash, 1: Long
         entry_price = 0
         entry_date = None
+        max_price_since_entry = 0
+        
+        cash = initial_capital
+        holdings = 0
         
         for date, price, signal in zip(prices.index, prices, signals):
+            # Mark to Market
+            if position == 1:
+                current_val = cash + holdings * price
+                
+                # Check Trailing Stop
+                if trailing_stop_pct > 0:
+                    max_price_since_entry = max(max_price_since_entry, price)
+                    stop_price = max_price_since_entry * (1 - trailing_stop_pct)
+                    
+                    if price < stop_price:
+                        # Trigger Stop Loss
+                        position = 0
+                        exit_price = price
+                        cash = holdings * exit_price
+                        holdings = 0
+                        
+                        pnl = (exit_price - entry_price) / entry_price
+                        trades.append({
+                            'Side': 'Long',
+                            'Entry Date': entry_date,
+                            'Exit Date': date,
+                            'Buy Price': entry_price,
+                            'Sell Price': exit_price,
+                            'PnL (%)': pnl * 100,
+                            'Status': 'Trailing Stop'
+                        })
+                        equity_curve.append(cash)
+                        continue # Skip normal signal processing for this bar
+            else:
+                current_val = cash
+            
+            # Signal Processing
             if position == 0 and signal == 1:
                 # Buy
                 position = 1
                 entry_price = price
                 entry_date = date
+                max_price_since_entry = price
+                
+                holdings = cash / price
+                cash = 0
             elif position == 1 and signal == 0:
                 # Sell
                 position = 0
                 exit_price = price
+                cash = holdings * exit_price
+                holdings = 0
+                
                 pnl = (exit_price - entry_price) / entry_price
                 trades.append({
                     'Side': 'Long',
@@ -356,10 +392,13 @@ class BacktestEngine:
                     'PnL (%)': pnl * 100,
                     'Status': 'Closed'
                 })
-                
+            
+            equity_curve.append(current_val)
+            
         # Capture Open Position
         if position == 1:
             current_price = prices.iloc[-1]
+            current_val = holdings * current_price
             pnl = (current_price - entry_price) / entry_price
             trades.append({
                 'Side': 'Long',
@@ -370,9 +409,17 @@ class BacktestEngine:
                 'PnL (%)': pnl * 100,
                 'Status': 'Open'
             })
+            equity_curve[-1] = current_val # Update last point
+            
+        # Convert to Series
+        equity_curve_series = pd.Series(equity_curve[1:], index=prices.index)
+        benchmark_curve = initial_capital * (1 + returns).cumprod()
+        
+        # Derived Strategy Returns
+        strat_returns = equity_curve_series.pct_change().fillna(0)
                 
         return {
-            'equity_curve': equity_curve,
+            'equity_curve': equity_curve_series,
             'benchmark_curve': benchmark_curve,
             'trades': pd.DataFrame(trades),
             'returns': strat_returns
@@ -533,17 +580,17 @@ with st.sidebar:
     # Ticker Inputs
     col_t1, col_t2 = st.columns(2)
     with col_t1:
-        raw_ticker = st.text_input("Main Ticker", "RELIANCE" if market_region == "Indian Market (INR)" else "BTC-USD").upper()
+        raw_ticker = st.text_input("Main Ticker", "RELIANCE" if market_region == "Indian Market (INR)" else "AAPL").upper()
     with col_t2:
-        raw_pair = st.text_input("Pair Ticker", "INFY" if market_region == "Indian Market (INR)" else "ETH-USD").upper()
+        raw_pair = st.text_input("Pair Ticker", "").upper()
     
     # Auto-append suffix if needed
     TICKER = raw_ticker + SUFFIX if (SUFFIX and not raw_ticker.endswith(SUFFIX)) else raw_ticker
-    PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and not raw_pair.endswith(SUFFIX)) else raw_pair
+    PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
     
-    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365*2))
+    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
@@ -1388,6 +1435,8 @@ if df_main is not None:
         
         # Common Backtest Params
         col_b1, col_b2, col_b3 = st.columns(3)
+        with col_b1:
+            trailing_stop = st.slider("Trailing Stop Loss (%)", 0.0, 20.0, 0.0, step=0.5) / 100
         with col_b2:
             initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000)
         
@@ -1624,7 +1673,7 @@ if df_main is not None:
 
         # Run Backtest Engine if signals exist
         if signals is not None:
-            bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap)
+            bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop)
             
             # Metrics
             strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
