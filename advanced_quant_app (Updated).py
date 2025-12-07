@@ -1482,12 +1482,14 @@ if df_main is not None:
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
             # Signal Method Selection
-            signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability"], horizontal=True)
+            signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"], horizontal=True)
 
             if signal_method == "Regime Weighted Expected Return":
                 st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
-            else:
+            elif signal_method == "Regime Probability":
                 st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
+            else:
+                st.markdown("**Strategy:** Long immediately when entering **Bull Regime**. Sell immediately when exiting.")
 
             # Resample if Weekly
             if bt_freq == "Weekly":
@@ -1596,6 +1598,39 @@ if df_main is not None:
                             
                             format_plot_dates(ax_ctx, bull_probs.index)
                             ax_ctx.set_title(f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})")
+                            ax_ctx.legend()
+                            format_plot_dates(ax_ctx, bull_probs.index)
+                            ax_ctx.set_title(f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})")
+                            ax_ctx.legend()
+                            st.pyplot(fig_ctx)
+
+                    else: # Regime Switching Period
+                        # Logic: Long if Bull Probability is the highest (Dominant)
+                        # This is similar to 'Regime Probability' but framed as "Period"
+                        # We ensure it's strictly 1 or 0 based on dominance.
+                        
+                        dominant_regime = probs_df.idxmax(axis=1)
+                        
+                        # Align indices
+                        common_idx = strat_prices.index.intersection(dominant_regime.index)
+                        dominant_regime = dominant_regime.loc[common_idx]
+                        
+                        # Signal: 1 if Dominant Regime is Bull
+                        signals = (dominant_regime == bull_regime_idx).astype(int)
+                        
+                        # Plot Context
+                        with st.expander("See Strategy Context"):
+                            fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                            
+                            # Plot Price
+                            ax_ctx.plot(strat_prices.index, strat_prices, color='gray', alpha=0.5, label='Price')
+                            
+                            # Highlight Bull Periods
+                            ax_ctx.fill_between(strat_prices.index, strat_prices.min(), strat_prices.max(), 
+                                                where=(signals==1), color='green', alpha=0.2, label='Bull Regime Period')
+                            
+                            format_plot_dates(ax_ctx, strat_prices.index)
+                            ax_ctx.set_title(f"Regime Switching Periods (Bull Regime: {bull_regime_idx})")
                             ax_ctx.legend()
                             st.pyplot(fig_ctx)
 
