@@ -1562,7 +1562,7 @@ if df_main is not None:
                             ax_ctx.legend()
                             st.pyplot(fig_ctx)
 
-                    else: # Regime Probability Strategy
+                    elif signal_method == "Regime Probability":
                         # Logic: Long if Bull Probability is the highest (Dominant)
                         # Or specifically: Bull > Bear (and Bull > Normal)
                         
@@ -1596,9 +1596,6 @@ if df_main is not None:
                             # Highlight Long Zones
                             ax_ctx.fill_between(bull_probs.index, 0, 1, where=(signals==1), color='green', alpha=0.1, label='Long Signal')
                             
-                            format_plot_dates(ax_ctx, bull_probs.index)
-                            ax_ctx.set_title(f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})")
-                            ax_ctx.legend()
                             format_plot_dates(ax_ctx, bull_probs.index)
                             ax_ctx.set_title(f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})")
                             ax_ctx.legend()
