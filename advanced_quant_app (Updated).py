@@ -301,140 +301,6 @@ def merton_jump_diffusion(S0, T, r, sigma, lam, mu_j, sigma_j, steps, paths):
         
     return prices
 
-class BacktestEngine:
-    """
-    Handles simple vectorised backtesting for regime-based strategies.
-    """
-    @staticmethod
-    def run_strategy(prices, signals, initial_capital=10000.0):
-        """
-        prices: Series of asset prices
-        signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
-        """
-        # Align
-        common_idx = prices.index.intersection(signals.index)
-        prices = prices.loc[common_idx]
-        signals = signals.loc[common_idx]
-        
-        # Calculate Returns
-        returns = prices.pct_change().fillna(0)
-        
-        # Strategy Returns (Lagged signal to avoid lookahead)
-        # Signal at t determines position for t+1 return
-        strat_returns = signals.shift(1).fillna(0) * returns
-        
-        # Equity Curves
-        cum_returns = (1 + returns).cumprod()
-        strat_cum_returns = (1 + strat_returns).cumprod()
-        
-        equity_curve = initial_capital * strat_cum_returns
-        benchmark_curve = initial_capital * cum_returns
-        
-        # Trade Log
-        trades = []
-        position = 0 # 0: Cash, 1: Long
-        entry_price = 0
-        entry_date = None
-        
-        for date, price, signal in zip(prices.index, prices, signals):
-            if position == 0 and signal == 1:
-                # Buy
-                position = 1
-                entry_price = price
-                entry_date = date
-            elif position == 1 and signal == 0:
-                # Sell
-                position = 0
-                exit_price = price
-                pnl = (exit_price - entry_price) / entry_price
-                trades.append({
-                    'Side': 'Long',
-                    'Entry Date': entry_date,
-                    'Exit Date': date,
-                    'Buy Price': entry_price,
-                    'Sell Price': exit_price,
-                    'PnL (%)': pnl * 100,
-                    'Status': 'Closed'
-                })
-                
-        # Capture Open Position
-        if position == 1:
-            current_price = prices.iloc[-1]
-            pnl = (current_price - entry_price) / entry_price
-            trades.append({
-                'Side': 'Long',
-                'Entry Date': entry_date,
-                'Exit Date': None, # Open
-                'Buy Price': entry_price,
-                'Sell Price': current_price, # Mark-to-Market
-                'PnL (%)': pnl * 100,
-                'Status': 'Open'
-            })
-                
-        return {
-            'equity_curve': equity_curve,
-            'benchmark_curve': benchmark_curve,
-            'trades': pd.DataFrame(trades),
-            'returns': strat_returns
-        }
-
-    @staticmethod
-    def calculate_metrics(returns, risk_free_rate=0.0):
-        """
-        Calculates Sharpe, Sortino, Max Drawdown
-        """
-        if len(returns) < 2: return {}
-        
-        # Annualization factor
-        ann_factor = 252
-        
-        # Excess Returns
-        excess_ret = returns - (risk_free_rate / 252)
-        
-        # Sharpe
-        sharpe = np.sqrt(ann_factor) * excess_ret.mean() / (returns.std() + 1e-9)
-        
-        # Sortino (Downside Deviation)
-        downside = returns[returns < 0]
-        sortino = np.sqrt(ann_factor) * excess_ret.mean() / (downside.std() + 1e-9)
-        
-        # Max Drawdown
-        cum_ret = (1 + returns).cumprod()
-        peak = cum_ret.cummax()
-        drawdown = (cum_ret - peak) / peak
-        max_dd = drawdown.min()
-        
-        # CAGR
-        total_ret = (1 + returns).prod()
-        n_years = len(returns) / 252
-        cagr = (total_ret ** (1/n_years)) - 1 if n_years > 0 else 0
-        
-        return {
-            'Sharpe Ratio': sharpe,
-            'Sortino Ratio': sortino,
-            'Max Drawdown': max_dd,
-            'CAGR': cagr
-        }
-
-@st.cache_resource
-def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
-    """
-    Cached helper to fit Markov Regression.
-    Returns the fitted result object.
-    """
-    try:
-        mod_markov = MarkovRegression(
-            model_data,
-            k_regimes=n_regimes,
-            trend='c',
-            switching_variance=switch_vol,
-            switching_trend=switch_trend
-        )
-        res_markov = mod_markov.fit(search_reps=50, disp=False)
-        return res_markov
-    except Exception as e:
-        return None
-
 @st.cache_data
 def load_data(ticker, start, end):
     try:
@@ -533,17 +399,17 @@ with st.sidebar:
     # Ticker Inputs
     col_t1, col_t2 = st.columns(2)
     with col_t1:
-        raw_ticker = st.text_input("Main Ticker", "RELIANCE" if market_region == "Indian Market (INR)" else "AAPL").upper()
+        raw_ticker = st.text_input("Main Ticker", "RELIANCE" if market_region == "Indian Market (INR)" else "BTC-USD").upper()
     with col_t2:
-        raw_pair = st.text_input("Pair Ticker", "").upper()
+        raw_pair = st.text_input("Pair Ticker", "INFY" if market_region == "Indian Market (INR)" else "ETH-USD").upper()
     
     # Auto-append suffix if needed
     TICKER = raw_ticker + SUFFIX if (SUFFIX and not raw_ticker.endswith(SUFFIX)) else raw_ticker
-    PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
+    PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
     
-    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
+    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365*2))
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
@@ -560,15 +426,13 @@ if df_main is not None:
     st.subheader(f"Data Analysis: {TICKER}")
     
     # Layout Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Volatility (GARCH)", 
         "Regime Switching", 
         "Stochastic (Heston/Jump)", 
         "Kalman Filter", 
-
         "Macro Factors",
-        "Structural",
-        "Backtest"
+        "Structural"
     ])
 
     # ==========================================
@@ -696,19 +560,23 @@ if df_main is not None:
         st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {start_dt_regime.date()}")
         
         # ===== MODEL FITTING =====
-        # ===== MODEL FITTING =====
-        res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
-        
-        if res_markov is None:
-             st.error("❌ Model fitting failed. Try different parameters.")
-             st.stop()
-        
-        # ===== CONVERGENCE CHECKS =====
-        if not res_markov.mle_retvals['converged']:
-            st.error("⛔ Model did not converge. Try longer history or simpler model.")
-            st.stop()
-            
         try:
+            mod_markov = MarkovRegression(
+                model_data,
+                k_regimes=n_regimes,
+                trend='c',
+                switching_variance=switch_vol,
+                switching_trend=switch_trend
+            )
+            
+            with st.spinner(f"Fitting {n_regimes}-regime model..."):
+                res_markov = mod_markov.fit(search_reps=50, disp=False)
+            
+            # ===== CONVERGENCE CHECKS =====
+            if not res_markov.mle_retvals['converged']:
+                st.error("⛔ Model did not converge. Try longer history or simpler model.")
+                st.stop()
+            
             trans_matrix = res_markov.regime_transition
             
             # Check for degenerate regimes
@@ -865,53 +733,26 @@ if df_main is not None:
                 
             st.pyplot(fig_m)
             
-            # ===== PARAMETERS INTERPRETATION =====
-            with st.expander("📋 Model Interpretation (Human Readable)"):
-                st.write("### What do these numbers mean?")
+            # ===== PARAMETERS TABLE =====
+            with st.expander("📋 Technical Parameters"):
+                summary_data = {
+                    "Parameter": res_markov.params.index,
+                    "Value": res_markov.params.values.astype(float),
+                    "Std Error": res_markov.bse.values.astype(float),
+                    "P-Value": res_markov.pvalues.values.astype(float)
+                }
+                df_summary = pd.DataFrame(summary_data)
+                # Format only numeric columns to avoid error with "Parameter" string column
+                st.dataframe(df_summary.style.format({
+                    "Value": "{:.4f}",
+                    "Std Error": "{:.4f}",
+                    "P-Value": "{:.4f}"
+                }))
                 
-                params = res_markov.params
-                pvalues = res_markov.pvalues
-                
-                for param_name, value in params.items():
-                    pval = pvalues.get(param_name, 1.0)
-                    
-                    # Determine Significance
-                    if pval < 0.01: sig_label = "✅ Highly Significant (Strong Evidence)"
-                    elif pval < 0.05: sig_label = "✅ Significant (Good Evidence)"
-                    elif pval < 0.10: sig_label = "⚠️ Weakly Significant"
-                    else: sig_label = "❌ Not Significant (Likely Noise)"
-                    
-                    # Interpret Parameter Type
-                    interpretation = ""
-                    if "p[" in param_name:
-                        # Transition Probability
-                        from_reg = param_name.split("[")[1].split("->")[0]
-                        to_reg = param_name.split("->")[1].split("]")[0]
-                        if from_reg == to_reg:
-                            interpretation = f"**Stability of Regime {from_reg}:** {value:.1%} chance of staying in this regime tomorrow."
-                        else:
-                            interpretation = f"**Switching Chance:** {value:.1%} chance of switching from Regime {from_reg} to {to_reg}."
-                            
-                    elif "sigma2" in param_name:
-                        reg_idx = param_name.split("[")[1].split("]")[0] if "[" in param_name else "Global"
-                        interpretation = f"**Volatility (Regime {reg_idx}):** Market variance is {value:.4f}."
-                        
-                    elif "const" in param_name:
-                        reg_idx = param_name.split("[")[1].split("]")[0] if "[" in param_name else "Global"
-                        interpretation = f"**Avg Return (Regime {reg_idx}):** Daily return is approx {value:.4f}%."
-                        
-                    st.markdown(f"""
-                    **{param_name}**: {value:.4f}  
-                    _{interpretation}_  
-                    Confidence: {sig_label}
-                    """)
-                    st.divider()
-                
-                st.caption(f"Model Fit Quality (AIC): {res_markov.aic:.2f} (Lower is better)")
-            
+                st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
             
         except Exception as e:
-            st.error(f"❌ Error in Regime Analysis: {str(e)}")
+            st.error(f"❌ Model fitting failed: {str(e)}")
             
             st.write("**💡 Troubleshooting:**")
             st.info("""
@@ -1440,7 +1281,6 @@ if df_main is not None:
         strat_prices = prices_bt
         
         if strategy_type == "Regime Switching (Trend Following)":
-            st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
             
             # Regime Parameters
             col_r1, col_r2, col_r3 = st.columns(3)
@@ -1456,6 +1296,14 @@ if df_main is not None:
                 bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
             with col_r5:
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
+
+            # Signal Method Selection
+            signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability"], horizontal=True)
+
+            if signal_method == "Regime Weighted Expected Return":
+                st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
+            else:
+                st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
 
             # Resample if Weekly
             if bt_freq == "Weekly":
@@ -1479,54 +1327,104 @@ if df_main is not None:
                 res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
                 
                 if res_bt:
-                    # Calculate Expected Return
-                    # E[R] = Sum(Prob_i * Mean_i)
-                    expected_ret = pd.Series(0.0, index=model_data_bt.index)
-                    
+                    # Identify Regimes (Sort by Mean)
+                    regime_means = []
                     for i in range(bt_n_regimes):
-                        # Get Regime Mean
                         if f'const[{i}]' in res_bt.params:
                             mean_val = res_bt.params[f'const[{i}]']
                         else:
                             mean_val = res_bt.params.get('const', 0.0)
-                            
-                        # Get Filtered Probability (No Lookahead)
-                        prob = res_bt.filtered_marginal_probabilities.iloc[:, i]
+                        regime_means.append((i, mean_val))
+                    
+                    # Sort regimes by mean return (High to Low) -> Index 0 is Bull
+                    sorted_regimes = sorted(regime_means, key=lambda x: x[1], reverse=True)
+                    bull_regime_idx = sorted_regimes[0][0]
+                    
+                    # Get Filtered Probabilities
+                    probs_df = res_bt.filtered_marginal_probabilities
+                    
+                    if signal_method == "Regime Weighted Expected Return":
+                        # Calculate Expected Return
+                        expected_ret = pd.Series(0.0, index=model_data_bt.index)
+                        for i in range(bt_n_regimes):
+                            # Get Regime Mean
+                            if f'const[{i}]' in res_bt.params:
+                                mean_val = res_bt.params[f'const[{i}]']
+                            else:
+                                mean_val = res_bt.params.get('const', 0.0)
+                                
+                            # Get Filtered Probability
+                            prob = probs_df.iloc[:, i]
+                            expected_ret += prob * mean_val
                         
-                        expected_ret += prob * mean_val
-                    
-                    # Align indices
-                    common_idx = strat_prices.index.intersection(expected_ret.index)
-                    expected_ret = expected_ret.loc[common_idx]
-                    
-                    # Generate Signals (1 = Long if Exp Ret > 0, else 0)
-                    signals = (expected_ret > 0).astype(int)
-                    
+                        # Align indices
+                        common_idx = strat_prices.index.intersection(expected_ret.index)
+                        expected_ret = expected_ret.loc[common_idx]
+                        
+                        # Generate Signals (1 = Long if Exp Ret > 0, else 0)
+                        signals = (expected_ret > 0).astype(int)
+                        
+                        # Plot Context
+                        with st.expander("See Strategy Context"):
+                            fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                            ax_ctx.plot(expected_ret.index, expected_ret, color='purple', label='Expected Return')
+                            ax_ctx.axhline(0, color='black', linestyle='--', linewidth=1)
+                            ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret>0), color='green', alpha=0.3, label='Long Zone')
+                            ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret<0), color='red', alpha=0.3, label='Cash/Short Zone')
+                            format_plot_dates(ax_ctx, expected_ret.index)
+                            ax_ctx.set_title("Regime-Weighted Expected Return")
+                            ax_ctx.legend()
+                            st.pyplot(fig_ctx)
+
+                    else: # Regime Probability Strategy
+                        # Logic: Long if Bull Probability is the highest (Dominant)
+                        # Or specifically: Bull > Bear (and Bull > Normal)
+                        
+                        bull_probs = probs_df.iloc[:, bull_regime_idx]
+                        
+                        # Determine if Bull is dominant
+                        # We can just check if argmax is the bull index
+                        dominant_regime = probs_df.idxmax(axis=1) # Returns column name (0, 1, etc)
+                        
+                        # Align indices
+                        common_idx = strat_prices.index.intersection(dominant_regime.index)
+                        dominant_regime = dominant_regime.loc[common_idx]
+                        bull_probs = bull_probs.loc[common_idx]
+                        
+                        # Signal: 1 if Dominant Regime is Bull, else 0
+                        signals = (dominant_regime == bull_regime_idx).astype(int)
+                        
+                        # Plot Context
+                        with st.expander("See Strategy Context"):
+                            fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                            
+                            # Plot Bull Probability
+                            ax_ctx.plot(bull_probs.index, bull_probs, color='green', label='Bull Probability')
+                            
+                            # Plot Others
+                            for r_idx, r_mean in sorted_regimes:
+                                if r_idx != bull_regime_idx:
+                                    other_probs = probs_df.iloc[:, r_idx].loc[common_idx]
+                                    ax_ctx.plot(other_probs.index, other_probs, linestyle='--', alpha=0.6, label=f'Regime {r_idx} Prob')
+                            
+                            # Highlight Long Zones
+                            ax_ctx.fill_between(bull_probs.index, 0, 1, where=(signals==1), color='green', alpha=0.1, label='Long Signal')
+                            
+                            format_plot_dates(ax_ctx, bull_probs.index)
+                            ax_ctx.set_title(f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})")
+                            ax_ctx.legend()
+                            st.pyplot(fig_ctx)
+
                     # Debug Dataframe
                     with st.expander("🔍 Debug: Signal Details"):
                         debug_df = pd.DataFrame({
                             "Price": strat_prices,
-                            "Expected Return": expected_ret,
                             "Signal": signals
                         }).dropna()
                         st.dataframe(debug_df.style.format({
                             "Price": "{:.2f}",
-                            "Expected Return": "{:.4f}",
                             "Signal": "{:.0f}"
                         }), use_container_width=True)
-
-                    # Plot Strategy Context
-                    with st.expander("See Strategy Context"):
-                        fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
-                        ax_ctx.plot(expected_ret.index, expected_ret, color='purple', label='Expected Return')
-                        ax_ctx.axhline(0, color='black', linestyle='--', linewidth=1)
-                        ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret>0), color='green', alpha=0.3, label='Long Zone')
-                        ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret<0), color='red', alpha=0.3, label='Cash/Short Zone')
-                        
-                        format_plot_dates(ax_ctx, expected_ret.index)
-                        ax_ctx.set_title("Regime-Weighted Expected Return")
-                        ax_ctx.legend()
-                        st.pyplot(fig_ctx)
                         
                 else:
                     st.error("Regime model fitting failed.")
