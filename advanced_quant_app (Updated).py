@@ -1620,13 +1620,14 @@ if df_main is not None:
                             fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
                             
                             # Plot Price
-                            ax_ctx.plot(strat_prices.index, strat_prices, color='gray', alpha=0.5, label='Price')
+                            strat_prices_aligned = strat_prices.loc[common_idx]
+                            ax_ctx.plot(strat_prices_aligned.index, strat_prices_aligned, color='gray', alpha=0.5, label='Price')
                             
                             # Highlight Bull Periods
-                            ax_ctx.fill_between(strat_prices.index, strat_prices.min(), strat_prices.max(), 
+                            ax_ctx.fill_between(strat_prices_aligned.index, strat_prices_aligned.min(), strat_prices_aligned.max(), 
                                                 where=(signals==1), color='green', alpha=0.2, label='Bull Regime Period')
                             
-                            format_plot_dates(ax_ctx, strat_prices.index)
+                            format_plot_dates(ax_ctx, strat_prices_aligned.index)
                             ax_ctx.set_title(f"Regime Switching Periods (Bull Regime: {bull_regime_idx})")
                             ax_ctx.legend()
                             st.pyplot(fig_ctx)
