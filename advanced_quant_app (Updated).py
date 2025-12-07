@@ -301,6 +301,25 @@ def merton_jump_diffusion(S0, T, r, sigma, lam, mu_j, sigma_j, steps, paths):
         
     return prices
 
+@st.cache_resource
+def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
+    """
+    Cached helper to fit Markov Regression.
+    Returns the fitted result object.
+    """
+    try:
+        mod_markov = MarkovRegression(
+            model_data,
+            k_regimes=n_regimes,
+            trend='c',
+            switching_variance=switch_vol,
+            switching_trend=switch_trend
+        )
+        res_markov = mod_markov.fit(search_reps=50, disp=False)
+        return res_markov
+    except Exception as e:
+        return None
+
 @st.cache_data
 def load_data(ticker, start, end):
     try:
