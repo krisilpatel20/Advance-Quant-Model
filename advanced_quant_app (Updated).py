@@ -426,13 +426,14 @@ if df_main is not None:
     st.subheader(f"Data Analysis: {TICKER}")
     
     # Layout Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Volatility (GARCH)", 
         "Regime Switching", 
         "Stochastic (Heston/Jump)", 
         "Kalman Filter", 
         "Macro Factors",
-        "Structural"
+        "Structural",
+        "Backtest"
     ])
 
     # ==========================================
