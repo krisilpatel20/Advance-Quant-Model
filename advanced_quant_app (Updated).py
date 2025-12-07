@@ -301,6 +301,121 @@ def merton_jump_diffusion(S0, T, r, sigma, lam, mu_j, sigma_j, steps, paths):
         
     return prices
 
+class BacktestEngine:
+    """
+    Handles simple vectorised backtesting for regime-based strategies.
+    """
+    @staticmethod
+    def run_strategy(prices, signals, initial_capital=10000.0):
+        """
+        prices: Series of asset prices
+        signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
+        """
+        # Align
+        common_idx = prices.index.intersection(signals.index)
+        prices = prices.loc[common_idx]
+        signals = signals.loc[common_idx]
+        
+        # Calculate Returns
+        returns = prices.pct_change().fillna(0)
+        
+        # Strategy Returns (Lagged signal to avoid lookahead)
+        # Signal at t determines position for t+1 return
+        strat_returns = signals.shift(1).fillna(0) * returns
+        
+        # Equity Curves
+        cum_returns = (1 + returns).cumprod()
+        strat_cum_returns = (1 + strat_returns).cumprod()
+        
+        equity_curve = initial_capital * strat_cum_returns
+        benchmark_curve = initial_capital * cum_returns
+        
+        # Trade Log
+        trades = []
+        position = 0 # 0: Cash, 1: Long
+        entry_price = 0
+        entry_date = None
+        
+        for date, price, signal in zip(prices.index, prices, signals):
+            if position == 0 and signal == 1:
+                # Buy
+                position = 1
+                entry_price = price
+                entry_date = date
+            elif position == 1 and signal == 0:
+                # Sell
+                position = 0
+                exit_price = price
+                pnl = (exit_price - entry_price) / entry_price
+                trades.append({
+                    'Side': 'Long',
+                    'Entry Date': entry_date,
+                    'Exit Date': date,
+                    'Buy Price': entry_price,
+                    'Sell Price': exit_price,
+                    'PnL (%)': pnl * 100,
+                    'Status': 'Closed'
+                })
+                
+        # Capture Open Position
+        if position == 1:
+            current_price = prices.iloc[-1]
+            pnl = (current_price - entry_price) / entry_price
+            trades.append({
+                'Side': 'Long',
+                'Entry Date': entry_date,
+                'Exit Date': None, # Open
+                'Buy Price': entry_price,
+                'Sell Price': current_price, # Mark-to-Market
+                'PnL (%)': pnl * 100,
+                'Status': 'Open'
+            })
+                
+        return {
+            'equity_curve': equity_curve,
+            'benchmark_curve': benchmark_curve,
+            'trades': pd.DataFrame(trades),
+            'returns': strat_returns
+        }
+
+    @staticmethod
+    def calculate_metrics(returns, risk_free_rate=0.0):
+        """
+        Calculates Sharpe, Sortino, Max Drawdown
+        """
+        if len(returns) < 2: return {}
+        
+        # Annualization factor
+        ann_factor = 252
+        
+        # Excess Returns
+        excess_ret = returns - (risk_free_rate / 252)
+        
+        # Sharpe
+        sharpe = np.sqrt(ann_factor) * excess_ret.mean() / (returns.std() + 1e-9)
+        
+        # Sortino (Downside Deviation)
+        downside = returns[returns < 0]
+        sortino = np.sqrt(ann_factor) * excess_ret.mean() / (downside.std() + 1e-9)
+        
+        # Max Drawdown
+        cum_ret = (1 + returns).cumprod()
+        peak = cum_ret.cummax()
+        drawdown = (cum_ret - peak) / peak
+        max_dd = drawdown.min()
+        
+        # CAGR
+        total_ret = (1 + returns).prod()
+        n_years = len(returns) / 252
+        cagr = (total_ret ** (1/n_years)) - 1 if n_years > 0 else 0
+        
+        return {
+            'Sharpe Ratio': sharpe,
+            'Sortino Ratio': sortino,
+            'Max Drawdown': max_dd,
+            'CAGR': cagr
+        }
+
 @st.cache_resource
 def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
     """
