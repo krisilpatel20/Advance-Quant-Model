@@ -1486,6 +1486,7 @@ if df_main is not None:
 
             if signal_method == "Regime Weighted Expected Return":
                 st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
+                sell_on_peak = st.checkbox("Sell on Downturn (U-Turn)", value=False, help="Sell immediately when Expected Return starts to fall, even if positive. Buy ONLY when crossing 0 from below.")
             elif signal_method == "Regime Probability":
                 st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
             else:
@@ -1547,8 +1548,34 @@ if df_main is not None:
                         common_idx = strat_prices.index.intersection(expected_ret.index)
                         expected_ret = expected_ret.loc[common_idx]
                         
-                        # Generate Signals (1 = Long if Exp Ret > 0, else 0)
-                        signals = (expected_ret > 0).astype(int)
+                        # Generate Signals
+                        if sell_on_peak:
+                            # State-based logic: Buy on 0 cross, Sell on Downturn
+                            sig_list = np.zeros(len(expected_ret))
+                            position = 0
+                            
+                            # Convert to numpy for speed
+                            exp_ret_vals = expected_ret.values
+                            
+                            for i in range(1, len(exp_ret_vals)):
+                                curr = exp_ret_vals[i]
+                                prev = exp_ret_vals[i-1]
+                                
+                                if position == 0:
+                                    # Buy ONLY on 0 crossover (prev <= 0 and curr > 0)
+                                    if prev <= 0 and curr > 0:
+                                        position = 1
+                                elif position == 1:
+                                    # Sell on Downturn (curr < prev) OR if it drops below 0 (curr < 0)
+                                    if curr < prev or curr < 0:
+                                        position = 0
+                                
+                                sig_list[i] = position
+                            
+                            signals = pd.Series(sig_list, index=expected_ret.index)
+                        else:
+                            # Standard Logic: 1 = Long if Exp Ret > 0, else 0
+                            signals = (expected_ret > 0).astype(int)
                         
                         # Plot Context
                         with st.expander("See Strategy Context"):
