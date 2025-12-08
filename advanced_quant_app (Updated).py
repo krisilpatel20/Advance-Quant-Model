@@ -750,7 +750,12 @@ if df_main is not None:
                 with tab_cast:
                     f_horizon = st.slider("Forecast Horizon (Days)", 1, 63, 21)
                     
-                    forecasts = res.forecast(horizon=f_horizon)
+                    try:
+                        forecasts = res.forecast(horizon=f_horizon, reindex=False)
+                    except ValueError:
+                        # Fallback for models/distributions where analytic is not supported (e.g. EGARCH/Skewt)
+                        forecasts = res.forecast(horizon=f_horizon, method='simulation', simulations=1000, reindex=False)
+                    
                     var_forecast = forecasts.variance.iloc[-1]
                     vol_forecast = np.sqrt(var_forecast)
                     
@@ -803,13 +808,21 @@ if df_main is not None:
                         if dist_type == "Normal":
                             q = stats.norm.ppf(1-conf_level) # e.g. -1.645 for 95%
                         elif dist_type == "Student's t":
-                            nu = res.params['nu']
+                            nu = res.params.get('nu')
                             q = stats.t.ppf(1-conf_level, df=nu)
+                            
                         elif dist_type == "Skewed Student's t":
-                             # Approx with t for now or use arch's built-in ppf if available
-                             # Arch distribution objects have ppf
-                             dist_inst = am.distribution
-                             q = dist_inst.ppf(1-conf_level, res.params.values) if hasattr(dist_inst, 'ppf') else stats.norm.ppf(1-conf_level)
+                             # Skewed T expects 2 parameters: nu (degree of freedom) and lambda (skew)
+                             nu = res.params.get('nu')
+                             lam = res.params.get('lambda')
+                             
+                             if nu is not None and lam is not None:
+                                 dist_inst = am.distribution
+                                 # arch distribution ppf expects params as a list/array
+                                 q = dist_inst.ppf(1-conf_level, [nu, lam])
+                             else:
+                                 # Fallback to normal if params missing (unlikely if converged)
+                                 q = stats.norm.ppf(1-conf_level)
 
                         var_pct = -q * next_vol # Positive number representing loss
                         var_val = var_pct * acc_size
