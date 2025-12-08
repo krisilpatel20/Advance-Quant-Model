@@ -9,6 +9,7 @@ from scipy.optimize import minimize
 import statsmodels.api as sm
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 from datetime import datetime, timedelta
 
 # Try importing arch, handle if missing
@@ -618,56 +619,227 @@ if df_main is not None:
     ])
 
     # ==========================================
-    # TAB 1: GARCH / EGARCH
+    # TAB 1: VOLATILITY (GARCH/Risk)
     # ==========================================
     with tab1:
-        st.write("### GARCH & EGARCH Volatility Modeling")
+        st.write("### 📉 Advanced Volatility Analysis")
+        
         if ARCH_AVAILABLE:
             returns_pct = df_main['Returns'] * 100 # Rescale for better optimization
             
-            col1, col2 = st.columns(2)
+            # 1. CONFIGURATION
+            # ---------------------------
+            with st.expander("⚙️ Model Configuration", expanded=True):
+                c_mdl1, c_mdl2, c_mdl3 = st.columns(3)
+                with c_mdl1:
+                    vol_model_type = st.selectbox("Volatility Model", ["GARCH", "GJR-GARCH", "EGARCH"])
+                with c_mdl2:
+                    dist_type = st.selectbox("Distribution", ["Normal", "Student's t", "Skewed Student's t"])
+                with c_mdl3:
+                    vol_lag = st.slider("GARCH Lag (p, q)", 1, 3, 1)
+
+            # Map inputs to arch arguments
+            vol_map = {"GARCH": "Garch", "GJR-GARCH": "Garch", "EGARCH": "EGarch"}
+            dist_map = {"Normal": "Normal", "Student's t": "t", "Skewed Student's t": "skewt"}
             
-            # GARCH(1,1)
-            with col1:
-                st.write("**GARCH(1,1) Model**")
-                garch_model = arch_model(returns_pct, vol='Garch', p=1, q=1, dist='Normal')
-                res_garch = garch_model.fit(disp='off')
-                st.write(f"Alpha (Shock): {res_garch.params['alpha[1]']:.4f}")
-                st.write(f"Beta (Persistence): {res_garch.params['beta[1]']:.4f}")
+            o_param = 1 if vol_model_type == "GJR-GARCH" else 0
+            
+            # Fit Model
+            try:
+                am = arch_model(returns_pct, vol=vol_map[vol_model_type], p=vol_lag, o=o_param, q=vol_lag, dist=dist_map[dist_type])
+                res = am.fit(disp='off')
                 
-                fig_g, ax_g = plt.subplots(figsize=(10,4))
-                ax_g.plot(res_garch.conditional_volatility, color='blue', label='Conditional Volatility')
-                ax_g.set_title("GARCH(1,1) Conditional Volatility")
-                format_plot_dates(ax_g, returns_pct.index) # Apply Date Formatting
-                st.pyplot(fig_g)
+                # 2. MAIN RESULTS DISPLAY
+                # ---------------------------
+                col_res1, col_res2 = st.columns([2, 1])
+                
+                with col_res1:
+                    st.subheader("Conditional Volatility")
+                    fig_v, ax_v = plt.subplots(figsize=(10, 4))
+                    ax_v.plot(res.conditional_volatility, color='#2980b9', linewidth=1.5, label=f'{vol_model_type} Vol')
+                    ax_v.set_title(f"{vol_model_type} ({dist_type}) Conditional Volatility")
+                    ax_v.legend()
+                    format_plot_dates(ax_v, returns_pct.index)
+                    st.pyplot(fig_v)
+                    
+                with col_res2:
+                    st.subheader("Model Parameters")
+                    st.dataframe(pd.DataFrame({
+                        "Param": res.params.index,
+                        "Value": res.params.values,
+                        "t-stat": res.tvalues.values
+                    }).set_index("Param").style.format("{:.4f}"))
+                    
+                    st.markdown("### Analysis")
+                    
+                    # 1. Persistence & Half-Life
+                    # standard GARCH persistence = alpha + beta
+                    pers_val = np.nan
+                    if 'beta[1]' in res.params and 'alpha[1]' in res.params:
+                        pers_val = res.params['alpha[1]'] + res.params['beta[1]']
+                        if vol_model_type == 'GJR-GARCH' and 'gamma[1]' in res.params:
+                             # GJR Persistence approx = alpha + beta + gamma/2
+                             pers_val += res.params['gamma[1]'] / 2
+                    
+                    if not np.isnan(pers_val):
+                        st.metric("Persistence", f"{pers_val:.4f}", help="Closer to 1 = Volatility shocks last longer.")
+                        if pers_val < 1:
+                            half_life = np.log(0.5) / np.log(pers_val)
+                            st.metric("Half-Life (Days)", f"{half_life:.1f}", help="Days for a shock to initially decay by 50%.")
+                        else:
+                            st.caption("Non-stationary (Persistence >= 1)")
 
-            # GJR-GARCH(1,1) - Robust Leverage Effect
-            with col2:
-                st.write("**GJR-GARCH(1,1) Model**")
-                # o=1 enables the asymmetric term (gamma)
-                gjr_model = arch_model(returns_pct, vol='Garch', p=1, o=1, q=1, dist='Normal')
-                res_gjr = gjr_model.fit(disp='off')
+                    # 2. Leverage Effect
+                    if 'gamma[1]' in res.params:
+                        gamma_val = res.params['gamma[1]']
+                        st.metric("Leverage (Gamma)", f"{gamma_val:.4f}")
+                        if gamma_val > 0.05:
+                            st.success("✅ Leverage Effect Confirmed: Market drops increase volatility more than rises.")
+                        elif gamma_val < -0.05:
+                            st.info("Inverse Leverage Structure.")
+                        else:
+                            st.caption("No significant asymmetry.")
+                            
+                    st.markdown("---")
+                    st.metric("AIC", f"{res.aic:.2f}")
+                    st.metric("BIC", f"{res.bic:.2f}")
+
+                # 3. DIAGNOSTICS & FORECASTING
+                # ---------------------------
+                tab_diag, tab_cast, tab_risk = st.tabs(["🔍 Diagnostics", "🔮 Forecasting", "🛡️ Risk Management"])
                 
-                st.write(f"Alpha (Shock): {res_gjr.params['alpha[1]']:.4f}")
-                
-                # Gamma is the leverage term in GJR-GARCH
-                if 'gamma[1]' in res_gjr.params:
-                    gamma_val = res_gjr.params['gamma[1]']
-                    st.write(f"Gamma (Leverage): {gamma_val:.4f}")
-                    if gamma_val > 0:
-                        st.caption("Positive Gamma implies 'Leverage Effect': Volatility rises more when prices fall.")
+                # --- A. DIAGNOSTICS ---
+                with tab_diag:
+                    d_col1, d_col2 = st.columns(2)
+                    
+                    std_resid = res.std_resid
+                    
+                    # 1. Standardized Residuals Plot
+                    with d_col1:
+                        st.markdown("**Standardized Residuals**")
+                        fig_r, ax_r = plt.subplots(figsize=(8, 4))
+                        ax_r.plot(std_resid, color='gray', alpha=0.7)
+                        ax_r.axhline(0, color='black', linestyle='--')
+                        format_plot_dates(ax_r, returns_pct.index)
+                        st.pyplot(fig_r)
+                        
+                    # 2. QQ Plot
+                    with d_col2:
+                        st.markdown("**Q-Q Plot (vs Normal)**")
+                        fig_qq = plt.figure(figsize=(8, 4))
+                        ax_qq = fig_qq.add_subplot(111)
+                        stats.probplot(std_resid, dist="norm", plot=ax_qq)
+                        st.pyplot(fig_qq)
+                        
+                    # 3. Serial Correlation Tests
+                    st.markdown("**Residual Diagnostics (Autocorrelation)**")
+                    lb_test = acorr_ljungbox(std_resid, lags=[10], return_df=True)
+                    arch_test = het_arch(std_resid)
+                    
+                    diag_data = {
+                        "Test": ["Ljung-Box (No Serial Corr)", "ARCH-LM (No ARCH Effect)"],
+                        "p-value": [lb_test['lb_pvalue'].iloc[0], arch_test[1]],
+                        "Conclusion": [
+                            "Fail to Reject H0 (Good)" if lb_test['lb_pvalue'].iloc[0] > 0.05 else "Reject H0 (Bad - Autocorr exists)",
+                            "Fail to Reject H0 (Good)" if arch_test[1] > 0.05 else "Reject H0 (Bad - ARCH exists)"
+                        ]
+                    }
+                    st.table(pd.DataFrame(diag_data).set_index("Test"))
+
+                # --- B. FORECASTING ---
+                with tab_cast:
+                    f_horizon = st.slider("Forecast Horizon (Days)", 1, 63, 21)
+                    
+                    forecasts = res.forecast(horizon=f_horizon)
+                    var_forecast = forecasts.variance.iloc[-1]
+                    vol_forecast = np.sqrt(var_forecast)
+                    
+                    st.write(f"**Volatility Forecast for next {f_horizon} days**")
+                    
+                    # Plot Forecast
+                    fig_f, ax_f = plt.subplots(figsize=(10, 4))
+                    # History
+                    last_days = 60
+                    hist_dates = returns_pct.index[-last_days:]
+                    hist_vol = res.conditional_volatility[-last_days:]
+                    
+                    ax_f.plot(hist_dates, hist_vol, color='black', alpha=0.5, label='Historical Vol')
+                    
+                    # Forecast
+                    fut_dates = [returns_pct.index[-1] + timedelta(days=i) for i in range(1, f_horizon+1)]
+                    ax_f.plot(fut_dates, vol_forecast, color='red', marker='o', linestyle='--', label='Forecast Vol')
+                    
+                    ax_f.set_title("Volatility Term Structure Forecast")
+                    format_plot_dates(ax_f, hist_dates) # Basic formatting for history part
+                    ax_f.legend()
+                    st.pyplot(fig_f)
+                    
+                    # Term Structure Comment
+                    current_vol = res.conditional_volatility[-1]
+                    lt_vol = np.sqrt(res.params['omega'] / (1 - res.params['alpha[1]'] - res.params['beta[1]'])) if 'beta[1]' in res.params else current_vol
+                    
+                    if vol_forecast.iloc[-1] < current_vol:
+                         st.success(f"Mean Reversion: Volatility expected to DECLINE towards long-term avg.")
                     else:
-                        st.caption("Zero/Neg Gamma: No standard leverage effect.")
-                else:
-                    st.warning("Gamma not found.")
+                         st.warning(f"Mean Reversion: Volatility expected to RISE towards long-term avg.")
 
-                fig_e, ax_e = plt.subplots(figsize=(10,4))
-                ax_e.plot(res_gjr.conditional_volatility, color='green', label='Conditional Volatility')
-                ax_e.set_title("GJR-GARCH(1,1) Conditional Volatility")
-                format_plot_dates(ax_e, returns_pct.index) # Apply Date Formatting
-                st.pyplot(fig_e)
+                # --- C. RISK MANAGEMENT ---
+                with tab_risk:
+                    st.markdown("**Value at Risk (VaR) & Sizing**")
+                    
+                    r_col1, r_col2 = st.columns(2)
+                    
+                    with r_col1:
+                        acc_size = st.number_input("Portfolio Value", 1000, 10000000, 100000)
+                        conf_level = st.selectbox("Confidence Level", [0.95, 0.99])
+                        
+                        # Calculate VaR
+                        # One-day ahead VaR based on model
+                        # VaR = mean + sigma * q(alpha)
+                        
+                        next_vol = np.sqrt(forecasts.variance.iloc[-1].iloc[0]) / 100 # Convert back to decimal
+                        
+                        # Quantile depends on distribution
+                        if dist_type == "Normal":
+                            q = stats.norm.ppf(1-conf_level) # e.g. -1.645 for 95%
+                        elif dist_type == "Student's t":
+                            nu = res.params['nu']
+                            q = stats.t.ppf(1-conf_level, df=nu)
+                        elif dist_type == "Skewed Student's t":
+                             # Approx with t for now or use arch's built-in ppf if available
+                             # Arch distribution objects have ppf
+                             dist_inst = am.distribution
+                             q = dist_inst.ppf(1-conf_level, res.params.values) if hasattr(dist_inst, 'ppf') else stats.norm.ppf(1-conf_level)
+
+                        var_pct = -q * next_vol # Positive number representing loss
+                        var_val = var_pct * acc_size
+                        
+                        st.metric(f"1-Day VaR ({conf_level:.0%})", f"{CURRENCY}{var_val:,.2f}", f"-{var_pct*100:.2f}%")
+                        st.caption("Estimated maximum loss for tomorrow with selected confidence.")
+
+                    with r_col2:
+                        target_vol = st.slider("Target Annual Volatility (%)", 5, 50, 15) / 100
+                        
+                        # Position Sizing
+                        # Size = (Target Vol / Current Vol) * Capital
+                        
+                        current_ann_vol = next_vol * np.sqrt(252)
+                        lev_factor = target_vol / current_ann_vol
+                        rec_exposure = acc_size * lev_factor
+                        
+                        st.metric("Vol-Targeted Exposure", f"{CURRENCY}{rec_exposure:,.0f}", f"Leverage: {lev_factor:.2f}x")
+                        
+                        if lev_factor > 1.0:
+                            st.warning("Requires Leverage (Margin)")
+                        else:
+                            st.success("Cash Position (Defensive)")
+
+            except Exception as e:
+                st.error(f"Model Fit Failed: {e}")
+                st.info("Try a different distribution or simpler model (GARCH).")
+                
         else:
-            st.warning("Please install 'arch' library to view GARCH models.")
+            st.warning("⚠️ 'arch' library not found. Please run `pip install arch`.")
 
     # ==========================================
     # TAB 2: REGIME SWITCHING
@@ -1486,7 +1658,6 @@ if df_main is not None:
 
             if signal_method == "Regime Weighted Expected Return":
                 st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
-                sell_on_peak = st.checkbox("Sell on Downturn (U-Turn)", value=False, help="Sell immediately when Expected Return starts to fall, even if positive. Buy ONLY when crossing 0 from below.")
             elif signal_method == "Regime Probability":
                 st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
             else:
@@ -1548,34 +1719,8 @@ if df_main is not None:
                         common_idx = strat_prices.index.intersection(expected_ret.index)
                         expected_ret = expected_ret.loc[common_idx]
                         
-                        # Generate Signals
-                        if sell_on_peak:
-                            # State-based logic: Buy on 0 cross, Sell on Downturn
-                            sig_list = np.zeros(len(expected_ret))
-                            position = 0
-                            
-                            # Convert to numpy for speed
-                            exp_ret_vals = expected_ret.values
-                            
-                            for i in range(1, len(exp_ret_vals)):
-                                curr = exp_ret_vals[i]
-                                prev = exp_ret_vals[i-1]
-                                
-                                if position == 0:
-                                    # Buy ONLY on 0 crossover (prev <= 0 and curr > 0)
-                                    if prev <= 0 and curr > 0:
-                                        position = 1
-                                elif position == 1:
-                                    # Sell on Downturn (curr < prev) OR if it drops below 0 (curr < 0)
-                                    if curr < prev or curr < 0:
-                                        position = 0
-                                
-                                sig_list[i] = position
-                            
-                            signals = pd.Series(sig_list, index=expected_ret.index)
-                        else:
-                            # Standard Logic: 1 = Long if Exp Ret > 0, else 0
-                            signals = (expected_ret > 0).astype(int)
+                        # Generate Signals (1 = Long if Exp Ret > 0, else 0)
+                        signals = (expected_ret > 0).astype(int)
                         
                         # Plot Context
                         with st.expander("See Strategy Context"):
