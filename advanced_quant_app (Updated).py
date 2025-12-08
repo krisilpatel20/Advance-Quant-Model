@@ -856,14 +856,17 @@ if df_main is not None:
         col_config1, col_config2, col_config3 = st.columns(3)
         
         with col_config1:
-            regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=0)
+            # CHANGED: Default index 1 is Weekly (0=Daily, 1=Weekly)
+            regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=1)
         with col_config2:
-            lookback_years = st.slider("Lookback Period (Years)", 1, 10, 5)
+            # CHANGED: Default value 2
+            lookback_years = st.slider("Lookback Period (Years)", 1, 10, 2)
         with col_config3:
             n_regimes = st.slider("Number of Regimes", 2, 4, 2)
         
         # New: Signal Stability Control
-        stability = st.slider("Signal Stability (Pre-Smoothing)", 0, 10, 3, 
+        # CHANGED: Default value 4
+        stability = st.slider("Signal Stability (Pre-Smoothing)", 0, 10, 4, 
                               help="0 = Raw Data (Fastest), 10 = Very Smooth (Lagged). Higher values filter out noise.")
         
         col_sw1, col_sw2 = st.columns(2)
