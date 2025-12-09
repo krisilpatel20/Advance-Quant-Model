@@ -882,6 +882,10 @@ if df_main is not None:
         stability = st.slider("Signal Stability (Pre-Smoothing)", 0, 10, 4, 
                               help="0 = Raw Data (Fastest), 10 = Very Smooth (Lagged). Higher values filter out noise.")
         
+        # New: High-Conviction Threshold
+        conviction_thresh = st.slider("High-Conviction Threshold", 0.5, 0.95, 0.7, step=0.05, 
+                                      help="Minimum probability required to confirm a regime signal.")
+        
         col_sw1, col_sw2 = st.columns(2)
         with col_sw1:
             switch_trend = st.checkbox("Switching Mean (Trend)", value=True,
@@ -1002,11 +1006,43 @@ if df_main is not None:
             
             regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
             
-            st.info(f"""
-            **📍 Current Market State:** {regime_label} (Regime {current_regime})  
-            **Confidence:** {current_prob:.1%}  
-            **As of:** {model_data.index[-1].date()}
-            """)
+            # Conviction Logic
+            is_conviction = current_prob >= conviction_thresh
+            
+            # Calculate Stability Score (Mean Persistence)
+            stability_score = np.mean([r['persistence'] for r in regime_stats])
+            
+            # Display Dashboard
+            st.divider()
+            c_dash1, c_dash2, c_dash3 = st.columns(3)
+            
+            with c_dash1:
+                st.caption("Current State")
+                if is_conviction:
+                    st.subheader(f"{regime_label}")
+                    st.success(f"High Conviction ({current_prob:.1%})")
+                else:
+                    st.subheader("⚪ Mixed / Uncertain")
+                    st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
+            
+            with c_dash2:
+                st.caption("Dominance Score (Confidence)")
+                # Spread between 1st and 2nd highest probability
+                sorted_probs = sorted(last_probs.values, reverse=True)
+                spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+                
+                st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
+                st.progress(max(0.0, min(1.0, float(spread))))
+                
+            with c_dash3:
+                st.caption("Regime Stability Metrics")
+                st.metric("Avg Persistence", f"{stability_score:.1%}")
+                # Switch Frequency (proxy)
+                expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
+                st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
+
+            st.write(f"**As of:** {model_data.index[-1].date()}")
+            st.divider()
             
             # ===== VISUALIZATION =====
             st.write("### 📈 Regime Analysis (Real-time / Filtered)")
