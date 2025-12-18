@@ -12,9 +12,6 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 from datetime import datetime, timedelta
 from scipy.special import gammaln, logsumexp, gamma
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
-from sklearn.cluster import KMeans
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -24,6 +21,15 @@ try:
     ARCH_AVAILABLE = True
 except ImportError:
     ARCH_AVAILABLE = False
+
+# Try importing sklearn, handle if missing
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import silhouette_score
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 # ==========================================
 # 1. CONFIGURATION & STYLING
@@ -2041,55 +2047,58 @@ if df_main is not None:
         st.write("### 🧠 Advanced Regime Detection (HMM + Bayesian)")
         st.caption("combines Hidden Markov Models (Student-t Emissions) with Bayesian Changepoint Detection.")
         
-        if st.button("Run Advanced Analysis"):
-            with st.spinner("Fitting institutional models (HMM + Bayes + Hawkes)..."):
-                detector = AdvancedRegimeDetector(df_main['Log_Returns'])
-                detector.fit_all(n_states=3)
-                
-                # Metrics
-                m_col1, m_col2 = st.columns(2)
-                with m_col1:
-                    st.metric("HMM AIC", f"{detector.metrics['hmm_aic']:.0f}")
-                with m_col2:
-                    current_sig, current_data = detector.get_trading_signal()
-                    st.metric("System Signal", current_sig, current_data['label'])
-                
-                # Visualization
-                st.write("#### Regime Probability Stream")
-                
-                probs = detector.regimes['hmm_probs']
-                fig_hmm, ax_hmm = plt.subplots(figsize=(10, 4))
-                
-                # Stackplot
-                ax_hmm.stackplot(df_main.index, probs.T, labels=['Bull', 'Normal', 'Bear/Crisis'][0:probs.shape[1]],
-                                 colors=['green', 'gold', 'red'][0:probs.shape[1]], alpha=0.5)
-                ax_hmm.set_title("Regime Probabilities (Student-t HMM)")
-                format_plot_dates(ax_hmm, df_main.index)
-                st.pyplot(fig_hmm)
-                
-                st.write("#### Bayesian Changepoint Probabilities")
-                cp_probs = detector.regimes['changepoint_probs']
-                fig_cp, ax_cp = plt.subplots(figsize=(10, 3))
-                ax_cp.plot(df_main.index, cp_probs, color='purple', linewidth=1)
-                ax_cp.fill_between(df_main.index, 0, cp_probs, color='purple', alpha=0.2)
-                ax_cp.set_title("Structural Break Probability (Bayesian Online Detection)")
-                ax_cp.set_ylim(0, 1)
-                format_plot_dates(ax_cp, df_main.index)
-                st.pyplot(fig_cp)
-                
-                # Characteristics Table
-                st.write("#### Regime Characteristics")
-                char_df = pd.DataFrame(detector.regime_characteristics)
-                st.dataframe(char_df.style.format({
-                    'mean_return': "{:.2%}",
-                    'volatility': "{:.2%}",
-                    'frequency': "{:.1%}",
-                    'avg_duration': "{:.1f}",
-                    'max_drawdown': "{:.2%}"
-                }))
-
+        if not SKLEARN_AVAILABLE:
+            st.error("⚠️ `scikit-learn` library is missing. HMM initialization requires it. Please run `pip install scikit-learn`.")
         else:
-            st.info("Click 'Run Advanced Analysis' to train models (Computationally Intensive).")
+            if st.button("Run Advanced Analysis"):
+                with st.spinner("Fitting institutional models (HMM + Bayes + Hawkes)..."):
+                    detector = AdvancedRegimeDetector(df_main['Log_Returns'])
+                    detector.fit_all(n_states=3)
+                    
+                    # Metrics
+                    m_col1, m_col2 = st.columns(2)
+                    with m_col1:
+                        st.metric("HMM AIC", f"{detector.metrics['hmm_aic']:.0f}")
+                    with m_col2:
+                        current_sig, current_data = detector.get_trading_signal()
+                        st.metric("System Signal", current_sig, current_data['label'])
+                    
+                    # Visualization
+                    st.write("#### Regime Probability Stream")
+                    
+                    probs = detector.regimes['hmm_probs']
+                    fig_hmm, ax_hmm = plt.subplots(figsize=(10, 4))
+                    
+                    # Stackplot
+                    ax_hmm.stackplot(df_main.index, probs.T, labels=['Bull', 'Normal', 'Bear/Crisis'][0:probs.shape[1]],
+                                     colors=['green', 'gold', 'red'][0:probs.shape[1]], alpha=0.5)
+                    ax_hmm.set_title("Regime Probabilities (Student-t HMM)")
+                    format_plot_dates(ax_hmm, df_main.index)
+                    st.pyplot(fig_hmm)
+                    
+                    st.write("#### Bayesian Changepoint Probabilities")
+                    cp_probs = detector.regimes['changepoint_probs']
+                    fig_cp, ax_cp = plt.subplots(figsize=(10, 3))
+                    ax_cp.plot(df_main.index, cp_probs, color='purple', linewidth=1)
+                    ax_cp.fill_between(df_main.index, 0, cp_probs, color='purple', alpha=0.2)
+                    ax_cp.set_title("Structural Break Probability (Bayesian Online Detection)")
+                    ax_cp.set_ylim(0, 1)
+                    format_plot_dates(ax_cp, df_main.index)
+                    st.pyplot(fig_cp)
+                    
+                    # Characteristics Table
+                    st.write("#### Regime Characteristics")
+                    char_df = pd.DataFrame(detector.regime_characteristics)
+                    st.dataframe(char_df.style.format({
+                        'mean_return': "{:.2%}",
+                        'volatility': "{:.2%}",
+                        'frequency': "{:.1%}",
+                        'avg_duration': "{:.1f}",
+                        'max_drawdown': "{:.2%}"
+                    }))
+
+            else:
+                st.info("Click 'Run Advanced Analysis' to train models (Computationally Intensive).")
 
 
 else:
