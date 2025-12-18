@@ -314,6 +314,245 @@ def merton_jump_diffusion(S0, T, r, sigma, lam, mu_j, sigma_j, steps, paths):
         
     return prices
 
+
+class RealizedVolatility:
+    @staticmethod
+    def realized_variance(returns):
+        """Standard Realized Variance (sum of squared returns)."""
+        return np.sum(returns**2)
+
+    @staticmethod
+    def bipower_variation(returns):
+        """Bipower Variation (robust to jumps).
+        BV = (pi/2) * sum(|rt| * |rt-1|)
+        """
+        abs_rets = np.abs(returns)
+        # Vectorized scalar product of lagged absolutes
+        if len(returns) < 2: return 0.0
+        return (np.pi / 2) * np.sum(abs_rets[1:] * abs_rets[:-1])
+
+    @staticmethod
+    def jump_component(returns):
+        """Tests for jumps using RV and BV interaction (Barndorff-Nielsen & Shephard)."""
+        rv = RealizedVolatility.realized_variance(returns)
+        bv = RealizedVolatility.bipower_variation(returns)
+        
+        # Jump contribution is difference between Total Vol (RV) and Continuous Vol (BV)
+        jump_var = max(rv - bv, 0)
+        jump_ratio = jump_var / rv if rv > 0 else 0.0
+        
+        # Simplified significance test (Heuristic)
+        # Z = (RV - BV) / (RV * sqrt(theta * max(1/N, some_const)))
+        n = len(returns)
+        if n < 10: 
+            return {'jump_ratio': 0.0, 'p_value': 1.0, 'z_score': 0.0}
+        
+        # Heuristic Z-score for significance
+        # A jump ratio > 0.5 with high data count is usually significant
+        z_score = (jump_ratio - 0.05) * np.sqrt(n/2) # Simple heuristic scaling
+        p_value = 1 - stats.norm.cdf(z_score)
+        
+        return {'jump_ratio': jump_ratio, 'p_value': p_value, 'z_score': z_score}
+
+class HawkesVolatility:
+    def __init__(self):
+        self.mu = 0.5
+        self.alpha = 0.5 # Excitation
+        self.beta = 2.0  # Decay
+        self.metrics = {}
+
+    def fit(self, returns):
+        """
+        Fits a simple univariate Hawkes process to Volatility Peaks (POT).
+        """
+        # 1. Identify "Events" (Extreme Volatility)
+        # Use simple Peak Over Threshold (POT) on absolute returns
+        vol_proxy = np.abs(returns)
+        if len(vol_proxy) < 20:
+             return self
+             
+        threshold = np.percentile(vol_proxy, 90) # Top 10% events
+        events = np.where(vol_proxy > threshold)[0]
+        
+        if len(events) < 5:
+             # Not enough data
+             return self
+             
+        # LL Function for Hawkes: sum(log(lambda(ti))) - integral(lambda(t))
+        # lambda(t) = mu + sum(alpha * exp(-beta * (t - ti)))
+        
+        def neg_log_likelihood(params):
+            mu_p, alpha_p, beta_p = params
+            if mu_p <= 0 or alpha_p < 0 or beta_p <= alpha_p: return 1e9
+            
+            t = events
+            n = len(t)
+            T_end = len(returns) # total duration in days
+            
+            # Recursive calculation of R(k) = sum(exp(-beta*(tk - ti)))
+            # R(k) = exp(-beta*(tk - tk-1)) * (1 + R(k-1))
+            R = np.zeros(n)
+            for i in range(1, n):
+                dt = t[i] - t[i-1]
+                R[i] = np.exp(-beta_p * dt) * (1 + R[i-1])
+            
+            # Avoid log(0)
+            intensities = mu_p + alpha_p * R
+            if np.any(intensities <= 0): return 1e9
+            
+            term1 = np.sum(np.log(intensities))
+            
+            # Integral term: int(mu) + sum(alpha/beta * (1 - exp(-beta*(T - ti))))
+            term2 = mu_p * T_end + (alpha_p / beta_p) * np.sum(1 - np.exp(-beta_p * (T_end - t)))
+            
+            return -(term1 - term2)
+            
+        try:
+            # Bounds: mu>0, alpha>0, beta>alpha (stationarity)
+            res = minimize(neg_log_likelihood, [0.1, 0.2, 1.0], 
+                           bounds=[(1e-4, 2.0), (1e-4, 5.0), (0.1, 10.0)], method='L-BFGS-B')
+            self.mu, self.alpha, self.beta = res.x
+        except:
+            pass # Keep defaults
+            
+        return self
+
+    def branching_ratio(self):
+        """Measure of self-excitement intensity (alpha/beta). <1 is stable."""
+        if self.beta == 0: return 0.0
+        return self.alpha / self.beta
+
+    def half_life(self):
+        """Time for a shock to decay by half (ln(2)/beta)."""
+        if self.beta == 0: return 0.0
+        return np.log(2) / self.beta
+
+class AdvancedRegimeDetector:
+    def __init__(self, log_returns):
+        self.data = log_returns.values.reshape(-1, 1) if hasattr(log_returns, 'values') else log_returns
+        self.dates = log_returns.index if hasattr(log_returns, 'index') else np.arange(len(log_returns))
+        self.metrics = {}
+        self.regimes = {}
+        self.regime_characteristics = []
+
+    def fit_all(self, n_states=3):
+        """Fits both HMM and Bayesian Changepoint logic."""
+        
+        # 1. HMM (using GMM Proxy if sklearn available)
+        if SKLEARN_AVAILABLE:
+            from sklearn.mixture import GaussianMixture
+            
+            # Fit GMM as HMM proxy (Regime Clustering)
+            model = GaussianMixture(n_components=n_states, covariance_type='full', random_state=42)
+            model.fit(self.data)
+            
+            hidden_states = model.predict(self.data)
+            probs = model.predict_proba(self.data)
+            
+            # Re-order states by mean volatility (0=Low, 1=Med, 2=High)
+            state_vars = []
+            for i in range(n_states):
+                # Filter data for this state
+                mask = (hidden_states == i)
+                if np.sum(mask) > 0:
+                    state_vars.append(np.std(self.data[mask]))
+                else:
+                    state_vars.append(0)
+                
+            # Sort indices: low vol -> high vol
+            sorted_idx = np.argsort(state_vars)
+            
+            # Create mapping: old_id -> new_id (0,1,2)
+            map_dict = {old: new for new, old in enumerate(sorted_idx)}
+            
+            # Apply mapping to states and probs
+            sorted_states = np.vectorize(map_dict.get)(hidden_states)
+            sorted_probs = probs[:, sorted_idx]
+            
+            self.regimes['hmm_states'] = sorted_states
+            self.regimes['hmm_probs'] = sorted_probs
+            self.metrics['hmm_aic'] = model.aic(self.data)
+            
+            # Calculate Characteristics
+            self._calculate_characteristics(sorted_states)
+        else:
+            # Fallback if no sklearn
+            self.regimes['hmm_probs'] = np.zeros((len(self.data), n_states))
+            self.metrics['hmm_aic'] = 0
+        
+        # 2. Bayesian Changepoint Detection (Simplified Proxy)
+        self.regimes['changepoint_probs'] = self._bayesian_changepoint_proxy(self.data.flatten())
+        
+    def _bayesian_changepoint_proxy(self, data):
+        """
+        Fast proxy for changepoint probability using rolling volatility regime shifts.
+        True BCP is computationally heavy for Streamlit.
+        """
+        vol = pd.Series(data).rolling(window=22).std().fillna(method='bfill')
+        
+        # Detect shifts in volatility (Z-score of vol change)
+        vol_change = vol.diff().abs()
+        mean_change = vol_change.rolling(252, min_periods=20).mean()
+        std_change = vol_change.rolling(252, min_periods=20).std()
+        
+        # Z-score
+        z = (vol_change - mean_change) / (std_change + 1e-8)
+        
+        # Sigmoid probability transform: Z > 2 implies likely shift
+        probs = 1 / (1 + np.exp(-(z - 2.0)))
+        return probs.fillna(0).values
+
+    def _calculate_characteristics(self, states):
+        df = pd.DataFrame(self.data, columns=['ret'])
+        df['state'] = states
+        
+        # Group by state
+        stats_df = df.groupby('state')['ret'].agg(['mean', 'std', 'count'])
+        
+        self.regime_characteristics = []
+        labels = ['Bull/Calm', 'Normal/Transition', 'Bear/Crisis'] 
+        
+        for i in range(len(stats_df)):
+            if i >= len(labels): cn = f"State {i}"
+            else: cn = labels[i]
+            
+            s = stats_df.iloc[i]
+            self.regime_characteristics.append({
+                'label': cn,
+                'mean_return': s['mean'] * 252, # Annualized
+                'volatility': s['std'] * np.sqrt(252),
+                'frequency': s['count'] / len(df),
+                'avg_duration': 0.0, # Placeholder
+                'max_drawdown': 0.0 # Placeholder
+            })
+            
+    def get_trading_signal(self):
+        """Derives signal from latest regime probabilities."""
+        if 'hmm_probs' not in self.regimes:
+            return "N/A", {'label': 'No Model', 'confidence': 0.0}
+            
+        probs = self.regimes['hmm_probs'][-1] # [Low, Med, High] sorted
+        
+        # Logic: 
+        # High Vol (Idx 2) > 50% => RISK OFF
+        # Low Vol (Idx 0) > 60% => RISK ON
+        # Else => NEUTRAL
+        
+        n_states = len(probs)
+        if n_states < 3:
+             return "NEUTRAL", {'label': 'Unknown', 'confidence': 0.0}
+             
+        p_safe = probs[0]
+        p_danger = probs[-1]
+        
+        if p_danger > 0.5:
+            return "DEFENSIVE / SHORT", {'label': 'High Volatility', 'confidence': p_danger}
+        elif p_safe > 0.6:
+            return "AGGRESSIVE LONG", {'label': 'Low Volatility', 'confidence': p_safe}
+        else:
+            return "NEUTRAL / HEDGED", {'label': 'Transition/Mixed', 'confidence': max(probs)}
+
+
 class BacktestEngine:
     """
     Handles simple vectorised backtesting for regime-based strategies.
