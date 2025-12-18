@@ -2279,6 +2279,31 @@ if df_main is not None:
         else:
             st.success("Stable: Volatility mean-reverts quickly.")
 
+        # Visualization
+        st.subheader("Volatility Clustering Visuals")
+        
+        # 1. Squared Returns (Volatility Proxy)
+        fig_vol, ax_vol = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        
+        # Plot Returns
+        ax_vol[0].plot(df_main.index, df_main['Returns'], color='gray', alpha=0.6, linewidth=0.8, label="Returns")
+        ax_vol[0].set_title(f"{TICKER} Returns Series")
+        ax_vol[0].legend(loc='upper right')
+        
+        # Plot Squared Returns (Clustering)
+        squared_rets = df_main['Returns']**2
+        ax_vol[1].plot(df_main.index, squared_rets, color='orange', alpha=0.8, linewidth=0.8, label="Squared Returns (Vol Proxy)")
+        
+        # Highlight high vol
+        threshold = squared_rets.mean() + 2 * squared_rets.std()
+        ax_vol[1].axhline(threshold, color='red', linestyle='--', linewidth=0.8, label="2-Sigma Threshold")
+        
+        ax_vol[1].set_title("Volatility Clustering (Squared Returns)")
+        ax_vol[1].legend(loc='upper right')
+        
+        format_plot_dates(ax_vol[1], df_main.index)
+        st.pyplot(fig_vol)
+
     # ==========================================
     # TAB 9: ADVANCED REGIME DETECTION
     # ==========================================
