@@ -46,6 +46,12 @@ GARCH/EGARCH | Regime Switching (Filtered) | Jump Diffusion | Heston Stochastic 
 if not ARCH_AVAILABLE:
     st.error("⚠️ The 'arch' library is not installed. GARCH/EGARCH modules will be limited. Run `pip install arch`.")
 
+if not SKLEARN_AVAILABLE:
+    import sys
+    st.error(f"⚠️ Debug Info: Executable: {sys.executable}")
+    st.error(f"⚠️ Debug Info: Python Path: {sys.path}")
+    st.error("⚠️ `scikit-learn` import failed. See debug info above.")
+
 # ==========================================
 # 2. HELPER CLASSES & FUNCTIONS
 # ==========================================
