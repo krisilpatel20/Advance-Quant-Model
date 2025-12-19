@@ -556,6 +556,61 @@ class AdvancedRegimeDetector:
             return "NEUTRAL / HEDGED", {'label': 'Transition/Mixed', 'confidence': max(probs)}
 
 
+
+class SMLAnalyzer:
+    def __init__(self, ticker_returns, benchmark_returns, rf_annual=0.04):
+        self.r_asset = ticker_returns
+        self.r_bench = benchmark_returns
+        self.rf_annual = rf_annual
+        self.rf_daily = rf_annual / 252
+        
+    def calculate_metrics(self, window=90):
+        # Align data
+        common_idx = self.r_asset.index.intersection(self.r_bench.index)
+        y = self.r_asset.loc[common_idx] - self.rf_daily # Excess Asset Returns
+        x = self.r_bench.loc[common_idx] - self.rf_daily # Excess Market Returns
+        
+        df = pd.DataFrame({'asset_ex': y, 'mkt_ex': x}, index=common_idx)
+        
+        # 1. Rolling Beta & Alpha (HAC Robust)
+        betas = []
+        alphas = []
+        
+        # Pre-allocate array for speed
+        beta_arr = np.full(len(df), np.nan)
+        alpha_arr = np.full(len(df), np.nan)
+        
+        # Need at least 'window' points
+        for i in range(window, len(df)):
+            window_slice = df.iloc[i-window:i]
+            y_win = window_slice['asset_ex']
+            x_win = sm.add_constant(window_slice['mkt_ex'])
+            
+            try:
+                # OLS with HAC (Heteroskedasticity & Autocorrelation Consistent) Standard Errors
+                # maxlags=1 is usually sufficient for daily stock data
+                model = sm.OLS(y_win, x_win).fit(cov_type='HAC', cov_kwds={'maxlags': 1})
+                alpha_arr[i] = model.params.get('const', np.nan)
+                beta_arr[i] = model.params.get('mkt_ex', np.nan)
+            except:
+                pass # nan default
+                
+        df['Beta'] = beta_arr
+        df['Alpha_Daily'] = alpha_arr
+        
+        # 2. CAPM Checks
+        # E(Ri) = Rf + Beta(E(Rm) - Rf)
+        # We use realized market return over the window as proxy for E(Rm)
+        rolling_mkt_ret_ann = df['mkt_ex'].rolling(window).mean() * 252
+        
+        df['SML_Exp_Return'] = self.rf_annual + (df['Beta'] * rolling_mkt_ret_ann)
+        df['Actual_Return_Ann'] = (df['asset_ex'].rolling(window).mean() * 252) + self.rf_annual
+        
+        # Mispricing (Alpha in return space)
+        df['Mispricing_Spread'] = df['Actual_Return_Ann'] - df['SML_Exp_Return']
+        
+        return df.dropna()
+
 class BacktestEngine:
     """
     Handles simple vectorised backtesting for regime-based strategies.
@@ -863,7 +918,7 @@ if df_main is not None:
     st.subheader(f"Data Analysis: {TICKER}")
     
     # Layout Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Volatility (GARCH)", 
         "Regime Switching", 
         "Stochastic (Heston/Jump)", 
@@ -872,7 +927,8 @@ if df_main is not None:
         "Structural",
         "Backtest",
         "Volatility Clustering",
-        "Advanced Regime"
+        "Advanced Regime",
+        "SML & Alpha"
     ])
 
     # ==========================================
@@ -2368,6 +2424,115 @@ if df_main is not None:
                 st.info("Click 'Run Advanced Analysis' to train models (Computationally Intensive).")
 
 
+    # ==========================================
+    # TAB 10: SML & ALPHA (CAPM)
+    # ==========================================
+    with tab10:
+        st.write("### 📐 Securities Market Line (SML) & Alpha Analysis")
+        st.caption("Institutional Factor Analysis: Rolling Beta, Jensen's Alpha, and Mispricing Spreads (Robust OLS).")
+
+        # Configuration
+        col_sml1, col_sml2 = st.columns(2)
+        with col_sml1:
+            bench_ticker = st.selectbox("Benchmark Index", ["SPY", "QQQ", "IWM", "VT", "^NSEI"] if market_region != "Indian Market (INR)" else ["^NSEI", "^NSEBANK", "SPY"])
+        with col_sml2:
+            roll_win = st.slider("Rolling Window (Days)", 30, 252, 90)
+
+        if st.button("Run Alpha Analysis"):
+            with st.spinner(f"Calibrating CAPM against {bench_ticker} (HAC Robust Errors)..."):
+                # Load Benchmark Data
+                df_bench = load_data(bench_ticker, start_date, end_date)
+                
+                if df_bench is not None:
+                    # Initialize Analyzer
+                    analyzer = SMLAnalyzer(df_main['Returns'], df_bench['Returns'], rf_annual=rf_rate)
+                    res_sml = analyzer.calculate_metrics(window=roll_win)
+                    
+                    # 1. METRICS DASHBOARD
+                    # --------------------
+                    last_row = res_sml.iloc[-1]
+                    
+                    m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+                    with m_c1:
+                        st.metric("Current Beta", f"{last_row['Beta']:.2f}", help="Sensitivity to Market")
+                    with m_c2:
+                        st.metric("Jensen's Alpha", f"{last_row['Alpha_Daily']*252:.2%}", help="Annualized Excess Return vs Risk-Adjusted Exp")
+                    with m_c3:
+                        st.metric("SML Exp Return", f"{last_row['SML_Exp_Return']:.2%}", help="Fair return for this level of risk")
+                    with m_c4:
+                        mispricing = last_row['Mispricing_Spread']
+                        st.metric("Mispricing Spread", f"{mispricing*100:.2f}%", 
+                                  delta="Undervalued" if mispricing > 0 else "Overvalued",
+                                  delta_color="normal")
+
+                    # 2. VISUALIZATION
+                    # --------------------
+                    st.divider()
+                    
+                    # A. SML SCATTER PLOT
+                    st.write("#### 1. Security Market Line (SML)")
+                    
+                    # Calculate aggregate risk/return for scatter
+                    # We'll plot Rolling periods as points
+                    
+                    fig_sml, ax_sml = plt.subplots(figsize=(10, 6))
+                    
+                    # SML Line: x = Beta, y = Rf + Beta * (Rm - Rf)
+                    # We use the AVERAGE market excess return over the period for the theoretical line
+                    avg_mkt_excess = res_sml['mkt_ex'].mean() * 252
+                    
+                    betas_line = np.linspace(0, max(res_sml['Beta'].max(), 2.0), 100)
+                    sml_y = rf_rate + betas_line * avg_mkt_excess
+                    
+                    ax_sml.plot(betas_line, sml_y, color='black', linestyle='--', linewidth=2, label='Security Market Line (SML)')
+                    
+                    # Current Asset Point
+                    curr_beta = last_row['Beta']
+                    curr_ret = last_row['Actual_Return_Ann']
+                    
+                    ax_sml.scatter(curr_beta, curr_ret, color='blue', s=100, zorder=5, label=f'{TICKER} (Current)')
+                    
+                    # Historic Points (Cloud)
+                    ax_sml.scatter(res_sml['Beta'], res_sml['Actual_Return_Ann'], 
+                                   c=range(len(res_sml)), cmap='Blues', alpha=0.3, s=20, label='Historical Path')
+                    
+                    # Benchmark (Beta 1, Mkt Return)
+                    mkt_ret_tot = (res_sml['mkt_ex'].mean() * 252) + rf_rate
+                    ax_sml.scatter(1.0, mkt_ret_tot, color='red', marker='D', s=80, label='Market')
+                    
+                    # Formatting
+                    ax_sml.set_xlabel("Systematic Risk (Beta)")
+                    ax_sml.set_ylabel("Annualized Expected Return")
+                    ax_sml.set_title("Risk-Reward Profile vs Equilibrium")
+                    ax_sml.legend()
+                    ax_sml.grid(True, alpha=0.3)
+                    
+                    st.pyplot(fig_sml)
+                    
+                    # B. ROLLING ALPHA & BETA
+                    st.write("#### 2. Rolling Factor Dynamics")
+                    
+                    fig_dyn, ax_dyn = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+                    
+                    # Beta
+                    ax_dyn[0].plot(res_sml.index, res_sml['Beta'], color='purple', label='Rolling Beta')
+                    ax_dyn[0].axhline(1.0, color='gray', linestyle='--')
+                    ax_dyn[0].set_title(f"Systematic Risk (Beta) - {roll_win} Day Window")
+                    ax_dyn[0].legend()
+                    
+                    # Alpha
+                    ax_dyn[1].plot(res_sml.index, res_sml['Alpha_Daily'] * 252, color='green', label='Annualized Alpha')
+                    ax_dyn[1].axhline(0, color='gray', linestyle='--')
+                    ax_dyn[1].fill_between(res_sml.index, 0, res_sml['Alpha_Daily'] * 252, where=(res_sml['Alpha_Daily']>0), color='green', alpha=0.1)
+                    ax_dyn[1].fill_between(res_sml.index, 0, res_sml['Alpha_Daily'] * 252, where=(res_sml['Alpha_Daily']<0), color='red', alpha=0.1)
+                    ax_dyn[1].set_title("Manager Skill / Mispricing (Alpha)")
+                    ax_dyn[1].legend()
+                    
+                    format_plot_dates(ax_dyn[1], res_sml.index)
+                    st.pyplot(fig_dyn)
+
+                else:
+                    st.error(f"Could not load data for Benchmark: {bench_ticker}")
 else:
     st.info("Enter a ticker and ensure data is loaded to begin analysis.")
 
