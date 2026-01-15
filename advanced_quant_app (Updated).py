@@ -18,6 +18,16 @@ try:
 except ImportError:
     ARCH_AVAILABLE = False
 
+# Try importing sklearn
+try:
+    import sklearn
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+# Statsmodels Diagnostic Imports
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
+
 # ==========================================
 # 1. CONFIGURATION & STYLING
 # ==========================================
