@@ -1232,21 +1232,24 @@ if df_main is not None:
             returns = returns.ewm(span=stability, adjust=False).mean()
             st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
         
-        # FIX: Ensure data is 1D Series and Float to avoid '0-dimensional array' errors in statsmodels/numpy
+        # FIX: Ensure data is strictly 1D Series with Float dtype
         try:
-            model_data = returns.dropna() * 100  # Scale to percentages
+            model_data = returns.dropna() * 100
             
-            # 1. Ensure it's a Series (squeeze 1-col DF to Series)
-            if isinstance(model_data, pd.DataFrame):
-                model_data = model_data.squeeze()
+            # Reconstruct Series to guarantee 1D structure
+            # This handles (N,1) DataFrames, Series, etc.
+            if len(model_data) < 10:
+                st.error("Insufficient data points for modeling (>10 required).")
+                st.stop()
                 
-            # 2. Ensure it's strictly float (no objects)
-            model_data = model_data.astype(float)
+            model_data = pd.Series(
+                model_data.values.flatten().astype(float), 
+                index=model_data.index
+            )
             
-            # 3. Handle case where squeeze() resulted in scalar (if only 1 data point)
-            if model_data.ndim == 0:
-                 st.error("Insufficient data points for modeling (Scalar detected).")
-                 st.stop()
+            if model_data.ndim != 1:
+                st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
+                st.stop()
                  
         except Exception as e:
             st.error(f"Data Prep Error: {e}")
@@ -2054,13 +2057,14 @@ if df_main is not None:
             else:
                 model_data_bt = returns_bt_resampled.dropna() * 100
 
-            # FIX: Ensure 1D structure for Backtest too
-            if isinstance(model_data_bt, pd.DataFrame):
-                model_data_bt = model_data_bt.squeeze()
-            model_data_bt = model_data_bt.astype(float)
+            # FIX: Robust 1D Series reconstruction
+            if len(model_data_bt) > 10:
+                model_data_bt = pd.Series(
+                    model_data_bt.values.flatten().astype(float),
+                    index=model_data_bt.index
+                )
             
-            # Additional Check: If it became a scalar or 0-dim
-            if model_data_bt.ndim == 0:
+            if len(model_data_bt) < 10:
                  st.error("Backtest Error: Insufficient data found for model.")
             else:
                 with st.spinner("Fitting Regime Model..."):
