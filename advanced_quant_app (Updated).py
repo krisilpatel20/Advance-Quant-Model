@@ -771,16 +771,34 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
     Returns the fitted result object.
     """
     try:
+        # CONVERT TO NUMPY: Strict isolation from Pandas Index issues
+        # This solves "only 0-dimensional arrays can be converted to Python scalars"
+        if hasattr(model_data, 'values'):
+            endog = model_data.values.flatten().astype(float)
+            idx = model_data.index
+        else:
+            endog = model_data
+            idx = None
+
         mod_markov = MarkovRegression(
-            model_data,
+            endog,
             k_regimes=n_regimes,
             trend='c',
             switching_variance=switch_vol,
             switching_trend=switch_trend
         )
         res_markov = mod_markov.fit(search_reps=50, disp=False)
+        
+        # RE-ATTACH INDEX: Manually assign index to results for compatibility
+        if idx is not None:
+             # Force the DataFrame to have the original DateTimeIndex
+             # Statsmodels returns a DataFrame with RangeIndex when input is Numpy
+             res_markov.filtered_marginal_probabilities.index = idx
+             
         return res_markov
     except Exception as e:
+        # Log error to Streamlit for visibility (optional)
+        # st.error(f"Fit failed: {e}") 
         return None
 
 @st.cache_data
@@ -1258,17 +1276,15 @@ if df_main is not None:
         st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {start_dt_regime.date()}")
         
         # ===== MODEL FITTING =====
-        try:
-            mod_markov = MarkovRegression(
-                model_data,
-                k_regimes=n_regimes,
-                trend='c',
-                switching_variance=switch_vol,
-                switching_trend=switch_trend
-            )
+        with st.spinner(f"Fitting {n_regimes}-regime model..."):
+            res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
             
-            with st.spinner(f"Fitting {n_regimes}-regime model..."):
-                res_markov = mod_markov.fit(search_reps=50, disp=False)
+        if res_markov is None:
+            st.error("Model fitting failed (fit_regime_model returned None).")
+            st.stop()
+            
+        # Verify convergence implicitly via success return
+
             
             # ===== CONVERGENCE CHECKS =====
             if not res_markov.mle_retvals['converged']:
@@ -1481,17 +1497,7 @@ if df_main is not None:
                 
                 st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
             
-        except Exception as e:
-            st.error(f"❌ Model fitting failed: {str(e)}")
-            
-            st.write("**💡 Troubleshooting:**")
-            st.info("""
-            - Try **longer history** (5+ years recommended)
-            - **Disable 'Switching Mean'** (simpler model)
-            - Use **Weekly data** instead of Daily
-            - Reduce **number of regimes** to 2
-            - Try a **different ticker** (less volatile assets work better)
-            """)
+
 
 
     # ==========================================
