@@ -936,7 +936,7 @@ with st.sidebar:
     st.caption(f"Active Ticker: {TICKER}")
     
     # DEBUG: Temporary visualization to prove logic
-    with st.expander("🛠️ Debug Info (Remove Later)"):
+    with st.expander("🛠️ Debug Info (Remove Later)", expanded=True):
         st.write(f"Region: {market_region}")
         st.code(f"SUFFIX = '{SUFFIX}'")
         st.code(f"Raw Ticker = '{raw_ticker}'")
