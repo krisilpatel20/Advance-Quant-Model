@@ -1308,7 +1308,11 @@ if df_main is not None:
             st.error("⛔ Model did not converge. Try longer history or simpler model.")
             st.stop()
         
-        trans_matrix = res_markov.regime_transition
+        trans_matrix = np.squeeze(res_markov.regime_transition)
+        
+        # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
+        if trans_matrix.ndim < 2:
+             trans_matrix = np.atleast_2d(trans_matrix)
         
         # Check for degenerate regimes
         if np.any(trans_matrix > 0.99):
