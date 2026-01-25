@@ -935,6 +935,13 @@ with st.sidebar:
     
     st.caption(f"Active Ticker: {TICKER}")
     
+    # DEBUG: Temporary visualization to prove logic
+    with st.expander("🛠️ Debug Info (Remove Later)"):
+        st.write(f"Region: {market_region}")
+        st.code(f"SUFFIX = '{SUFFIX}'")
+        st.code(f"Raw Ticker = '{raw_ticker}'")
+        st.code(f"Final TICKER = '{TICKER}'")
+    
     start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
     end_date = st.date_input("End Date", datetime.now())
     
