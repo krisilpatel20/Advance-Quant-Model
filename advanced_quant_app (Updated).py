@@ -771,38 +771,46 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
     Returns the fitted result object.
     """
     # PREPARE DATA
-    # This solves "only 0-dimensional arrays can be converted to Python scalars"
+    # Ensure input is a clean 1D float array, then wrap back into Series 
+    # to preserve Statsmodels pandas-compatibility (param names, indices)
     if hasattr(model_data, 'values'):
-        endog = model_data.values.flatten().astype(float)
+        clean_values = model_data.values.flatten().astype(float)
         idx = model_data.index
     else:
-        endog = model_data
-        idx = None
+        clean_values = np.array(model_data).flatten().astype(float)
+        # Create dummy index if none exists, to satisfy Statsmodels internal checks
+        idx = pd.RangeIndex(len(clean_values))
 
     # VALIDATION: Check for NaNs or Infinite values
-    if np.any(np.isnan(endog)) or np.any(np.isinf(endog)):
+    if np.any(np.isnan(clean_values)) or np.any(np.isinf(clean_values)):
         st.error("❌ Data contains NaNs or Infinite values. Cannot fit model.")
         return None
         
     # VALIDATION: Check for constant data (no variance)
-    if np.std(endog) < 1e-9:
+    if np.std(clean_values) < 1e-9:
         st.error("❌ Data is constant (no variance). Cannot fit model.")
         return None
+        
+    # Reconstruct robust 1D Series for Statsmodels
+    endog_series = pd.Series(clean_values, index=idx)
 
     try:
         mod_markov = MarkovRegression(
-            endog,
+            endog_series,
             k_regimes=n_regimes,
             trend='c',
             switching_variance=switch_vol,
             switching_trend=switch_trend
         )
         res_markov = mod_markov.fit(search_reps=50, disp=False)
-        
-        # RE-ATTACH INDEX: Manually assign index to results for compatibility
-        if idx is not None:
-             res_markov.filtered_marginal_probabilities.index = idx
              
+        # ENFORCE PANDAS OUTPUT: Statsmodels sometimes returns numpy arrays
+        if isinstance(res_markov.params, np.ndarray):
+            names = res_markov.model.param_names
+            res_markov.params = pd.Series(res_markov.params, index=names)
+            res_markov.bse = pd.Series(res_markov.bse, index=names)
+            res_markov.pvalues = pd.Series(res_markov.pvalues, index=names)
+            
         return res_markov
     except Exception as e:
         st.error(f"❌ Fit failed: {str(e)}")
