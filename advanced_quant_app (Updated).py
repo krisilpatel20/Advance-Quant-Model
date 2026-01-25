@@ -770,16 +770,26 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
     Cached helper to fit Markov Regression.
     Returns the fitted result object.
     """
-    try:
-        # CONVERT TO NUMPY: Strict isolation from Pandas Index issues
-        # This solves "only 0-dimensional arrays can be converted to Python scalars"
-        if hasattr(model_data, 'values'):
-            endog = model_data.values.flatten().astype(float)
-            idx = model_data.index
-        else:
-            endog = model_data
-            idx = None
+    # PREPARE DATA
+    # This solves "only 0-dimensional arrays can be converted to Python scalars"
+    if hasattr(model_data, 'values'):
+        endog = model_data.values.flatten().astype(float)
+        idx = model_data.index
+    else:
+        endog = model_data
+        idx = None
 
+    # VALIDATION: Check for NaNs or Infinite values
+    if np.any(np.isnan(endog)) or np.any(np.isinf(endog)):
+        st.error("❌ Data contains NaNs or Infinite values. Cannot fit model.")
+        return None
+        
+    # VALIDATION: Check for constant data (no variance)
+    if np.std(endog) < 1e-9:
+        st.error("❌ Data is constant (no variance). Cannot fit model.")
+        return None
+
+    try:
         mod_markov = MarkovRegression(
             endog,
             k_regimes=n_regimes,
@@ -791,14 +801,13 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
         
         # RE-ATTACH INDEX: Manually assign index to results for compatibility
         if idx is not None:
-             # Force the DataFrame to have the original DateTimeIndex
-             # Statsmodels returns a DataFrame with RangeIndex when input is Numpy
              res_markov.filtered_marginal_probabilities.index = idx
              
         return res_markov
     except Exception as e:
-        # Log error to Streamlit for visibility (optional)
-        # st.error(f"Fit failed: {e}") 
+        st.error(f"❌ Fit failed: {str(e)}")
+        if "Singular matrix" in str(e):
+             st.warning("Hint: underlying data might be too flat or collinear.")
         return None
 
 @st.cache_data
@@ -1286,221 +1295,221 @@ if df_main is not None:
         # Verify convergence implicitly via success return
 
             
-            # ===== CONVERGENCE CHECKS =====
-            if not res_markov.mle_retvals['converged']:
-                st.error("⛔ Model did not converge. Try longer history or simpler model.")
-                st.stop()
+        # ===== CONVERGENCE CHECKS =====
+        if not res_markov.mle_retvals['converged']:
+            st.error("⛔ Model did not converge. Try longer history or simpler model.")
+            st.stop()
+        
+        trans_matrix = res_markov.regime_transition
+        
+        # Check for degenerate regimes
+        if np.any(trans_matrix > 0.99):
+            st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
+        
+        # ===== REGIME CHARACTERIZATION =====
+        regime_stats = []
+        for i in range(n_regimes):
+            # Handle case where switching_trend=False (single 'const')
+            if f'const[{i}]' in res_markov.params:
+                mean_val = res_markov.params[f'const[{i}]']
+            else:
+                mean_val = res_markov.params.get('const', 0.0)
             
-            trans_matrix = res_markov.regime_transition
-            
-            # Check for degenerate regimes
-            if np.any(trans_matrix > 0.99):
-                st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
-            
-            # ===== REGIME CHARACTERIZATION =====
-            regime_stats = []
-            for i in range(n_regimes):
-                # Handle case where switching_trend=False (single 'const')
-                if f'const[{i}]' in res_markov.params:
-                    mean_val = res_markov.params[f'const[{i}]']
-                else:
-                    mean_val = res_markov.params.get('const', 0.0)
+            # Handle case where switching_variance=False (single 'sigma2')
+            if f'sigma2[{i}]' in res_markov.params:
+                vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
+            else:
+                vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
                 
-                # Handle case where switching_variance=False (single 'sigma2')
-                if f'sigma2[{i}]' in res_markov.params:
-                    vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
-                else:
-                    vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
-                    
-                regime_stats.append({
-                    'regime': i,
-                    'mean': float(mean_val),
-                    'vol': float(vol_val),
-                    'persistence': float(trans_matrix[i, i])
-                })
-            
-            # Sort by mean (high to low)
-            regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
-            
-            # ===== DISPLAY REGIMES =====
-            st.write("### 📊 Identified Regimes")
-            
-            cols = st.columns(n_regimes)
-            labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
-            
-            for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
-                with col:
-                    st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
-                    st.metric("Mean Return", f"{regime['mean']:.2f}%")
-                    st.metric("Volatility", f"{regime['vol']:.2f}%")
-                    st.metric("Persistence", f"{regime['persistence']:.1%}")
-                    
-                    avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
-                    st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
-            
-            # ===== CURRENT STATE =====
-            # Use .iloc[-1] to get the probabilities at the LAST time step
-            last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
-            current_regime = np.argmax(last_probs)
-            current_prob = last_probs.iloc[current_regime]
-            
-            regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
-            
-            # Conviction Logic
-            is_conviction = current_prob >= conviction_thresh
-            
-            # Calculate Stability Score (Mean Persistence)
-            stability_score = np.mean([r['persistence'] for r in regime_stats])
-            
-            # Display Dashboard
-            st.divider()
-            c_dash1, c_dash2, c_dash3 = st.columns(3)
-            
-            with c_dash1:
-                st.caption("Current State")
-                if is_conviction:
-                    st.subheader(f"{regime_label}")
-                    st.success(f"High Conviction ({current_prob:.1%})")
-                else:
-                    st.subheader("⚪ Mixed / Uncertain")
-                    st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
-            
-            with c_dash2:
-                st.caption("Dominance Score (Confidence)")
-                # Spread between 1st and 2nd highest probability
-                sorted_probs = sorted(last_probs.values, reverse=True)
-                spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+            regime_stats.append({
+                'regime': i,
+                'mean': float(mean_val),
+                'vol': float(vol_val),
+                'persistence': float(trans_matrix[i, i])
+            })
+        
+        # Sort by mean (high to low)
+        regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
+        
+        # ===== DISPLAY REGIMES =====
+        st.write("### 📊 Identified Regimes")
+        
+        cols = st.columns(n_regimes)
+        labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
+        
+        for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
+            with col:
+                st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
+                st.metric("Mean Return", f"{regime['mean']:.2f}%")
+                st.metric("Volatility", f"{regime['vol']:.2f}%")
+                st.metric("Persistence", f"{regime['persistence']:.1%}")
                 
-                st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
-                st.progress(max(0.0, min(1.0, float(spread))))
-                
-            with c_dash3:
-                st.caption("Regime Stability Metrics")
-                st.metric("Avg Persistence", f"{stability_score:.1%}")
-                # Switch Frequency (proxy)
-                expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
-                st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
+                avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
+                st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
+        
+        # ===== CURRENT STATE =====
+        # Use .iloc[-1] to get the probabilities at the LAST time step
+        last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
+        current_regime = np.argmax(last_probs)
+        current_prob = last_probs.iloc[current_regime]
+        
+        regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
+        
+        # Conviction Logic
+        is_conviction = current_prob >= conviction_thresh
+        
+        # Calculate Stability Score (Mean Persistence)
+        stability_score = np.mean([r['persistence'] for r in regime_stats])
+        
+        # Display Dashboard
+        st.divider()
+        c_dash1, c_dash2, c_dash3 = st.columns(3)
+        
+        with c_dash1:
+            st.caption("Current State")
+            if is_conviction:
+                st.subheader(f"{regime_label}")
+                st.success(f"High Conviction ({current_prob:.1%})")
+            else:
+                st.subheader("⚪ Mixed / Uncertain")
+                st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
+        
+        with c_dash2:
+            st.caption("Dominance Score (Confidence)")
+            # Spread between 1st and 2nd highest probability
+            sorted_probs = sorted(last_probs.values, reverse=True)
+            spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+            
+            st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
+            st.progress(max(0.0, min(1.0, float(spread))))
+            
+        with c_dash3:
+            st.caption("Regime Stability Metrics")
+            st.metric("Avg Persistence", f"{stability_score:.1%}")
+            # Switch Frequency (proxy)
+            expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
+            st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
 
-            st.write(f"**As of:** {model_data.index[-1].date()}")
-            st.divider()
+        st.write(f"**As of:** {model_data.index[-1].date()}")
+        st.divider()
+        
+        # ===== VISUALIZATION =====
+        st.write("### 📈 Regime Analysis (Real-time / Filtered)")
+        
+        fig_m, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+        
+        # Plot 1: Returns with regime shading
+        axes[0].plot(model_data.index, model_data, color='black', alpha=0.6, linewidth=1)
+        
+        for i, regime in enumerate(regime_stats):
+            # Use .iloc for robust column access
+            # CHANGED: Use filtered probabilities to avoid look-ahead bias
+            probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+            # Invert color map: i=0 (Bull) -> 1.0 (Green), i=N (Bear) -> 0.0 (Red)
+            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+            color = plt.cm.RdYlGn(color_idx)
             
-            # ===== VISUALIZATION =====
-            st.write("### 📈 Regime Analysis (Real-time / Filtered)")
+            axes[0].fill_between(model_data.index, model_data.min(), model_data.max(),
+                                  where=(probs > 0.6),
+                                  alpha=0.15, color=color, label=labels[i])
+        
+        axes[0].set_title(f"{TICKER} Returns with Regime Periods")
+        axes[0].legend(loc='upper left')
+        axes[0].set_ylabel("Return (%)")
+        
+        # Plot 2: Probabilities
+        # Option to smooth the probability line itself for readability
+        smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
+        
+        for i, regime in enumerate(regime_stats):
+            # Invert color map
+            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+            color = plt.cm.RdYlGn(color_idx)
             
-            fig_m, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+            regime = regime_stats[i] # get back regime obj
+            # Get raw probabilities
+            # CHANGED: Use filtered probabilities
+            raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
             
-            # Plot 1: Returns with regime shading
-            axes[0].plot(model_data.index, model_data, color='black', alpha=0.6, linewidth=1)
+            # Apply smoothing if requested
+            if smooth_probs:
+                plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
+            else:
+                plot_probs = raw_probs
             
-            for i, regime in enumerate(regime_stats):
-                # Use .iloc for robust column access
-                # CHANGED: Use filtered probabilities to avoid look-ahead bias
-                probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-                # Invert color map: i=0 (Bull) -> 1.0 (Green), i=N (Bear) -> 0.0 (Red)
-                color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-                color = plt.cm.RdYlGn(color_idx)
-                
-                axes[0].fill_between(model_data.index, model_data.min(), model_data.max(),
-                                      where=(probs > 0.6),
-                                      alpha=0.15, color=color, label=labels[i])
-            
-            axes[0].set_title(f"{TICKER} Returns with Regime Periods")
-            axes[0].legend(loc='upper left')
-            axes[0].set_ylabel("Return (%)")
-            
-            # Plot 2: Probabilities
-            # Option to smooth the probability line itself for readability
-            smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
-            
-            for i, regime in enumerate(regime_stats):
-                # Invert color map
-                color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-                color = plt.cm.RdYlGn(color_idx)
-                
-                regime = regime_stats[i] # get back regime obj
-                # Get raw probabilities
-                # CHANGED: Use filtered probabilities
-                raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-                
-                # Apply smoothing if requested
-                if smooth_probs:
-                    plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
-                else:
-                    plot_probs = raw_probs
-                
-                # Use fill_between (Area Chart) for better readability than just lines
-                axes[1].fill_between(model_data.index, 0, plot_probs, 
-                                     color=color, alpha=0.3, label=labels[i])
-                axes[1].plot(model_data.index, plot_probs, color=color, linewidth=1.5)
+            # Use fill_between (Area Chart) for better readability than just lines
+            axes[1].fill_between(model_data.index, 0, plot_probs, 
+                                 color=color, alpha=0.3, label=labels[i])
+            axes[1].plot(model_data.index, plot_probs, color=color, linewidth=1.5)
 
-            axes[1].axhline(1/n_regimes, color='gray', linestyle='--', alpha=0.4, 
-                            label='Equal probability')
-            axes[1].set_title("Regime Probabilities (Filtered/Real-time)")
-            axes[1].set_ylabel("Probability")
-            axes[1].set_ylim([0, 1])
-            axes[1].legend()
-            
-            # Plot 3: Expected Return
-            # Helper to safely get const
-            def get_const(i):
-                # Check for regime specific const first, then global const
-                if f'const[{i}]' in res_markov.params:
-                    return float(res_markov.params[f'const[{i}]'])
-                return float(res_markov.params.get('const', 0.0))
+        axes[1].axhline(1/n_regimes, color='gray', linestyle='--', alpha=0.4, 
+                        label='Equal probability')
+        axes[1].set_title("Regime Probabilities (Filtered/Real-time)")
+        axes[1].set_ylabel("Probability")
+        axes[1].set_ylim([0, 1])
+        axes[1].legend()
+        
+        # Plot 3: Expected Return
+        # Helper to safely get const
+        def get_const(i):
+            # Check for regime specific const first, then global const
+            if f'const[{i}]' in res_markov.params:
+                return float(res_markov.params[f'const[{i}]'])
+            return float(res_markov.params.get('const', 0.0))
 
-            # Initialize expected_ret as a Series with the correct index
-            expected_ret = pd.Series(0.0, index=model_data.index)
+        # Initialize expected_ret as a Series with the correct index
+        expected_ret = pd.Series(0.0, index=model_data.index)
+        
+        for i in range(n_regimes):
+            # CHANGED: Use filtered probabilities
+            prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
+            const_val = get_const(i)
+            expected_ret += prob * const_val
+        
+        axes[2].plot(model_data.index, expected_ret, color='darkblue', linewidth=2)
+        axes[2].axhline(0, color='black', linestyle='-', alpha=0.3)
+        
+        # Fill between requires numpy arrays for 'where' sometimes, or robust Series
+        axes[2].fill_between(model_data.index, 0, expected_ret,
+                              where=(expected_ret > 0), color='green', alpha=0.3)
+        axes[2].fill_between(model_data.index, 0, expected_ret,
+                              where=(expected_ret < 0), color='red', alpha=0.3)
+        axes[2].set_title("Regime-Weighted Expected Return")
+        axes[2].set_ylabel("Expected Return (%)")
+        
+        # Format dates for ALL axes and ensure labels are visible
+        # Format dates: Only for the last axis to avoid overlap
+        format_plot_dates(axes[-1], model_data.index)
+        axes[-1].tick_params(labelbottom=True)
+        
+        # Ensure other axes don't show labels (redundant with sharex but safe)
+        for ax in axes[:-1]:
+            ax.tick_params(labelbottom=False)
             
-            for i in range(n_regimes):
-                # CHANGED: Use filtered probabilities
-                prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
-                const_val = get_const(i)
-                expected_ret += prob * const_val
+        st.pyplot(fig_m)
+        
+        # ===== PARAMETERS TABLE =====
+        with st.expander("📋 Technical Parameters"):
+            summary_data = {
+                "Parameter": res_markov.params.index,
+                "Value": res_markov.params.values.astype(float),
+                "Std Error": res_markov.bse.values.astype(float),
+                "P-Value": res_markov.pvalues.values.astype(float)
+            }
+            df_summary = pd.DataFrame(summary_data)
+            # Format only numeric columns to avoid error with "Parameter" string column
+            st.dataframe(df_summary.style.format({
+                "Value": "{:.4f}",
+                "Std Error": "{:.4f}",
+                "P-Value": "{:.4f}"
+            }))
             
-            axes[2].plot(model_data.index, expected_ret, color='darkblue', linewidth=2)
-            axes[2].axhline(0, color='black', linestyle='-', alpha=0.3)
-            
-            # Fill between requires numpy arrays for 'where' sometimes, or robust Series
-            axes[2].fill_between(model_data.index, 0, expected_ret,
-                                  where=(expected_ret > 0), color='green', alpha=0.3)
-            axes[2].fill_between(model_data.index, 0, expected_ret,
-                                  where=(expected_ret < 0), color='red', alpha=0.3)
-            axes[2].set_title("Regime-Weighted Expected Return")
-            axes[2].set_ylabel("Expected Return (%)")
-            
-            # Format dates for ALL axes and ensure labels are visible
-            # Format dates: Only for the last axis to avoid overlap
-            format_plot_dates(axes[-1], model_data.index)
-            axes[-1].tick_params(labelbottom=True)
-            
-            # Ensure other axes don't show labels (redundant with sharex but safe)
-            for ax in axes[:-1]:
-                ax.tick_params(labelbottom=False)
-                
-            st.pyplot(fig_m)
-            
-            # ===== PARAMETERS TABLE =====
-            with st.expander("📋 Technical Parameters"):
-                summary_data = {
-                    "Parameter": res_markov.params.index,
-                    "Value": res_markov.params.values.astype(float),
-                    "Std Error": res_markov.bse.values.astype(float),
-                    "P-Value": res_markov.pvalues.values.astype(float)
-                }
-                df_summary = pd.DataFrame(summary_data)
-                # Format only numeric columns to avoid error with "Parameter" string column
-                st.dataframe(df_summary.style.format({
-                    "Value": "{:.4f}",
-                    "Std Error": "{:.4f}",
-                    "P-Value": "{:.4f}"
-                }))
-                
-                st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
-            
+            st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
+        
 
 
 
-    # ==========================================
+# ==========================================
     # TAB 3: STOCHASTIC MODELS (Heston/Jump)
     # ==========================================
     with tab3:
