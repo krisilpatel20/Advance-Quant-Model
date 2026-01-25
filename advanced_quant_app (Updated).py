@@ -900,13 +900,22 @@ with st.sidebar:
     st.header("Thesis Parameters")
     
     # Market Region Selector
-    market_region = st.selectbox("Market Region", ["US Market (USD)", "Indian Market (INR)"])
+    market_region = st.selectbox("Market Region", [
+        "US Market (USD)", 
+        "Indian Market (INR)", 
+        "Futures / Commodities (USD)"
+    ])
     
     if market_region == "Indian Market (INR)":
         CURRENCY = "₹"
         BENCHMARK = "^NSEI"
         DEFAULT_RF = 7.0
         SUFFIX = ".NS"
+    elif market_region == "Futures / Commodities (USD)":
+        CURRENCY = "$"
+        BENCHMARK = "GC=F" # Gold Futures (Comex) as default safe haven benchmark
+        DEFAULT_RF = 4.0
+        SUFFIX = "=F" # Common suffix, though some are just tickers (e.g. CL=F, SI=F)
     else:
         CURRENCY = "$"
         BENCHMARK = "SPY"
