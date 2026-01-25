@@ -915,7 +915,7 @@ with st.sidebar:
         CURRENCY = "$"
         BENCHMARK = "GC=F" # Gold Futures (Comex) as default safe haven benchmark
         DEFAULT_RF = 4.0
-        SUFFIX = "" # Common suffix, though some are just tickers (e.g. CL=F, SI=F)
+        SUFFIX = "" # User requested no default suffix (allows specific contracts like SIH26.CMX)
     else:
         CURRENCY = "$"
         BENCHMARK = "SPY"
