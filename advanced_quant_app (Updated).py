@@ -25,6 +25,14 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+# Try importing GS Factor Analytics
+try:
+    from gs_factor_analytics import FactorAnalytics, GS_QUANT_FOUND
+except ImportError:
+    GS_QUANT_FOUND = False
+    FactorAnalytics = None
+
+
 # Statsmodels Diagnostic Imports
 from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 
@@ -959,7 +967,7 @@ if df_main is not None:
     st.subheader(f"Data Analysis: {TICKER}")
     
     # Layout Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "Volatility (GARCH)", 
         "Regime Switching", 
         "Stochastic (Heston/Jump)", 
@@ -969,7 +977,8 @@ if df_main is not None:
         "Backtest",
         "Volatility Clustering",
         "Advanced Regime",
-        "SML & Alpha"
+        "SML & Alpha",
+        "GS Factor Analytics"
     ])
 
     # ==========================================
@@ -2598,9 +2607,81 @@ if df_main is not None:
 
                 else:
                     st.error(f"Could not load data for Benchmark: {bench_ticker}")
+    # ==========================================
+    # TAB 11: GS FACTOR ANALYTICS
+    # ==========================================
+    with tab11:
+        st.write("### 🏦 GS Quant Factor Analytics")
+        st.caption("Institutional Style Factor Analysis using Goldman Sachs Marquee API.")
+
+        if not GS_QUANT_FOUND:
+            st.error("⚠️ `gs_quant` library is missing. Please run `pip install gs-quant`.")
+        else:
+            st.info("ℹ️ Requires valid GS Quant Session/Credentials configured locally (.gs_quant/session.json or Env Vars).")
+            
+            # Check for position set inputs
+            st.subheader("Factor Analysis Configuration")
+            col_gs1, col_gs2 = st.columns(2)
+            with col_gs1:
+                risk_model = st.selectbox("Risk Model ID", ["AXIOMA_AXUS4S", "BARRA_EFM_USALTL", "AXIOMA_AXWW4S"], index=0)
+            with col_gs2:
+                 # Currency: Map symbol to ISO code
+                 curr_map = {"$": "USD", "₹": "INR", "€": "EUR", "£": "GBP"}
+                 default_curr = curr_map.get(CURRENCY, "USD")
+                 currency = st.selectbox("Reporting Currency", ["USD", "EUR", "GBP", "JPY", "INR"], index=["USD", "EUR", "GBP", "JPY", "INR"].index(default_curr) if default_curr in ["USD", "EUR", "GBP", "JPY", "INR"] else 0)
+
+            if st.button("Run Factor Analysis"):
+                with st.spinner("Fetching Factor Analysis from GS Marquee..."):
+                    try:
+                        # 1. Initialize Analytics Helper
+                        analytics = FactorAnalytics(risk_model_id=risk_model, currency=currency)
+                        
+                        # 2. Create Position Set (Mock Portfolio or Single Asset)
+                        # Using the active ticker with a notional
+                        from gs_quant.markets.position_set import PositionSet
+                        from gs_quant.target.common import Position as GsPosition
+                        
+                        identifier = TICKER
+                        # Basic mapping for common cases where yahoo ticker differs from GS
+                        # e.g. "AAPL" -> "AAPL UW"
+                        
+                        positions = [
+                            GsPosition(identifier=identifier, quantity=100) # Mock quantity
+                        ]
+                        
+                        # Create Position Set
+                        # Use end_date from sidebar
+                        pos_set = PositionSet(positions=positions, date=end_date)
+                        
+                        # 3. Get Analysis
+                        results = analytics.get_factor_analysis(pos_set)
+                        
+                        # 4. Visualization
+                        
+                        # Style Factors
+                        fig_style = analytics.create_style_factor_chart(results, rows=10, title=f"Style Factors: {TICKER}")
+                        st.plotly_chart(fig_style, use_container_width=True)
+                        
+                        # Summary Table
+                        st.write("#### Portfolio Risk Summary")
+                        df_summary = analytics.create_exposure_summary_table(results)
+                        st.dataframe(df_summary, use_container_width=True)
+                        
+                        # Performance Chart (if available)
+                        if 'timeseriesData' in results:
+                             st.write("#### Performance Analysis")
+                             fig_perf = analytics.create_dynamic_performance_chart(results)
+                             st.plotly_chart(fig_perf, use_container_width=True)
+
+                    except Exception as e:
+                        st.error(f"Factor Analysis Failed: {str(e)}")
+                        if "401" in str(e) or "Unauthorized" in str(e):
+                             st.warning("Authentication Error: Please check your GS Quant credentials.")
+
 else:
     st.info("Enter a ticker and ensure data is loaded to begin analysis.")
 
 # Footer
 st.markdown("---")
 st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
+
