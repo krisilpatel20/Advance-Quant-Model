@@ -2025,7 +2025,7 @@ if df_main is not None:
         st.write("### 🛠️ Strategy Backtest")
         
         # Strategy Selector
-        strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)"], horizontal=True)
+        strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)"], horizontal=True)
         
         # Common Backtest Params
         col_b1, col_b2, col_b3 = st.columns(3)
@@ -2305,6 +2305,44 @@ if df_main is not None:
                                         where=(signals==1), color='green', alpha=0.1, label='Long Zone')
                     
                     format_plot_dates(ax_ctx, prices_bt.index)
+                    ax_ctx.legend()
+                    st.pyplot(fig_ctx)
+
+        elif strategy_type == "Momentum Hedge (EMA/SMA Cross)":
+            st.markdown("**Strategy:** Long when **Short EMA > Med SMA**. Cash/Hedge when **Short EMA < Med SMA**.")
+            
+            c_h1, c_h2 = st.columns(2)
+            with c_h1:
+                short_len = st.slider("Short EMA Length", 5, 50, 20)
+            with c_h2:
+                med_len = st.slider("Medium SMA Length", 20, 200, 60)
+                
+            with st.spinner("Calculating Momentum Hedge Signals..."):
+                # Calculate Indicators
+                short_ema = prices_bt.ewm(span=short_len, adjust=False).mean()
+                med_sma = prices_bt.rolling(window=med_len).mean()
+                
+                # Generate Signals
+                # Logic: Flag = 1 when Short < Med (Hedge active). So Long Signal = 1 when Not Flagged (Short >= Med).
+                # To match exactly: flag = shortMA < medMA ? 1.0 : 0.0
+                signals = (short_ema >= med_sma).astype(int)
+                
+                # Plot Context
+                with st.expander("See Strategy Context"):
+                    fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                    ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
+                    ax_ctx.plot(short_ema.index, short_ema, color='orange', linewidth=1.5, label=f'Short EMA ({short_len})')
+                    ax_ctx.plot(med_sma.index, med_sma, color='blue', linewidth=1.5, label=f'Med SMA ({med_len})')
+                    
+                    # Highlight Long Zones (Green)
+                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
+                                        where=(signals==1), color='green', alpha=0.1, label='Long Zone')
+                    # Highlight Hedge Zones (Red)
+                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
+                                        where=(signals==0), color='red', alpha=0.1, label='Hedge Zone (Active Flag)')
+                    
+                    format_plot_dates(ax_ctx, prices_bt.index)
+                    ax_ctx.set_title("Momentum Hedge Signal (EMA/SMA Cross)")
                     ax_ctx.legend()
                     st.pyplot(fig_ctx)
 
