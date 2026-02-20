@@ -10,6 +10,9 @@ import statsmodels.api as sm
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from statsmodels.tsa.seasonal import seasonal_decompose
 from datetime import datetime, timedelta
+import io
+from fpdf import FPDF
+import xlsxwriter
 
 # Try importing arch, handle if missing
 try:
@@ -895,6 +898,76 @@ def calculate_beta(ticker_returns, benchmark_ticker='SPY', lookback_years=2):
     except:
         return 1.0 # Fallback to market beta
 
+class ReportGenerator:
+    """
+    Handles PDF and Excel generation for the quant report.
+    """
+    def __init__(self, ticker, start_date, end_date):
+        self.ticker = ticker
+        self.start_date = start_date
+        self.end_date = end_date
+        self.data_store = {} # Stores dataframes and dicts for Excel
+        self.plots = {} # Stores IO buffers for plots
+
+    def add_data(self, key, df_or_dict):
+        self.data_store[key] = df_or_dict
+
+    def add_plot(self, key, fig):
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        self.plots[key] = buf
+
+    def generate_excel(self):
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            for key, data in self.data_store.items():
+                if isinstance(data, pd.DataFrame):
+                    # Clean sheet name (max 31 chars, no invalid chars)
+                    sheet_name = "".join([c for c in key if c.isalnum() or c in (" ", "_")])[:31]
+                    data.to_excel(writer, sheet_name=sheet_name)
+                elif isinstance(data, dict):
+                    df_dict = pd.DataFrame(list(data.items()), columns=['Metric', 'Value'])
+                    sheet_name = "".join([c for c in key if c.isalnum() or c in (" ", "_")])[:31]
+                    df_dict.to_excel(writer, sheet_name=sheet_name, index=False)
+        return output.getvalue()
+
+    def generate_pdf(self):
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        
+        # Title
+        pdf.set_font("Arial", 'B', 20)
+        pdf.cell(0, 10, f"Quant Analysis Report: {self.ticker}", ln=True, align='C')
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 10, f"Period: {self.start_date} to {self.end_date}", ln=True, align='C')
+        pdf.ln(10)
+
+        # Iterate through stored items and add to PDF
+        for key, data in self.data_store.items():
+            pdf.set_font("Arial", 'B', 14)
+            pdf.cell(0, 10, key, ln=True)
+            pdf.set_font("Arial", size=10)
+            
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    val_str = f"{v:.4f}" if isinstance(v, (float, np.float64)) else str(v)
+                    pdf.cell(0, 5, f"{k}: {val_str}", ln=True)
+            elif isinstance(data, pd.DataFrame):
+                pdf.cell(0, 5, f"Data table: {len(data)} rows. See Excel for full data.", ln=True)
+            
+            # Add corresponding plot if exists
+            if key in self.plots:
+                # Save temp image for FPDF (fpdf2 supports io buffers but FPDF might need a file or specific format)
+                # Actually fpdf2 supports BytesIO.
+                pdf.image(self.plots[key], x=10, w=180)
+                pdf.ln(5)
+            
+            pdf.ln(5)
+            
+        return pdf.output()
+
 # ==========================================
 # 3. SIDEBAR CONTROLS
 # ==========================================
@@ -948,9 +1021,38 @@ with st.sidebar:
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
-    rf_rate = st.number_input("Risk Free Rate (%)", 0.0, 20.0, DEFAULT_RF) / 100
-    
     st.info(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
+
+    st.subheader("Report Export")
+    if 'report_gen' not in st.session_state:
+        st.session_state.report_gen = None
+
+    if st.session_state.report_gen:
+        col_ex1, col_ex2 = st.columns(2)
+        with col_ex1:
+            try:
+                pdf_bytes = st.session_state.report_gen.generate_pdf()
+                st.download_button(
+                    label="📥 PDF Report",
+                    data=pdf_bytes,
+                    file_name=f"Quant_Report_{TICKER}.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.error(f"PDF Error: {e}")
+        with col_ex2:
+            try:
+                excel_bytes = st.session_state.report_gen.generate_excel()
+                st.download_button(
+                    label="📥 Excel Data",
+                    data=excel_bytes,
+                    file_name=f"Quant_Data_{TICKER}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except Exception as e:
+                st.error(f"Excel Error: {e}")
+    else:
+        st.caption("Perform an analysis to enable exports.")
 
 # ==========================================
 # 4. DATA LOADING
@@ -959,6 +1061,10 @@ df_main = load_data(TICKER, start_date, end_date)
 
 if df_main is not None:
     st.subheader(f"Data Analysis: {TICKER}")
+    
+    # Initialize Report Generator
+    st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
+    st.session_state.report_gen.add_data("Historical Data", df_main.tail(100))
     
     # Layout Tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
@@ -1017,14 +1123,17 @@ if df_main is not None:
                     ax_v.legend()
                     format_plot_dates(ax_v, returns_pct.index)
                     st.pyplot(fig_v)
+                    st.session_state.report_gen.add_plot("GARCH Volatility", fig_v)
                     
                 with col_res2:
-                    st.subheader("Model Parameters")
-                    st.dataframe(pd.DataFrame({
+                    params_df = pd.DataFrame({
                         "Param": res.params.index,
                         "Value": res.params.values,
                         "t-stat": res.tvalues.values
-                    }).set_index("Param").style.format("{:.4f}"))
+                    }).set_index("Param")
+                    st.subheader("Model Parameters")
+                    st.dataframe(params_df.style.format("{:.4f}"))
+                    st.session_state.report_gen.add_data("GARCH Parameters", params_df)
                     
                     st.markdown("### Analysis")
                     
@@ -1377,6 +1486,8 @@ if df_main is not None:
                 avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
                 st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
         
+        st.session_state.report_gen.add_data("Regime Statistics", pd.DataFrame(regime_stats))
+        
         # ===== CURRENT STATE =====
         # Use .iloc[-1] to get the probabilities at the LAST time step
         last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
@@ -1517,6 +1628,7 @@ if df_main is not None:
             ax.tick_params(labelbottom=False)
             
         st.pyplot(fig_m)
+        st.session_state.report_gen.add_plot("Regime Switching Analysis", fig_m)
         
         # ===== PARAMETERS TABLE =====
         with st.expander("📋 Technical Parameters"):
@@ -2376,6 +2488,8 @@ if df_main is not None:
             ax_bt.legend()
             format_plot_dates(ax_bt, bt_results['equity_curve'].index)
             st.pyplot(fig_bt)
+            st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+            st.session_state.report_gen.add_data("Backtest Metrics", strat_metrics)
             
             # Trade Log
             st.write("#### 📝 Trade Log")
@@ -2635,6 +2749,9 @@ if df_main is not None:
                     
                     format_plot_dates(ax_dyn[1], res_sml.index)
                     st.pyplot(fig_dyn)
+                    st.session_state.report_gen.add_plot("SML Factor Dynamics", fig_dyn)
+                    st.session_state.report_gen.add_data("SML Analysis Results", res_sml.tail(100))
+                    st.session_state.report_gen.add_data("Current SML Metrics", last_row.to_dict())
 
                 else:
                     st.error(f"Could not load data for Benchmark: {bench_ticker}")
