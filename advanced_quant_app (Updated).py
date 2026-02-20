@@ -919,7 +919,17 @@ class ReportGenerator:
 
     def add_plot(self, key, fig):
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight')
+        if hasattr(fig, 'savefig'): # Matplotlib
+            fig.savefig(buf, format='png', bbox_inches='tight')
+        elif hasattr(fig, 'write_image'): # Plotly
+            try:
+                fig.write_image(buf, format='png', engine='kaleido')
+            except Exception as e:
+                # Fallback if kaleido fails
+                print(f"Plotly export failed: {e}")
+                return
+        else:
+            return
         buf.seek(0)
         self.plots[key] = buf
 
@@ -943,33 +953,71 @@ class ReportGenerator:
         pdf.add_page()
         
         # Title
-        pdf.set_font("Arial", 'B', 20)
-        pdf.cell(0, 10, f"Quant Analysis Report: {self.ticker}", ln=True, align='C')
-        pdf.set_font("Arial", size=12)
-        pdf.cell(0, 10, f"Period: {self.start_date} to {self.end_date}", ln=True, align='C')
+        pdf.set_font("Arial", 'B', 24)
+        pdf.set_text_color(44, 62, 80) # Dark Blue
+        pdf.cell(0, 20, f"Unified Quant Analysis Report", ln=True, align='C')
+        
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(0, 10, f"Asset: {self.ticker}", ln=True, align='C')
+        
+        pdf.set_font("Arial", size=10)
+        pdf.set_text_color(100, 100, 100)
+        pdf.cell(0, 10, f"Analysis Period: {self.start_date} to {self.end_date}", ln=True, align='C')
+        pdf.cell(0, 10, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align='C')
         pdf.ln(10)
+        
+        # Track which plots have been printed
+        printed_plots = set()
 
-        # Iterate through stored items and add to PDF
+        # 1. First print all Data Store items (and their matching plots)
         for key, data in self.data_store.items():
             pdf.set_font("Arial", 'B', 14)
-            pdf.cell(0, 10, key, ln=True)
+            pdf.set_text_color(31, 119, 180) # Theme blue
+            pdf.cell(0, 10, f"SECTION: {key}", ln=True)
+            pdf.line(pdf.get_x(), pdf.get_y(), pdf.get_x() + 190, pdf.get_y())
+            pdf.ln(2)
+            
             pdf.set_font("Arial", size=10)
+            pdf.set_text_color(0, 0, 0)
             
             if isinstance(data, dict):
                 for k, v in data.items():
-                    val_str = f"{v:.4f}" if isinstance(v, (float, np.float64)) else str(v)
-                    pdf.cell(0, 5, f"{k}: {val_str}", ln=True)
+                    val_str = f"{v:.4f}" if isinstance(v, (float, np.float64, np.float32)) else str(v)
+                    pdf.cell(70, 6, f"{k}:", border=0)
+                    pdf.cell(0, 6, val_str, ln=True, border=0)
             elif isinstance(data, pd.DataFrame):
-                pdf.cell(0, 5, f"Data table: {len(data)} rows. See Excel for full data.", ln=True)
+                pdf.cell(0, 7, f"Data Table: {len(data)} rows. (See Excel for full dataset)", ln=True, italic=True)
             
             # Add corresponding plot if exists
             if key in self.plots:
-                # Save temp image for FPDF (fpdf2 supports io buffers but FPDF might need a file or specific format)
-                # Actually fpdf2 supports BytesIO.
-                pdf.image(self.plots[key], x=10, w=180)
+                pdf.ln(2)
+                pdf.image(self.plots[key], x=15, w=180)
+                printed_plots.add(key)
                 pdf.ln(5)
             
+            pdf.ln(10)
+            
+            # Add page break if near bottom
+            if pdf.get_y() > 230:
+                pdf.add_page()
+
+        # 2. Print any remaining plots that weren't matched to data_store keys
+        remaining_plots = [k for k in self.plots.keys() if k not in printed_plots]
+        if remaining_plots:
+            if pdf.get_y() > 100: # New page if not much room
+                pdf.add_page()
+                
+            pdf.set_font("Arial", 'B', 16)
+            pdf.cell(0, 10, "Additional Visualizations", ln=True)
             pdf.ln(5)
+            
+            for key in remaining_plots:
+                pdf.set_font("Arial", 'B', 12)
+                pdf.cell(0, 10, key, ln=True)
+                pdf.image(self.plots[key], x=15, w=180)
+                pdf.ln(10)
+                if pdf.get_y() > 230:
+                    pdf.add_page()
             
         # fpdf2 returns bytearray by default when no dest is provided
         pdf_raw = pdf.output()
@@ -1821,6 +1869,8 @@ if df_main is not None:
                     hovermode="x unified"
                 )
                 st.plotly_chart(fig, use_container_width=True)
+                st.session_state.report_gen.add_plot("Merton Jump Diffusion", fig)
+                st.session_state.report_gen.add_data("Merton Metrics", {"Mean": final_mean, "Median": final_median})
 
         elif sim_type == "Heston Stochastic Volatility":
             col1, col2 = st.columns([1, 3])
@@ -1931,6 +1981,8 @@ if df_main is not None:
                     hovermode="x unified"
                 )
                 st.plotly_chart(fig_h, use_container_width=True)
+                st.session_state.report_gen.add_plot("Heston Price Simulation", fig_h)
+                st.session_state.report_gen.add_data("Heston Metrics", {"Mean": final_mean, "Median": final_median})
                 
                 # Volatility Plot (Optional, keep simple or upgrade too)
                 st.write("**Stochastic Volatility Paths**")
@@ -1951,6 +2003,7 @@ if df_main is not None:
                     height=300
                 )
                 st.plotly_chart(fig_v, use_container_width=True)
+                st.session_state.report_gen.add_plot("Heston Volatility Process", fig_v)
 
     # ==========================================
     # TAB 4: KALMAN FILTER
@@ -1998,6 +2051,8 @@ if df_main is not None:
                     format_plot_dates(ax_k2, dates) # Apply Date Formatting
                     
                     st.pyplot(fig_k)
+                    st.session_state.report_gen.add_plot("Kalman Pairs Analysis", fig_k)
+                    st.session_state.report_gen.add_data("Kalman Hedge Ratio", {"Beta": beta[-1]})
                     st.write(f"Current Hedge Ratio: **{beta[-1]:.4f}** (Long 1 {TICKER}, Short {beta[-1]:.4f} {PAIR_TICKER})")
                 else:
                     st.error("Not enough overlapping data for pairs analysis.")
@@ -2056,6 +2111,8 @@ if df_main is not None:
             ax_kt.grid(True, which='major', linestyle='--', alpha=0.5)
             
             st.pyplot(fig_kt)
+            st.session_state.report_gen.add_plot("Kalman Trend Analysis", fig_kt)
+            st.session_state.report_gen.add_data("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
             
             # Signal & Metrics
             current_price = prices[-1]
@@ -2122,6 +2179,8 @@ if df_main is not None:
                 
             ax_hm.set_title("Asset Class Correlations")
             st.pyplot(fig_hm)
+            st.session_state.report_gen.add_plot("Macro Correlations", fig_hm)
+            st.session_state.report_gen.add_data("Correlation Matrix", corr_matrix)
             
             st.write(f"**Structural Thesis Check:**")
             oil_corr = corr_matrix.loc[TICKER, 'Crude Oil']
@@ -2133,6 +2192,11 @@ if df_main is not None:
                 st.info(f"Inverse correlation with Energy ({oil_corr:.2f}).")
             else:
                 st.warning(f"Low sensitivity to Energy prices ({oil_corr:.2f}).")
+            
+            st.session_state.report_gen.add_data("Macro Sensitivity Thesis", {
+                "Oil Correlation": oil_corr,
+                "Rate Correlation": rate_corr
+            })
 
     # ==========================================
     # TAB 6: STRUCTURAL
@@ -2155,6 +2219,8 @@ if df_main is not None:
             format_plot_dates(ax3, df_main.index) # Apply Date Formatting to the shared x-axis
             
             st.pyplot(fig_dec)
+            st.session_state.report_gen.add_plot("Structural Decomposition", fig_dec)
+            st.session_state.report_gen.add_data("Decomposition Period", {"Period": period})
         else:
             st.warning("Insufficient data for decomposition with selected period.")
 
@@ -2585,6 +2651,11 @@ if df_main is not None:
         else:
             st.success("Stable: Volatility mean-reverts quickly.")
 
+        st.session_state.report_gen.add_data("Volatility Clustering Metrics", {
+            "RV": rv, "BV": bv, "Jump Ratio": jump_res['jump_ratio'],
+            "Branching Ratio": br, "Half-Life": hl
+        })
+
         # Visualization
         st.subheader("Volatility Clustering Visuals")
         
@@ -2609,6 +2680,7 @@ if df_main is not None:
         
         format_plot_dates(ax_vol[1], df_main.index)
         st.pyplot(fig_vol)
+        st.session_state.report_gen.add_plot("Volatility Clustering Visuals", fig_vol)
 
     # ==========================================
     # TAB 9: ADVANCED REGIME DETECTION
@@ -2632,6 +2704,9 @@ if df_main is not None:
                     with m_col2:
                         current_sig, current_data = detector.get_trading_signal()
                         st.metric("System Signal", current_sig, current_data['label'])
+                        
+                        st.session_state.report_gen.add_data("Advanced Regime Metrics", detector.metrics)
+                        st.session_state.report_gen.add_data("Current Regime Signal", {"Signal": current_sig, "Label": current_data['label']})
                     
                     # Visualization
                     st.write("#### Regime Probability Stream")
@@ -2645,6 +2720,7 @@ if df_main is not None:
                     ax_hmm.set_title("Regime Probabilities (Student-t HMM)")
                     format_plot_dates(ax_hmm, df_main.index)
                     st.pyplot(fig_hmm)
+                    st.session_state.report_gen.add_plot("HMM Regime Probabilities", fig_hmm)
                     
                     st.write("#### Bayesian Changepoint Probabilities")
                     cp_probs = detector.regimes['changepoint_probs']
@@ -2652,6 +2728,9 @@ if df_main is not None:
                     ax_cp.plot(df_main.index, cp_probs, color='purple', linewidth=1)
                     ax_cp.fill_between(df_main.index, 0, cp_probs, color='purple', alpha=0.2)
                     ax_cp.set_title("Structural Break Probability (Bayesian Online Detection)")
+                    format_plot_dates(ax_cp, df_main.index)
+                    st.pyplot(fig_cp)
+                    st.session_state.report_gen.add_plot("Bayesian Changepoints", fig_cp)
                     ax_cp.set_ylim(0, 1)
                     format_plot_dates(ax_cp, df_main.index)
                     st.pyplot(fig_cp)
