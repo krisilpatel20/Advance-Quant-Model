@@ -986,7 +986,9 @@ class ReportGenerator:
                     pdf.cell(70, 6, f"{k}:", border=0)
                     pdf.cell(0, 6, val_str, ln=True, border=0)
             elif isinstance(data, pd.DataFrame):
-                pdf.cell(0, 7, f"Data Table: {len(data)} rows. (See Excel for full dataset)", ln=True, italic=True)
+                pdf.set_font("Arial", 'I', 10)
+                pdf.cell(0, 7, f"Data Table: {len(data)} rows. (See Excel for full dataset)", ln=True)
+                pdf.set_font("Arial", size=10)
             
             # Add corresponding plot if exists
             if key in self.plots:
