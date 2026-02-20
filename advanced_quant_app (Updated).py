@@ -1026,6 +1026,7 @@ with st.sidebar:
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
+    rf_rate = st.number_input("Risk Free Rate (%)", 0.0, 20.0, DEFAULT_RF) / 100
     st.info(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
 
     st.subheader("Report Export")
