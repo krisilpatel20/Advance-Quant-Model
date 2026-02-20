@@ -1045,18 +1045,29 @@ with st.sidebar:
             col_ex1, col_ex2 = st.columns(2)
             with col_ex1:
                 try:
-                    pdf_output = st.session_state.report_gen.generate_pdf()
-                    # Standardize to bytes and wrap in BytesIO for Streamlit compatibility
-                    pdf_bytes = bytes(pdf_output)
+                    raw_pdf = st.session_state.report_gen.generate_pdf()
                     
+                    # Hyper-robust conversion to bytes
+                    if isinstance(raw_pdf, bytes):
+                        pdf_bytes = raw_pdf
+                    elif isinstance(raw_pdf, bytearray):
+                        pdf_bytes = bytes(raw_pdf)
+                    elif isinstance(raw_pdf, str):
+                        pdf_bytes = raw_pdf.encode('latin1')
+                    else:
+                        pdf_bytes = bytes(raw_pdf)
+                        
                     st.download_button(
                         label="📥 PDF Report",
-                        data=io.BytesIO(pdf_bytes),
+                        data=pdf_bytes,
                         file_name=f"Quant_Report_{TICKER}.pdf",
-                        mime="application/pdf"
+                        mime="application/pdf",
+                        key="pdf_download_btn"
                     )
                 except Exception as e:
-                    st.error(f"PDF Error: {e}")
+                    st.error(f"PDF Error: {str(e)}")
+                    st.info(f"Debug Info: Type of data is {type(raw_pdf) if 'raw_pdf' in locals() else 'Unknown'}")
+                    st.caption(f"Active File: {__file__}")
             with col_ex2:
                 try:
                     excel_bytes = st.session_state.report_gen.generate_excel()
