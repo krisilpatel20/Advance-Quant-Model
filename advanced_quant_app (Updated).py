@@ -971,7 +971,7 @@ class ReportGenerator:
             
             pdf.ln(5)
             
-        return pdf.output()
+        return bytes(pdf.output())
 
 # ==========================================
 # 3. SIDEBAR CONTROLS
