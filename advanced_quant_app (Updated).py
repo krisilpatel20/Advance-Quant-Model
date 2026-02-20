@@ -971,7 +971,11 @@ class ReportGenerator:
             
             pdf.ln(5)
             
-        return bytes(pdf.output())
+        # fpdf2 returns bytearray by default when no dest is provided
+        pdf_raw = pdf.output()
+        if isinstance(pdf_raw, bytearray):
+            return bytes(pdf_raw)
+        return pdf_raw
 
 # ==========================================
 # 3. SIDEBAR CONTROLS
@@ -1042,6 +1046,10 @@ with st.sidebar:
             with col_ex1:
                 try:
                     pdf_bytes = st.session_state.report_gen.generate_pdf()
+                    # Double-check type for robustness
+                    if isinstance(pdf_bytes, bytearray):
+                        pdf_bytes = bytes(pdf_bytes)
+                        
                     st.download_button(
                         label="📥 PDF Report",
                         data=pdf_bytes,
