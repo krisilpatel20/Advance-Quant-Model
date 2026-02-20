@@ -6,5 +6,7 @@ matplotlib
 scipy
 statsmodels
 arch
-scikit-learn
+fpdf2
+xlsxwriter
 plotly
+scikit-learn
