@@ -1045,14 +1045,13 @@ with st.sidebar:
             col_ex1, col_ex2 = st.columns(2)
             with col_ex1:
                 try:
-                    pdf_bytes = st.session_state.report_gen.generate_pdf()
-                    # Double-check type for robustness
-                    if isinstance(pdf_bytes, bytearray):
-                        pdf_bytes = bytes(pdf_bytes)
-                        
+                    pdf_output = st.session_state.report_gen.generate_pdf()
+                    # Standardize to bytes and wrap in BytesIO for Streamlit compatibility
+                    pdf_bytes = bytes(pdf_output)
+                    
                     st.download_button(
                         label="📥 PDF Report",
-                        data=pdf_bytes,
+                        data=io.BytesIO(pdf_bytes),
                         file_name=f"Quant_Report_{TICKER}.pdf",
                         mime="application/pdf"
                     )
