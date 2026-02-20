@@ -11,8 +11,13 @@ from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from statsmodels.tsa.seasonal import seasonal_decompose
 from datetime import datetime, timedelta
 import io
-from fpdf import FPDF
-import xlsxwriter
+# Try importing export libraries
+try:
+    from fpdf import FPDF
+    import xlsxwriter
+    EXPORT_AVAILABLE = True
+except ImportError:
+    EXPORT_AVAILABLE = False
 
 # Try importing arch, handle if missing
 try:
@@ -1024,35 +1029,39 @@ with st.sidebar:
     st.info(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
 
     st.subheader("Report Export")
-    if 'report_gen' not in st.session_state:
-        st.session_state.report_gen = None
-
-    if st.session_state.report_gen:
-        col_ex1, col_ex2 = st.columns(2)
-        with col_ex1:
-            try:
-                pdf_bytes = st.session_state.report_gen.generate_pdf()
-                st.download_button(
-                    label="📥 PDF Report",
-                    data=pdf_bytes,
-                    file_name=f"Quant_Report_{TICKER}.pdf",
-                    mime="application/pdf"
-                )
-            except Exception as e:
-                st.error(f"PDF Error: {e}")
-        with col_ex2:
-            try:
-                excel_bytes = st.session_state.report_gen.generate_excel()
-                st.download_button(
-                    label="📥 Excel Data",
-                    data=excel_bytes,
-                    file_name=f"Quant_Data_{TICKER}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            except Exception as e:
-                st.error(f"Excel Error: {e}")
+    if not EXPORT_AVAILABLE:
+        st.error("📥 Export libraries missing.")
+        st.info("To enable PDF/Excel exports, add `fpdf2` and `xlsxwriter` to your `requirements.txt` or run: `pip install fpdf2 xlsxwriter`")
     else:
-        st.caption("Perform an analysis to enable exports.")
+        if 'report_gen' not in st.session_state:
+            st.session_state.report_gen = None
+
+        if st.session_state.report_gen:
+            col_ex1, col_ex2 = st.columns(2)
+            with col_ex1:
+                try:
+                    pdf_bytes = st.session_state.report_gen.generate_pdf()
+                    st.download_button(
+                        label="📥 PDF Report",
+                        data=pdf_bytes,
+                        file_name=f"Quant_Report_{TICKER}.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"PDF Error: {e}")
+            with col_ex2:
+                try:
+                    excel_bytes = st.session_state.report_gen.generate_excel()
+                    st.download_button(
+                        label="📥 Excel Data",
+                        data=excel_bytes,
+                        file_name=f"Quant_Data_{TICKER}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                except Exception as e:
+                    st.error(f"Excel Error: {e}")
+        else:
+            st.caption("Perform an analysis to enable exports.")
 
 # ==========================================
 # 4. DATA LOADING
