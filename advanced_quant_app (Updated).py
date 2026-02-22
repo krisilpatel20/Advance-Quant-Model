@@ -2387,11 +2387,11 @@ if df_main is not None:
             
             st.pyplot(fig_kt)
             st.session_state.report_gen.add_plot("Kalman Trend Analysis", fig_kt)
-            st.session_state.report_gen.add_data("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
-            
             # Signal & Metrics
             current_price = prices[-1]
             diff_pct = (current_price - current_trend) / current_trend * 100
+
+            st.session_state.report_gen.add_data("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
             
             # Display Current Values
             c1, c2, c3 = st.columns(3)
