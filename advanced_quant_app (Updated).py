@@ -2565,26 +2565,71 @@ if df_main is not None:
             st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'Compare Fitness' button below to find the best fit.")
 
             if st.button("📊 Compare Regime Fitness (N=2,3,4)", use_container_width=True):
-                with st.spinner("Analyzing model complexity..."):
+                with st.spinner("Analyzing model complexity and performance..."):
                     comp_results = []
+                    # Setup local data context
+                    loc_prices = prices_bt.resample('W').last().dropna() if bt_freq == "Weekly" else prices_bt
+                    loc_returns = loc_prices.pct_change().dropna()
+                    if bt_stability > 0:
+                        loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
+                    else:
+                        loc_model_data = loc_returns.dropna() * 100
+                    
                     for n in [2, 3, 4]:
-                        r = fit_regime_model(model_data_bt, n, bt_switch_vol, bt_switch_trend)
+                        r = fit_regime_model(loc_model_data, n, bt_switch_vol, bt_switch_trend)
                         if r:
-                            comp_results.append({"Regimes": n, "AIC": r.aic, "BIC": r.bic})
+                            # 1. Identify Bull Regime
+                            r_means = []
+                            for i in range(n):
+                                m_val = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
+                                r_means.append((i, m_val))
+                            bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
+                            
+                            # 2. Generate Signals
+                            p_df = r.filtered_marginal_probabilities
+                            if signal_method == "Regime Weighted Expected Return":
+                                e_ret = pd.Series(0.0, index=loc_model_data.index)
+                                for i in range(n):
+                                    m = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
+                                    e_ret += p_df.iloc[:, i] * m
+                                sigs = (e_ret > 0).astype(int)
+                            elif signal_method == "Regime Probability":
+                                dom = p_df.idxmax(axis=1)
+                                sigs = (dom == bull_idx).astype(int)
+                            else: # Period
+                                dom = p_df.idxmax(axis=1)
+                                sigs = (dom == bull_idx).astype(int)
+                            
+                            # 3. Run Backtest
+                            common_idx = loc_prices.index.intersection(sigs.index)
+                            bt_res = BacktestEngine.run_strategy(loc_prices.loc[common_idx], sigs.loc[common_idx], initial_cap, trailing_stop)
+                            
+                            comp_results.append({
+                                "Regimes": n, 
+                                "AIC": r.aic, 
+                                "BIC": r.bic, 
+                                "Total Return %": bt_res['total_return']
+                            })
                     
                     if comp_results:
                         comp_df = pd.DataFrame(comp_results)
-                        # Identify Best Fit
                         best_aic = comp_df.loc[comp_df['AIC'].idxmin(), 'Regimes']
                         best_bic = comp_df.loc[comp_df['BIC'].idxmin(), 'Regimes']
+                        best_pnl = comp_df.loc[comp_df['Total Return %'].idxmax(), 'Regimes']
                         
                         st.write("#### Comparison Results")
-                        st.table(comp_df.style.highlight_min(subset=['AIC', 'BIC'], color='lightgreen'))
+                        st.table(comp_df.style.highlight_min(subset=['AIC', 'BIC'], color='lightgreen')
+                                           .highlight_max(subset=['Total Return %'], color='lightgreen'))
                         
-                        if best_aic == best_bic:
-                            st.success(f"🎯 **Best Fit**: {best_aic} Regimes (Unanimous Leader)")
-                        else:
-                            st.warning(f"⚖️ **Disagreement**: AIC suggests {best_aic}, but BIC (conservative) prefers {best_bic}. Use {best_bic} for safer trading.")
+                        c_fit, c_perf = st.columns(2)
+                        with c_fit:
+                            st.success(f"⚖️ **Robustness**: {best_bic} Regimes (Best BIC)")
+                        with c_perf:
+                            st.success(f"🚀 **Performance**: {best_pnl} Regimes (Best PnL)")
+                        
+                        if best_bic != best_pnl:
+                            st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
+
 
 
             # Signal Method Selection
