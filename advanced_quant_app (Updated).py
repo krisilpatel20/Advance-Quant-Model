@@ -2561,6 +2561,9 @@ if df_main is not None:
             with col_r5:
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
+            # --- MODEL FITNESS INFO ---
+            st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'AIC' metric below to find the best fit.")
+
             # Signal Method Selection
             signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"], horizontal=True)
 
@@ -2608,6 +2611,14 @@ if df_main is not None:
                     res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
                     
                     if res_bt:
+                        # --- DISPLAY FITNESS METRICS ---
+                        fit_col1, fit_col2 = st.columns(2)
+                        with fit_col1:
+                            st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
+                        with fit_col2:
+                            st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
+                        st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
+                        
                         # Identify Regimes (Sort by Mean)
                         regime_means = []
                         for i in range(bt_n_regimes):
