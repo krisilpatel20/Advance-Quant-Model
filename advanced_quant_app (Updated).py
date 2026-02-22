@@ -2405,11 +2405,16 @@ if df_main is not None:
             bt_end_date = st.date_input("Backtest End", datetime.now())
 
         # Data Prep
-        if bt_start_date >= bt_end_date:
-            st.error("Start date must be before end date.")
-            st.stop()
-            
-        df_bt = load_data(TICKER, bt_start_date, bt_end_date)
+        if live_mode:
+             # Use the global live data for backtest scope
+             df_bt = df_main
+             bt_msg = f"Live Backtest ({data_interval})"
+        else:
+            if bt_start_date >= bt_end_date:
+                st.error("Start date must be before end date.")
+                st.stop()
+            df_bt = load_data(TICKER, bt_start_date, bt_end_date, interval='1d')
+            bt_msg = "Historical Backtest (1d)"
         
         if df_bt is None or df_bt.empty:
             st.error("Could not load data for backtest. Check dates and ticker.")
@@ -2713,6 +2718,15 @@ if df_main is not None:
         # Run Backtest Engine if signals exist
         if signals is not None:
             bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop)
+            
+            # --- STRATEGY SIGNAL BANNER ---
+            last_sig = signals.iloc[-1]
+            last_dt = signals.index[-1]
+            st.divider()
+            if last_sig == 1:
+                st.success(f"🚀 **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Action: **HOLD LONG**")
+            else:
+                st.error(f"🛑 **STRATEGY SIGNAL (CASH)** | Last Update: {last_dt} | Action: **STAY IN CASH / HEDGE**")
             
             # Metrics
             strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
