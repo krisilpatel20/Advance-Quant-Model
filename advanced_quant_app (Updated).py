@@ -559,6 +559,117 @@ class AdvancedRegimeDetector:
         else:
             return "NEUTRAL / HEDGED", {'label': 'Transition/Mixed', 'confidence': max(probs)}
 
+class ProRegimeDetector:
+    """
+    Institutional-grade Regime Detection using Multi-Factor Feature Vectors.
+    Analyzes Returns, Volatility, and Trend-Deviation simultaneously.
+    """
+    def __init__(self, prices, log_returns):
+        self.prices = prices if isinstance(prices, pd.Series) else pd.Series(prices)
+        self.returns = log_returns if isinstance(log_returns, pd.Series) else pd.Series(log_returns)
+        self.features = None
+        self.regimes = {}
+        self.metrics = {}
+        self.state_labels = {}
+
+    def _prepare_features(self):
+        # 1. Momentum (Short-term smoothed returns)
+        f1 = self.returns.rolling(window=5).mean().fillna(0)
+        
+        # 2. Volatility Cluster (Z-scored 20d Vol)
+        vol = self.returns.rolling(window=20).std().fillna(method='bfill')
+        v_mean = vol.rolling(252, min_periods=20).mean()
+        v_std = vol.rolling(252, min_periods=20).std()
+        f2 = (vol - v_mean) / (v_std + 1e-9)
+        f2 = f2.fillna(0)
+        
+        # 3. Structural Deviation (Price vs EMA20)
+        ema = self.prices.ewm(span=20).mean()
+        f3 = (self.prices - ema) / (ema + 1e-9)
+        f3 = f3.fillna(0)
+        
+        self.features = np.column_stack([f1.values, f2.values, f3.values])
+        return self.features
+
+    def fit(self, n_states=4):
+        X = self._prepare_features()
+        if SKLEARN_AVAILABLE:
+            from sklearn.mixture import GaussianMixture
+            from sklearn.preprocessing import StandardScaler
+            
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+            
+            # Fit Multivariate GMM
+            model = GaussianMixture(n_components=n_states, covariance_type='full', random_state=123, max_iter=200)
+            model.fit(X_scaled)
+            
+            states = model.predict(X_scaled)
+            probs = model.predict_proba(X_scaled)
+            
+            # --- INSTITUTIONAL STATE MAPPING ---
+            # We characterize states by their Mean Returns and Mean Volatility
+            state_stats = []
+            for i in range(n_states):
+                mask = (states == i)
+                if np.sum(mask) > 0:
+                    m_ret = np.mean(self.features[mask, 0])
+                    m_vol = np.mean(self.features[mask, 1])
+                    state_stats.append({'id': i, 'ret': m_ret, 'vol': m_vol})
+                else:
+                    state_stats.append({'id': i, 'ret': -999, 'vol': 999})
+            
+            # Logic-based labeling:
+            # 1. Bull/Quiet: High Ret, Low Vol
+            # 2. Bull/Volatile: High Ret, High Vol (Overextended)
+            # 3. Bear/Quiet: Low Ret, Low Vol (Distribution)
+            # 4. Bear/Volatile: Low Ret, High Vol (Panic/Crisis)
+            
+            # Sort by returns
+            sorted_by_ret = sorted(state_stats, key=lambda x: x['ret'], reverse=True)
+            bulls = sorted_by_ret[:2]
+            bears = sorted_by_ret[2:]
+            
+            # Within bulls, separate by vol
+            bull_low = min(bulls, key=lambda x: x['vol'])
+            bull_high = max(bulls, key=lambda x: x['vol'])
+            
+            # Within bears, separate by vol
+            bear_low = min(bears, key=lambda x: x['vol'])
+            bear_high = max(bears, key=lambda x: x['vol'])
+            
+            self.state_labels = {
+                bull_low['id']: "BULL / QUIET (Conviction)",
+                bull_high['id']: "BULL / VOLATILE (Exhaustion)",
+                bear_low['id']: "BEAR / QUIET (Distribution)",
+                bear_high['id']: "BEAR / VOLATILE (Panic/Crisis)"
+            }
+            
+            self.regimes['states'] = states
+            self.regimes['probs'] = probs
+            self.metrics['aic'] = model.aic(X_scaled)
+        else:
+            # Fallback
+            self.regimes['states'] = np.zeros(len(X))
+            self.regimes['probs'] = np.ones((len(X), 1))
+
+    def get_latest_verdict(self):
+        if 'states' not in self.regimes or not self.state_labels:
+            return "NEUTRAL", 0.0, "N/A"
+            
+        last_state = self.regimes['states'][-1]
+        last_prob = np.max(self.regimes['probs'][-1])
+        label = self.state_labels.get(last_state, "Unknown")
+        
+        if "BULL" in label:
+            verdict = "ACCUMULATE / LONG" if "QUIET" in label else "HEDGE / CAUTION"
+        elif "BEAR" in label:
+            verdict = "DEFENSIVE / SHORT" if "VOLATILE" in label else "REDUCE EXPOSURE"
+        else:
+            verdict = "NEUTRAL"
+            
+        return verdict, last_prob, label
+
 class SMLAnalyzer:
     def __init__(self, ticker_returns, benchmark_returns, rf_annual=0.04):
         self.r_asset = ticker_returns
@@ -1181,10 +1292,11 @@ if df_main is not None:
         prog_bar = st.progress(0)
         
     try:
-        # A. REGIME SIGNAL
-        detector = AdvancedRegimeDetector(df_main['Log_Returns'])
-        detector.fit_all(n_states=3)
-        regime_sig, regime_data = detector.get_trading_signal()
+        # A. REGIME SIGNAL (Institutional Upgrade)
+        pro_detector = ProRegimeDetector(df_main['Close'], df_main['Log_Returns'])
+        pro_detector.fit(n_states=4)
+        regime_sig, regime_prob, regime_label = pro_detector.get_latest_verdict()
+        regime_data = {'label': regime_label, 'confidence': regime_prob}
         prog_bar.progress(33)
         
         # B. TREND SIGNAL (Kalman)
@@ -1244,9 +1356,9 @@ if df_main is not None:
         col_dec1, col_dec2, col_dec3 = st.columns(3)
         
         with col_dec1:
-            st.metric("Regime State", regime_sig, f"{regime_data['confidence']:.1%} Conf")
-            if "LONG" in regime_sig: st.success("Bullish Regime confirmed.")
-            elif "SHORT" in regime_sig: st.error("Bearish/Crisis Regime detected.")
+            st.metric("Institutional Regime", regime_label, f"{regime_data['confidence']:.1%} Conf")
+            if "BULL" in regime_label: st.success(f"**Action**: {regime_sig}")
+            elif "BEAR" in regime_label: st.error(f"**Action**: {regime_sig}")
             else: st.info("Market in transition.")
 
         with col_dec2:
@@ -2871,54 +2983,48 @@ if df_main is not None:
         st.session_state.report_gen.add_plot("Volatility Clustering Visuals", fig_vol)
 
     # ==========================================
-    # TAB 9: ADVANCED REGIME DETECTION
+    # TAB 9: INSTITUTIONAL REGIME DETECTION
     # ==========================================
     with tab9:
-        st.write("### 🧠 Advanced Regime Detection (HMM + Bayesian)")
-        st.caption("combines Hidden Markov Models (Student-t Emissions) with Bayesian Changepoint Detection.")
+        st.write("### 🧠 Pro Regime Detection (Multi-Factor)")
+        st.caption("Institutional model using Returns, Volatility, and Trend Deviation via Multivariate GMM.")
         
         if not SKLEARN_AVAILABLE:
-            st.error("⚠️ `scikit-learn` library is missing. HMM initialization requires it. Please run `pip install scikit-learn`.")
+            st.error("⚠️ `scikit-learn` library is missing. Institutional upgrade requires it.")
         else:
-            if st.button("Run Advanced Analysis"):
-                with st.spinner("Fitting institutional models (HMM + Bayes + Hawkes)..."):
-                    detector = AdvancedRegimeDetector(df_main['Log_Returns'])
-                    detector.fit_all(n_states=3)
-                    
-                    # Metrics
-                    m_col1, m_col2 = st.columns(2)
-                    with m_col1:
-                        st.metric("HMM AIC", f"{detector.metrics['hmm_aic']:.0f}")
-                    with m_col2:
-                        current_sig, current_data = detector.get_trading_signal()
-                        st.metric("System Signal", current_sig, current_data['label'])
-                        
-                        st.session_state.report_gen.add_data("Advanced Regime Metrics", detector.metrics)
-                        st.session_state.report_gen.add_data("Current Regime Signal", {"Signal": current_sig, "Label": current_data['label']})
-                    
-                    # Visualization
-                    st.write("#### Regime Probability Stream")
-                    
-                    probs = detector.regimes['hmm_probs']
-                    fig_hmm, ax_hmm = plt.subplots(figsize=(10, 4))
-                    
-                    # Stackplot
-                    ax_hmm.stackplot(df_main.index, probs.T, labels=['Bull', 'Normal', 'Bear/Crisis'][0:probs.shape[1]],
-                                     colors=['green', 'gold', 'red'][0:probs.shape[1]], alpha=0.5)
-                    ax_hmm.set_title("Regime Probabilities (Student-t HMM)")
-                    format_plot_dates(ax_hmm, df_main.index)
-                    st.pyplot(fig_hmm)
-                    st.session_state.report_gen.add_plot("HMM Regime Probabilities", fig_hmm)
-                    
-                    st.write("#### Bayesian Changepoint Probabilities")
-                    cp_probs = detector.regimes['changepoint_probs']
-                    fig_cp, ax_cp = plt.subplots(figsize=(10, 3))
-                    ax_cp.plot(df_main.index, cp_probs, color='purple', linewidth=1)
-                    ax_cp.fill_between(df_main.index, 0, cp_probs, color='purple', alpha=0.2)
-                    ax_cp.set_title("Structural Break Probability (Bayesian Online Detection)")
-                    format_plot_dates(ax_cp, df_main.index)
-                    st.pyplot(fig_cp)
-                    st.session_state.report_gen.add_plot("Bayesian Changepoints", fig_cp)
+            # Use the global pro_detector fitted in the decision engine
+            m_col1, m_col2 = st.columns(2)
+            with m_col1:
+                st.metric("Regime Label", regime_label, f"{regime_prob:.1%} Confidence")
+            with m_col2:
+                st.metric("Model AIC", f"{pro_detector.metrics.get('aic', 0):.0f}")
+            
+            st.write("#### 🌊 Regime Probability Stream")
+            fig_pro, ax_pro = plt.subplots(figsize=(10, 4))
+            probs = pro_detector.regimes['probs']
+            # Map ids to labels for the legend
+            labels = [pro_detector.state_labels.get(i, f"State {i}") for i in range(probs.shape[1])]
+            ax_pro.stackplot(df_main.index, probs.T, labels=labels, alpha=0.6)
+            ax_pro.legend(loc='upper left', fontsize='x-small')
+            ax_pro.set_title("Multi-Factor Regime Probabilities")
+            format_plot_dates(ax_pro, df_main.index)
+            st.pyplot(fig_pro)
+            st.session_state.report_gen.add_plot("Institutional Regime Probabilities", fig_pro)
+            
+            # Feature breakdown
+            st.write("#### 📊 Institutional Feature Space")
+            feat_df = pd.DataFrame(pro_detector.features, columns=['Momentum', 'Vol_Z', 'Trend_Dev'], index=df_main.index)
+            fig_feat, ax_feat = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+            feat_df['Momentum'].plot(ax=ax_feat[0], title='Feature 1: Momentum (Returns)', color='blue', alpha=0.7)
+            feat_df['Vol_Z'].plot(ax=ax_feat[1], title='Feature 2: Volatility (Z-Score)', color='orange', alpha=0.7)
+            feat_df['Trend_Dev'].plot(ax=ax_feat[2], title='Feature 3: Structural Dev (Kalman)', color='green', alpha=0.7)
+            ax_feat[0].axhline(0, color='black', lw=0.5)
+            ax_feat[1].axhline(0, color='black', lw=0.5)
+            ax_feat[2].axhline(0, color='black', lw=0.5)
+            format_plot_dates(ax_feat[2], df_main.index)
+            plt.tight_layout()
+            st.pyplot(fig_feat)
+            st.session_state.report_gen.add_plot("Regime Feature Space", fig_feat)
                     ax_cp.set_ylim(0, 1)
                     format_plot_dates(ax_cp, df_main.index)
                     st.pyplot(fig_cp)
