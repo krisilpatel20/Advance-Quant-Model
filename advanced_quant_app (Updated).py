@@ -3025,23 +3025,6 @@ if df_main is not None:
             plt.tight_layout()
             st.pyplot(fig_feat)
             st.session_state.report_gen.add_plot("Regime Feature Space", fig_feat)
-                    ax_cp.set_ylim(0, 1)
-                    format_plot_dates(ax_cp, df_main.index)
-                    st.pyplot(fig_cp)
-                    
-                    # Characteristics Table
-                    st.write("#### Regime Characteristics")
-                    char_df = pd.DataFrame(detector.regime_characteristics)
-                    st.dataframe(char_df.style.format({
-                        'mean_return': "{:.2%}",
-                        'volatility': "{:.2%}",
-                        'frequency': "{:.1%}",
-                        'avg_duration': "{:.1f}",
-                        'max_drawdown': "{:.2%}"
-                    }))
-
-            else:
-                st.info("Click 'Run Advanced Analysis' to train models (Computationally Intensive).")
 
 
     # ==========================================
