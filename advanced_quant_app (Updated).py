@@ -2562,7 +2562,30 @@ if df_main is not None:
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
             # --- MODEL FITNESS INFO ---
-            st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'AIC' metric below to find the best fit.")
+            st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'Compare Fitness' button below to find the best fit.")
+
+            if st.button("📊 Compare Regime Fitness (N=2,3,4)", use_container_width=True):
+                with st.spinner("Analyzing model complexity..."):
+                    comp_results = []
+                    for n in [2, 3, 4]:
+                        r = fit_regime_model(model_data_bt, n, bt_switch_vol, bt_switch_trend)
+                        if r:
+                            comp_results.append({"Regimes": n, "AIC": r.aic, "BIC": r.bic})
+                    
+                    if comp_results:
+                        comp_df = pd.DataFrame(comp_results)
+                        # Identify Best Fit
+                        best_aic = comp_df.loc[comp_df['AIC'].idxmin(), 'Regimes']
+                        best_bic = comp_df.loc[comp_df['BIC'].idxmin(), 'Regimes']
+                        
+                        st.write("#### Comparison Results")
+                        st.table(comp_df.style.highlight_min(subset=['AIC', 'BIC'], color='lightgreen'))
+                        
+                        if best_aic == best_bic:
+                            st.success(f"🎯 **Best Fit**: {best_aic} Regimes (Unanimous Leader)")
+                        else:
+                            st.warning(f"⚖️ **Disagreement**: AIC suggests {best_aic}, but BIC (conservative) prefers {best_bic}. Use {best_bic} for safer trading.")
+
 
             # Signal Method Selection
             signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"], horizontal=True)
