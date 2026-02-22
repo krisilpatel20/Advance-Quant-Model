@@ -2618,7 +2618,7 @@ if df_main is not None:
                                 "Regimes": n, 
                                 "AIC": r.aic, 
                                 "BIC": r.bic, 
-                                "Total Return %": bt_res['total_return']
+                                "Total Return %": (bt_res['equity_curve'].iloc[-1] / initial_cap - 1) * 100
                             })
                     
                     if comp_results:
