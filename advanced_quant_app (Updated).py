@@ -1153,9 +1153,14 @@ with st.sidebar:
 # ==========================================
 # 4. DATA LOADING
 # ==========================================
+# Standardize current time to the nearest minute for robust caching
+now_rounded = datetime.now().replace(second=0, microsecond=0)
+
 if live_mode:
-    # For live mode, fetch last 7 days to ensure enough data for 1m/5m signals
-    df_main = load_data(TICKER, datetime.now() - timedelta(days=7), datetime.now(), interval=data_interval)
+    # Intraday limits: 1m (7d), 5m-15m (60d), 60m (730d)
+    # We use 30d as a robust default for decision support models to have enough history
+    lookback_days = 7 if data_interval == '1m' else 30
+    df_main = load_data(TICKER, now_rounded - timedelta(days=lookback_days), now_rounded, interval=data_interval)
 else:
     df_main = load_data(TICKER, start_date, end_date, interval='1d')
 
@@ -2472,14 +2477,19 @@ if df_main is not None:
                 model_data_bt = returns_bt_resampled.dropna() * 100
 
             # FIX: Robust 1D Series reconstruction
-            if len(model_data_bt) > 10:
+            if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
                 model_data_bt = pd.Series(
                     model_data_bt.values.flatten().astype(float),
                     index=model_data_bt.index
                 )
             
             if len(model_data_bt) < 10:
-                 st.error("Backtest Error: Insufficient data found for model.")
+                 st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
+                 st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
+                 if live_mode and bt_freq == "Weekly":
+                     st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
+                 elif not live_mode:
+                     st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
             else:
                 with st.spinner("Fitting Regime Model..."):
                     # Fit Model
