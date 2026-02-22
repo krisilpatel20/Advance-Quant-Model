@@ -2561,6 +2561,16 @@ if df_main is not None:
             with col_r5:
                 bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
+            # Signal Method Selection
+            signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"], horizontal=True)
+
+            if signal_method == "Regime Weighted Expected Return":
+                st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
+            elif signal_method == "Regime Probability":
+                st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
+            else:
+                st.markdown("**Strategy:** Long immediately when entering **Bull Regime**. Sell immediately when exiting.")
+
             # --- MODEL FITNESS INFO ---
             st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'Compare Fitness' button below to find the best fit.")
 
@@ -2630,17 +2640,6 @@ if df_main is not None:
                         if best_bic != best_pnl:
                             st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
 
-
-
-            # Signal Method Selection
-            signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"], horizontal=True)
-
-            if signal_method == "Regime Weighted Expected Return":
-                st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
-            elif signal_method == "Regime Probability":
-                st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
-            else:
-                st.markdown("**Strategy:** Long immediately when entering **Bull Regime**. Sell immediately when exiting.")
 
             # Resample if Weekly
             if bt_freq == "Weekly":
