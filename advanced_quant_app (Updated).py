@@ -11,6 +11,7 @@ from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from statsmodels.tsa.seasonal import seasonal_decompose
 from datetime import datetime, timedelta
 import io
+import time
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -828,10 +829,10 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
              st.warning("Hint: underlying data might be too flat or collinear.")
         return None
 
-@st.cache_data
-def load_data(ticker, start, end):
+@st.cache_data(ttl=60) # Cache live data for 1 minute
+def load_data(ticker, start, end, interval='1d'):
     try:
-        df = yf.download(ticker, start=start, end=end, progress=False)
+        df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
         if df.empty:
             return None
         # Handle MultiIndex if present (common in new yfinance versions)
@@ -845,12 +846,12 @@ def load_data(ticker, start, end):
                 df.columns = df.columns.droplevel(1)
 
         # Standard cleaning
-        # Check if 'Close' exists, if not try 'Adj Close'
         if 'Close' not in df.columns and 'Adj Close' in df.columns:
             df['Close'] = df['Adj Close']
             
-        df['Returns'] = df['Close'].pct_change().dropna()
-        df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1)).dropna()
+        if 'Close' in df.columns:
+            df['Returns'] = df['Close'].pct_change().dropna()
+            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1)).dropna()
         return df.dropna()
     except Exception as e:
         st.error(f"Error loading data for {ticker}: {e}")
@@ -1083,6 +1084,18 @@ with st.sidebar:
     rf_rate = st.number_input("Risk Free Rate (%)", 0.0, 20.0, DEFAULT_RF) / 100
     st.info(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
 
+    st.divider()
+    st.header("⚡ Live Decision Mode")
+    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
+    if live_mode:
+        data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
+        st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
+        if st.button("🔄 Refresh Live Data", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+    else:
+        data_interval = '1d'
+
     st.subheader("Report Export")
     if not EXPORT_AVAILABLE:
         st.error("📥 Export libraries missing.")
@@ -1135,7 +1148,11 @@ with st.sidebar:
 # ==========================================
 # 4. DATA LOADING
 # ==========================================
-df_main = load_data(TICKER, start_date, end_date)
+if live_mode:
+    # For live mode, fetch last 7 days to ensure enough data for 1m/5m signals
+    df_main = load_data(TICKER, datetime.now() - timedelta(days=7), datetime.now(), interval=data_interval)
+else:
+    df_main = load_data(TICKER, start_date, end_date, interval='1d')
 
 if df_main is not None:
     st.subheader(f"Data Analysis: {TICKER}")
@@ -1145,7 +1162,54 @@ if df_main is not None:
     st.session_state.report_gen.add_data("Historical Data", df_main.tail(100))
     
     # Layout Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    # ==========================================
+    # 5. UNIFIED DECISION ENGINE (Global Signals)
+    # ==========================================
+    with st.sidebar:
+        st.divider()
+        st.caption("🔍 Processing Model Signals...")
+        prog_bar = st.progress(0)
+        
+    try:
+        # A. REGIME SIGNAL
+        detector = AdvancedRegimeDetector(df_main['Log_Returns'])
+        detector.fit_all(n_states=3)
+        regime_sig, regime_data = detector.get_trading_signal()
+        prog_bar.progress(33)
+        
+        # B. TREND SIGNAL (Kalman)
+        kf_trend = KalmanFilterTrend(process_noise=1e-4, measurement_noise=1e-2)
+        trend_est, _ = kf_trend.filter(df_main['Close'].values)
+        last_price = df_main['Close'].iloc[-1]
+        last_trend = trend_est[-1]
+        trend_diff = (last_price - last_trend) / (last_trend + 1e-9)
+        prog_bar.progress(66)
+        
+        # C. VOLATILITY SIGNAL (GARCH Proxy)
+        returns_pct = df_main['Returns'] * 100
+        am_sum = arch_model(returns_pct, vol='Garch', p=1, q=1, dist='Normal')
+        res_sum = am_sum.fit(disp='off')
+        curr_vol = res_sum.conditional_volatility.iloc[-1]
+        avg_vol = res_sum.conditional_volatility.mean()
+        vol_state = "HIGH" if curr_vol > avg_vol * 1.2 else "LOW" if curr_vol < avg_vol * 0.8 else "NORMAL"
+        
+        # D. JUMP RISK
+        jump_sum = RealizedVolatility.jump_component(df_main['Returns'].values)
+        jump_detected = jump_sum['p_value'] < 0.05
+        prog_bar.progress(100)
+        time.sleep(0.5)
+        prog_bar.empty()
+        
+    except Exception as e:
+        st.sidebar.error(f"Decision Engine Error: {e}")
+        regime_sig, regime_data = "N/A", {'label': 'Error', 'confidence': 0.0}
+        trend_diff = 0.0
+        vol_state = "UNKNOWN"
+        jump_detected = False
+        res_sum = None # Will need check in tab1
+
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+        "💡 Decision Summary",
         "Volatility (GARCH)", 
         "Regime Switching", 
         "Stochastic (Heston/Jump)", 
@@ -1159,10 +1223,87 @@ if df_main is not None:
     ])
 
     # ==========================================
+    # TAB 0: DECISION SUMMARY
+    # ==========================================
+    with tab0:
+        st.write("### 🧠 Executive Decision Dashboard")
+        st.markdown(f"**Unified Quant Signal for {TICKER}** | Interval: `{data_interval}` | Mode: {'Live' if live_mode else 'Historical'}")
+        
+        # 2. DASHBOARD DISPLAY
+        # --------------------
+        col_dec1, col_dec2, col_dec3 = st.columns(3)
+        
+        with col_dec1:
+            st.metric("Regime State", regime_sig, f"{regime_data['confidence']:.1%} Conf")
+            if "LONG" in regime_sig: st.success("Bullish Regime confirmed.")
+            elif "SHORT" in regime_sig: st.error("Bearish/Crisis Regime detected.")
+            else: st.info("Market in transition.")
+
+        with col_dec2:
+            st.metric("Trend (Kalman)", f"{trend_diff:+.2%}", "Vs Trend Line")
+            if trend_diff > 0.02: st.success("Price trending above support.")
+            elif trend_diff < -0.02: st.warning("Trend breakdown in progress.")
+            else: st.info("Consolidating at trend line.")
+
+        with col_dec3:
+            st.metric("Volatility Regime", vol_state, f"{curr_vol:.2f} (Daily %)")
+            if vol_state == "HIGH": st.warning("High Vol: Reduce Position Size.")
+            elif vol_state == "LOW": st.success("Low Vol: Favorable for Leverage.")
+            else: st.info("Standard risk environment.")
+
+        st.divider()
+        
+        # 3. MASTER SENTIMENT GAUGE
+        sentiment_score = 0
+        if "LONG" in regime_sig: sentiment_score += 2
+        if "SHORT" in regime_sig: sentiment_score -= 2
+        if trend_diff > 0.01: sentiment_score += 1
+        if trend_diff < -0.01: sentiment_score -= 1
+        if vol_state == "LOW": sentiment_score += 1
+        if vol_state == "HIGH": sentiment_score -= 1
+        if jump_detected: sentiment_score -= 1
+        
+        m_col1, m_col2 = st.columns([1, 2])
+        with m_col1:
+            st.write("#### Master Quant Score")
+            # Score range approx -5 to +4
+            if sentiment_score >= 2: 
+                st.header(f"🟢 BULLISH ({sentiment_score})")
+                st.button("🚀 EXECUTE BUY", use_container_width=True, type="primary")
+            elif sentiment_score <= -2:
+                st.header(f"🔴 BEARISH ({sentiment_score})")
+                st.button("⚠️ EXECUTE SELL/HEDGE", use_container_width=True, type="primary")
+            else:
+                st.header(f"🟡 NEUTRAL ({sentiment_score})")
+                st.button("⚖️ MAINTAIN NEUTRAL", use_container_width=True)
+                
+        with m_col2:
+            st.write("#### Risk Alerts")
+            if jump_detected:
+                st.error("🚨 **FAT TAIL RISK**: Significant price jumps detected. Stochastic models (Heston/Jump) recommended for testing tail risk.")
+            else:
+                st.success("✅ **SMOOTH DYNAMICS**: No significant jumps. Gaussian models are stable.")
+            
+            if vol_state == "HIGH":
+                st.warning("⚠️ **VOL CLUSTERING**: Recent shocks are likely to trigger further volatility. See Hawkes tab.")
+            
+            # Recommendation
+            st.info(f"**Recommendation**: {regime_sig}. Target Exposure: {min(1.0, 0.5 + 0.1*sentiment_score):.0%} of risk parity weight.")
+
+        st.divider()
+        st.caption("This summary aggregates deep statistical models. For detailed justification, visit the respective tabs.")
+
+    # ==========================================
     # TAB 1: VOLATILITY (GARCH/Risk)
     # ==========================================
     with tab1:
         st.write("### 📉 Advanced Volatility Analysis")
+        # --- MODEL VERDICT BANNER ---
+        if res_sum is not None:
+            latest_vol = res_sum.conditional_volatility.iloc[-1]
+            vol_msg = f"Volatility is currently **{vol_state}** ({latest_vol:.2f}% daily)."
+            if vol_state == "HIGH": st.error(f"🎯 **MODEL VERDICT**: {vol_msg} Defensive sizing recommended.")
+            else: st.success(f"🎯 **MODEL VERDICT**: {vol_msg} Risk environment is stable.")
         
         if ARCH_AVAILABLE:
             returns_pct = df_main['Returns'] * 100 # Rescale for better optimization
@@ -1402,6 +1543,11 @@ if df_main is not None:
     # ==========================================
     with tab2:
         st.write("### Markov Regime Switching Model")
+        # --- MODEL VERDICT BANNER ---
+        if "LONG" in regime_sig: st.success(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}** in {regime_data['label']}. High conviction for bullish exposure.")
+        elif "SHORT" in regime_sig: st.error(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}**. Market risk is elevated.")
+        else: st.info(f"🎯 **MODEL VERDICT**: {regime_sig}. Await confirmation of a clear regime shift.")
+
         st.markdown("""
         Identifies hidden market states (e.g., Bull vs Bear) from return dynamics.  
         Each regime has distinct mean return and volatility characteristics.
@@ -2012,6 +2158,11 @@ if df_main is not None:
     # ==========================================
     with tab4:
         st.write("### Kalman Filter Analysis")
+        # --- MODEL VERDICT BANNER ---
+        if trend_diff > 0.03: st.success(f"🎯 **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend. Structural uptrend intact.")
+        elif trend_diff < -0.03: st.error(f"🎯 **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend. Structural breakdown in progress.")
+        else: st.info(f"🎯 **MODEL VERDICT**: Price is trading within **{abs(trend_diff):.1%}** of the Kalman Trend (Neutral/Consolidation).")
+
         
         kf_mode = st.radio("Analysis Mode", ["Pairs Trading (Relative Value)", "Single Asset (Trend)"])
         
@@ -2609,6 +2760,12 @@ if df_main is not None:
     # ==========================================
     with tab8:
         st.write("### 🌩️ Volatility Clustering & Jump Analysis")
+        # --- MODEL VERDICT BANNER ---
+        latest_rv = np.sqrt(rv)*np.sqrt(252)
+        if jump_detected: st.error(f"🎯 **MODEL VERDICT**: Significant **JUMPS** detected. Continuous volatility ({latest_rv:.1%}) is secondary to structural shocks. Use Merton/Heston models.")
+        elif br > 0.8: st.warning(f"🎯 **MODEL VERDICT**: High **Volatility Clustering** (Branching Ratio: {br:.2f}). Recent shocks are likely to trigger further volatility.")
+        else: st.success(f"🎯 **MODEL VERDICT**: Volatility is **Stable**. No significant clustering or jumps detected.")
+
         st.caption("Institutional analysis of volatility properties using High-Frequency logic applied to Daily data.")
         
         # 1. Realized Measures
