@@ -835,7 +835,12 @@ def load_data(ticker, start, end, interval='1d'):
         df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
         if df.empty:
             return None
-        # Handle MultiIndex if present (common in new yfinance versions)
+            
+        # NORMALIZE TIMEZONE: Ensure all data is timezone-naive to avoid join errors
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        # Handle MultiIndex if present
         if isinstance(df.columns, pd.MultiIndex):
             df = df.xs(ticker, axis=1, level=1, drop_level=True) if ticker in df.columns.get_level_values(1) else df
             # If structure is different (Ticker as top level)
