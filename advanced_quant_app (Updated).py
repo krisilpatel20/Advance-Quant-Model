@@ -940,6 +940,61 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
              st.warning("Hint: underlying data might be too flat or collinear.")
         return None
 
+
+def get_master_signal(ticker, df):
+    """
+    Unified Decision Logic for a single asset.
+    Returns a dictionary of all quant metrics and the final Master Sentiment Score.
+    """
+    try:
+        # 1. Regime Signal
+        p_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
+        p_detector.fit(n_states=4)
+        regime_sig, regime_prob, regime_label = p_detector.get_latest_verdict()
+        regime_data = {'label': regime_label, 'confidence': regime_prob}
+        
+        # 2. Trend (Kalman)
+        k_filter = KalmanFilterTrend(process_noise=1e-4, measurement_noise=1e-2)
+        trend_est, _ = k_filter.filter(df['Close'].values)
+        last_price = df['Close'].iloc[-1]
+        last_trend = trend_est[-1]
+        trend_diff = (last_price - last_trend) / (last_trend + 1e-9)
+        
+        # 3. Volatility (GARCH Proxy)
+        returns_scaled = df['Returns'] * 100
+        am = arch_model(returns_scaled, vol='Garch', p=1, q=1, dist='Normal')
+        res = am.fit(disp='off')
+        curr_vol = res.conditional_volatility.iloc[-1]
+        avg_vol = res.conditional_volatility.mean()
+        vol_state = "HIGH" if curr_vol > avg_vol * 1.2 else "LOW" if curr_vol < avg_vol * 0.8 else "NORMAL"
+        
+        # 4. Jump Risk
+        jump_res = RealizedVolatility.jump_component(df['Returns'].values)
+        jump_detected = jump_res['p_value'] < 0.05
+
+        # 5. Master Sentiment Score calculation
+        sentiment_score = 0
+        if "LONG" in regime_sig: sentiment_score += 2
+        if "SHORT" in regime_sig: sentiment_score -= 2
+        if trend_diff > 0.01: sentiment_score += 1
+        if trend_diff < -0.01: sentiment_score -= 1
+        if vol_state == "LOW": sentiment_score += 1
+        if vol_state == "HIGH": sentiment_score -= 1
+        if jump_detected: sentiment_score -= 1
+        
+        return {
+            'regime_sig': regime_sig,
+            'regime_label': regime_label,
+            'regime_data': regime_data,
+            'trend_diff': trend_diff,
+            'vol_state': vol_state,
+            'curr_vol': curr_vol,
+            'jump_detected': jump_detected,
+            'sentiment_score': sentiment_score
+        }
+    except Exception as e:
+        return None
+
 @st.cache_data(ttl=60) # Cache live data for 1 minute
 def load_data(ticker, start, end, interval='1d'):
     try:
@@ -1290,47 +1345,36 @@ if df_main is not None:
         st.divider()
         st.caption("🔍 Processing Model Signals...")
         prog_bar = st.progress(0)
-        
-    try:
-        # A. REGIME SIGNAL (Institutional Upgrade)
-        pro_detector = ProRegimeDetector(df_main['Close'], df_main['Log_Returns'])
-        pro_detector.fit(n_states=4)
-        regime_sig, regime_prob, regime_label = pro_detector.get_latest_verdict()
-        regime_data = {'label': regime_label, 'confidence': regime_prob}
-        prog_bar.progress(33)
-        
-        # B. TREND SIGNAL (Kalman)
-        kf_trend = KalmanFilterTrend(process_noise=1e-4, measurement_noise=1e-2)
-        trend_est, _ = kf_trend.filter(df_main['Close'].values)
-        last_price = df_main['Close'].iloc[-1]
-        last_trend = trend_est[-1]
-        trend_diff = (last_price - last_trend) / (last_trend + 1e-9)
-        prog_bar.progress(66)
-        
-        # C. VOLATILITY SIGNAL (GARCH Proxy)
+    
+    analysis = get_master_signal(TICKER, df_main)
+    if analysis:
+        regime_sig = analysis['regime_sig']
+        regime_label = analysis['regime_label']
+        regime_data = analysis['regime_data']
+        trend_diff = analysis['trend_diff']
+        vol_state = analysis['vol_state']
+        curr_vol = analysis['curr_vol']
+        jump_detected = analysis['jump_detected']
+        sentiment_score = analysis['sentiment_score']
+        # For Tab 1 diagnostics
         returns_pct = df_main['Returns'] * 100
         am_sum = arch_model(returns_pct, vol='Garch', p=1, q=1, dist='Normal')
         res_sum = am_sum.fit(disp='off')
-        curr_vol = res_sum.conditional_volatility.iloc[-1]
-        avg_vol = res_sum.conditional_volatility.mean()
-        vol_state = "HIGH" if curr_vol > avg_vol * 1.2 else "LOW" if curr_vol < avg_vol * 0.8 else "NORMAL"
-        
-        # D. JUMP RISK
-        jump_sum = RealizedVolatility.jump_component(df_main['Returns'].values)
-        jump_detected = jump_sum['p_value'] < 0.05
         prog_bar.progress(100)
-        time.sleep(0.5)
-        prog_bar.empty()
-        
-    except Exception as e:
-        st.sidebar.error(f"Decision Engine Error: {e}")
+    else:
+        st.sidebar.error("Decision Engine Error: Statistical convergence failed.")
         regime_sig, regime_data = "N/A", {'label': 'Error', 'confidence': 0.0}
+        regime_label = "N/A"
         trend_diff = 0.0
         vol_state = "UNKNOWN"
+        curr_vol = 0.0
         jump_detected = False
-        res_sum = None # Will need check in tab1
+        sentiment_score = 0
+        res_sum = None
+    
+    prog_bar.empty()
 
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "💡 Decision Summary",
         "Volatility (GARCH)", 
         "Regime Switching", 
@@ -1341,7 +1385,8 @@ if df_main is not None:
         "Backtest",
         "Volatility Clustering",
         "Advanced Regime",
-        "SML & Alpha"
+        "SML & Alpha",
+        "📡 Multi-Asset Scan"
     ])
 
     # ==========================================
@@ -1376,14 +1421,7 @@ if df_main is not None:
         st.divider()
         
         # 3. MASTER SENTIMENT GAUGE
-        sentiment_score = 0
-        if "LONG" in regime_sig: sentiment_score += 2
-        if "SHORT" in regime_sig: sentiment_score -= 2
-        if trend_diff > 0.01: sentiment_score += 1
-        if trend_diff < -0.01: sentiment_score -= 1
-        if vol_state == "LOW": sentiment_score += 1
-        if vol_state == "HIGH": sentiment_score -= 1
-        if jump_detected: sentiment_score -= 1
+        # Score already calculated in global decision engine via get_master_signal
         
         m_col1, m_col2 = st.columns([1, 2])
         with m_col1:
@@ -3225,3 +3263,77 @@ else:
 st.markdown("---")
 st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
 
+
+    # ==========================================
+    # TAB 11: MULTI-ASSET SCAN
+    # ==========================================
+    with tab11:
+        st.write("### 📡 Global Cross-Asset Scanner")
+        st.markdown("Scan your portfolio or watchlists for institutional 'Master Quant' signals.")
+        
+        universe_str = st.text_area("Ticker Universe (Comma separated)", 
+                                  value="AAPL, TSLA, MSFT, NVDA, SPY, BTC-USD, GC=F",
+                                  help="Enter tickers separated by commas. Crypto should use -USD suffix.")
+        
+        if st.button("🚀 Start Global Scan", use_container_width=True):
+            tickers_to_scan = [t.strip().upper() for t in universe_str.split(",") if t.strip()]
+            
+            long_list = []
+            cash_list = []
+            
+            scan_prog = st.progress(0)
+            status_text = st.empty()
+            
+            for i, tick in enumerate(tickers_to_scan):
+                status_text.text(f"Scanning {tick} ({i+1}/{len(tickers_to_scan)})...")
+                # Fetch data
+                s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
+                
+                if s_df is not None and not s_df.empty:
+                    s_analysis = get_master_signal(tick, s_df)
+                    if s_analysis:
+                        s_score = s_analysis['sentiment_score']
+                        s_price = s_df['Close'].iloc[-1]
+                        s_info = {
+                            'Ticker': tick,
+                            'Price': s_price,
+                            'Score': s_score,
+                            'Regime': s_analysis['regime_label'],
+                            'Trend': f"{s_analysis['trend_diff']:+.2%}",
+                            'Action': s_analysis['regime_sig']
+                        }
+                        
+                        if s_score >= 1:
+                            long_list.append(s_info)
+                        else:
+                            cash_list.append(s_info)
+                
+                scan_prog.progress((i + 1) / len(tickers_to_scan))
+            
+            status_text.text("Scan Complete!")
+            time.sleep(1)
+            status_text.empty()
+            scan_prog.empty()
+            
+            # Display Results
+            res_col1, res_col2 = st.columns(2)
+            
+            with res_col1:
+                st.subheader(f"🚀 LONG / OPEN ({len(long_list)})")
+                if long_list:
+                    ldf = pd.DataFrame(long_list)
+                    # Color coding for score
+                    st.dataframe(ldf.style.background_gradient(subset=['Score'], cmap='Greens'), use_container_width=True)
+                else:
+                    st.info("No bullish signals found.")
+                    
+            with res_col2:
+                st.subheader(f"🛑 CLOSED / CASH / HEDGE ({len(cash_list)})")
+                if cash_list:
+                    cdf = pd.DataFrame(cash_list)
+                    st.dataframe(cdf.style.background_gradient(subset=['Score'], cmap='Reds'), use_container_width=True)
+                else:
+                    st.info("No bearish/neutral signals found.")
+
+            st.divider()
+            st.success("✅ **Scan Insight**: The lists above provide an immediate visual of where institutional capital and trend logic are flowing.")
