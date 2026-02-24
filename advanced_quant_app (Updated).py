@@ -1032,7 +1032,7 @@ def load_data(ticker, start, end, interval='1d'):
         return None
 
 
-@st.cache_data(ttl=3600*24) # Cache universes for 24h
+@st.cache_data(ttl=3600*24)
 def get_sp500_tickers():
     try:
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
@@ -1047,19 +1047,41 @@ def get_nasdaq100_tickers():
     try:
         url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
         table = pd.read_html(url)
-        df = table[4] # Usually the 5th table
+        df = table[4]
         return df['Ticker'].tolist()
     except:
         return ["AAPL", "MSFT", "AMZN", "GOOG", "NVDA", "META", "TSLA", "PEP", "AVGO", "COST"]
 
 @st.cache_data(ttl=3600*24)
-def get_etf_universe():
-    return [
-        "SPY", "IVV", "VOO", "QQQ", "VTI", "VEA", "VWO", "IEFA", "AGG", "BND", 
-        "GLD", "VUG", "VTV", "VIG", "IJH", "IJR", "IWF", "IWD", "XLK", "XLF", 
-        "XLV", "XLE", "XLI", "XLY", "XLP", "XLB", "XLU", "XLRE", "SMH", "IBB",
-        "TLT", "LQD", "HYG", "EEM", "EFA", "VGT", "VFH", "VHT", "VDE", "VIS"
-    ]
+def get_total_us_stocks():
+    """Retrieves all listed US stocks from NASDAQ and NYSE/Other sources."""
+    try:
+        # NASDAQ listed
+        nasdaq = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", sep="|")
+        nasdaq = nasdaq[nasdaq['Test Issue'] == 'N']
+        
+        # Other listed (NYSE, AMEX, etc.)
+        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|")
+        other = other[other['Test Issue'] == 'N']
+        # Filter out ETFs from the stock list
+        other_stocks = other[other['ETF'] == 'N']
+        
+        all_tickers = nasdaq['Symbol'].tolist() + other_stocks['NASDAQ Symbol'].tolist()
+        return sorted(list(set([str(t).strip() for t in all_tickers if str(t).strip() and len(str(t)) < 6])))
+    except:
+        return get_sp500_tickers() # Fallback
+
+@st.cache_data(ttl=3600*24)
+def get_total_us_etfs():
+    """Retrieves all listed US ETFs."""
+    try:
+        # ETFs are mostly in the 'otherlisted' directory
+        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|")
+        other = other[other['Test Issue'] == 'N']
+        etfs = other[other['ETF'] == 'Y']
+        return sorted(list(set([str(t).strip() for t in etfs['NASDAQ Symbol'].tolist()])))
+    except:
+        return get_etf_universe() # Fallback
 
 def get_market_cap(ticker):
     """Fetches approximate market cap in USD."""
@@ -3300,30 +3322,38 @@ if df_main is not None:
 
 
     # ==========================================
-    # TAB 11: INSTITUTIONAL GLOBAL SCANNER PRO
+    # TAB 11: INSTITUTIONAL TOTAL MARKET SCANNER
     # ==========================================
     with tab11:
-        st.write("### 📡 Institutional Global Scanner PRO")
+        st.write("### 📡 Institutional Total Market Scanner")
         st.markdown("""
-        Scan massive asset universes with deep statistical filters. 
-        Categorize thousands of assets into **Long** vs **Cash** lists based on Master Quant Score.
+        **Massive Scale Quant Discovery**. Scan the entire US listing universe (~9,000+ assets). 
+        Categorize every stock and ETF into **Long (Open)** vs **Cash (Closed)** lists using the Master Quant Score.
         """)
         
         scan_col1, scan_col2, scan_col3 = st.columns(3)
         
         with scan_col1:
-            universe_type = st.selectbox("Select Asset Class", 
-                                       ["S&P 500 (Large Cap)", "NASDAQ 100 (Tech)", "Top 50 ETFs", "Custom Watchlist"])
+            universe_type = st.selectbox("Market Universe", 
+                                       ["Total US Stocks (6,000+)", "Total US ETFs (3,000+)", 
+                                        "S&P 500", "NASDAQ 100", "Custom Watchlist"])
             
         with scan_col2:
-            mcap_filter = st.select_slider("Market Cap Floor", 
-                                        options=["All", "$10B (Mid+)", "$50B (Large+)", "$200B (Mega+)"],
+            mcap_filter = st.select_slider("Size Filter (Market Cap)", 
+                                        options=["All", "$500M (Micro+)", "$2B (Small+)", "$10B (Mid+)", "$50B (Large+)", "$200B (Mega+)"],
                                         value="All")
-            mcap_map = {"All": 0, "$10B (Mid+)": 1e10, "$50B (Large+)": 5e10, "$200B (Mega+)": 2e11}
+            mcap_map = {
+                "All": 0, 
+                "$500M (Micro+)": 5e8,
+                "$2B (Small+)": 2e9,
+                "$10B (Mid+)": 1e10, 
+                "$50B (Large+)": 5e10, 
+                "$200B (Mega+)": 2e11
+            }
             
         with scan_col3:
-            scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=500, value=50, 
-                                        help="Limits number of tickers to scan for speed. Deep scans (500+) take time.")
+            scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=2000, value=100, 
+                                        help="Limits number of tickers to scan for speed. Deep scans (1000+) are heavy.")
 
         # Custom list area only shows if needed
         custom_input = ""
@@ -3332,14 +3362,16 @@ if df_main is not None:
 
         st.divider()
         
-        if st.button("🚀 EXECUTE GLOBAL PRO SCAN", use_container_width=True, type="primary"):
+        if st.button("🚀 EXECUTE TOTAL MARKET SCAN", use_container_width=True, type="primary"):
             # Determine Tickers
-            if universe_type == "S&P 500 (Large Cap)":
+            if universe_type == "Total US Stocks (6,000+)":
+                full_list = get_total_us_stocks()
+            elif universe_type == "Total US ETFs (3,000+)":
+                full_list = get_total_us_etfs()
+            elif universe_type == "S&P 500":
                 full_list = get_sp500_tickers()
-            elif universe_type == "NASDAQ 100 (Tech)":
+            elif universe_type == "NASDAQ 100":
                 full_list = get_nasdaq100_tickers()
-            elif universe_type == "Top 50 ETFs":
-                full_list = get_etf_universe()
             else:
                 full_list = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
 
@@ -3352,15 +3384,16 @@ if df_main is not None:
             scan_prog = st.progress(0)
             status_text = st.empty()
             
+            # Start Scan Loop
             for i, tick in enumerate(tickers_to_scan):
-                status_text.text(f"Analyzing {tick} ({i+1}/{len(tickers_to_scan)})...")
+                status_text.text(f"Scanning Asset {tick} ({i+1}/{len(tickers_to_scan)})...")
                 
                 # Market Cap Check
                 mcap = get_market_cap(tick)
                 if mcap < mcap_map[mcap_filter] and mcap_filter != "All":
                     continue
                 
-                # Fetch data & Logic
+                # Fetch data & Logic (using the same global filters for consistency)
                 s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
                 
                 if s_df is not None and not s_df.empty:
@@ -3385,7 +3418,7 @@ if df_main is not None:
                 
                 scan_prog.progress((i + 1) / len(tickers_to_scan))
             
-            status_text.text("Global Pro Scan Complete!")
+            status_text.text("Total Market Analysis Complete!")
             time.sleep(1)
             status_text.empty()
             scan_prog.empty()
@@ -3399,7 +3432,7 @@ if df_main is not None:
                     ldf = pd.DataFrame(long_list).sort_values(by='Score', ascending=False)
                     st.dataframe(ldf.style.background_gradient(subset=['Score'], cmap='Greens'), use_container_width=True)
                 else:
-                    st.info("No bullish signals matches filters.")
+                    st.info("No bullish signals found in current scan window.")
                     
             with res_col2:
                 st.subheader(f"🛑 CLOSED / CASH / HEDGE ({len(cash_list)})")
@@ -3407,10 +3440,10 @@ if df_main is not None:
                     cdf = pd.DataFrame(cash_list).sort_values(by='Score', ascending=True)
                     st.dataframe(cdf.style.background_gradient(subset=['Score'], cmap='Reds'), use_container_width=True)
                 else:
-                    st.info("No bearish/neutral signals matched filters.")
+                    st.info("No bearish/neutral signals found in current scan window.")
 
             st.divider()
-            st.success(f"✅ **Institutional Review Complete**: Scanned {len(tickers_to_scan)} assets across `{universe_type}` universe.")
+            st.success(f"✅ **Total Market Review Complete**: Analyzed {len(tickers_to_scan)} assets from `{universe_type}` universe.")
 
 else:
     st.info("Enter a ticker and ensure data is loaded to begin analysis.")
