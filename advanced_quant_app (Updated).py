@@ -1139,6 +1139,8 @@ def get_sp500_tickers():
         df = table[0]
         return df['Symbol'].tolist()
     except:
+        pass
+
 @st.cache_data(ttl=3600*24)
 def get_nasdaq100_tickers():
     try:
