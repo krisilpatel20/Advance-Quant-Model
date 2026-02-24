@@ -626,32 +626,63 @@ class ProRegimeDetector:
             # 4. Bear/Volatile: Low Ret, High Vol (Panic/Crisis)
             
             # Sort by returns
-            sorted_by_ret = sorted(state_stats, key=lambda x: x['ret'], reverse=True)
-            bulls = sorted_by_ret[:2]
-            bears = sorted_by_ret[2:]
+            # Sort states by returns for logical mapping
+            sorted_stats = sorted(state_stats, key=lambda x: x['ret'], reverse=True)
             
-            # Within bulls, separate by vol
-            bull_low = min(bulls, key=lambda x: x['vol'])
-            bull_high = max(bulls, key=lambda x: x['vol'])
-            
-            # Within bears, separate by vol
-            bear_low = min(bears, key=lambda x: x['vol'])
-            bear_high = max(bears, key=lambda x: x['vol'])
-            
-            self.state_labels = {
-                bull_low['id']: "BULL / QUIET (Conviction)",
-                bull_high['id']: "BULL / VOLATILE (Exhaustion)",
-                bear_low['id']: "BEAR / QUIET (Distribution)",
-                bear_high['id']: "BEAR / VOLATILE (Panic/Crisis)"
-            }
+            if n_states == 4:
+                bulls = sorted_stats[:2]
+                bears = sorted_stats[2:]
+                bull_low = min(bulls, key=lambda x: x['vol'])
+                bull_high = max(bulls, key=lambda x: x['vol'])
+                bear_low = min(bears, key=lambda x: x['vol'])
+                bear_high = max(bears, key=lambda x: x['vol'])
+                self.state_labels = {
+                    bull_low['id']: "BULL / QUIET (Conviction)",
+                    bull_high['id']: "BULL / VOLATILE (Exhaustion)",
+                    bear_low['id']: "BEAR / QUIET (Distribution)",
+                    bear_high['id']: "BEAR / VOLATILE (Panic/Crisis)"
+                }
+            elif n_states == 2:
+                self.state_labels = {
+                    sorted_stats[0]['id']: "BULL REGIME (Accumulation)",
+                    sorted_stats[1]['id']: "BEAR REGIME (Distribution)"
+                }
+            elif n_states == 3:
+                self.state_labels = {
+                    sorted_stats[0]['id']: "BULL REGIME (Conviction)",
+                    sorted_stats[1]['id']: "NEUTRAL / TRANSITION",
+                    sorted_stats[2]['id']: "BEAR REGIME (Panic)"
+                }
             
             self.regimes['states'] = states
             self.regimes['probs'] = probs
+            # Calculate BIC manually for GMM (Scikit-learn model has .bic())
             self.metrics['aic'] = model.aic(X_scaled)
+            self.metrics['bic'] = model.bic(X_scaled)
+            self.metrics['n_states'] = n_states
         else:
-            # Fallback
             self.regimes['states'] = np.zeros(len(X))
             self.regimes['probs'] = np.ones((len(X), 1))
+
+    def fit_optimized(self, state_choices=[2, 3, 4]):
+        """Runs multiple models and picks the best one by BIC."""
+        best_bic = float('inf')
+        best_n = 4
+        
+        # We perform a quick search for best BIC
+        for n in state_choices:
+            try:
+                temp_model = ProRegimeDetector(self.prices, self.returns)
+                temp_model.fit(n_states=n)
+                if temp_model.metrics.get('bic', float('inf')) < best_bic:
+                    best_bic = temp_model.metrics['bic']
+                    best_n = n
+            except:
+                continue
+        
+        # Final fit with best N
+        self.fit(n_states=best_n)
+        return best_n
 
     def get_latest_verdict(self):
         if 'states' not in self.regimes or not self.state_labels:
@@ -941,17 +972,22 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
         return None
 
 
-def get_master_signal(ticker, df):
+def get_master_signal(ticker, df, n_regimes=4):
     """
     Unified Decision Logic for a single asset.
     Returns a dictionary of all quant metrics and the final Master Sentiment Score.
+    n_regimes can be an integer (2, 3, 4) or 'Auto' for Best Fit.
     """
     try:
         # 1. Regime Signal
         p_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
-        p_detector.fit(n_states=4)
+        if n_regimes == 'Auto':
+            p_detector.fit_optimized()
+        else:
+            p_detector.fit(n_states=int(n_regimes))
+            
         regime_sig, regime_prob, regime_label = p_detector.get_latest_verdict()
-        regime_data = {'label': regime_label, 'confidence': regime_prob}
+        regime_data = {'label': regime_label, 'confidence': regime_prob, 'n_states': p_detector.metrics.get('n_states', 4)}
         
         # 2. Trend (Kalman)
         k_filter = KalmanFilterTrend(process_noise=1e-4, measurement_noise=1e-2)
@@ -1335,6 +1371,25 @@ with st.sidebar:
     st.info(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
 
     st.divider()
+    st.header("🔬 Model Configuration")
+    regime_mode = st.selectbox("Regime Detection Mode", 
+                               ["Fixed: 4 States (Inst.)", 
+                                "Fixed: 2 States (Bull/Bear)", 
+                                "Fixed: 3 States (Bull/Neut/Bear)",
+                                "Auto: Best Fit (AIC/BIC)"],
+                               index=0,
+                               help="Standard: 4-states. Auto: Tries 2, 3, and 4 states for each asset and picks the best fit.")
+    
+    # Map to parameter
+    regime_val_map = {
+        "Fixed: 4 States (Inst.)": 4,
+        "Fixed: 2 States (Bull/Bear)": 2,
+        "Fixed: 3 States (Bull/Neut/Bear)": 3,
+        "Auto: Best Fit (AIC/BIC)": "Auto"
+    }
+    regime_param = regime_val_map[regime_mode]
+
+    st.divider()
     st.header("⚡ Live Decision Mode")
     live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
     if live_mode:
@@ -1425,7 +1480,7 @@ if df_main is not None:
         st.caption("🔍 Processing Model Signals...")
         prog_bar = st.progress(0)
     
-    analysis = get_master_signal(TICKER, df_main)
+    analysis = get_master_signal(TICKER, df_main, n_regimes=regime_param)
     if analysis:
         regime_sig = analysis['regime_sig']
         regime_label = analysis['regime_label']
@@ -3371,6 +3426,16 @@ if df_main is not None:
                                         help="Limits number of tickers to scan for speed. 1000+ assets take significant time.")
             if scan_depth > 500:
                 st.warning("⚠️ High Depth: Scanning thousands of assets with deep quant models can take 30+ minutes.")
+        
+        scan_col1b, scan_col2b = st.columns(2)
+        with scan_col1b:
+            scan_regime_mode = st.selectbox("Scanner Regime Mode", 
+                                           ["Fixed: 4 States", "Fixed: 2 States", "Fixed: 3 States", "Auto: Best Fit"],
+                                           index=0)
+            scan_reg_map = {"Fixed: 4 States": 4, "Fixed: 2 States": 2, "Fixed: 3 States": 3, "Auto: Best Fit": "Auto"}
+            scan_reg_param = scan_reg_map[scan_reg_mode]
+        with scan_col2b:
+            st.info("💡 'Auto' mode is higher accuracy but ~3x slower.")
 
         # Custom list area only shows if needed
         custom_input = ""
@@ -3414,7 +3479,7 @@ if df_main is not None:
                 s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
                 
                 if s_df is not None and not s_df.empty:
-                    s_analysis = get_master_signal(tick, s_df)
+                    s_analysis = get_master_signal(tick, s_df, n_regimes=scan_reg_param)
                     if s_analysis:
                         s_score = s_analysis['sentiment_score']
                         s_price = s_df['Close'].iloc[-1]
