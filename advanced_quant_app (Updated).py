@@ -986,11 +986,14 @@ def get_master_signal(ticker, df):
             'regime_sig': regime_sig,
             'regime_label': regime_label,
             'regime_data': regime_data,
+            'regime_prob': regime_prob,
+            'pro_detector': p_detector,
             'trend_diff': trend_diff,
             'vol_state': vol_state,
             'curr_vol': curr_vol,
             'jump_detected': jump_detected,
-            'sentiment_score': sentiment_score
+            'sentiment_score': sentiment_score,
+            'garch_res': res
         }
     except Exception as e:
         return None
@@ -1351,15 +1354,15 @@ if df_main is not None:
         regime_sig = analysis['regime_sig']
         regime_label = analysis['regime_label']
         regime_data = analysis['regime_data']
+        regime_prob = analysis['regime_prob']
+        pro_detector = analysis['pro_detector']
         trend_diff = analysis['trend_diff']
         vol_state = analysis['vol_state']
         curr_vol = analysis['curr_vol']
         jump_detected = analysis['jump_detected']
         sentiment_score = analysis['sentiment_score']
         # For Tab 1 diagnostics
-        returns_pct = df_main['Returns'] * 100
-        am_sum = arch_model(returns_pct, vol='Garch', p=1, q=1, dist='Normal')
-        res_sum = am_sum.fit(disp='off')
+        res_sum = analysis['garch_res']
         prog_bar.progress(100)
     else:
         st.sidebar.error("Decision Engine Error: Statistical convergence failed.")
