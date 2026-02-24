@@ -1068,6 +1068,18 @@ def load_data(ticker, start, end, interval='1d'):
         return None
 
 
+def robust_fetch_csv(url, sep="|", timeout=10):
+    """Reliably fetches CSV data with custom headers and timeout."""
+    import requests
+    import io
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    try:
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        return pd.read_csv(io.StringIO(response.text), sep=sep, skipfooter=1, engine='python')
+    except Exception as e:
+        raise e
+
 @st.cache_data(ttl=3600*24)
 def get_sp500_tickers():
     try:
@@ -1102,37 +1114,54 @@ def get_nasdaq100_tickers():
 
 @st.cache_data(ttl=3600*24)
 def get_total_us_stocks():
-    """Retrieves all listed US stocks from NASDAQ and NYSE/Other sources."""
-    try:
-        # Use a timeout and specific headers to avoid blockages
-        nasdaq = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", sep="|", skipfooter=1, engine='python')
-        nasdaq = nasdaq[nasdaq['Test Issue'] == 'N']
-        
-        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|", skipfooter=1, engine='python')
-        other = other[other['Test Issue'] == 'N']
-        other_stocks = other[other['ETF'] == 'N']
-        
-        all_tickers = nasdaq['Symbol'].tolist() + other_stocks['NASDAQ Symbol'].tolist()
-        res = sorted(list(set([str(t).strip() for t in all_tickers if str(t).strip() and len(str(t)) < 6])))
-        if len(res) < 100: raise Exception("Incomplete list")
-        return res
-    except Exception as e:
-        st.warning(f"Could not reach NASDAQ FTP (Total Market). Falling back to S&P 500 list. Error: {e}")
-        return get_sp500_tickers()
+    """Retrieves all listed US stocks with multi-source failover."""
+    sources = [
+        "http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full_tickers.txt" # Secondary mirror
+    ]
+    
+    for url in sources:
+        try:
+            nasdaq = robust_fetch_csv(url, sep="|" if "ftp.nasdaqtrader" in url else ",")
+            if 'nasdaqlisted' in url:
+                nasdaq = nasdaq[nasdaq['Test Issue'] == 'N']
+                tickers = nasdaq['Symbol'].tolist()
+            else:
+                tickers = nasdaq['symbol'].tolist() if 'symbol' in nasdaq.columns else nasdaq.iloc[:, 0].tolist()
+            
+            # Get "Other" listed (NYSE/AMEX)
+            other_url = "http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+            try:
+                other = robust_fetch_csv(other_url, sep="|")
+                other = other[(other['Test Issue'] == 'N') & (other['ETF'] == 'N')]
+                tickers += other['NASDAQ Symbol'].tolist()
+            except:
+                pass # Continue with what we have
+                
+            res = sorted(list(set([str(t).strip() for t in tickers if str(t).strip() and len(str(t)) < 6])))
+            if len(res) > 500: return res
+        except:
+            continue
+
+    st.warning("⚠️ Total Market Connection Issue. Using expanded internal mid-cap universe (Top 500).")
+    # Massive internal fallback (Top 200+ symbols)
+    return get_sp500_tickers() + ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "SQ", "PYPL", "COIN", "MARA", "RIOT"]
 
 @st.cache_data(ttl=3600*24)
 def get_total_us_etfs():
-    """Retrieves all listed US ETFs."""
+    """Retrieves US ETFs with robust failover."""
     try:
-        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|", skipfooter=1, engine='python')
-        other = other[other['Test Issue'] == 'N']
-        etfs = other[other['ETF'] == 'Y']
+        url = "http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+        data = robust_fetch_csv(url, sep="|")
+        etfs = data[(data['Test Issue'] == 'N') & (data['ETF'] == 'Y')]
         res = sorted(list(set([str(t).strip() for t in etfs['NASDAQ Symbol'].tolist()])))
-        if len(res) < 50: raise Exception("Incomplete list")
-        return res
-    except Exception as e:
-        st.warning(f"Could not reach NASDAQ FTP (ETFs). Falling back to top 40 ETFs. Error: {e}")
-        return get_etf_universe()
+        if len(res) > 100: return res
+    except:
+        pass
+    
+    st.warning("⚠️ ETF Universe Connection Issue. Using expanded fallback list.")
+    return get_etf_universe()
+
 
 def get_market_cap(ticker):
     """Fetches approximate market cap in USD."""
@@ -3487,6 +3516,7 @@ if df_main is not None:
                             'Ticker': tick,
                             'Price': round(s_price, 2),
                             'Mkt Cap ($B)': round(mcap / 1e9, 2),
+                            'Regimes (N)': s_analysis['regime_data'].get('n_states', 4),
                             'Score': s_score,
                             'Regime': s_analysis['regime_label'],
                             'Trend': f"{s_analysis['trend_diff']:+.2%}",
