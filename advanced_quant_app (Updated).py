@@ -979,11 +979,15 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
     n_regimes can be an integer (2, 3, 4) or 'Auto' for Best Fit.
     """
     try:
+        # Central Data Cleaning (Critical for GARCH/Regime stability)
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
+        
         # 0. Data Resampling for timeframe sync
         if freq == 'Weekly':
-            df = df.resample('W').last().dropna()
-            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1)).dropna()
-            df['Returns'] = df['Close'].pct_change().dropna()
+            df = df.resample('W').last().replace([np.inf, -np.inf], np.nan).dropna()
+            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+            df['Returns'] = df['Close'].pct_change()
+            df = df.replace([np.inf, -np.inf], np.nan).dropna()
             
         if len(df) < 15: # Safety check for model convergence
             return None
@@ -1040,6 +1044,10 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
         
         # 3. Volatility (GARCH Proxy)
         returns_scaled = df['Returns'] * 100
+        returns_scaled = returns_scaled.replace([np.inf, -np.inf], np.nan).dropna()
+        
+        if len(returns_scaled) < 15: return None # Safety for GARCH
+        
         am = arch_model(returns_scaled, vol='Garch', p=1, q=1, dist='Normal')
         res = am.fit(disp='off')
         curr_vol = res.conditional_volatility.iloc[-1]
@@ -1103,9 +1111,9 @@ def load_data(ticker, start, end, interval='1d'):
             df['Close'] = df['Adj Close']
             
         if 'Close' in df.columns:
-            df['Returns'] = df['Close'].pct_change().dropna()
-            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1)).dropna()
-        return df.dropna()
+            df['Returns'] = df['Close'].pct_change()
+            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+        return df.replace([np.inf, -np.inf], np.nan).dropna()
     except Exception as e:
         st.error(f"Error loading data for {ticker}: {e}")
         return None
@@ -1131,15 +1139,6 @@ def get_sp500_tickers():
         df = table[0]
         return df['Symbol'].tolist()
     except:
-        # Larger fallback list (Top 50)
-        return [
-            "AAPL", "MSFT", "AMZN", "GOOGL", "META", "BRK-B", "TSLA", "UNH", "JNJ", "XOM",
-            "V", "PG", "MA", "NVDA", "HD", "CVX", "ABBV", "LLY", "PEP", "MRK",
-            "BAC", "KO", "PFE", "AVGO", "TMO", "COST", "CSCO", "DIS", "ACN", "ABT",
-            "ORCL", "DHR", "LIN", "WMT", "VZ", "NEE", "ADBE", "PM", "NKE", "TXN",
-            "CRM", "UPS", "CMCSA", "HON", "MS", "BMY", "QCOM", "UNP", "INTC", "LOW"
-        ]
-
 @st.cache_data(ttl=3600*24)
 def get_nasdaq100_tickers():
     try:
