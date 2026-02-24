@@ -1040,7 +1040,14 @@ def get_sp500_tickers():
         df = table[0]
         return df['Symbol'].tolist()
     except:
-        return ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "BRK-B", "TSLA", "UNH", "JNJ", "XOM"]
+        # Larger fallback list (Top 50)
+        return [
+            "AAPL", "MSFT", "AMZN", "GOOGL", "META", "BRK-B", "TSLA", "UNH", "JNJ", "XOM",
+            "V", "PG", "MA", "NVDA", "HD", "CVX", "ABBV", "LLY", "PEP", "MRK",
+            "BAC", "KO", "PFE", "AVGO", "TMO", "COST", "CSCO", "DIS", "ACN", "ABT",
+            "ORCL", "DHR", "LIN", "WMT", "VZ", "NEE", "ADBE", "PM", "NKE", "TXN",
+            "CRM", "UPS", "CMCSA", "HON", "MS", "BMY", "QCOM", "UNP", "INTC", "LOW"
+        ]
 
 @st.cache_data(ttl=3600*24)
 def get_nasdaq100_tickers():
@@ -1050,38 +1057,46 @@ def get_nasdaq100_tickers():
         df = table[4]
         return df['Ticker'].tolist()
     except:
-        return ["AAPL", "MSFT", "AMZN", "GOOG", "NVDA", "META", "TSLA", "PEP", "AVGO", "COST"]
+        return [
+            "AAPL", "MSFT", "AMZN", "GOOG", "NVDA", "META", "TSLA", "PEP", "AVGO", "COST",
+            "AZN", "CSCO", "TMUS", "ADBE", "TXN", "CMCSA", "QCOM", "AMGN", "HON", "INTU",
+            "INTC", "SBUX", "AMD", "AMD", "GILD", "VRTX", "MDLZ", "REGN", "ISRG", "ADI",
+            "BKNG", "AMAT", "ADP", "PDD", "PYPL", "MU", "VRSK", "MELI", "KDP", "LUK"
+        ]
 
 @st.cache_data(ttl=3600*24)
 def get_total_us_stocks():
     """Retrieves all listed US stocks from NASDAQ and NYSE/Other sources."""
     try:
-        # NASDAQ listed
-        nasdaq = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", sep="|")
+        # Use a timeout and specific headers to avoid blockages
+        nasdaq = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", sep="|", skipfooter=1, engine='python')
         nasdaq = nasdaq[nasdaq['Test Issue'] == 'N']
         
-        # Other listed (NYSE, AMEX, etc.)
-        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|")
+        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|", skipfooter=1, engine='python')
         other = other[other['Test Issue'] == 'N']
-        # Filter out ETFs from the stock list
         other_stocks = other[other['ETF'] == 'N']
         
         all_tickers = nasdaq['Symbol'].tolist() + other_stocks['NASDAQ Symbol'].tolist()
-        return sorted(list(set([str(t).strip() for t in all_tickers if str(t).strip() and len(str(t)) < 6])))
-    except:
-        return get_sp500_tickers() # Fallback
+        res = sorted(list(set([str(t).strip() for t in all_tickers if str(t).strip() and len(str(t)) < 6])))
+        if len(res) < 100: raise Exception("Incomplete list")
+        return res
+    except Exception as e:
+        st.warning(f"Could not reach NASDAQ FTP (Total Market). Falling back to S&P 500 list. Error: {e}")
+        return get_sp500_tickers()
 
 @st.cache_data(ttl=3600*24)
 def get_total_us_etfs():
     """Retrieves all listed US ETFs."""
     try:
-        # ETFs are mostly in the 'otherlisted' directory
-        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|")
+        other = pd.read_csv("http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", sep="|", skipfooter=1, engine='python')
         other = other[other['Test Issue'] == 'N']
         etfs = other[other['ETF'] == 'Y']
-        return sorted(list(set([str(t).strip() for t in etfs['NASDAQ Symbol'].tolist()])))
-    except:
-        return get_etf_universe() # Fallback
+        res = sorted(list(set([str(t).strip() for t in etfs['NASDAQ Symbol'].tolist()])))
+        if len(res) < 50: raise Exception("Incomplete list")
+        return res
+    except Exception as e:
+        st.warning(f"Could not reach NASDAQ FTP (ETFs). Falling back to top 40 ETFs. Error: {e}")
+        return get_etf_universe()
 
 def get_market_cap(ticker):
     """Fetches approximate market cap in USD."""
@@ -3352,8 +3367,10 @@ if df_main is not None:
             }
             
         with scan_col3:
-            scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=2000, value=100, 
-                                        help="Limits number of tickers to scan for speed. Deep scans (1000+) are heavy.")
+            scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=10000, value=1000, 
+                                        help="Limits number of tickers to scan for speed. 1000+ assets take significant time.")
+            if scan_depth > 500:
+                st.warning("⚠️ High Depth: Scanning thousands of assets with deep quant models can take 30+ minutes.")
 
         # Custom list area only shows if needed
         custom_input = ""
