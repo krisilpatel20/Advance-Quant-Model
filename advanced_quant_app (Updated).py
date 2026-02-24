@@ -12,6 +12,7 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from datetime import datetime, timedelta
 import io
 import time
+from concurrent.futures import ThreadPoolExecutor
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -918,7 +919,7 @@ class BacktestEngine:
         }
 
 @st.cache_resource
-def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
+def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_reps=50):
     """
     Cached helper to fit Markov Regression.
     Returns the fitted result object.
@@ -955,7 +956,7 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
             switching_variance=switch_vol,
             switching_trend=switch_trend
         )
-        res_markov = mod_markov.fit(search_reps=50, disp=False)
+        res_markov = mod_markov.fit(search_reps=search_reps, disp=False)
              
         # ENFORCE PANDAS OUTPUT: Statsmodels sometimes returns numpy arrays
         if isinstance(res_markov.params, np.ndarray):
@@ -1002,13 +1003,15 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
         if engine == 'Markov':
             # Use the high-accuracy Markov model matching Backtest Tab
             if n_regimes == 'Auto':
-                # Optimization loop for Markov
+                # Optimization loop for Markov (Reduced reps for speed)
                 best_n = 4
                 best_score = -float('inf') if opt_goal == 'Performance (PnL)' else float('inf')
+                best_r = None
                 
                 for n in [2, 3, 4]:
                     try:
-                        r = fit_regime_model(df['Returns']*100, n, switch_vol, switch_trend)
+                        # Use fewer search reps for the selection phase to save time
+                        r = fit_regime_model(df['Returns']*100, n, switch_vol, switch_trend, search_reps=10)
                         if r:
                             if opt_goal == 'Performance (PnL)':
                                 # Run full backtest proxy matching Backtest Tab comparison
@@ -1019,7 +1022,6 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
                                     r_means.append((i, m))
                                 bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
                                 
-                                # Signal is Bull Regime (matches backtest Fitness tool behavior)
                                 dom = p_df.idxmax(axis=1)
                                 sigs = (dom == bull_idx).astype(int)
                                 
@@ -1029,13 +1031,16 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
                                 if pnl > best_score:
                                     best_score = pnl
                                     best_n = n
+                                    best_r = r
                             else: # BIC
                                 score = r.bic
                                 if score < best_score:
                                     best_score = score
                                     best_n = n
+                                    best_r = r
                     except: continue
-                res_markov = fit_regime_model(df['Returns']*100, best_n, switch_vol, switch_trend)
+                # We already have the best fit from the loop, no need to fit again
+                res_markov = best_r
             else:
                 res_markov = fit_regime_model(df['Returns']*100, int(n_regimes), switch_vol, switch_trend)
             
@@ -3597,7 +3602,7 @@ if df_main is not None:
         with st.expander("🛠️ Advanced Model Sync (Backtest Alignment)", expanded=False):
             async_col1, async_col2, async_col3 = st.columns(3)
             with async_col1:
-                scan_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=0,
+                scan_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=1,
                                          help="Markov engine matches Backtest Tab exactly but is slower for large lists.")
                 scan_engine_param = "Markov" if "Markov" in scan_engine else "GMM"
                 scan_initial_cap = st.number_input("Backtest Capital ($)", 1000, 1000000, 10000)
@@ -3642,20 +3647,20 @@ if df_main is not None:
             scan_prog = st.progress(0)
             status_text = st.empty()
             
-            # Start Scan Loop
-            for i, tick in enumerate(tickers_to_scan):
-                status_text.text(f"Scanning Asset {tick} ({i+1}/{len(tickers_to_scan)})...")
-                
-                # Market Cap Check
-                mcap = get_market_cap(tick)
-                if mcap < mcap_map[mcap_filter] and mcap_filter != "All":
-                    status_text.text(f"Skipping {tick} (MCap ${mcap/1e9:.2f}B < Filter)...")
-                    continue
-                
-                # Fetch data & Logic (using the same global filters for consistency)
-                s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
-                
-                if s_df is not None and not s_df.empty:
+            # -- Worker Function for Multithreading --
+            def process_ticker_worker(tick):
+                try:
+                    # 1. Market Cap Check
+                    mcap = get_market_cap(tick)
+                    if mcap_filter != "All" and mcap < mcap_map[mcap_filter]:
+                        return None
+                    
+                    # 2. Fetch Data
+                    s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
+                    if s_df is None or s_df.empty:
+                        return None
+                    
+                    # 3. Analyze
                     s_analysis = get_master_signal(tick, s_df, 
                                                   n_regimes=scan_reg_param, 
                                                   freq=scan_freq, 
@@ -3666,26 +3671,45 @@ if df_main is not None:
                                                   engine=scan_engine_param,
                                                   initial_cap=scan_initial_cap,
                                                   trailing_stop=scan_trailing_stop)
-                    if s_analysis:
-                        s_score = s_analysis['sentiment_score']
-                        s_price = s_df['Close'].iloc[-1]
-                        s_info = {
-                            'Ticker': tick,
-                            'Price': round(s_price, 2),
-                            'Mkt Cap ($B)': round(mcap / 1e9, 2),
-                            'Regimes (N)': s_analysis['regime_data'].get('n_states', 4),
-                            'Score': s_score,
-                            'Regime': s_analysis['regime_label'],
-                            'Trend': f"{s_analysis['trend_diff']:+.2%}",
-                            'Action': s_analysis['regime_sig']
-                        }
+                    if not s_analysis:
+                        return None
                         
-                        if s_score >= 1:
-                            long_list.append(s_info)
-                        else:
-                            cash_list.append(s_info)
+                    s_price = s_df['Close'].iloc[-1]
+                    return {
+                        'Ticker': tick,
+                        'Price': round(s_price, 2),
+                        'Mkt Cap ($B)': round(mcap / 1e9, 2),
+                        'Regimes (N)': s_analysis['regime_data'].get('n_states', 4),
+                        'Score': s_analysis['sentiment_score'],
+                        'Regime': s_analysis['regime_label'],
+                        'Trend': f"{s_analysis['trend_diff']:+.2%}",
+                        'Action': s_analysis['regime_sig']
+                    }
+                except:
+                    return None
+
+            # Start Parallel Scan
+            from concurrent.futures import as_completed
+            
+            # We use a reasonable number of workers to balance I/O and CPU
+            # yfinance is I/O bound (network), models are CPU bound. 
+            max_workers = 10 if scan_engine_param == "Markov" else 20
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_tick = {executor.submit(process_ticker_worker, t): t for t in tickers_to_scan}
                 
-                scan_prog.progress((i + 1) / len(tickers_to_scan))
+                for i, future in enumerate(as_completed(future_to_tick)):
+                    tick = future_to_tick[future]
+                    status_text.text(f"Processing {tick}... ({i+1}/{len(tickers_to_scan)})")
+                    
+                    result = future.result()
+                    if result:
+                        if result['Score'] >= 1:
+                            long_list.append(result)
+                        else:
+                            cash_list.append(result)
+                    
+                    scan_prog.progress((i + 1) / len(tickers_to_scan))
             
             # Store in session state for persistence
             st.session_state.scanner_results = {'long': long_list, 'cash': cash_list, 'universe': universe_type, 'count': len(tickers_to_scan)}
