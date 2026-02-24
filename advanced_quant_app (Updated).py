@@ -3433,7 +3433,7 @@ if df_main is not None:
                                            ["Fixed: 4 States", "Fixed: 2 States", "Fixed: 3 States", "Auto: Best Fit"],
                                            index=0)
             scan_reg_map = {"Fixed: 4 States": 4, "Fixed: 2 States": 2, "Fixed: 3 States": 3, "Auto: Best Fit": "Auto"}
-            scan_reg_param = scan_reg_map[scan_reg_mode]
+            scan_reg_param = scan_reg_map[scan_regime_mode]
         with scan_col2b:
             st.info("💡 'Auto' mode is higher accuracy but ~3x slower.")
 
