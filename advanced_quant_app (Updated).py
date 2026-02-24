@@ -1031,6 +1031,45 @@ def load_data(ticker, start, end, interval='1d'):
         st.error(f"Error loading data for {ticker}: {e}")
         return None
 
+
+@st.cache_data(ttl=3600*24) # Cache universes for 24h
+def get_sp500_tickers():
+    try:
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        table = pd.read_html(url)
+        df = table[0]
+        return df['Symbol'].tolist()
+    except:
+        return ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "BRK-B", "TSLA", "UNH", "JNJ", "XOM"]
+
+@st.cache_data(ttl=3600*24)
+def get_nasdaq100_tickers():
+    try:
+        url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
+        table = pd.read_html(url)
+        df = table[4] # Usually the 5th table
+        return df['Ticker'].tolist()
+    except:
+        return ["AAPL", "MSFT", "AMZN", "GOOG", "NVDA", "META", "TSLA", "PEP", "AVGO", "COST"]
+
+@st.cache_data(ttl=3600*24)
+def get_etf_universe():
+    return [
+        "SPY", "IVV", "VOO", "QQQ", "VTI", "VEA", "VWO", "IEFA", "AGG", "BND", 
+        "GLD", "VUG", "VTV", "VIG", "IJH", "IJR", "IWF", "IWD", "XLK", "XLF", 
+        "XLV", "XLE", "XLI", "XLY", "XLP", "XLB", "XLU", "XLRE", "SMH", "IBB",
+        "TLT", "LQD", "HYG", "EEM", "EFA", "VGT", "VFH", "VHT", "VDE", "VIS"
+    ]
+
+def get_market_cap(ticker):
+    """Fetches approximate market cap in USD."""
+    try:
+        t = yf.Ticker(ticker)
+        mcap = t.info.get('marketCap', 0)
+        return mcap
+    except:
+        return 0
+
 def get_analyst_target(ticker):
     """Fetches 1-year price target from Yahoo Finance."""
     try:
@@ -3261,18 +3300,51 @@ if df_main is not None:
 
 
     # ==========================================
-    # TAB 11: MULTI-ASSET SCAN
+    # TAB 11: INSTITUTIONAL GLOBAL SCANNER PRO
     # ==========================================
     with tab11:
-        st.write("### 📡 Global Cross-Asset Scanner")
-        st.markdown("Scan your portfolio or watchlists for institutional 'Master Quant' signals.")
+        st.write("### 📡 Institutional Global Scanner PRO")
+        st.markdown("""
+        Scan massive asset universes with deep statistical filters. 
+        Categorize thousands of assets into **Long** vs **Cash** lists based on Master Quant Score.
+        """)
         
-        universe_str = st.text_area("Ticker Universe (Comma separated)", 
-                                  value="AAPL, TSLA, MSFT, NVDA, SPY, BTC-USD, GC=F",
-                                  help="Enter tickers separated by commas. Crypto should use -USD suffix.")
+        scan_col1, scan_col2, scan_col3 = st.columns(3)
         
-        if st.button("🚀 Start Global Scan", use_container_width=True):
-            tickers_to_scan = [t.strip().upper() for t in universe_str.split(",") if t.strip()]
+        with scan_col1:
+            universe_type = st.selectbox("Select Asset Class", 
+                                       ["S&P 500 (Large Cap)", "NASDAQ 100 (Tech)", "Top 50 ETFs", "Custom Watchlist"])
+            
+        with scan_col2:
+            mcap_filter = st.select_slider("Market Cap Floor", 
+                                        options=["All", "$10B (Mid+)", "$50B (Large+)", "$200B (Mega+)"],
+                                        value="All")
+            mcap_map = {"All": 0, "$10B (Mid+)": 1e10, "$50B (Large+)": 5e10, "$200B (Mega+)": 2e11}
+            
+        with scan_col3:
+            scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=500, value=50, 
+                                        help="Limits number of tickers to scan for speed. Deep scans (500+) take time.")
+
+        # Custom list area only shows if needed
+        custom_input = ""
+        if universe_type == "Custom Watchlist":
+            custom_input = st.text_area("Ticker List (Comma separated)", "AAPL, TSLA, BTC-USD, GC=F")
+
+        st.divider()
+        
+        if st.button("🚀 EXECUTE GLOBAL PRO SCAN", use_container_width=True, type="primary"):
+            # Determine Tickers
+            if universe_type == "S&P 500 (Large Cap)":
+                full_list = get_sp500_tickers()
+            elif universe_type == "NASDAQ 100 (Tech)":
+                full_list = get_nasdaq100_tickers()
+            elif universe_type == "Top 50 ETFs":
+                full_list = get_etf_universe()
+            else:
+                full_list = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
+
+            # Apply Depth
+            tickers_to_scan = full_list[:scan_depth]
             
             long_list = []
             cash_list = []
@@ -3281,8 +3353,14 @@ if df_main is not None:
             status_text = st.empty()
             
             for i, tick in enumerate(tickers_to_scan):
-                status_text.text(f"Scanning {tick} ({i+1}/{len(tickers_to_scan)})...")
-                # Fetch data
+                status_text.text(f"Analyzing {tick} ({i+1}/{len(tickers_to_scan)})...")
+                
+                # Market Cap Check
+                mcap = get_market_cap(tick)
+                if mcap < mcap_map[mcap_filter] and mcap_filter != "All":
+                    continue
+                
+                # Fetch data & Logic
                 s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
                 
                 if s_df is not None and not s_df.empty:
@@ -3292,7 +3370,8 @@ if df_main is not None:
                         s_price = s_df['Close'].iloc[-1]
                         s_info = {
                             'Ticker': tick,
-                            'Price': s_price,
+                            'Price': round(s_price, 2),
+                            'Mkt Cap ($B)': round(mcap / 1e9, 2),
                             'Score': s_score,
                             'Regime': s_analysis['regime_label'],
                             'Trend': f"{s_analysis['trend_diff']:+.2%}",
@@ -3306,7 +3385,7 @@ if df_main is not None:
                 
                 scan_prog.progress((i + 1) / len(tickers_to_scan))
             
-            status_text.text("Scan Complete!")
+            status_text.text("Global Pro Scan Complete!")
             time.sleep(1)
             status_text.empty()
             scan_prog.empty()
@@ -3317,22 +3396,21 @@ if df_main is not None:
             with res_col1:
                 st.subheader(f"🚀 LONG / OPEN ({len(long_list)})")
                 if long_list:
-                    ldf = pd.DataFrame(long_list)
-                    # Color coding for score
+                    ldf = pd.DataFrame(long_list).sort_values(by='Score', ascending=False)
                     st.dataframe(ldf.style.background_gradient(subset=['Score'], cmap='Greens'), use_container_width=True)
                 else:
-                    st.info("No bullish signals found.")
+                    st.info("No bullish signals matches filters.")
                     
             with res_col2:
                 st.subheader(f"🛑 CLOSED / CASH / HEDGE ({len(cash_list)})")
                 if cash_list:
-                    cdf = pd.DataFrame(cash_list)
+                    cdf = pd.DataFrame(cash_list).sort_values(by='Score', ascending=True)
                     st.dataframe(cdf.style.background_gradient(subset=['Score'], cmap='Reds'), use_container_width=True)
                 else:
-                    st.info("No bearish/neutral signals found.")
+                    st.info("No bearish/neutral signals matched filters.")
 
             st.divider()
-            st.success("✅ **Scan Insight**: The lists above provide an immediate visual of where institutional capital and trend logic are flowing.")
+            st.success(f"✅ **Institutional Review Complete**: Scanned {len(tickers_to_scan)} assets across `{universe_type}` universe.")
 
 else:
     st.info("Enter a ticker and ensure data is loaded to begin analysis.")
