@@ -972,17 +972,23 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
         return None
 
 
-def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)'):
+def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)', stability=0, switch_vol=True, switch_trend=True, engine='Markov', initial_cap=10000.0, trailing_stop=0.0):
     """
     Unified Decision Logic for a single asset.
     Returns a dictionary of all quant metrics and the final Master Sentiment Score.
     n_regimes can be an integer (2, 3, 4) or 'Auto' for Best Fit.
     """
     try:
-        # Central Data Cleaning (Critical for GARCH/Regime stability)
+        # Central Data Cleaning
         df = df.replace([np.inf, -np.inf], np.nan).dropna()
         
-        # 0. Data Resampling for timeframe sync
+        # 0. Apply Model Stability (Smoothing) if requested
+        if stability > 0:
+            df['Returns'] = df['Returns'].ewm(span=stability, adjust=False).mean()
+            df['Log_Returns'] = df['Log_Returns'].ewm(span=stability, adjust=False).mean()
+            df['Close'] = df['Close'].ewm(span=stability, adjust=False).mean() 
+        
+        # 1. Data Resampling for timeframe sync
         if freq == 'Weekly':
             df = df.resample('W').last().replace([np.inf, -np.inf], np.nan).dropna()
             df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
@@ -992,48 +998,103 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
         if len(df) < 15: # Safety check for model convergence
             return None
 
-        # 1. Regime Signal
-        p_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
-        if n_regimes == 'Auto':
-            if opt_goal == 'Performance (PnL)':
-                # Find best N by historical returns (matching Tab 7 logic)
+        # 2. Regime Signal (Synchronized Engine)
+        if engine == 'Markov':
+            # Use the high-accuracy Markov model matching Backtest Tab
+            if n_regimes == 'Auto':
+                # Optimization loop for Markov
                 best_n = 4
-                max_perf = -float('inf')
+                best_score = -float('inf') if opt_goal == 'Performance (PnL)' else float('inf')
+                
                 for n in [2, 3, 4]:
                     try:
-                        temp_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
-                        temp_detector.fit(n_states=n)
-                        
-                        # Use filtered probabilities for a smoother "expected return" PnL proxy
-                        # This matches the "Regime Weighted Expected Return" strategy in Tab 7
-                        p_df = temp_detector.regimes['probs']
-                        r_means = []
-                        for sid, slbl in temp_detector.state_labels.items():
-                            mask = (temp_detector.regimes['states'] == sid)
-                            m_ret = df['Returns'].iloc[mask].mean() if any(mask) else 0
-                            r_means.append(m_ret)
-                        
-                        # Expected return vector
-                        expected_returns = np.dot(p_df, r_means)
-                        sigs = (expected_returns > 0).astype(int)
-                        
-                        # Compute simple equity curve
-                        walk_returns = df['Returns'].values[1:] * sigs[:-1]
-                        ret_sum = walk_returns.sum()
-                        
-                        if ret_sum > max_perf:
-                            max_perf = ret_sum
-                            best_n = n
-                    except Exception as e:
-                        continue
-                p_detector.fit(n_states=best_n)
+                        r = fit_regime_model(df['Returns']*100, n, switch_vol, switch_trend)
+                        if r:
+                            if opt_goal == 'Performance (PnL)':
+                                # Run full backtest proxy matching Backtest Tab comparison
+                                p_df = r.filtered_marginal_probabilities
+                                r_means = []
+                                for i in range(n):
+                                    m = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
+                                    r_means.append((i, m))
+                                bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
+                                
+                                # Signal is Bull Regime (matches backtest Fitness tool behavior)
+                                dom = p_df.idxmax(axis=1)
+                                sigs = (dom == bull_idx).astype(int)
+                                
+                                bt_res = BacktestEngine.run_strategy(df['Close'], sigs, initial_cap, trailing_stop)
+                                pnl = (bt_res['equity_curve'].iloc[-1] / initial_cap - 1)
+                                
+                                if pnl > best_score:
+                                    best_score = pnl
+                                    best_n = n
+                            else: # BIC
+                                score = r.bic
+                                if score < best_score:
+                                    best_score = score
+                                    best_n = n
+                    except: continue
+                res_markov = fit_regime_model(df['Returns']*100, best_n, switch_vol, switch_trend)
             else:
-                p_detector.fit_optimized()
-        else:
-            p_detector.fit(n_states=int(n_regimes))
+                res_markov = fit_regime_model(df['Returns']*100, int(n_regimes), switch_vol, switch_trend)
             
-        regime_sig, regime_prob, regime_label = p_detector.get_latest_verdict()
-        regime_data = {'label': regime_label, 'confidence': regime_prob, 'n_states': p_detector.metrics.get('n_states', 4)}
+            if not res_markov: return None
+            
+            # Map Markov results to scanner standard
+            p_df = res_markov.filtered_marginal_probabilities
+            n_states = res_markov.k_regimes
+            r_means = []
+            for i in range(n_states):
+                m = res_markov.params[f'const[{i}]'] if f'const[{i}]' in res_markov.params else res_markov.params.get('const', 0.0)
+                r_means.append((i, m))
+            
+            bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
+            bear_idx = sorted(r_means, key=lambda x: x[1])[0][0]
+            curr_state = p_df.iloc[-1].idxmax()
+            regime_prob = p_df.iloc[-1].max()
+            
+            if curr_state == bull_idx:
+                regime_sig, regime_label = "LONG", "BULL"
+            elif curr_state == bear_idx:
+                regime_sig, regime_label = "SHORT", "BEAR"
+            else:
+                regime_sig, regime_label = "CASH", "NEUTRAL"
+            
+            regime_data = {'label': regime_label, 'confidence': regime_prob, 'n_states': n_states}
+            p_detector = None # Placeholder since we didn't use GMM
+            
+        else: # GMM Engine (Fast)
+            p_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
+            if n_regimes == 'Auto':
+                if opt_goal == 'Performance (PnL)':
+                    best_n = 4
+                    max_perf = -float('inf')
+                    for n in [2, 3, 4]:
+                        try:
+                            temp_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
+                            temp_detector.fit(n_states=n)
+                            p_df = temp_detector.regimes['probs']
+                            r_means = []
+                            for sid, slbl in temp_detector.state_labels.items():
+                                mask = (temp_detector.regimes['states'] == sid)
+                                m_ret = df['Returns'].iloc[mask].mean() if any(mask) else 0
+                                r_means.append(m_ret)
+                            expected_returns = np.dot(p_df, r_means)
+                            sigs = (expected_returns > 0).astype(int)
+                            ret_sum = (df['Returns'].values[1:] * sigs[:-1]).sum()
+                            if ret_sum > max_perf:
+                                max_perf = ret_sum
+                                best_n = n
+                        except: continue
+                    p_detector.fit(n_states=best_n)
+                else:
+                    p_detector.fit_optimized()
+            else:
+                p_detector.fit(n_states=int(n_regimes))
+                
+            regime_sig, regime_prob, regime_label = p_detector.get_latest_verdict()
+            regime_data = {'label': regime_label, 'confidence': regime_prob, 'n_states': p_detector.metrics.get('n_states', 4)}
         
         # 2. Trend (Kalman)
         k_filter = KalmanFilterTrend(process_noise=1e-4, measurement_noise=1e-2)
@@ -3514,6 +3575,21 @@ if df_main is not None:
             if scan_regime_mode == "Auto: Best Fit":
                 st.info("💡 Auto-Performance mode ensures results match best historical backtest.")
             
+        with st.expander("🛠️ Advanced Model Sync (Backtest Alignment)", expanded=False):
+            async_col1, async_col2, async_col3 = st.columns(3)
+            with async_col1:
+                scan_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=0,
+                                         help="Markov engine matches Backtest Tab exactly but is slower for large lists.")
+                scan_engine_param = "Markov" if "Markov" in scan_engine else "GMM"
+                scan_initial_cap = st.number_input("Backtest Capital ($)", 1000, 1000000, 10000)
+            with async_col2:
+                scan_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4, 
+                                          help="Matches 'Signal Stability' in Backtest Tab. Smoothes data before fitting.")
+                scan_trailing_stop = st.slider("Trailing Stop (%)", 0.0, 20.0, 0.0, step=0.5) / 100
+            with async_col3:
+                scan_switch_vol = st.toggle("Switching Volatility", value=True)
+                scan_switch_trend = st.toggle("Switching Mean", value=True)
+
         if live_mode and scan_freq == "Weekly":
             st.warning("⚠️ **Invalid Combo**: Weekly frequency on Live Intraday data typically has too few bars (< 15) for the models. Scanner may skip all assets. Switch Frequency to 'Daily' or disable 'Live Mode'.")
 
@@ -3545,79 +3621,3 @@ if df_main is not None:
             
             st.session_state.scanner_results = None # Reset previous
             scan_prog = st.progress(0)
-            status_text = st.empty()
-            
-            # Start Scan Loop
-            for i, tick in enumerate(tickers_to_scan):
-                status_text.text(f"Scanning Asset {tick} ({i+1}/{len(tickers_to_scan)})...")
-                
-                # Market Cap Check
-                mcap = get_market_cap(tick)
-                if mcap < mcap_map[mcap_filter] and mcap_filter != "All":
-                    status_text.text(f"Skipping {tick} (MCap ${mcap/1e9:.2f}B < Filter)...")
-                    continue
-                
-                # Fetch data & Logic (using the same global filters for consistency)
-                s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
-                
-                if s_df is not None and not s_df.empty:
-                    s_analysis = get_master_signal(tick, s_df, n_regimes=scan_reg_param, freq=scan_freq, opt_goal=scan_opt_goal)
-                    if s_analysis:
-                        s_score = s_analysis['sentiment_score']
-                        s_price = s_df['Close'].iloc[-1]
-                        s_info = {
-                            'Ticker': tick,
-                            'Price': round(s_price, 2),
-                            'Mkt Cap ($B)': round(mcap / 1e9, 2),
-                            'Regimes (N)': s_analysis['regime_data'].get('n_states', 4),
-                            'Score': s_score,
-                            'Regime': s_analysis['regime_label'],
-                            'Trend': f"{s_analysis['trend_diff']:+.2%}",
-                            'Action': s_analysis['regime_sig']
-                        }
-                        
-                        if s_score >= 1:
-                            long_list.append(s_info)
-                        else:
-                            cash_list.append(s_info)
-                
-                scan_prog.progress((i + 1) / len(tickers_to_scan))
-            
-            # Store in session state for persistence
-            st.session_state.scanner_results = {'long': long_list, 'cash': cash_list, 'universe': universe_type, 'count': len(tickers_to_scan)}
-
-        # Always display results from session state if they exist
-        if 'scanner_results' in st.session_state and st.session_state.scanner_results:
-            res = st.session_state.scanner_results
-            long_list = res['long']
-            cash_list = res['cash']
-            
-            # Display Results
-            res_col1, res_col2 = st.columns(2)
-            
-            with res_col1:
-                st.subheader(f"🚀 LONG / OPEN ({len(long_list)})")
-                if long_list:
-                    ldf = pd.DataFrame(long_list).sort_values(by='Score', ascending=False)
-                    st.dataframe(ldf.style.background_gradient(subset=['Score'], cmap='Greens'), use_container_width=True)
-                else:
-                    st.info("No bullish signals found in current scan window.")
-                    
-            with res_col2:
-                st.subheader(f"🛑 CLOSED / CASH / HEDGE ({len(cash_list)})")
-                if cash_list:
-                    cdf = pd.DataFrame(cash_list).sort_values(by='Score', ascending=True)
-                    st.dataframe(cdf.style.background_gradient(subset=['Score'], cmap='Reds'), use_container_width=True)
-                else:
-                    st.info("No bearish/neutral signals found in current scan window.")
-
-            st.divider()
-            st.success(f"✅ **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
-
-else:
-    st.info("Enter a ticker and ensure data is loaded to begin analysis.")
-
-# Footer
-st.markdown("---")
-st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
-
