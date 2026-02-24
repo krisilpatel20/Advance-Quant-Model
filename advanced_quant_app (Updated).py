@@ -3256,13 +3256,6 @@ if df_main is not None:
                 else:
                     st.error(f"Could not load data for Benchmark: {bench_ticker}")
 
-else:
-    st.info("Enter a ticker and ensure data is loaded to begin analysis.")
-
-# Footer
-st.markdown("---")
-st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
-
 
     # ==========================================
     # TAB 11: MULTI-ASSET SCAN
@@ -3337,3 +3330,11 @@ st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementat
 
             st.divider()
             st.success("✅ **Scan Insight**: The lists above provide an immediate visual of where institutional capital and trend logic are flowing.")
+
+else:
+    st.info("Enter a ticker and ensure data is loaded to begin analysis.")
+
+# Footer
+st.markdown("---")
+st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
+
