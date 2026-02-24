@@ -1523,6 +1523,16 @@ with st.sidebar:
     }
     regime_param = regime_val_map[regime_mode]
 
+    with st.expander("🛠️ Advanced Model Sync", expanded=False):
+        reg_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=0)
+        reg_engine_param = "Markov" if "Markov" in reg_engine else "GMM"
+        reg_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4)
+        reg_opt_goal = st.selectbox("Optimization Goal", ["Robustness (BIC)", "Performance (PnL)"], index=0)
+        reg_switch_vol = st.toggle("Switching Volatility", value=True)
+        reg_switch_trend = st.toggle("Switching Mean", value=True)
+        initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000)
+        trailing_stop = st.slider("Trailing Stop Loss (%)", 0.0, 20.0, 0.0, step=0.5) / 100
+
     st.divider()
     st.header("⚡ Live Decision Mode")
     live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
@@ -1614,7 +1624,16 @@ if df_main is not None:
         st.caption("🔍 Processing Model Signals...")
         prog_bar = st.progress(0)
     
-    analysis = get_master_signal(TICKER, df_main, n_regimes=regime_param, opt_goal=regime_mode.split(': ')[-1])
+    analysis = get_master_signal(TICKER, df_main, 
+                                  n_regimes=regime_param, 
+                                  freq='Daily', 
+                                  opt_goal=reg_opt_goal,
+                                  stability=reg_stability,
+                                  switch_vol=reg_switch_vol,
+                                  switch_trend=reg_switch_trend,
+                                  engine=reg_engine_param,
+                                  initial_cap=initial_cap,
+                                  trailing_stop=trailing_stop)
     if analysis:
         regime_sig = analysis['regime_sig']
         regime_label = analysis['regime_label']
@@ -2814,14 +2833,8 @@ if df_main is not None:
         # Strategy Selector
         strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)"], horizontal=True)
         
-        # Common Backtest Params
-        col_b1, col_b2, col_b3 = st.columns(3)
-        with col_b1:
-            trailing_stop = st.slider("Trailing Stop Loss (%)", 0.0, 20.0, 0.0, step=0.5) / 100
-        with col_b2:
-            initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000)
-        
         # Date Selection
+        col_b3 = st.container()
         with col_b3:
             default_start = datetime.now() - timedelta(days=365)
             bt_start_date = st.date_input("Backtest Start", default_start)
@@ -3371,11 +3384,17 @@ if df_main is not None:
     # ==========================================
     with tab9:
         st.write("### 🧠 Pro Regime Detection (Multi-Factor)")
-        st.caption("Institutional model using Returns, Volatility, and Trend Deviation via Multivariate GMM.")
         
         if not SKLEARN_AVAILABLE:
             st.error("⚠️ `scikit-learn` library is missing. Institutional upgrade requires it.")
+        elif pro_detector is None:
+            st.info("🏛️ **Active Engine**: Markov Switching Model (High Accuracy)")
+            st.write(f"The current analysis is using the **Markov Regression** engine. This model identifies the current state based on transition probabilities and filtered marginals.")
+            st.success(f"Current State: **{regime_label}** ({regime_prob:.1%} confidence)")
+            st.caption(f"Number of States: {regime_data.get('n_states', 'Unknown')}")
+            st.caption("Note: GMM-specific feature plots are disabled for Markov models.")
         else:
+            st.caption("Institutional model using Returns, Volatility, and Trend Deviation via Multivariate GMM.")
             # Use the global pro_detector fitted in the decision engine
             m_col1, m_col2 = st.columns(2)
             with m_col1:
@@ -3401,7 +3420,7 @@ if df_main is not None:
             fig_feat, ax_feat = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
             feat_df['Momentum'].plot(ax=ax_feat[0], title='Feature 1: Momentum (Returns)', color='blue', alpha=0.7)
             feat_df['Vol_Z'].plot(ax=ax_feat[1], title='Feature 2: Volatility (Z-Score)', color='orange', alpha=0.7)
-            feat_df['Trend_Dev'].plot(ax=ax_feat[2], title='Feature 3: Structural Dev (Kalman)', color='green', alpha=0.7)
+            feat_df['Trend_Dev'].plot(ax=ax_feat[2], title='Feature 2: Structural Dev (Kalman)', color='green', alpha=0.7)
             ax_feat[0].axhline(0, color='black', lw=0.5)
             ax_feat[1].axhline(0, color='black', lw=0.5)
             ax_feat[2].axhline(0, color='black', lw=0.5)
@@ -3621,3 +3640,88 @@ if df_main is not None:
             
             st.session_state.scanner_results = None # Reset previous
             scan_prog = st.progress(0)
+            status_text = st.empty()
+            
+            # Start Scan Loop
+            for i, tick in enumerate(tickers_to_scan):
+                status_text.text(f"Scanning Asset {tick} ({i+1}/{len(tickers_to_scan)})...")
+                
+                # Market Cap Check
+                mcap = get_market_cap(tick)
+                if mcap < mcap_map[mcap_filter] and mcap_filter != "All":
+                    status_text.text(f"Skipping {tick} (MCap ${mcap/1e9:.2f}B < Filter)...")
+                    continue
+                
+                # Fetch data & Logic (using the same global filters for consistency)
+                s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
+                
+                if s_df is not None and not s_df.empty:
+                    s_analysis = get_master_signal(tick, s_df, 
+                                                  n_regimes=scan_reg_param, 
+                                                  freq=scan_freq, 
+                                                  opt_goal=scan_opt_goal,
+                                                  stability=scan_stability,
+                                                  switch_vol=scan_switch_vol,
+                                                  switch_trend=scan_switch_trend,
+                                                  engine=scan_engine_param,
+                                                  initial_cap=scan_initial_cap,
+                                                  trailing_stop=scan_trailing_stop)
+                    if s_analysis:
+                        s_score = s_analysis['sentiment_score']
+                        s_price = s_df['Close'].iloc[-1]
+                        s_info = {
+                            'Ticker': tick,
+                            'Price': round(s_price, 2),
+                            'Mkt Cap ($B)': round(mcap / 1e9, 2),
+                            'Regimes (N)': s_analysis['regime_data'].get('n_states', 4),
+                            'Score': s_score,
+                            'Regime': s_analysis['regime_label'],
+                            'Trend': f"{s_analysis['trend_diff']:+.2%}",
+                            'Action': s_analysis['regime_sig']
+                        }
+                        
+                        if s_score >= 1:
+                            long_list.append(s_info)
+                        else:
+                            cash_list.append(s_info)
+                
+                scan_prog.progress((i + 1) / len(tickers_to_scan))
+            
+            # Store in session state for persistence
+            st.session_state.scanner_results = {'long': long_list, 'cash': cash_list, 'universe': universe_type, 'count': len(tickers_to_scan)}
+
+        # Always display results from session state if they exist
+        if 'scanner_results' in st.session_state and st.session_state.scanner_results:
+            res = st.session_state.scanner_results
+            long_list = res['long']
+            cash_list = res['cash']
+            
+            # Display Results
+            res_col1, res_col2 = st.columns(2)
+            
+            with res_col1:
+                st.subheader(f"🚀 LONG / OPEN ({len(long_list)})")
+                if long_list:
+                    ldf = pd.DataFrame(long_list).sort_values(by='Score', ascending=False)
+                    st.dataframe(ldf.style.background_gradient(subset=['Score'], cmap='Greens'), use_container_width=True)
+                else:
+                    st.info("No bullish signals found in current scan window.")
+                    
+            with res_col2:
+                st.subheader(f"🛑 CLOSED / CASH / HEDGE ({len(cash_list)})")
+                if cash_list:
+                    cdf = pd.DataFrame(cash_list).sort_values(by='Score', ascending=True)
+                    st.dataframe(cdf.style.background_gradient(subset=['Score'], cmap='Reds'), use_container_width=True)
+                else:
+                    st.info("No bearish/neutral signals found in current scan window.")
+
+            st.divider()
+            st.success(f"✅ **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
+
+else:
+    st.info("Enter a ticker and ensure data is loaded to begin analysis.")
+
+# Footer
+st.markdown("---")
+st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
+
