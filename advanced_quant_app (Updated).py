@@ -972,17 +972,52 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend):
         return None
 
 
-def get_master_signal(ticker, df, n_regimes=4):
+def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)'):
     """
     Unified Decision Logic for a single asset.
     Returns a dictionary of all quant metrics and the final Master Sentiment Score.
     n_regimes can be an integer (2, 3, 4) or 'Auto' for Best Fit.
     """
     try:
+        # 0. Data Resampling for timeframe sync
+        if freq == 'Weekly':
+            df = df.resample('W').last().dropna()
+            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1)).dropna()
+            df['Returns'] = df['Close'].pct_change().dropna()
+            
+        if len(df) < 15: # Safety check for model convergence
+            return None
+
         # 1. Regime Signal
         p_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
         if n_regimes == 'Auto':
-            p_detector.fit_optimized()
+            if opt_goal == 'Performance (PnL)':
+                # Find best N by historical returns (matching Tab 7 logic)
+                best_n = 4
+                max_perf = -float('inf')
+                for n in [2, 3, 4]:
+                    try:
+                        temp_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
+                        temp_detector.fit(n_states=n)
+                        v, prob, label = temp_detector.get_latest_verdict()
+                        
+                        # Generate simple vector backtest for speed in scanner
+                        # Signal is BULL if "BULL" in label
+                        # We use simple return sum as proxy for performance comparison
+                        # More robust: check filtered states
+                        states = temp_detector.regimes['states']
+                        sigs = np.zeros(len(states))
+                        for sid, slbl in temp_detector.state_labels.items():
+                            if "BULL" in slbl: sigs[states == sid] = 1
+                        
+                        ret_sum = (df['Returns'].values[1:] * sigs[:-1]).sum()
+                        if ret_sum > max_perf:
+                            max_perf = ret_sum
+                            best_n = n
+                    except: continue
+                p_detector.fit(n_states=best_n)
+            else:
+                p_detector.fit_optimized()
         else:
             p_detector.fit(n_states=int(n_regimes))
             
@@ -1509,7 +1544,7 @@ if df_main is not None:
         st.caption("🔍 Processing Model Signals...")
         prog_bar = st.progress(0)
     
-    analysis = get_master_signal(TICKER, df_main, n_regimes=regime_param)
+    analysis = get_master_signal(TICKER, df_main, n_regimes=regime_param, opt_goal=regime_mode.split(': ')[-1])
     if analysis:
         regime_sig = analysis['regime_sig']
         regime_label = analysis['regime_label']
@@ -3456,7 +3491,7 @@ if df_main is not None:
             if scan_depth > 500:
                 st.warning("⚠️ High Depth: Scanning thousands of assets with deep quant models can take 30+ minutes.")
         
-        scan_col1b, scan_col2b = st.columns(2)
+        scan_col1b, scan_col2b, scan_col3b = st.columns(3)
         with scan_col1b:
             scan_regime_mode = st.selectbox("Scanner Regime Mode", 
                                            ["Fixed: 4 States", "Fixed: 2 States", "Fixed: 3 States", "Auto: Best Fit"],
@@ -3464,7 +3499,11 @@ if df_main is not None:
             scan_reg_map = {"Fixed: 4 States": 4, "Fixed: 2 States": 2, "Fixed: 3 States": 3, "Auto: Best Fit": "Auto"}
             scan_reg_param = scan_reg_map[scan_regime_mode]
         with scan_col2b:
-            st.info("💡 'Auto' mode is higher accuracy but ~3x slower.")
+            scan_opt_goal = st.selectbox("Optimization Goal", ["Robustness (BIC)", "Performance (PnL)"], index=0)
+        with scan_col3b:
+            scan_freq = st.selectbox("Scanner Frequency", ["Daily", "Weekly"], index=0)
+            if scan_regime_mode == "Auto: Best Fit":
+                st.info("💡 Auto-Performance mode ensures results match best historical backtest.")
 
         # Custom list area only shows if needed
         custom_input = ""
@@ -3508,7 +3547,7 @@ if df_main is not None:
                 s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
                 
                 if s_df is not None and not s_df.empty:
-                    s_analysis = get_master_signal(tick, s_df, n_regimes=scan_reg_param)
+                    s_analysis = get_master_signal(tick, s_df, n_regimes=scan_reg_param, freq=scan_freq, opt_goal=scan_opt_goal)
                     if s_analysis:
                         s_score = s_analysis['sentiment_score']
                         s_price = s_df['Close'].iloc[-1]
