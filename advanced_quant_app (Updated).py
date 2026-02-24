@@ -999,22 +999,29 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
                     try:
                         temp_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
                         temp_detector.fit(n_states=n)
-                        v, prob, label = temp_detector.get_latest_verdict()
                         
-                        # Generate simple vector backtest for speed in scanner
-                        # Signal is BULL if "BULL" in label
-                        # We use simple return sum as proxy for performance comparison
-                        # More robust: check filtered states
-                        states = temp_detector.regimes['states']
-                        sigs = np.zeros(len(states))
+                        # Use filtered probabilities for a smoother "expected return" PnL proxy
+                        # This matches the "Regime Weighted Expected Return" strategy in Tab 7
+                        p_df = temp_detector.regimes['probs']
+                        r_means = []
                         for sid, slbl in temp_detector.state_labels.items():
-                            if "BULL" in slbl: sigs[states == sid] = 1
+                            mask = (temp_detector.regimes['states'] == sid)
+                            m_ret = df['Returns'].iloc[mask].mean() if any(mask) else 0
+                            r_means.append(m_ret)
                         
-                        ret_sum = (df['Returns'].values[1:] * sigs[:-1]).sum()
+                        # Expected return vector
+                        expected_returns = np.dot(p_df, r_means)
+                        sigs = (expected_returns > 0).astype(int)
+                        
+                        # Compute simple equity curve
+                        walk_returns = df['Returns'].values[1:] * sigs[:-1]
+                        ret_sum = walk_returns.sum()
+                        
                         if ret_sum > max_perf:
                             max_perf = ret_sum
                             best_n = n
-                    except: continue
+                    except Exception as e:
+                        continue
                 p_detector.fit(n_states=best_n)
             else:
                 p_detector.fit_optimized()
@@ -1067,6 +1074,7 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
             'garch_res': res
         }
     except Exception as e:
+        st.error(f"Error in Decision Engine for {ticker}: {e}")
         return None
 
 @st.cache_data(ttl=60) # Cache live data for 1 minute
@@ -3486,8 +3494,8 @@ if df_main is not None:
             }
             
         with scan_col3:
-            scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=10000, value=1000, 
-                                        help="Limits number of tickers to scan for speed. 1000+ assets take significant time.")
+            scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=10000, value=50, 
+                                        help="Limits number of tickers to scan for speed. 50-100 is recommended for 'Auto' mode.")
             if scan_depth > 500:
                 st.warning("⚠️ High Depth: Scanning thousands of assets with deep quant models can take 30+ minutes.")
         
@@ -3504,6 +3512,9 @@ if df_main is not None:
             scan_freq = st.selectbox("Scanner Frequency", ["Daily", "Weekly"], index=0)
             if scan_regime_mode == "Auto: Best Fit":
                 st.info("💡 Auto-Performance mode ensures results match best historical backtest.")
+            
+        if live_mode and scan_freq == "Weekly":
+            st.warning("⚠️ **Invalid Combo**: Weekly frequency on Live Intraday data typically has too few bars (< 15) for the models. Scanner may skip all assets. Switch Frequency to 'Daily' or disable 'Live Mode'.")
 
         # Custom list area only shows if needed
         custom_input = ""
@@ -3531,6 +3542,7 @@ if df_main is not None:
             long_list = []
             cash_list = []
             
+            st.session_state.scanner_results = None # Reset previous
             scan_prog = st.progress(0)
             status_text = st.empty()
             
@@ -3541,6 +3553,7 @@ if df_main is not None:
                 # Market Cap Check
                 mcap = get_market_cap(tick)
                 if mcap < mcap_map[mcap_filter] and mcap_filter != "All":
+                    status_text.text(f"Skipping {tick} (MCap ${mcap/1e9:.2f}B < Filter)...")
                     continue
                 
                 # Fetch data & Logic (using the same global filters for consistency)
@@ -3569,10 +3582,14 @@ if df_main is not None:
                 
                 scan_prog.progress((i + 1) / len(tickers_to_scan))
             
-            status_text.text("Total Market Analysis Complete!")
-            time.sleep(1)
-            status_text.empty()
-            scan_prog.empty()
+            # Store in session state for persistence
+            st.session_state.scanner_results = {'long': long_list, 'cash': cash_list, 'universe': universe_type, 'count': len(tickers_to_scan)}
+
+        # Always display results from session state if they exist
+        if 'scanner_results' in st.session_state and st.session_state.scanner_results:
+            res = st.session_state.scanner_results
+            long_list = res['long']
+            cash_list = res['cash']
             
             # Display Results
             res_col1, res_col2 = st.columns(2)
@@ -3594,7 +3611,7 @@ if df_main is not None:
                     st.info("No bearish/neutral signals found in current scan window.")
 
             st.divider()
-            st.success(f"✅ **Total Market Review Complete**: Analyzed {len(tickers_to_scan)} assets from `{universe_type}` universe.")
+            st.success(f"✅ **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
 
 else:
     st.info("Enter a ticker and ensure data is loaded to begin analysis.")
