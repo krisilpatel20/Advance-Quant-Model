@@ -1655,60 +1655,11 @@ if live_mode:
 else:
     df_main = load_data(TICKER, start_date, end_date, interval='1d')
 
-if df_main is not None:
-    st.subheader(f"Data Analysis: {TICKER}")
+    st.subheader("Asset & Macro Analysis Suite")
     
-    # Initialize Report Generator
-    st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
-    st.session_state.report_gen.add_data("Historical Data", df_main.tail(100))
-    
-    # Layout Tabs
+    # 5. UNIFIED TAB ARCHITECTURE
     # ==========================================
-    # 5. UNIFIED DECISION ENGINE (Global Signals)
-    # ==========================================
-    with st.sidebar:
-        st.divider()
-        st.caption("🔍 Processing Model Signals...")
-        prog_bar = st.progress(0)
-    
-    analysis = get_master_signal(TICKER, df_main, 
-                                  n_regimes=regime_param, 
-                                  freq='Daily', 
-                                  opt_goal=reg_opt_goal,
-                                  stability=reg_stability,
-                                  switch_vol=reg_switch_vol,
-                                  switch_trend=reg_switch_trend,
-                                  engine=reg_engine_param,
-                                  initial_cap=initial_cap,
-                                  trailing_stop=trailing_stop)
-    if analysis:
-        regime_sig = analysis['regime_sig']
-        regime_label = analysis['regime_label']
-        regime_data = analysis['regime_data']
-        regime_prob = analysis['regime_prob']
-        pro_detector = analysis['pro_detector']
-        trend_diff = analysis['trend_diff']
-        vol_state = analysis['vol_state']
-        curr_vol = analysis['curr_vol']
-        jump_detected = analysis['jump_detected']
-        sentiment_score = analysis['sentiment_score']
-        # For Tab 1 diagnostics
-        res_sum = analysis['garch_res']
-        prog_bar.progress(100)
-    else:
-        st.sidebar.error("Decision Engine Error: Statistical convergence failed.")
-        regime_sig, regime_data = "N/A", {'label': 'Error', 'confidence': 0.0}
-        regime_label = "N/A"
-        trend_diff = 0.0
-        vol_state = "UNKNOWN"
-        curr_vol = 0.0
-        jump_detected = False
-        sentiment_score = 0
-        res_sum = None
-    
-    prog_bar.empty()
-
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
+    tabs = st.tabs([
         "💡 Decision Summary",
         "Volatility (GARCH)", 
         "Regime Switching", 
@@ -1723,12 +1674,71 @@ if df_main is not None:
         "📡 Multi-Asset Scan",
         "🏦 FED Balance Sheet"
     ])
+    
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = tabs
+
+    if df_main is not None:
+        # Initialize Report Generator
+        st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
+        st.session_state.report_gen.add_data("Historical Data", df_main.tail(100))
+        
+        # 6. UNIFIED DECISION ENGINE (Global Signals)
+        # ==========================================
+        with st.sidebar:
+            st.divider()
+            st.caption("🔍 Processing Model Signals...")
+            prog_bar = st.progress(0)
+        
+        analysis = get_master_signal(TICKER, df_main, 
+                                      n_regimes=regime_param, 
+                                      freq='Daily', 
+                                      opt_goal=reg_opt_goal,
+                                      stability=reg_stability,
+                                      switch_vol=reg_switch_vol,
+                                      switch_trend=reg_switch_trend,
+                                      engine=reg_engine_param,
+                                      initial_cap=initial_cap,
+                                      trailing_stop=trailing_stop)
+        if analysis:
+            regime_sig = analysis['regime_sig']
+            regime_label = analysis['regime_label']
+            regime_data = analysis['regime_data']
+            regime_prob = analysis['regime_prob']
+            pro_detector = analysis['pro_detector']
+            trend_diff = analysis['trend_diff']
+            vol_state = analysis['vol_state']
+            curr_vol = analysis['curr_vol']
+            jump_detected = analysis['jump_detected']
+            sentiment_score = analysis['sentiment_score']
+            # For Tab 1 diagnostics
+            res_sum = analysis['garch_res']
+            prog_bar.progress(100)
+            prog_bar.empty()
+        else:
+            st.sidebar.error("Decision Engine Error: Statistical convergence failed.")
+            regime_sig, regime_data = "N/A", {'label': 'Error', 'confidence': 0.0}
+            regime_label = "N/A"
+            trend_diff = 0.0
+            vol_state = "UNKNOWN"
+            curr_vol = 0.0
+            jump_detected = False
+            sentiment_score = 0
+            res_sum = None
+            prog_bar.empty()
+    else:
+        # No ticker loaded state
+        regime_sig, regime_label, sentiment_score = "N/A", "N/A", 0
+        regime_data = {'label': 'N/A', 'confidence': 0.0}
 
     # ==========================================
     # TAB 0: DECISION SUMMARY
     # ==========================================
     with tab0:
-        st.write("### 🧠 Executive Decision Dashboard")
+        if df_main is None:
+            st.info("💡 **Welcome to the Quant Suite**. Currently, no ticker is loaded. Enter a ticker in the sidebar and enable 'Load Data' to begin technical and statistical analysis.")
+            st.write("Meanwhile, you can explore the **🏦 FED Balance Sheet** tab for macroeconomic context.")
+        else:
+            st.write("### 🧠 Executive Decision Dashboard")
         st.markdown(f"**Unified Quant Signal for {TICKER}** | Interval: `{data_interval}` | Mode: {'Live' if live_mode else 'Historical'}")
         
         # 2. DASHBOARD DISPLAY
@@ -1792,7 +1802,10 @@ if df_main is not None:
     # TAB 1: VOLATILITY (GARCH/Risk)
     # ==========================================
     with tab1:
-        st.write("### 📉 Advanced Volatility Analysis")
+        if df_main is None:
+            st.warning("Please load a ticker to view Volatility models.")
+        else:
+            st.write("### 📉 Advanced Volatility Analysis")
         # --- MODEL VERDICT BANNER ---
         if res_sum is not None:
             latest_vol = res_sum.conditional_volatility.iloc[-1]
@@ -2037,7 +2050,10 @@ if df_main is not None:
     # TAB 2: REGIME SWITCHING
     # ==========================================
     with tab2:
-        st.write("### Markov Regime Switching Model")
+        if df_main is None:
+            st.warning("Please load a ticker to view Regime Switching models.")
+        else:
+            st.write("### Markov Regime Switching Model")
         # --- MODEL VERDICT BANNER ---
         if "LONG" in regime_sig: st.success(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}** in {regime_data['label']}. High conviction for bullish exposure.")
         elif "SHORT" in regime_sig: st.error(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}**. Market risk is elevated.")
@@ -2374,7 +2390,10 @@ if df_main is not None:
     # TAB 3: STOCHASTIC MODELS (Heston/Jump)
     # ==========================================
     with tab3:
-        st.write("### Advanced Stochastic Simulations")
+        if df_main is None:
+            st.warning("Please load a ticker to view Stochastic/Jump models.")
+        else:
+            st.write("### Advanced Stochastic Simulations")
         
         col_conf1, col_conf2 = st.columns(2)
         with col_conf1:
@@ -2652,7 +2671,10 @@ if df_main is not None:
     # TAB 4: KALMAN FILTER
     # ==========================================
     with tab4:
-        st.write("### Kalman Filter Analysis")
+        if df_main is None:
+            st.warning("Please load a ticker to view Kalman Filter dynamics.")
+        else:
+            st.write("### Kalman Filter Analysis")
         # --- MODEL VERDICT BANNER ---
         if trend_diff > 0.03: st.success(f"🎯 **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend. Structural uptrend intact.")
         elif trend_diff < -0.03: st.error(f"🎯 **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend. Structural breakdown in progress.")
@@ -2786,7 +2808,10 @@ if df_main is not None:
     # TAB 5: MACRO FACTORS
     # ==========================================
     with tab5:
-        st.write("### Macro Factor Sensitivity")
+        if df_main is None:
+            st.warning("Please load a ticker to view Factor analysis.")
+        else:
+            st.write("### Macro Factor Sensitivity")
         st.markdown("Correlation of returns against key structural drivers.")
         
         macro_tickers = {
@@ -2850,7 +2875,10 @@ if df_main is not None:
     # TAB 6: STRUCTURAL
     # ==========================================
     with tab6:
-        st.write("### Structural Decomposition")
+        if df_main is None:
+            st.warning("Please load a ticker to view Structural Decomposition.")
+        else:
+            st.write("### Structural Decomposition")
         # Need freq for decomposition. 
         # Business days ~ 5 (weekly), 21 (monthly), 252 (yearly)
         period = st.selectbox("Seasonality Period", [5, 21, 63, 252], index=1)
@@ -2876,7 +2904,10 @@ if df_main is not None:
     # TAB 7: BACKTEST
     # ==========================================
     with tab7:
-        st.write("### 🛠️ Strategy Backtest")
+        if df_main is None:
+            st.warning("Please load a ticker to run Backtests.")
+        else:
+            st.write("### 🛠️ Strategy Backtest")
         
         # Strategy Selector
         strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)"], horizontal=True)
@@ -3342,7 +3373,10 @@ if df_main is not None:
 
 
     with tab8:
-        st.write("### 🌩️ Volatility Clustering & Jump Analysis")
+        if df_main is None:
+            st.warning("Please load a ticker to view Volatility Clustering.")
+        else:
+            st.write("### 🌩️ Volatility Clustering & Jump Analysis")
         
         # --- CALCULATION FOR VERDICT ---
         returns_arr = df_main['Returns'].values
@@ -3431,7 +3465,10 @@ if df_main is not None:
     # TAB 9: INSTITUTIONAL REGIME DETECTION
     # ==========================================
     with tab9:
-        st.write("### 🧠 Pro Regime Detection (Multi-Factor)")
+        if df_main is None:
+            st.warning("Please load a ticker to view Advanced Regime diagnostics.")
+        else:
+            st.write("### 🧠 Pro Regime Detection (Multi-Factor)")
         
         if not SKLEARN_AVAILABLE:
             st.error("⚠️ `scikit-learn` library is missing. Institutional upgrade requires it.")
@@ -3482,7 +3519,10 @@ if df_main is not None:
     # TAB 10: SML & ALPHA (CAPM)
     # ==========================================
     with tab10:
-        st.write("### 📐 Securities Market Line (SML) & Alpha Analysis")
+        if df_main is None:
+            st.warning("Please load a ticker to view SML/Alpha analysis.")
+        else:
+            st.write("### 📐 Securities Market Line (SML) & Alpha Analysis")
         st.caption("Institutional Factor Analysis: Rolling Beta, Jensen's Alpha, and Mispricing Spreads (Robust OLS).")
 
         # Configuration
@@ -3788,44 +3828,44 @@ if df_main is not None:
             st.divider()
             st.success(f"✅ **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
 
-    # ==========================================
-    # TAB 12: FED BALANCE SHEET
-    # ==========================================
     with tab12:
         st.write("### 🏦 Federal Reserve Balance Sheet (Assets & Liabilities)")
         st.caption("Macroeconomic dashboard tracking FED liquidity and monetary policy shifts via FRED.")
         
         fed_date_col1, fed_date_col2 = st.columns(2)
         with fed_date_col1:
-            fed_start = st.date_input("FED History Start", datetime(2010, 1, 1))
+            fed_start_date = st.date_input("FED History Start", datetime(2010, 1, 1))
         
         @st.fragment
         def render_fed_dashboard():
-            # 1. Load Assets
-            asset_dfs = {}
-            for sid, name in FED_ASSETS.items():
-                df = load_fred_data(sid)
-                if df is not None:
-                    asset_dfs[name] = df[sid]
-            
-            # 2. Load Liabilities
-            liab_dfs = {}
-            for sid, name in FED_LIABILITIES.items():
-                df = load_fred_data(sid)
-                if df is not None:
-                    # Liabilities are usually plotted as negative in OpenBB, 
-                    # but here we'll use a stacked area above zero for clarity, 
-                    # or mirror it as requested.
-                    liab_dfs[name] = df[sid]
+            with st.status("Fetching FRED Macro Data...", expanded=True) as status:
+                # 1. Load Assets
+                asset_dfs = {}
+                for sid, name in FED_ASSETS.items():
+                    status.update(label=f"Loading Asset: {name}...")
+                    df = load_fred_data(sid)
+                    if df is not None:
+                        asset_dfs[name] = df[sid]
+                
+                # 2. Load Liabilities
+                liab_dfs = {}
+                for sid, name in FED_LIABILITIES.items():
+                    status.update(label=f"Loading Liability: {name}...")
+                    df = load_fred_data(sid)
+                    if df is not None:
+                        liab_dfs[name] = df[sid]
+                
+                status.update(label="All Macro data synchronized!", state="complete", expanded=False)
             
             if asset_dfs:
-                assets_master = pd.DataFrame(asset_dfs).fillna(method='ffill').dropna()
-                assets_master = assets_master[assets_master.index >= pd.Timestamp(fed_start)]
+                # Use fillna(0) to handle different start dates or frequencies
+                assets_master = pd.DataFrame(asset_dfs).fillna(0)
+                assets_master = assets_master[assets_master.index >= pd.Timestamp(fed_start_date)]
                 
                 # Total Assets Plot
                 st.subheader("Federal Reserve Assets (Stacked)")
                 fig_assets, ax_assets = plt.subplots(figsize=(12, 6))
-                # Plot in Millions
+                # Plot in Billions (original data is in Millions)
                 (assets_master / 1e3).plot.area(ax=ax_assets, alpha=0.7, stacked=True, cmap='tab20')
                 ax_assets.set_ylabel("Amount (Billions $)")
                 ax_assets.set_title("FED Assets: Detailed Breakdown")
@@ -3836,7 +3876,7 @@ if df_main is not None:
                 st.subheader("Weekly Change in Total Assets (WALCL)")
                 walcl = load_fred_data("WALCL")
                 if walcl is not None:
-                    walcl = walcl[walcl.index >= pd.Timestamp(fed_start)]
+                    walcl = walcl[walcl.index >= pd.Timestamp(fed_start_date)]
                     # Weekly change in Billions
                     walcl_diff = walcl.diff().dropna() / 1e3
                     fig_diff, ax_diff = plt.subplots(figsize=(12, 4))
@@ -3848,8 +3888,8 @@ if df_main is not None:
                     st.pyplot(fig_diff)
             
             if liab_dfs:
-                liabs_master = pd.DataFrame(liab_dfs).fillna(method='ffill').dropna()
-                liabs_master = liabs_master[liabs_master.index >= pd.Timestamp(fed_start)]
+                liabs_master = pd.DataFrame(liab_dfs).fillna(0)
+                liabs_master = liabs_master[liabs_master.index >= pd.Timestamp(fed_start_date)]
                 
                 st.subheader("Federal Reserve Liabilities (Stacked)")
                 fig_liabs, ax_liabs = plt.subplots(figsize=(12, 6))
