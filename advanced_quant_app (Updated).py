@@ -1184,6 +1184,48 @@ def load_data(ticker, start, end, interval='1d'):
         st.error(f"Error loading data for {ticker}: {e}")
         return None
 
+@st.cache_data(ttl=3600) # Macro data changes weekly, cache for 1 hour
+def load_fred_data(series_id):
+    """
+    Robust FRED data loader using direct CSV fetching.
+    No API key required.
+    """
+    try:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df.set_index('DATE', inplace=True)
+        # Handle '.' as NaN frequently found in FRED weekly data
+        df[series_id] = pd.to_numeric(df[series_id], errors='coerce')
+        return df
+    except Exception as e:
+        print(f"Error loading FRED {series_id}: {e}")
+        return None
+
+# FED Balance Sheet Series Definitions
+FED_ASSETS = {
+    "WGCAL": "Gold Certificate Account",
+    "SDRACL": "Special Drawing Rights Certificate Account",
+    "WCOINL": "Coin",
+    "WSHONBLL": "Treasury Bills",
+    "WSHONBNL": "Treasury Notes and Bonds",
+    "WSHONBIIL": "Treasury Tips",
+    "WSHOMCB": "Mortgage-Backed Securities",
+    "WUDSHO": "Unamortized Premiums on Securities",
+    "WLCFOCEL": "Other Credit Extensions",
+    "WOTHAL": "Other Assets"
+}
+
+FED_LIABILITIES = {
+    "WCURCIR": "Currency in Circulation",
+    "WDTPGCAS": "Treasury General Account (TGA)",
+    "RRPONTSYD": "Overnight Reverse Repo (RRP)",
+    "WLRRAL": "Reverse Repurchase Agreements (Total)",
+    "WLFN": "Federal Reserve Notes",
+    "WDFOL": "Foreign Official Deposits",
+    "WDLTCL": "Term Deposits held by Depository Institutions"
+}
+
 
 def robust_fetch_csv(url, sep="|", timeout=10):
     """Reliably fetches CSV data with custom headers and timeout."""
@@ -1666,7 +1708,7 @@ if df_main is not None:
     
     prog_bar.empty()
 
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
         "💡 Decision Summary",
         "Volatility (GARCH)", 
         "Regime Switching", 
@@ -1678,7 +1720,8 @@ if df_main is not None:
         "Volatility Clustering",
         "Advanced Regime",
         "SML & Alpha",
-        "📡 Multi-Asset Scan"
+        "📡 Multi-Asset Scan",
+        "🏦 FED Balance Sheet"
     ])
 
     # ==========================================
@@ -3714,6 +3757,9 @@ if df_main is not None:
             # Store in session state for persistence
             st.session_state.scanner_results = {'long': long_list, 'cash': cash_list, 'universe': universe_type, 'count': len(tickers_to_scan)}
 
+            # Store in session state for persistence
+            st.session_state.scanner_results = {'long': long_list, 'cash': cash_list, 'universe': universe_type, 'count': len(tickers_to_scan)}
+
         # Always display results from session state if they exist
         if 'scanner_results' in st.session_state and st.session_state.scanner_results:
             res = st.session_state.scanner_results
@@ -3741,6 +3787,79 @@ if df_main is not None:
 
             st.divider()
             st.success(f"✅ **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
+
+    # ==========================================
+    # TAB 12: FED BALANCE SHEET
+    # ==========================================
+    with tab12:
+        st.write("### 🏦 Federal Reserve Balance Sheet (Assets & Liabilities)")
+        st.caption("Macroeconomic dashboard tracking FED liquidity and monetary policy shifts via FRED.")
+        
+        fed_date_col1, fed_date_col2 = st.columns(2)
+        with fed_date_col1:
+            fed_start = st.date_input("FED History Start", datetime(2010, 1, 1))
+        
+        @st.fragment
+        def render_fed_dashboard():
+            # 1. Load Assets
+            asset_dfs = {}
+            for sid, name in FED_ASSETS.items():
+                df = load_fred_data(sid)
+                if df is not None:
+                    asset_dfs[name] = df[sid]
+            
+            # 2. Load Liabilities
+            liab_dfs = {}
+            for sid, name in FED_LIABILITIES.items():
+                df = load_fred_data(sid)
+                if df is not None:
+                    # Liabilities are usually plotted as negative in OpenBB, 
+                    # but here we'll use a stacked area above zero for clarity, 
+                    # or mirror it as requested.
+                    liab_dfs[name] = df[sid]
+            
+            if asset_dfs:
+                assets_master = pd.DataFrame(asset_dfs).fillna(method='ffill').dropna()
+                assets_master = assets_master[assets_master.index >= pd.Timestamp(fed_start)]
+                
+                # Total Assets Plot
+                st.subheader("Federal Reserve Assets (Stacked)")
+                fig_assets, ax_assets = plt.subplots(figsize=(12, 6))
+                # Plot in Millions
+                (assets_master / 1e3).plot.area(ax=ax_assets, alpha=0.7, stacked=True, cmap='tab20')
+                ax_assets.set_ylabel("Amount (Billions $)")
+                ax_assets.set_title("FED Assets: Detailed Breakdown")
+                ax_assets.legend(loc='upper left', fontsize='x-small', ncol=2)
+                st.pyplot(fig_assets)
+                
+                # Total Balance Sheet Weekly Changes
+                st.subheader("Weekly Change in Total Assets (WALCL)")
+                walcl = load_fred_data("WALCL")
+                if walcl is not None:
+                    walcl = walcl[walcl.index >= pd.Timestamp(fed_start)]
+                    # Weekly change in Billions
+                    walcl_diff = walcl.diff().dropna() / 1e3
+                    fig_diff, ax_diff = plt.subplots(figsize=(12, 4))
+                    # Color bars based on pos/neg
+                    colors = ['green' if x >= 0 else 'red' for x in walcl_diff['WALCL']]
+                    ax_diff.bar(walcl_diff.index, walcl_diff['WALCL'], color=colors, width=7, alpha=0.6)
+                    ax_diff.set_ylabel("Change (Billions $)")
+                    ax_diff.set_title("FED Balance Sheet: Weekly Expansion/Contraction")
+                    st.pyplot(fig_diff)
+            
+            if liab_dfs:
+                liabs_master = pd.DataFrame(liab_dfs).fillna(method='ffill').dropna()
+                liabs_master = liabs_master[liabs_master.index >= pd.Timestamp(fed_start)]
+                
+                st.subheader("Federal Reserve Liabilities (Stacked)")
+                fig_liabs, ax_liabs = plt.subplots(figsize=(12, 6))
+                (liabs_master / 1e3).plot.area(ax=ax_liabs, alpha=0.7, stacked=True, cmap='Set3')
+                ax_liabs.set_ylabel("Amount (Billions $)")
+                ax_liabs.set_title("FED Liabilities & Capital Accounts")
+                ax_liabs.legend(loc='upper left', fontsize='x-small', ncol=2)
+                st.pyplot(fig_liabs)
+        
+        render_fed_dashboard()
 
 else:
     st.info("Enter a ticker and ensure data is loaded to begin analysis.")
