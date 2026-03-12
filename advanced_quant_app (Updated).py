@@ -756,6 +756,165 @@ class SMLAnalyzer:
         
         return df.dropna()
 
+class MADTrendModes:
+    """
+    Translates the 'MAD Trend Modes' logic from Pine Script.
+    Includes Mean Absolute Deviation (MAD), "For Loop" system, and various MAs.
+    """
+    @staticmethod
+    def sma(series, length):
+        return series.rolling(window=length).mean()
+
+    @staticmethod
+    def ema(series, length):
+        return series.ewm(span=length, adjust=False).mean()
+
+    @staticmethod
+    def wma(series, length):
+        weights = np.arange(1, length + 1)
+        return series.rolling(window=length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+    @staticmethod
+    def hma(series, length):
+        half_length = int(length / 2)
+        sqrt_length = int(np.sqrt(length))
+        wma_half = MADTrendModes.wma(series, half_length)
+        wma_full = MADTrendModes.wma(series, length)
+        combined = 2 * wma_half - wma_full
+        return MADTrendModes.wma(combined.dropna(), sqrt_length).reindex_like(series)
+
+    @staticmethod
+    def ma_switch(series, length, avg_type):
+        if avg_type == "SMA": return MADTrendModes.sma(series, length)
+        if avg_type == "EMA": return MADTrendModes.ema(series, length)
+        if avg_type == "WMA": return MADTrendModes.wma(series, length)
+        if avg_type == "HMA": return MADTrendModes.hma(series, length)
+        # Fallback to SMA if type not implemented
+        return MADTrendModes.sma(series, length)
+
+    @staticmethod
+    def calculate_mad(series, benchmark, length):
+        """
+        MAD = sum(|src[t-i] - benchmark[t]|) / length
+        """
+        vals = series.values
+        bench_vals = benchmark.values
+        res = np.full(len(series), np.nan)
+        for i in range(length - 1, len(series)):
+            window = vals[i-length+1 : i+1]
+            res[i] = np.mean(np.abs(window - bench_vals[i]))
+        return pd.Series(res, index=series.index)
+
+    @staticmethod
+    def system_score(series, a, b):
+        """
+        system = sum(sign(src[t] - src[t-i])) for i in a..b
+        """
+        vals = series.values
+        res = np.zeros(len(series))
+        for t in range(b, len(series)):
+            total = 0
+            for i in range(a, b + 1):
+                if t - i >= 0:
+                    total += 1 if vals[t] > vals[t - i] else -1
+            res[t] = total
+        return pd.Series(res, index=series.index)
+
+    @staticmethod
+    def get_signals(df, params):
+        """
+        Generates strategy signals based on parameters.
+        """
+        src = df['Close']
+        mode = params.get('signal_mode', 'Bollinger Bands')
+        
+        # BB Params
+        bb_ma_type = params.get('bb_ma_type', 'EMA')
+        bb_len = params.get('bb_len', 25)
+        bb_mult_p = params.get('bb_mult_p', 1.4)
+        bb_mult_n = params.get('bb_mult_n', 1.0)
+        
+        # for loop params
+        fl_ma_type = params.get('fl_ma_type', 'ALMA') # Fallback to SMA if not impl
+        fl_len = params.get('fl_len', 10)
+        fl_a = params.get('fl_a', 10)
+        fl_b = params.get('fl_b', 60)
+        fl_thresh_l = params.get('fl_thresh_l', 23)
+        fl_thresh_s = params.get('fl_thresh_s', 3)
+        
+        # combined params
+        c_thresh_l = params.get('c_thresh_l', 0.0)
+        c_thresh_s = params.get('c_thresh_s', 0.0)
+
+        # 1. BB Calculations
+        avg_bb = MADTrendModes.ma_switch(src, bb_len, bb_ma_type)
+        mad_bb = MADTrendModes.calculate_mad(src, avg_bb, bb_len)
+        bb_up = avg_bb + (mad_bb * bb_mult_p)
+        bb_dn = avg_bb - (mad_bb * bb_mult_n)
+        
+        # 2. FL Calculations
+        avg_fl = MADTrendModes.ma_switch(src, fl_len, fl_ma_type)
+        mad_fl_val = MADTrendModes.calculate_mad(src, avg_fl, fl_len)
+        
+        # Weighted source for system
+        # mad_w_src = ma_switch(source*mad2, mad_length_fl, ma_benchmark_type_fl) / ma_switch(mad2, mad_length_fl, ma_benchmark_type_fl)
+        num = MADTrendModes.ma_switch(src * mad_fl_val, fl_len, fl_ma_type)
+        den = MADTrendModes.ma_switch(mad_fl_val, fl_len, fl_ma_type)
+        mad_w_src = num / den
+        
+        sys_score = MADTrendModes.system_score(mad_w_src, fl_a, fl_b)
+        
+        # Signal variables
+        bb_score = pd.Series(0, index=src.index)
+        fl_score = pd.Series(0, index=src.index)
+        
+        # Crossovers
+        # Pine ta.crossover(source, bb_up)
+        bb_long = (src > bb_up) & (src.shift(1) <= bb_up.shift(1))
+        bb_short = (src < bb_dn) & (src.shift(1) >= bb_dn.shift(1))
+        
+        # We need to maintain state like the Pine code's var int score = 0
+        # However, for backtest we can just generate entry/exit signals.
+        # The Pine code set score := 1 on crossover and score := -1 on crossunder.
+        # This is a stateful signal (Hold Long until Short signal).
+        
+        curr_bb_score = 0
+        for i in range(len(src)):
+            if bb_long.iloc[i]: curr_bb_score = 1
+            elif bb_short.iloc[i]: curr_bb_score = -1
+            bb_score.iloc[i] = curr_bb_score
+            
+        fl_long = (sys_score > fl_thresh_l) & (sys_score.shift(1) <= fl_thresh_l)
+        fl_short = (sys_score < fl_thresh_s) & (sys_score.shift(1) >= fl_thresh_s)
+        
+        curr_fl_score = 0
+        for i in range(len(src)):
+            if fl_long.iloc[i]: curr_fl_score = 1
+            elif fl_short.iloc[i]: curr_fl_score = -1
+            fl_score.iloc[i] = curr_fl_score
+            
+        # 3. Combined Signal
+        c_signal = (bb_score + fl_score) / 2
+        c_long = (c_signal > c_thresh_l) & (c_signal.shift(1) <= c_thresh_l)
+        c_short = (c_signal < c_thresh_s) & (c_signal.shift(1) >= c_thresh_s)
+        
+        combined_score = pd.Series(0, index=src.index)
+        curr_c_score = 0
+        for i in range(len(src)):
+            if c_long.iloc[i]: curr_c_score = 1
+            elif c_short.iloc[i]: curr_c_score = -1
+            combined_score.iloc[i] = curr_c_score
+            
+        # Final Selection
+        if mode == "Bollinger Bands":
+            final_score = bb_score
+        elif mode == "For Loop":
+            final_score = fl_score
+        else: # Combined
+            final_score = combined_score
+            
+        return (final_score == 1).astype(int)
+
 class BacktestEngine:
     """
     Handles simple vectorised backtesting for regime-based strategies.
@@ -2910,7 +3069,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -3312,6 +3471,74 @@ with tab7:
                 ax_ctx.set_title("Momentum Hedge Signal (EMA/SMA Cross)")
                 ax_ctx.legend()
                 st.pyplot(fig_ctx)
+
+    elif strategy_type == "MAD Trend Modes":
+        st.markdown("### 📊 MAD Trend Modes Settings")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            sig_mode = st.selectbox("Signal Mode", ["Bollinger Bands", "For Loop", "Combined Signal"])
+            ma_type = st.selectbox("MA Type", ["EMA", "SMA", "WMA", "HMA"])
+        with col_m2:
+            mad_len = st.number_input("MAD Length", 5, 100, 25)
+            
+        mad_params = {'signal_mode': sig_mode, 'bb_ma_type': ma_type, 'bb_len': mad_len}
+        
+        if sig_mode == "Bollinger Bands":
+            col_bb1, col_bb2 = st.columns(2)
+            with col_bb1:
+                mult_p = st.number_input("+ Multiplier", 0.1, 5.0, 1.4)
+            with col_bb2:
+                mult_n = st.number_input("- Multiplier", 0.1, 5.0, 1.0)
+            mad_params.update({'bb_mult_p': mult_p, 'bb_mult_n': mult_n})
+            
+        elif sig_mode == "For Loop":
+            col_fl1, col_fl2, col_fl3 = st.columns(3)
+            with col_fl1:
+                fl_a = st.number_input("From", 1, 100, 10)
+            with col_fl2:
+                fl_b = st.number_input("To", 1, 200, 60)
+            with col_fl3:
+                fl_len = st.number_input("Loop MA Length", 1, 50, 10)
+            col_fl4, col_fl5 = st.columns(2)
+            with col_fl4:
+                thresh_l = st.number_input("Threshold Long", 1, 100, 23)
+            with col_fl5:
+                thresh_s = st.number_input("Threshold Short", -100, 100, 3)
+            mad_params.update({
+                'fl_ma_type': ma_type,
+                'fl_len': fl_len,
+                'fl_a': fl_a,
+                'fl_b': fl_b,
+                'fl_thresh_l': thresh_l,
+                'fl_thresh_s': thresh_s
+            })
+        else: # Combined Signal
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                c_thresh_l = st.number_input("Threshold Long (Combined)", -1.0, 1.0, 0.0, step=0.01)
+            with col_c2:
+                c_thresh_s = st.number_input("Threshold Short (Combined)", -1.0, 1.0, 0.0, step=0.01)
+            mad_params.update({
+                'c_thresh_l': c_thresh_l,
+                'c_thresh_s': c_thresh_s
+            })
+
+        if st.button("🚀 Run MAD Backtest", use_container_width=True):
+            with st.spinner("Generating MAD Trend signals..."):
+                signals = MADTrendModes.get_signals(df_bt, mad_params)
+                
+                # Plot Context
+                with st.expander("See Strategy Context", expanded=True):
+                    fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                    ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
+                    # Highlight Long Zones (Green)
+                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
+                                        where=(signals==1), color='green', alpha=0.1, label='Long Zone')
+                    
+                    format_plot_dates(ax_ctx, prices_bt.index)
+                    ax_ctx.set_title(f"MAD Trend Modes Signal ({sig_mode})")
+                    ax_ctx.legend()
+                    st.pyplot(fig_ctx)
 
     # Run Backtest Engine if signals exist
     if signals is not None:
