@@ -1888,6 +1888,11 @@ else:
     # No ticker loaded state
     regime_sig, regime_label, sentiment_score = "N/A", "N/A", 0
     regime_data = {'label': 'N/A', 'confidence': 0.0}
+    trend_diff = 0.0
+    vol_state = "UNKNOWN"
+    curr_vol = 0.0
+    jump_detected = False
+    res_sum = None
 
 # ==========================================
 # TAB 0: DECISION SUMMARY
