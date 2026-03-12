@@ -795,30 +795,42 @@ class MADTrendModes:
     @staticmethod
     def calculate_mad(series, benchmark, length):
         """
-        MAD = sum(|src[t-i] - benchmark[t]|) / length
+        Vectorized MAD: sum(|src[t-i] - benchmark[t]|) / length
         """
+        # Using numpy stride tricks for ultra-fast windowing
+        from numpy.lib.stride_tricks import sliding_window_view
+        
         vals = series.values
         bench_vals = benchmark.values
+        
+        # Create sliding windows of size 'length'
+        if len(vals) < length:
+            return pd.Series(np.nan, index=series.index)
+            
+        windows = sliding_window_view(vals, length)
+        # windows[i] is the window ending at index i + length - 1
+        
+        # We need to subtract bench_vals[i + length - 1] from each element in windows[i]
+        # broad casting: windows shape (N-L+1, L), bench_vals[L-1:] shape (N-L+1,)
+        diffs = np.abs(windows - bench_vals[length-1:, np.newaxis])
+        res_vals = np.mean(diffs, axis=1)
+        
+        # Pad with NaNs for the beginning
         res = np.full(len(series), np.nan)
-        for i in range(length - 1, len(series)):
-            window = vals[i-length+1 : i+1]
-            res[i] = np.mean(np.abs(window - bench_vals[i]))
+        res[length-1:] = res_vals
         return pd.Series(res, index=series.index)
 
     @staticmethod
     def system_score(series, a, b):
         """
-        system = sum(sign(src[t] - src[t-i])) for i in a..b
+        Vectorized system: sum(sign(src[t] - src[t-i])) for i in a..b
         """
-        vals = series.values
-        res = np.zeros(len(series))
-        for t in range(b, len(series)):
-            total = 0
-            for i in range(a, b + 1):
-                if t - i >= 0:
-                    total += 1 if vals[t] > vals[t - i] else -1
-            res[t] = total
-        return pd.Series(res, index=series.index)
+        total = pd.Series(0.0, index=series.index)
+        for i in range(a, b + 1):
+            shifted = series.shift(i)
+            # Use np.sign logic: (series > shifted) - (series < shifted)
+            total += np.sign(series - shifted).fillna(0)
+        return total
 
     @staticmethod
     def get_signals(df, params):
@@ -864,46 +876,27 @@ class MADTrendModes:
         
         sys_score = MADTrendModes.system_score(mad_w_src, fl_a, fl_b)
         
-        # Signal variables
-        bb_score = pd.Series(0, index=src.index)
-        fl_score = pd.Series(0, index=src.index)
-        
         # Crossovers
-        # Pine ta.crossover(source, bb_up)
         bb_long = (src > bb_up) & (src.shift(1) <= bb_up.shift(1))
         bb_short = (src < bb_dn) & (src.shift(1) >= bb_dn.shift(1))
+
+        # Stateful Signal logic
+        def get_stateful_signal(long_cond, short_cond, index):
+            sig = pd.Series(np.nan, index=index)
+            sig.loc[long_cond] = 1
+            sig.loc[short_cond] = -1
+            return sig.ffill().fillna(0)
+
+        bb_score = get_stateful_signal(bb_long, bb_short, src.index)
         
-        # We need to maintain state like the Pine code's var int score = 0
-        # However, for backtest we can just generate entry/exit signals.
-        # The Pine code set score := 1 on crossover and score := -1 on crossunder.
-        # This is a stateful signal (Hold Long until Short signal).
-        
-        curr_bb_score = 0
-        for i in range(len(src)):
-            if bb_long.iloc[i]: curr_bb_score = 1
-            elif bb_short.iloc[i]: curr_bb_score = -1
-            bb_score.iloc[i] = curr_bb_score
-            
         fl_long = (sys_score > fl_thresh_l) & (sys_score.shift(1) <= fl_thresh_l)
         fl_short = (sys_score < fl_thresh_s) & (sys_score.shift(1) >= fl_thresh_s)
+        fl_score = get_stateful_signal(fl_long, fl_short, src.index)
         
-        curr_fl_score = 0
-        for i in range(len(src)):
-            if fl_long.iloc[i]: curr_fl_score = 1
-            elif fl_short.iloc[i]: curr_fl_score = -1
-            fl_score.iloc[i] = curr_fl_score
-            
-        # 3. Combined Signal
         c_signal = (bb_score + fl_score) / 2
         c_long = (c_signal > c_thresh_l) & (c_signal.shift(1) <= c_thresh_l)
         c_short = (c_signal < c_thresh_s) & (c_signal.shift(1) >= c_thresh_s)
-        
-        combined_score = pd.Series(0, index=src.index)
-        curr_c_score = 0
-        for i in range(len(src)):
-            if c_long.iloc[i]: curr_c_score = 1
-            elif c_short.iloc[i]: curr_c_score = -1
-            combined_score.iloc[i] = curr_c_score
+        combined_score = get_stateful_signal(c_long, c_short, src.index)
             
         # Final Selection
         if mode == "Bollinger Bands":
@@ -1077,8 +1070,8 @@ class BacktestEngine:
             'CAGR': cagr
         }
 
-@st.cache_resource
-def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_reps=50):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_reps=20):
     """
     Cached helper to fit Markov Regression.
     Returns the fitted result object.
@@ -1132,6 +1125,7 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_rep
         return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)', stability=0, switch_vol=True, switch_trend=True, engine='Markov', initial_cap=10000.0, trailing_stop=0.0):
     """
     Unified Decision Logic for a single asset.
@@ -1169,8 +1163,8 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
                 
                 for n in [2, 3, 4]:
                     try:
-                        # Use fewer search reps for the selection phase to save time
-                        r = fit_regime_model(df['Returns']*100, n, switch_vol, switch_trend, search_reps=10)
+                        # Use very few search reps for the selection phase to save time
+                        r = fit_regime_model(df['Returns']*100, n, switch_vol, switch_trend, search_reps=5)
                         if r:
                             if opt_goal == 'Performance (PnL)':
                                 # Run full backtest proxy matching Backtest Tab comparison
