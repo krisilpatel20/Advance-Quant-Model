@@ -784,11 +784,44 @@ class MADTrendModes:
         return MADTrendModes.wma(combined.dropna(), sqrt_length).reindex_like(series)
 
     @staticmethod
+    def rma(series, length):
+        """
+        RMA = 1/L * src + (1 - 1/L) * RMA[1]
+        Equivalent to EMA with alpha = 1/L
+        """
+        return series.ewm(alpha=1/length, adjust=False).mean()
+
+    @staticmethod
+    def alma(series, length, offset=0.85, sigma=6):
+        """
+        Arnaud Legoux Moving Average
+        """
+        m = offset * (length - 1)
+        s = length / sigma
+        weights = np.exp(-((np.arange(length) - m) ** 2) / (2 * s * s))
+        weights /= weights.sum()
+        return series.rolling(window=length).apply(lambda x: np.dot(x, weights), raw=True)
+
+    @staticmethod
+    def lsma(series, length):
+        """
+        Least Squares Moving Average (Linear Regression)
+        """
+        def linreg_end(y):
+            x = np.arange(len(y))
+            slope, intercept = np.polyfit(x, y, 1)
+            return slope * (len(y) - 1) + intercept
+        return series.rolling(window=length).apply(linreg_end, raw=True)
+
+    @staticmethod
     def ma_switch(series, length, avg_type):
         if avg_type == "SMA": return MADTrendModes.sma(series, length)
         if avg_type == "EMA": return MADTrendModes.ema(series, length)
         if avg_type == "WMA": return MADTrendModes.wma(series, length)
         if avg_type == "HMA": return MADTrendModes.hma(series, length)
+        if avg_type == "RMA": return MADTrendModes.rma(series, length)
+        if avg_type == "ALMA": return MADTrendModes.alma(series, length)
+        if avg_type == "LSMA": return MADTrendModes.lsma(series, length)
         # Fallback to SMA if type not implemented
         return MADTrendModes.sma(series, length)
 
@@ -3068,7 +3101,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -3476,7 +3509,7 @@ with tab7:
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             sig_mode = st.selectbox("Signal Mode", ["Bollinger Bands", "For Loop", "Combined Signal"])
-            ma_type = st.selectbox("MA Type", ["EMA", "SMA", "WMA", "HMA"])
+            ma_type = st.selectbox("MA Type", ["EMA", "SMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"])
         with col_m2:
             mad_len = st.number_input("MAD Length", 5, 100, 25)
             
@@ -3536,6 +3569,58 @@ with tab7:
                     
                     format_plot_dates(ax_ctx, prices_bt.index)
                     ax_ctx.set_title(f"MAD Trend Modes Signal ({sig_mode})")
+                    ax_ctx.legend()
+                    st.pyplot(fig_ctx)
+
+    elif strategy_type == "Dual MA Cross":
+        st.markdown("### 🔀 Dual Moving Average Cross Settings")
+        ma_options = ["SMA", "EMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"]
+        
+        c_ma1, c_ma2 = st.columns(2)
+        with c_ma1:
+            st.subheader("Fast MA (Short-term)")
+            f_ma_type = st.selectbox("Fast MA Type", ma_options, index=1) # Default EMA
+            f_ma_len = st.number_input("Fast MA Length", 1, 250, 20)
+        with c_ma2:
+            st.subheader("Slow MA (Long-term)")
+            s_ma_type = st.selectbox("Slow MA Type", ma_options, index=0) # Default SMA
+            s_ma_len = st.number_input("Slow MA Length", 1, 250, 50)
+            
+        if st.button("🚀 Run Dual MA Backtest", use_container_width=True):
+            if f_ma_len >= s_ma_len:
+                st.warning("Fast MA length is typically shorter than Slow MA length. Results may be inverted.")
+                
+            with st.spinner("Calculating Moving Average Crossovers..."):
+                # Calculate MAs
+                fast_ma = MADTrendModes.ma_switch(prices_bt, f_ma_len, f_ma_type)
+                slow_ma = MADTrendModes.ma_switch(prices_bt, s_ma_len, s_ma_type)
+                
+                # Generate Signals: Long when Fast > Slow, Cash when Fast < Slow
+                # Using stateful ffill logic for consistency
+                long_cond = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
+                short_cond = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
+                
+                def get_stateful_ma_signal(l_cond, s_cond, index):
+                    sig = pd.Series(np.nan, index=index)
+                    sig.loc[l_cond] = 1
+                    sig.loc[s_cond] = 0
+                    return sig.ffill().fillna(0)
+                
+                signals = get_stateful_ma_signal(long_cond, short_cond, prices_bt.index)
+                
+                # Plot Context
+                with st.expander("See Strategy Context", expanded=True):
+                    fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                    ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
+                    ax_ctx.plot(fast_ma.index, fast_ma, label=f'Fast {f_ma_type} ({f_ma_len})', color='orange', alpha=0.8)
+                    ax_ctx.plot(slow_ma.index, slow_ma, label=f'Slow {s_ma_type} ({s_ma_len})', color='blue', alpha=0.8)
+                    
+                    # Highlight Long Zones (Green)
+                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
+                                        where=(signals==1), color='green', alpha=0.1, label='Long Zone')
+                    
+                    format_plot_dates(ax_ctx, prices_bt.index)
+                    ax_ctx.set_title(f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})")
                     ax_ctx.legend()
                     st.pyplot(fig_ctx)
 
