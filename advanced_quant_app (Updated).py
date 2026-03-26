@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import io
 import time
 from concurrent.futures import ThreadPoolExecutor
+
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -35,9 +36,7 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-
 # Statsmodels Diagnostic Imports
-
 from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 
 # ==========================================
@@ -60,380 +59,221 @@ if not ARCH_AVAILABLE:
 # ==========================================
 
 def format_plot_dates(ax, dates):
-    """
-    Helper to format x-axis dates for better readability.
-    Handles Weekly (1/1, 1/8) and Monthly (Sep, Oct) gaps.
-    """
     if len(dates) == 0:
         return
-        
-    # Convert to datetime if not already
     if not isinstance(dates, pd.DatetimeIndex):
         dates = pd.to_datetime(dates)
-        
     span_days = (dates[-1] - dates[0]).days
-    
-    # Locator and Formatter logic
-    if span_days < 90: # Less than 3 months -> Weekly
+    if span_days < 90:
         ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-    else: 
-        # User requested granular monthly ticks even for long periods
-        # We use MonthLocator. For very long periods, matplotlib might auto-hide some,
-        # but we set the locator explicitly.
+    else:
         ax.xaxis.set_major_locator(mdates.MonthLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%y'))
-        
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center', fontsize=8)
+
 
 class Calibrator:
     @staticmethod
     def calibrate_heston(returns):
-        """
-        Estimates Heston parameters from historical returns using a Method of Moments approach.
-        
-        NOTE: This is a 'Historical Proxy Calibration'. It fits parameters to the historical 
-        volatility dynamics (via GARCH proxy), not to option prices. It captures how volatility 
-        *has behaved*, not necessarily how the market *prices* future volatility (Implied Vol).
-        """
         dt = 1/252
-        
-        # 1. Estimate Volatility Dynamics
-        # Use GARCH(1,1) to get a proxy for spot volatility series
         am = arch_model(returns * 100, vol='Garch', p=1, o=0, q=1, dist='Normal')
         res = am.fit(disp='off')
-        conditional_vol = res.conditional_volatility / 100 # Convert back to decimal
+        conditional_vol = res.conditional_volatility / 100
         variance = conditional_vol**2
-        
-        # 2. Estimate Heston Parameters from the variance series
-        # dv = kappa(theta - v)dt + xi*sqrt(v)dW
-        # Discretized: v_{t+1} - v_t = kappa*theta*dt - kappa*v_t*dt + noise
-        # Regression: Y = alpha + beta*X + epsilon
-        # Y = (v_{t+1} - v_t)/dt, X = v_t
-        # beta = -kappa, alpha = kappa*theta -> theta = -alpha/beta
-        
         variance = variance.values if hasattr(variance, 'values') else variance
         v_curr = variance[:-1]
         v_next = variance[1:]
         Y = (v_next - v_curr) / dt
         X = v_curr
-        
-        # Simple Linear Regression
         A = np.vstack([X, np.ones(len(X))]).T
         beta, alpha = np.linalg.lstsq(A, Y, rcond=None)[0]
-        
         kappa = -beta
         theta = alpha / kappa if kappa != 0 else np.mean(variance)
-        
-        # Ensure positive parameters
         kappa = max(kappa, 0.1)
         theta = max(theta, 0.01)
-        
-        # Estimate Vol of Vol (xi)
-        # Residuals of the regression approximate xi * sqrt(v) * dW
         residuals = Y - (alpha + beta * X)
-        # Var(residuals) approx xi^2 * v / dt
-        # This is rough, let's just take std of residuals * sqrt(dt) / mean(sqrt(v))
         xi = np.std(residuals) * np.sqrt(dt) / np.mean(np.sqrt(v_curr))
         xi = max(xi, 0.1)
-        
-        # Estimate Correlation (rho)
-        # Corr(returns, variance_changes)
-        # Heston assumes corr between price process and vol process Brownian motions
         rho = np.corrcoef(returns[1:], np.diff(variance))[0, 1]
-        
-        # Estimate Drift (mu)
-        mu = np.mean(returns) / dt + 0.5 * np.mean(variance) # Annualized geometric drift adjustment
-        
+        mu = np.mean(returns) / dt + 0.5 * np.mean(variance)
         return {
-            'mu': mu,
-            'kappa': kappa,
-            'theta': theta,
-            'xi': xi,
-            'rho': rho,
-            'v0': variance[-1],
-            'S0': 100.0 
+            'mu': mu, 'kappa': kappa, 'theta': theta,
+            'xi': xi, 'rho': rho, 'v0': variance[-1], 'S0': 100.0
         }
 
+
 class KalmanFilterReg:
-    """
-    A simple Kalman Filter implementation to estimate the dynamic beta (slope)
-    and alpha (intercept) between two asset price series.
-    """
     def __init__(self, delta=1e-4, R=1e-3):
-        # delta: process noise covariance (flexibility of beta)
-        # R: measurement noise covariance
         self.delta = delta
         self.R = R
-        self.trans_cov = delta / (1 - delta) * np.eye(2) # Process noise matrix
-        self.obs_mat = np.expand_dims(np.vstack([[1], [1]]), axis=1) # Initial observation matrix placeholder
+        self.trans_cov = delta / (1 - delta) * np.eye(2)
 
     def run_filter(self, y, x):
-        """
-        y: Dependent variable (Target Ticker)
-        x: Independent variable (Reference Ticker)
-        """
         n = len(y)
-        state_mean = np.zeros((n, 2)) # [Alpha, Beta]
+        state_mean = np.zeros((n, 2))
         state_cov = np.zeros((n, 2, 2))
-        
-        # Initial guesses
         state_mean[0] = [0, 1]
         state_cov[0] = np.eye(2)
-        
         for t in range(1, n):
-            # 1. Prediction Step
-            # State stays same (Random Walk hypothesis), Covariance increases by process noise
             pred_state = state_mean[t-1]
             pred_cov = state_cov[t-1] + self.trans_cov
-            
-            # 2. Observation Step
-            obs_mat = np.array([[1.0, x[t]]]) # Observation matrix H = [1, x_t]
-            
-            # Innovation (Prediction Error)
+            obs_mat = np.array([[1.0, x[t]]])
             y_pred = np.dot(obs_mat, pred_state)
             error = y[t] - y_pred
-            
-            # Innovation Covariance
             S = np.dot(np.dot(obs_mat, pred_cov), obs_mat.T) + self.R
-            
-            # Kalman Gain
             K = np.dot(pred_cov, obs_mat.T) / S
-            
-            # 3. Update Step
             state_mean[t] = pred_state + (K.flatten() * error)
             state_cov[t] = pred_cov - np.dot(np.dot(K, obs_mat), pred_cov)
-            
         return state_mean, state_cov
 
+
 class KalmanFilterTrend:
-    """
-    Local level model for trend extraction: y_t = mu_t + noise
-    """
     def __init__(self, process_noise=1e-5, measurement_noise=1e-3):
         self.Q = process_noise
         self.R = measurement_noise
-    
+
     def filter(self, data):
-        """Forward pass (causal estimates)"""
         n = len(data)
         estimates = np.zeros(n)
         covariances = np.zeros(n)
-        
-        # Initialize with mean of first 10 points
         init_window = min(10, n // 10)
         x = np.mean(data[:init_window])
         P = np.var(data[:init_window]) if init_window > 1 else 1.0
-        
         for t in range(n):
-            # Predict
             x_pred = x
             P_pred = P + self.Q
-            
-            # Update
             K = P_pred / (P_pred + self.R)
             x = x_pred + K * (data[t] - x_pred)
             P = (1 - K) * P_pred
-            
             estimates[t] = x
             covariances[t] = P
-        
         return estimates, covariances
-    
+
     def smooth(self, data):
-        """Forward + backward pass (uses all data)"""
         n = len(data)
-        
-        # Forward pass
         filtered_means, filtered_covs = self.filter(data)
-        
-        # Backward pass
         smoothed_means = np.zeros(n)
         smoothed_covs = np.zeros(n)
-        
         smoothed_means[-1] = filtered_means[-1]
         smoothed_covs[-1] = filtered_covs[-1]
-        
         for t in range(n - 2, -1, -1):
             P_pred = filtered_covs[t] + self.Q
             J = filtered_covs[t] / P_pred
-            
             smoothed_means[t] = filtered_means[t] + J * (smoothed_means[t+1] - filtered_means[t])
             smoothed_covs[t] = filtered_covs[t] + J**2 * (smoothed_covs[t+1] - P_pred)
-        
         return smoothed_means, smoothed_covs
 
+
 def simulate_heston(S0, T, r, kappa, theta, sigma, rho, v0, steps, paths):
-    """
-    Simulate Monte Carlo paths for Heston Stochastic Volatility Model.
-    dS = mu*S*dt + sqrt(v)*S*dW1
-    dv = kappa*(theta - v)*dt + sigma*sqrt(v)*dW2
-    """
     dt = T/steps
     prices = np.zeros((steps + 1, paths))
     vols = np.zeros((steps + 1, paths))
     prices[0] = S0
     vols[0] = v0
-    
     for t in range(1, steps + 1):
-        # Generate correlated Brownian motions
         Z1 = np.random.normal(size=paths)
         Z2 = rho * Z1 + np.sqrt(1 - rho**2) * np.random.normal(size=paths)
-        
-        # Volatility Process (ensure non-negative with max(...,0) or abs)
         v_prev = vols[t-1]
-        # Discretization using Euler-Maruyama (absorbing barrier at 0 for vol)
         dv = kappa * (theta - v_prev) * dt + sigma * np.sqrt(np.abs(v_prev)) * np.sqrt(dt) * Z2
         v_curr = np.abs(v_prev + dv)
         vols[t] = v_curr
-        
-        # Price Process
         dS = r * prices[t-1] * dt + np.sqrt(v_curr) * prices[t-1] * np.sqrt(dt) * Z1
         prices[t] = prices[t-1] + dS
-        
     return prices, vols
 
+
 def merton_jump_diffusion(S0, T, r, sigma, lam, mu_j, sigma_j, steps, paths):
-    """
-    Simulate Merton Jump Diffusion Paths.
-    lam: intensity of jumps (jumps per year)
-    mu_j: mean of jump size (log)
-    sigma_j: std dev of jump size
-    """
     dt = T/steps
     prices = np.zeros((steps + 1, paths))
     prices[0] = S0
-    
-    # Drift correction for jumps so it remains risk-neutral
-    # Drift correction for jumps so it remains risk-neutral
-    # drift = r - 0.5 * sigma**2 - lam * (exp(mu_j + 0.5*sigma_j²) - 1)
     drift = r - 0.5 * sigma**2 - lam * (np.exp(mu_j + 0.5 * sigma_j**2) - 1)
-    
     for t in range(1, steps + 1):
         z = np.random.normal(size=paths)
-        # Poisson Jump Component
-        # N is number of jumps in this step (usually 0 or 1 for small dt)
         N = np.random.poisson(lam * dt, size=paths)
-        # Jump size J
         J = np.random.normal(mu_j, sigma_j, size=paths) * N
-        
-        # Geometric Brownian Motion + Jump
-        # S_t = S_{t-1} * exp( (drift)*dt + sigma*dW + Sum(J) )
         prices[t] = prices[t-1] * np.exp(drift * dt + sigma * np.sqrt(dt) * z + J)
-        
     return prices
+
 
 class RealizedVolatility:
     @staticmethod
     def realized_variance(returns):
-        """Standard Realized Variance (sum of squared returns)."""
         return np.sum(returns**2)
 
     @staticmethod
     def bipower_variation(returns):
-        """Bipower Variation (robust to jumps).
-        BV = (pi/2) * sum(|rt| * |rt-1|)
-        """
         abs_rets = np.abs(returns)
-        # Vectorized scalar product of lagged absolutes
-        if len(returns) < 2: return 0.0
+        if len(returns) < 2:
+            return 0.0
         return (np.pi / 2) * np.sum(abs_rets[1:] * abs_rets[:-1])
 
     @staticmethod
     def jump_component(returns):
-        """Tests for jumps using RV and BV interaction (Barndorff-Nielsen & Shephard)."""
         rv = RealizedVolatility.realized_variance(returns)
         bv = RealizedVolatility.bipower_variation(returns)
-        
-        # Jump contribution is difference between Total Vol (RV) and Continuous Vol (BV)
         jump_var = max(rv - bv, 0)
         jump_ratio = jump_var / rv if rv > 0 else 0.0
-        
-        # Simplified significance test (Heuristic)
-        # Z = (RV - BV) / (RV * sqrt(theta * max(1/N, some_const)))
         n = len(returns)
-        if n < 10: 
+        if n < 10:
             return {'jump_ratio': 0.0, 'p_value': 1.0, 'z_score': 0.0}
-        
-        # Heuristic Z-score for significance
-        # A jump ratio > 0.5 with high data count is usually significant
-        z_score = (jump_ratio - 0.05) * np.sqrt(n/2) # Simple heuristic scaling
+        z_score = (jump_ratio - 0.05) * np.sqrt(n/2)
         p_value = 1 - stats.norm.cdf(z_score)
-        
         return {'jump_ratio': jump_ratio, 'p_value': p_value, 'z_score': z_score}
+
 
 class HawkesVolatility:
     def __init__(self):
         self.mu = 0.5
-        self.alpha = 0.5 # Excitation
-        self.beta = 2.0  # Decay
+        self.alpha = 0.5
+        self.beta = 2.0
         self.metrics = {}
 
     def fit(self, returns):
-        """
-        Fits a simple univariate Hawkes process to Volatility Peaks (POT).
-        """
-        # 1. Identify "Events" (Extreme Volatility)
-        # Use simple Peak Over Threshold (POT) on absolute returns
         vol_proxy = np.abs(returns)
         if len(vol_proxy) < 20:
-             return self
-             
-        threshold = np.percentile(vol_proxy, 90) # Top 10% events
+            return self
+        threshold = np.percentile(vol_proxy, 90)
         events = np.where(vol_proxy > threshold)[0]
-        
         if len(events) < 5:
-             # Not enough data
-             return self
-             
-        # LL Function for Hawkes: sum(log(lambda(ti))) - integral(lambda(t))
-        # lambda(t) = mu + sum(alpha * exp(-beta * (t - ti)))
-        
+            return self
+
         def neg_log_likelihood(params):
             mu_p, alpha_p, beta_p = params
-            if mu_p <= 0 or alpha_p < 0 or beta_p <= alpha_p: return 1e9
-            
+            if mu_p <= 0 or alpha_p < 0 or beta_p <= alpha_p:
+                return 1e9
             t = events
             n = len(t)
-            T_end = len(returns) # total duration in days
-            
-            # Recursive calculation of R(k) = sum(exp(-beta*(tk - ti)))
-            # R(k) = exp(-beta*(tk - tk-1)) * (1 + R(k-1))
+            T_end = len(returns)
             R = np.zeros(n)
             for i in range(1, n):
                 dt = t[i] - t[i-1]
                 R[i] = np.exp(-beta_p * dt) * (1 + R[i-1])
-            
-            # Avoid log(0)
             intensities = mu_p + alpha_p * R
-            if np.any(intensities <= 0): return 1e9
-            
+            if np.any(intensities <= 0):
+                return 1e9
             term1 = np.sum(np.log(intensities))
-            
-            # Integral term: int(mu) + sum(alpha/beta * (1 - exp(-beta*(T - ti))))
             term2 = mu_p * T_end + (alpha_p / beta_p) * np.sum(1 - np.exp(-beta_p * (T_end - t)))
-            
             return -(term1 - term2)
-            
+
         try:
-            # Bounds: mu>0, alpha>0, beta>alpha (stationarity)
-            res = minimize(neg_log_likelihood, [0.1, 0.2, 1.0], 
+            res = minimize(neg_log_likelihood, [0.1, 0.2, 1.0],
                            bounds=[(1e-4, 2.0), (1e-4, 5.0), (0.1, 10.0)], method='L-BFGS-B')
             self.mu, self.alpha, self.beta = res.x
         except:
-            pass # Keep defaults
-            
+            pass
         return self
 
     def branching_ratio(self):
-        """Measure of self-excitement intensity (alpha/beta). <1 is stable."""
-        if self.beta == 0: return 0.0
+        if self.beta == 0:
+            return 0.0
         return self.alpha / self.beta
 
     def half_life(self):
-        """Time for a shock to decay by half (ln(2)/beta)."""
-        if self.beta == 0: return 0.0
+        if self.beta == 0:
+            return 0.0
         return np.log(2) / self.beta
+
 
 class AdvancedRegimeDetector:
     def __init__(self, log_returns):
@@ -444,115 +284,71 @@ class AdvancedRegimeDetector:
         self.regime_characteristics = []
 
     def fit_all(self, n_states=3):
-        """Fits both HMM and Bayesian Changepoint logic."""
-        
-        # 1. HMM (using GMM Proxy if sklearn available)
         if SKLEARN_AVAILABLE:
             from sklearn.mixture import GaussianMixture
-            
-            # Fit GMM as HMM proxy (Regime Clustering)
             model = GaussianMixture(n_components=n_states, covariance_type='full', random_state=42)
             model.fit(self.data)
-            
             hidden_states = model.predict(self.data)
             probs = model.predict_proba(self.data)
-            
-            # Re-order states by mean volatility (0=Low, 1=Med, 2=High)
             state_vars = []
             for i in range(n_states):
-                # Filter data for this state
                 mask = (hidden_states == i)
                 if np.sum(mask) > 0:
                     state_vars.append(np.std(self.data[mask]))
                 else:
                     state_vars.append(0)
-                
-            # Sort indices: low vol -> high vol
             sorted_idx = np.argsort(state_vars)
-            
-            # Create mapping: old_id -> new_id (0,1,2)
             map_dict = {old: new for new, old in enumerate(sorted_idx)}
-            
-            # Apply mapping to states and probs
             sorted_states = np.vectorize(map_dict.get)(hidden_states)
             sorted_probs = probs[:, sorted_idx]
-            
             self.regimes['hmm_states'] = sorted_states
             self.regimes['hmm_probs'] = sorted_probs
             self.metrics['hmm_aic'] = model.aic(self.data)
-            
-            # Calculate Characteristics
             self._calculate_characteristics(sorted_states)
         else:
-            # Fallback if no sklearn
             self.regimes['hmm_probs'] = np.zeros((len(self.data), n_states))
             self.metrics['hmm_aic'] = 0
-        
-        # 2. Bayesian Changepoint Detection (Simplified Proxy)
         self.regimes['changepoint_probs'] = self._bayesian_changepoint_proxy(self.data.flatten())
-        
+
     def _bayesian_changepoint_proxy(self, data):
-        """
-        Fast proxy for changepoint probability using rolling volatility regime shifts.
-        True BCP is computationally heavy for Streamlit.
-        """
         vol = pd.Series(data).rolling(window=22).std().fillna(method='bfill')
-        
-        # Detect shifts in volatility (Z-score of vol change)
         vol_change = vol.diff().abs()
         mean_change = vol_change.rolling(252, min_periods=20).mean()
         std_change = vol_change.rolling(252, min_periods=20).std()
-        
-        # Z-score
         z = (vol_change - mean_change) / (std_change + 1e-8)
-        
-        # Sigmoid probability transform: Z > 2 implies likely shift
         probs = 1 / (1 + np.exp(-(z - 2.0)))
         return probs.fillna(0).values
 
     def _calculate_characteristics(self, states):
         df = pd.DataFrame(self.data, columns=['ret'])
         df['state'] = states
-        
-        # Group by state
         stats_df = df.groupby('state')['ret'].agg(['mean', 'std', 'count'])
-        
         self.regime_characteristics = []
-        labels = ['Bull/Calm', 'Normal/Transition', 'Bear/Crisis'] 
-        
+        labels = ['Bull/Calm', 'Normal/Transition', 'Bear/Crisis']
         for i in range(len(stats_df)):
-            if i >= len(labels): cn = f"State {i}"
-            else: cn = labels[i]
-            
+            if i >= len(labels):
+                cn = f"State {i}"
+            else:
+                cn = labels[i]
             s = stats_df.iloc[i]
             self.regime_characteristics.append({
                 'label': cn,
-                'mean_return': s['mean'] * 252, # Annualized
+                'mean_return': s['mean'] * 252,
                 'volatility': s['std'] * np.sqrt(252),
                 'frequency': s['count'] / len(df),
-                'avg_duration': 0.0, # Placeholder
-                'max_drawdown': 0.0 # Placeholder
+                'avg_duration': 0.0,
+                'max_drawdown': 0.0
             })
-            
+
     def get_trading_signal(self):
-        """Derives signal from latest regime probabilities."""
         if 'hmm_probs' not in self.regimes:
             return "N/A", {'label': 'No Model', 'confidence': 0.0}
-            
-        probs = self.regimes['hmm_probs'][-1] # [Low, Med, High] sorted
-        
-        # Logic: 
-        # High Vol (Idx 2) > 50% => RISK OFF
-        # Low Vol (Idx 0) > 60% => RISK ON
-        # Else => NEUTRAL
-        
+        probs = self.regimes['hmm_probs'][-1]
         n_states = len(probs)
         if n_states < 3:
-             return "NEUTRAL", {'label': 'Unknown', 'confidence': 0.0}
-             
+            return "NEUTRAL", {'label': 'Unknown', 'confidence': 0.0}
         p_safe = probs[0]
         p_danger = probs[-1]
-        
         if p_danger > 0.5:
             return "DEFENSIVE / SHORT", {'label': 'High Volatility', 'confidence': p_danger}
         elif p_safe > 0.6:
@@ -560,11 +356,8 @@ class AdvancedRegimeDetector:
         else:
             return "NEUTRAL / HEDGED", {'label': 'Transition/Mixed', 'confidence': max(probs)}
 
+
 class ProRegimeDetector:
-    """
-    Institutional-grade Regime Detection using Multi-Factor Feature Vectors.
-    Analyzes Returns, Volatility, and Trend-Deviation simultaneously.
-    """
     def __init__(self, prices, log_returns):
         self.prices = prices if isinstance(prices, pd.Series) else pd.Series(prices)
         self.returns = log_returns if isinstance(log_returns, pd.Series) else pd.Series(log_returns)
@@ -574,21 +367,15 @@ class ProRegimeDetector:
         self.state_labels = {}
 
     def _prepare_features(self):
-        # 1. Momentum (Short-term smoothed returns)
         f1 = self.returns.rolling(window=5).mean().fillna(0)
-        
-        # 2. Volatility Cluster (Z-scored 20d Vol)
         vol = self.returns.rolling(window=20).std().fillna(method='bfill')
         v_mean = vol.rolling(252, min_periods=20).mean()
         v_std = vol.rolling(252, min_periods=20).std()
         f2 = (vol - v_mean) / (v_std + 1e-9)
         f2 = f2.fillna(0)
-        
-        # 3. Structural Deviation (Price vs EMA20)
         ema = self.prices.ewm(span=20).mean()
         f3 = (self.prices - ema) / (ema + 1e-9)
         f3 = f3.fillna(0)
-        
         self.features = np.column_stack([f1.values, f2.values, f3.values])
         return self.features
 
@@ -597,19 +384,12 @@ class ProRegimeDetector:
         if SKLEARN_AVAILABLE:
             from sklearn.mixture import GaussianMixture
             from sklearn.preprocessing import StandardScaler
-            
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X)
-            
-            # Fit Multivariate GMM
             model = GaussianMixture(n_components=n_states, covariance_type='full', random_state=123, max_iter=200)
             model.fit(X_scaled)
-            
             states = model.predict(X_scaled)
             probs = model.predict_proba(X_scaled)
-            
-            # --- INSTITUTIONAL STATE MAPPING ---
-            # We characterize states by their Mean Returns and Mean Volatility
             state_stats = []
             for i in range(n_states):
                 mask = (states == i)
@@ -619,17 +399,7 @@ class ProRegimeDetector:
                     state_stats.append({'id': i, 'ret': m_ret, 'vol': m_vol})
                 else:
                     state_stats.append({'id': i, 'ret': -999, 'vol': 999})
-            
-            # Logic-based labeling:
-            # 1. Bull/Quiet: High Ret, Low Vol
-            # 2. Bull/Volatile: High Ret, High Vol (Overextended)
-            # 3. Bear/Quiet: Low Ret, Low Vol (Distribution)
-            # 4. Bear/Volatile: Low Ret, High Vol (Panic/Crisis)
-            
-            # Sort by returns
-            # Sort states by returns for logical mapping
             sorted_stats = sorted(state_stats, key=lambda x: x['ret'], reverse=True)
-            
             if n_states == 4:
                 bulls = sorted_stats[:2]
                 bears = sorted_stats[2:]
@@ -654,10 +424,8 @@ class ProRegimeDetector:
                     sorted_stats[1]['id']: "NEUTRAL / TRANSITION",
                     sorted_stats[2]['id']: "BEAR REGIME (Panic)"
                 }
-            
             self.regimes['states'] = states
             self.regimes['probs'] = probs
-            # Calculate BIC manually for GMM (Scikit-learn model has .bic())
             self.metrics['aic'] = model.aic(X_scaled)
             self.metrics['bic'] = model.bic(X_scaled)
             self.metrics['n_states'] = n_states
@@ -666,11 +434,8 @@ class ProRegimeDetector:
             self.regimes['probs'] = np.ones((len(X), 1))
 
     def fit_optimized(self, state_choices=[2, 3, 4]):
-        """Runs multiple models and picks the best one by BIC."""
         best_bic = float('inf')
         best_n = 4
-        
-        # We perform a quick search for best BIC
         for n in state_choices:
             try:
                 temp_model = ProRegimeDetector(self.prices, self.returns)
@@ -680,27 +445,23 @@ class ProRegimeDetector:
                     best_n = n
             except:
                 continue
-        
-        # Final fit with best N
         self.fit(n_states=best_n)
         return best_n
 
     def get_latest_verdict(self):
         if 'states' not in self.regimes or not self.state_labels:
             return "NEUTRAL", 0.0, "N/A"
-            
         last_state = self.regimes['states'][-1]
         last_prob = np.max(self.regimes['probs'][-1])
         label = self.state_labels.get(last_state, "Unknown")
-        
         if "BULL" in label:
             verdict = "ACCUMULATE / LONG" if "QUIET" in label else "HEDGE / CAUTION"
         elif "BEAR" in label:
             verdict = "DEFENSIVE / SHORT" if "VOLATILE" in label else "REDUCE EXPOSURE"
         else:
             verdict = "NEUTRAL"
-            
         return verdict, last_prob, label
+
 
 class SMLAnalyzer:
     def __init__(self, ticker_returns, benchmark_returns, rf_annual=0.04):
@@ -708,59 +469,34 @@ class SMLAnalyzer:
         self.r_bench = benchmark_returns
         self.rf_annual = rf_annual
         self.rf_daily = rf_annual / 252
-        
+
     def calculate_metrics(self, window=90):
-        # Align data
         common_idx = self.r_asset.index.intersection(self.r_bench.index)
-        y = self.r_asset.loc[common_idx] - self.rf_daily # Excess Asset Returns
-        x = self.r_bench.loc[common_idx] - self.rf_daily # Excess Market Returns
-        
+        y = self.r_asset.loc[common_idx] - self.rf_daily
+        x = self.r_bench.loc[common_idx] - self.rf_daily
         df = pd.DataFrame({'asset_ex': y, 'mkt_ex': x}, index=common_idx)
-        
-        # 1. Rolling Beta & Alpha (HAC Robust)
-        betas = []
-        alphas = []
-        
-        # Pre-allocate array for speed
         beta_arr = np.full(len(df), np.nan)
         alpha_arr = np.full(len(df), np.nan)
-        
-        # Need at least 'window' points
         for i in range(window, len(df)):
             window_slice = df.iloc[i-window:i]
             y_win = window_slice['asset_ex']
             x_win = sm.add_constant(window_slice['mkt_ex'])
-            
             try:
-                # OLS with HAC (Heteroskedasticity & Autocorrelation Consistent) Standard Errors
-                # maxlags=1 is usually sufficient for daily stock data
                 model = sm.OLS(y_win, x_win).fit(cov_type='HAC', cov_kwds={'maxlags': 1})
                 alpha_arr[i] = model.params.get('const', np.nan)
                 beta_arr[i] = model.params.get('mkt_ex', np.nan)
             except:
-                pass # nan default
-                
+                pass
         df['Beta'] = beta_arr
         df['Alpha_Daily'] = alpha_arr
-        
-        # 2. CAPM Checks
-        # E(Ri) = Rf + Beta(E(Rm) - Rf)
-        # We use realized market return over the window as proxy for E(Rm)
         rolling_mkt_ret_ann = df['mkt_ex'].rolling(window).mean() * 252
-        
         df['SML_Exp_Return'] = self.rf_annual + (df['Beta'] * rolling_mkt_ret_ann)
         df['Actual_Return_Ann'] = (df['asset_ex'].rolling(window).mean() * 252) + self.rf_annual
-        
-        # Mispricing (Alpha in return space)
         df['Mispricing_Spread'] = df['Actual_Return_Ann'] - df['SML_Exp_Return']
-        
         return df.dropna()
 
+
 class MADTrendModes:
-    """
-    Translates the 'MAD Trend Modes' logic from Pine Script.
-    Includes Mean Absolute Deviation (MAD), "For Loop" system, and various MAs.
-    """
     @staticmethod
     def sma(series, length):
         return series.rolling(window=length).mean()
@@ -785,17 +521,10 @@ class MADTrendModes:
 
     @staticmethod
     def rma(series, length):
-        """
-        RMA = 1/L * src + (1 - 1/L) * RMA[1]
-        Equivalent to EMA with alpha = 1/L
-        """
         return series.ewm(alpha=1/length, adjust=False).mean()
 
     @staticmethod
     def alma(series, length, offset=0.85, sigma=6):
-        """
-        Arnaud Legoux Moving Average
-        """
         m = offset * (length - 1)
         s = length / sigma
         weights = np.exp(-((np.arange(length) - m) ** 2) / (2 * s * s))
@@ -804,14 +533,47 @@ class MADTrendModes:
 
     @staticmethod
     def lsma(series, length):
-        """
-        Least Squares Moving Average (Linear Regression)
-        """
         def linreg_end(y):
             x = np.arange(len(y))
             slope, intercept = np.polyfit(x, y, 1)
             return slope * (len(y) - 1) + intercept
         return series.rolling(window=length).apply(linreg_end, raw=True)
+
+    @staticmethod
+    def ehlers_supersmoother(series, period):
+        """
+        Ehlers SuperSmoother Filter — Original 2-pole version.
+        From John Ehlers' 'Cybernetic Analysis for Stocks and Futures' (2004).
+
+        Coefficients:
+          a1 = exp(-1.414 * pi / period)
+          b1 = 2 * a1 * cos(1.414 * 180 / period)  [degrees]
+          c2 = b1
+          c3 = -a1^2
+          c1 = 1 - c2 - c3
+
+        Recursive formula:
+          SS[i] = c1 * (src[i] + src[i-1]) / 2 + c2 * SS[i-1] + c3 * SS[i-2]
+        """
+        import math
+        period = max(period, 2)  # guard against period < 2
+        a1 = math.exp(-1.414 * math.pi / period)
+        b1 = 2.0 * a1 * math.cos(math.radians(1.414 * 180.0 / period))
+        c2 = b1
+        c3 = -(a1 ** 2)
+        c1 = 1.0 - c2 - c3
+
+        vals = series.values.astype(float)
+        n = len(vals)
+        ss = np.zeros(n)
+
+        for i in range(n):
+            src_avg = (vals[i] + vals[i - 1]) / 2.0 if i >= 1 else vals[i]
+            ss_prev1 = ss[i - 1] if i >= 1 else src_avg
+            ss_prev2 = ss[i - 2] if i >= 2 else src_avg
+            ss[i] = c1 * src_avg + c2 * ss_prev1 + c3 * ss_prev2
+
+        return pd.Series(ss, index=series.index)
 
     @staticmethod
     def ma_switch(series, length, avg_type):
@@ -822,98 +584,62 @@ class MADTrendModes:
         if avg_type == "RMA": return MADTrendModes.rma(series, length)
         if avg_type == "ALMA": return MADTrendModes.alma(series, length)
         if avg_type == "LSMA": return MADTrendModes.lsma(series, length)
-        # Fallback to SMA if type not implemented
         return MADTrendModes.sma(series, length)
 
     @staticmethod
     def calculate_mad(series, benchmark, length):
-        """
-        Vectorized MAD: sum(|src[t-i] - benchmark[t]|) / length
-        """
-        # Using numpy stride tricks for ultra-fast windowing
         from numpy.lib.stride_tricks import sliding_window_view
-        
         vals = series.values
         bench_vals = benchmark.values
-        
-        # Create sliding windows of size 'length'
         if len(vals) < length:
             return pd.Series(np.nan, index=series.index)
-            
         windows = sliding_window_view(vals, length)
-        # windows[i] is the window ending at index i + length - 1
-        
-        # We need to subtract bench_vals[i + length - 1] from each element in windows[i]
-        # broad casting: windows shape (N-L+1, L), bench_vals[L-1:] shape (N-L+1,)
         diffs = np.abs(windows - bench_vals[length-1:, np.newaxis])
         res_vals = np.mean(diffs, axis=1)
-        
-        # Pad with NaNs for the beginning
         res = np.full(len(series), np.nan)
         res[length-1:] = res_vals
         return pd.Series(res, index=series.index)
 
     @staticmethod
     def system_score(series, a, b):
-        """
-        Vectorized system: sum(sign(src[t] - src[t-i])) for i in a..b
-        """
         total = pd.Series(0.0, index=series.index)
         for i in range(a, b + 1):
             shifted = series.shift(i)
-            # Use np.sign logic: (series > shifted) - (series < shifted)
             total += np.sign(series - shifted).fillna(0)
         return total
 
     @staticmethod
     def get_signals(df, params):
-        """
-        Generates strategy signals based on parameters.
-        """
         src = df['Close']
         mode = params.get('signal_mode', 'Bollinger Bands')
-        
-        # BB Params
         bb_ma_type = params.get('bb_ma_type', 'EMA')
         bb_len = params.get('bb_len', 25)
         bb_mult_p = params.get('bb_mult_p', 1.4)
         bb_mult_n = params.get('bb_mult_n', 1.0)
-        
-        # for loop params
-        fl_ma_type = params.get('fl_ma_type', 'ALMA') # Fallback to SMA if not impl
+        fl_ma_type = params.get('fl_ma_type', 'ALMA')
         fl_len = params.get('fl_len', 10)
         fl_a = params.get('fl_a', 10)
         fl_b = params.get('fl_b', 60)
         fl_thresh_l = params.get('fl_thresh_l', 23)
         fl_thresh_s = params.get('fl_thresh_s', 3)
-        
-        # combined params
         c_thresh_l = params.get('c_thresh_l', 0.0)
         c_thresh_s = params.get('c_thresh_s', 0.0)
 
-        # 1. BB Calculations
         avg_bb = MADTrendModes.ma_switch(src, bb_len, bb_ma_type)
         mad_bb = MADTrendModes.calculate_mad(src, avg_bb, bb_len)
         bb_up = avg_bb + (mad_bb * bb_mult_p)
         bb_dn = avg_bb - (mad_bb * bb_mult_n)
-        
-        # 2. FL Calculations
+
         avg_fl = MADTrendModes.ma_switch(src, fl_len, fl_ma_type)
         mad_fl_val = MADTrendModes.calculate_mad(src, avg_fl, fl_len)
-        
-        # Weighted source for system
-        # mad_w_src = ma_switch(source*mad2, mad_length_fl, ma_benchmark_type_fl) / ma_switch(mad2, mad_length_fl, ma_benchmark_type_fl)
         num = MADTrendModes.ma_switch(src * mad_fl_val, fl_len, fl_ma_type)
         den = MADTrendModes.ma_switch(mad_fl_val, fl_len, fl_ma_type)
         mad_w_src = num / den
-        
         sys_score = MADTrendModes.system_score(mad_w_src, fl_a, fl_b)
-        
-        # Crossovers
+
         bb_long = (src > bb_up) & (src.shift(1) <= bb_up.shift(1))
         bb_short = (src < bb_dn) & (src.shift(1) >= bb_dn.shift(1))
 
-        # Stateful Signal logic
         def get_stateful_signal(long_cond, short_cond, index):
             sig = pd.Series(np.nan, index=index)
             sig.loc[long_cond] = 1
@@ -921,143 +647,98 @@ class MADTrendModes:
             return sig.ffill().fillna(0)
 
         bb_score = get_stateful_signal(bb_long, bb_short, src.index)
-        
         fl_long = (sys_score > fl_thresh_l) & (sys_score.shift(1) <= fl_thresh_l)
         fl_short = (sys_score < fl_thresh_s) & (sys_score.shift(1) >= fl_thresh_s)
         fl_score = get_stateful_signal(fl_long, fl_short, src.index)
-        
         c_signal = (bb_score + fl_score) / 2
         c_long = (c_signal > c_thresh_l) & (c_signal.shift(1) <= c_thresh_l)
         c_short = (c_signal < c_thresh_s) & (c_signal.shift(1) >= c_thresh_s)
         combined_score = get_stateful_signal(c_long, c_short, src.index)
-            
-        # Final Selection
+
         if mode == "Bollinger Bands":
             final_score = bb_score
         elif mode == "For Loop":
             final_score = fl_score
-        else: # Combined
+        else:
             final_score = combined_score
-            
+
         return (final_score == 1).astype(int)
 
+
 class BacktestEngine:
-    """
-    Handles simple vectorised backtesting for regime-based strategies.
-    """
     @staticmethod
     def run_strategy(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0):
-        """
-        prices: Series of asset prices
-        signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
-        trailing_stop_pct: Float (e.g., 0.05 for 5%). If > 0, applies trailing stop.
-        """
-        # Align
         common_idx = prices.index.intersection(signals.index)
         prices = prices.loc[common_idx]
         signals = signals.loc[common_idx]
-        
-        # Calculate Returns
         returns = prices.pct_change().fillna(0)
-        
-        # Note: Vectorized approach is hard with path-dependent trailing stop.
-        # We will use the loop for everything to be consistent and accurate with stops.
-        
         equity_curve = [initial_capital]
         trades = []
-        position = 0 # 0: Cash, 1: Long
+        position = 0
         entry_price = 0
         entry_date = None
         max_price_since_entry = 0
-        
         cash = initial_capital
         holdings = 0
-        
+
         for date, price, signal in zip(prices.index, prices, signals):
-            # Mark to Market
             if position == 1:
                 current_val = cash + holdings * price
-                
-                # Check Trailing Stop
                 if trailing_stop_pct > 0:
                     max_price_since_entry = max(max_price_since_entry, price)
                     stop_price = max_price_since_entry * (1 - trailing_stop_pct)
-                    
                     if price < stop_price:
-                        # Trigger Stop Loss
                         position = 0
                         exit_price = price
                         cash = holdings * exit_price
                         holdings = 0
-                        
                         pnl = (exit_price - entry_price) / entry_price
                         trades.append({
-                            'Side': 'Long',
-                            'Entry Date': entry_date,
-                            'Exit Date': date,
-                            'Buy Price': entry_price,
-                            'Sell Price': exit_price,
-                            'PnL (%)': pnl * 100,
-                            'Status': 'Trailing Stop'
+                            'Side': 'Long', 'Entry Date': entry_date, 'Exit Date': date,
+                            'Buy Price': entry_price, 'Sell Price': exit_price,
+                            'PnL (%)': pnl * 100, 'Status': 'Trailing Stop'
                         })
                         equity_curve.append(cash)
-                        continue # Skip normal signal processing for this bar
+                        continue
             else:
                 current_val = cash
-            
-            # Signal Processing
+
             if position == 0 and signal == 1:
-                # Buy
                 position = 1
                 entry_price = price
                 entry_date = date
                 max_price_since_entry = price
-                
                 holdings = cash / price
                 cash = 0
             elif position == 1 and signal == 0:
-                # Sell
                 position = 0
                 exit_price = price
                 cash = holdings * exit_price
                 holdings = 0
-                
                 pnl = (exit_price - entry_price) / entry_price
                 trades.append({
-                    'Side': 'Long',
-                    'Entry Date': entry_date,
-                    'Exit Date': date,
-                    'Buy Price': entry_price,
-                    'Sell Price': exit_price,
-                    'PnL (%)': pnl * 100,
-                    'Status': 'Closed'
+                    'Side': 'Long', 'Entry Date': entry_date, 'Exit Date': date,
+                    'Buy Price': entry_price, 'Sell Price': exit_price,
+                    'PnL (%)': pnl * 100, 'Status': 'Closed'
                 })
-            
+
             equity_curve.append(current_val)
-            
-        # Capture Open Position
+
         if position == 1:
             current_price = prices.iloc[-1]
             current_val = holdings * current_price
             pnl = (current_price - entry_price) / entry_price
             trades.append({
-                'Side': 'Long',
-                'Entry Date': entry_date,
-                'Exit Date': None, # Open
-                'Buy Price': entry_price,
-                'Sell Price': current_price, # Mark-to-Market
-                'PnL (%)': pnl * 100,
-                'Status': 'Open'
+                'Side': 'Long', 'Entry Date': entry_date, 'Exit Date': None,
+                'Buy Price': entry_price, 'Sell Price': current_price,
+                'PnL (%)': pnl * 100, 'Status': 'Open'
             })
-            equity_curve[-1] = current_val # Update last point
-            
-        # Convert to Series
+            equity_curve[-1] = current_val
+
         equity_curve_series = pd.Series(equity_curve[1:], index=prices.index)
         benchmark_curve = initial_capital * (1 + returns).cumprod()
-        
-        # Derived Strategy Returns
         strat_returns = equity_curve_series.pct_change().fillna(0)
-                
+
         return {
             'equity_curve': equity_curve_series,
             'benchmark_curve': benchmark_curve,
@@ -1067,195 +748,140 @@ class BacktestEngine:
 
     @staticmethod
     def calculate_metrics(returns, risk_free_rate=0.0):
-        """
-        Calculates Sharpe, Sortino, Max Drawdown
-        """
-        if len(returns) < 2: return {}
-        
-        # Annualization factor
+        if len(returns) < 2:
+            return {}
         ann_factor = 252
-        
-        # Excess Returns
         excess_ret = returns - (risk_free_rate / 252)
-        
-        # Sharpe
         sharpe = np.sqrt(ann_factor) * excess_ret.mean() / (returns.std() + 1e-9)
-        
-        # Sortino (Downside Deviation)
         downside = returns[returns < 0]
         sortino = np.sqrt(ann_factor) * excess_ret.mean() / (downside.std() + 1e-9)
-        
-        # Max Drawdown
         cum_ret = (1 + returns).cumprod()
         peak = cum_ret.cummax()
         drawdown = (cum_ret - peak) / peak
         max_dd = drawdown.min()
-        
-        # CAGR
         total_ret = (1 + returns).prod()
         n_years = len(returns) / 252
         cagr = (total_ret ** (1/n_years)) - 1 if n_years > 0 else 0
-        
         return {
-            'Sharpe Ratio': sharpe,
-            'Sortino Ratio': sortino,
-            'Max Drawdown': max_dd,
-            'CAGR': cagr
+            'Sharpe Ratio': sharpe, 'Sortino Ratio': sortino,
+            'Max Drawdown': max_dd, 'CAGR': cagr
         }
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_reps=20):
-    """
-    Cached helper to fit Markov Regression.
-    Returns the fitted result object.
-    """
-    # PREPARE DATA
-    # Ensure input is a clean 1D float array, then wrap back into Series 
-    # to preserve Statsmodels pandas-compatibility (param names, indices)
     if hasattr(model_data, 'values'):
         clean_values = model_data.values.flatten().astype(float)
         idx = model_data.index
     else:
         clean_values = np.array(model_data).flatten().astype(float)
-        # Create dummy index if none exists, to satisfy Statsmodels internal checks
         idx = pd.RangeIndex(len(clean_values))
 
-    # VALIDATION: Check for NaNs or Infinite values
     if np.any(np.isnan(clean_values)) or np.any(np.isinf(clean_values)):
         st.error("❌ Data contains NaNs or Infinite values. Cannot fit model.")
         return None
-        
-    # VALIDATION: Check for constant data (no variance)
     if np.std(clean_values) < 1e-9:
         st.error("❌ Data is constant (no variance). Cannot fit model.")
         return None
-        
-    # Reconstruct robust 1D Series for Statsmodels
-    endog_series = pd.Series(clean_values, index=idx)
 
+    endog_series = pd.Series(clean_values, index=idx)
     try:
         mod_markov = MarkovRegression(
-            endog_series,
-            k_regimes=n_regimes,
-            trend='c',
-            switching_variance=switch_vol,
-            switching_trend=switch_trend
+            endog_series, k_regimes=n_regimes, trend='c',
+            switching_variance=switch_vol, switching_trend=switch_trend
         )
         res_markov = mod_markov.fit(search_reps=search_reps, disp=False)
-             
-        # ENFORCE PANDAS OUTPUT: Statsmodels sometimes returns numpy arrays
         if isinstance(res_markov.params, np.ndarray):
             names = res_markov.model.param_names
             res_markov.params = pd.Series(res_markov.params, index=names)
             res_markov.bse = pd.Series(res_markov.bse, index=names)
             res_markov.pvalues = pd.Series(res_markov.pvalues, index=names)
-            
         return res_markov
     except Exception as e:
         st.error(f"❌ Fit failed: {str(e)}")
         if "Singular matrix" in str(e):
-             st.warning("Hint: underlying data might be too flat or collinear.")
+            st.warning("Hint: underlying data might be too flat or collinear.")
         return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)', stability=0, switch_vol=True, switch_trend=True, engine='Markov', initial_cap=10000.0, trailing_stop=0.0):
-    """
-    Unified Decision Logic for a single asset.
-    Returns a dictionary of all quant metrics and the final Master Sentiment Score.
-    n_regimes can be an integer (2, 3, 4) or 'Auto' for Best Fit.
-    """
+def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)', stability=0,
+                      switch_vol=True, switch_trend=True, engine='Markov',
+                      initial_cap=10000.0, trailing_stop=0.0):
     try:
-        # Central Data Cleaning
         df = df.replace([np.inf, -np.inf], np.nan).dropna()
-        
-        # 0. Apply Model Stability (Smoothing) if requested
         if stability > 0:
             df['Returns'] = df['Returns'].ewm(span=stability, adjust=False).mean()
             df['Log_Returns'] = df['Log_Returns'].ewm(span=stability, adjust=False).mean()
-            df['Close'] = df['Close'].ewm(span=stability, adjust=False).mean() 
-        
-        # 1. Data Resampling for timeframe sync
+            df['Close'] = df['Close'].ewm(span=stability, adjust=False).mean()
+
         if freq == 'Weekly':
             df = df.resample('W').last().replace([np.inf, -np.inf], np.nan).dropna()
             df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
             df['Returns'] = df['Close'].pct_change()
             df = df.replace([np.inf, -np.inf], np.nan).dropna()
-            
-        if len(df) < 15: # Safety check for model convergence
+
+        if len(df) < 15:
             return None
 
-        # 2. Regime Signal (Synchronized Engine)
         if engine == 'Markov':
-            # Use the high-accuracy Markov model matching Backtest Tab
             if n_regimes == 'Auto':
-                # Optimization loop for Markov (Reduced reps for speed)
                 best_n = 4
                 best_score = -float('inf') if opt_goal == 'Performance (PnL)' else float('inf')
                 best_r = None
-                
                 for n in [2, 3, 4]:
                     try:
-                        # Use very few search reps for the selection phase to save time
                         r = fit_regime_model(df['Returns']*100, n, switch_vol, switch_trend, search_reps=5)
                         if r:
                             if opt_goal == 'Performance (PnL)':
-                                # Run full backtest proxy matching Backtest Tab comparison
                                 p_df = r.filtered_marginal_probabilities
                                 r_means = []
                                 for i in range(n):
                                     m = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
                                     r_means.append((i, m))
                                 bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
-                                
                                 dom = p_df.idxmax(axis=1)
                                 sigs = (dom == bull_idx).astype(int)
-                                
                                 bt_res = BacktestEngine.run_strategy(df['Close'], sigs, initial_cap, trailing_stop)
                                 pnl = (bt_res['equity_curve'].iloc[-1] / initial_cap - 1)
-                                
                                 if pnl > best_score:
                                     best_score = pnl
                                     best_n = n
                                     best_r = r
-                            else: # BIC
+                            else:
                                 score = r.bic
                                 if score < best_score:
                                     best_score = score
                                     best_n = n
                                     best_r = r
-                    except: continue
-                # We already have the best fit from the loop, no need to fit again
+                    except:
+                        continue
                 res_markov = best_r
             else:
                 res_markov = fit_regime_model(df['Returns']*100, int(n_regimes), switch_vol, switch_trend)
-            
-            if not res_markov: return None
-            
-            # Map Markov results to scanner standard
+
+            if not res_markov:
+                return None
+
             p_df = res_markov.filtered_marginal_probabilities
             n_states = res_markov.k_regimes
             r_means = []
             for i in range(n_states):
                 m = res_markov.params[f'const[{i}]'] if f'const[{i}]' in res_markov.params else res_markov.params.get('const', 0.0)
                 r_means.append((i, m))
-            
             bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
             bear_idx = sorted(r_means, key=lambda x: x[1])[0][0]
             curr_state = p_df.iloc[-1].idxmax()
             regime_prob = p_df.iloc[-1].max()
-            
             if curr_state == bull_idx:
                 regime_sig, regime_label = "LONG", "BULL"
             elif curr_state == bear_idx:
                 regime_sig, regime_label = "SHORT", "BEAR"
             else:
                 regime_sig, regime_label = "CASH", "NEUTRAL"
-            
             regime_data = {'label': regime_label, 'confidence': regime_prob, 'n_states': n_states}
-            p_detector = None # Placeholder since we didn't use GMM
-            
-        else: # GMM Engine (Fast)
+            p_detector = None
+        else:
             p_detector = ProRegimeDetector(df['Close'], df['Log_Returns'])
             if n_regimes == 'Auto':
                 if opt_goal == 'Performance (PnL)':
@@ -1277,40 +903,36 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
                             if ret_sum > max_perf:
                                 max_perf = ret_sum
                                 best_n = n
-                        except: continue
+                        except:
+                            continue
                     p_detector.fit(n_states=best_n)
                 else:
                     p_detector.fit_optimized()
             else:
                 p_detector.fit(n_states=int(n_regimes))
-                
             regime_sig, regime_prob, regime_label = p_detector.get_latest_verdict()
             regime_data = {'label': regime_label, 'confidence': regime_prob, 'n_states': p_detector.metrics.get('n_states', 4)}
-        
-        # 2. Trend (Kalman)
+
         k_filter = KalmanFilterTrend(process_noise=1e-4, measurement_noise=1e-2)
         trend_est, _ = k_filter.filter(df['Close'].values)
         last_price = df['Close'].iloc[-1]
         last_trend = trend_est[-1]
         trend_diff = (last_price - last_trend) / (last_trend + 1e-9)
-        
-        # 3. Volatility (GARCH Proxy)
+
         returns_scaled = df['Returns'] * 100
         returns_scaled = returns_scaled.replace([np.inf, -np.inf], np.nan).dropna()
-        
-        if len(returns_scaled) < 15: return None # Safety for GARCH
-        
+        if len(returns_scaled) < 15:
+            return None
+
         am = arch_model(returns_scaled, vol='Garch', p=1, q=1, dist='Normal')
         res = am.fit(disp='off')
         curr_vol = res.conditional_volatility.iloc[-1]
         avg_vol = res.conditional_volatility.mean()
         vol_state = "HIGH" if curr_vol > avg_vol * 1.2 else "LOW" if curr_vol < avg_vol * 0.8 else "NORMAL"
-        
-        # 4. Jump Risk
+
         jump_res = RealizedVolatility.jump_component(df['Returns'].values)
         jump_detected = jump_res['p_value'] < 0.05
 
-        # 5. Master Sentiment Score calculation
         sentiment_score = 0
         if "LONG" in regime_sig: sentiment_score += 2
         if "SHORT" in regime_sig: sentiment_score -= 2
@@ -1319,49 +941,34 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
         if vol_state == "LOW": sentiment_score += 1
         if vol_state == "HIGH": sentiment_score -= 1
         if jump_detected: sentiment_score -= 1
-        
+
         return {
-            'regime_sig': regime_sig,
-            'regime_label': regime_label,
-            'regime_data': regime_data,
-            'regime_prob': regime_prob,
-            'pro_detector': p_detector,
-            'trend_diff': trend_diff,
-            'vol_state': vol_state,
-            'curr_vol': curr_vol,
-            'jump_detected': jump_detected,
-            'sentiment_score': sentiment_score,
-            'garch_res': res
+            'regime_sig': regime_sig, 'regime_label': regime_label, 'regime_data': regime_data,
+            'regime_prob': regime_prob, 'pro_detector': p_detector, 'trend_diff': trend_diff,
+            'vol_state': vol_state, 'curr_vol': curr_vol, 'jump_detected': jump_detected,
+            'sentiment_score': sentiment_score, 'garch_res': res
         }
     except Exception as e:
         st.error(f"Error in Decision Engine for {ticker}: {e}")
         return None
 
-@st.cache_data(ttl=60) # Cache live data for 1 minute
+
+@st.cache_data(ttl=60)
 def load_data(ticker, start, end, interval='1d'):
     try:
         df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
         if df.empty:
             return None
-            
-        # NORMALIZE TIMEZONE: Ensure all data is timezone-naive to avoid join errors
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
-
-        # Handle MultiIndex if present
         if isinstance(df.columns, pd.MultiIndex):
             df = df.xs(ticker, axis=1, level=1, drop_level=True) if ticker in df.columns.get_level_values(1) else df
-            # If structure is different (Ticker as top level)
             if ticker in df.columns:
-                 df = df[ticker]
-            # Fallback for simple single ticker download structure
+                df = df[ticker]
             elif 'Close' in df.columns and len(df.columns) > 1 and isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
-
-        # Standard cleaning
         if 'Close' not in df.columns and 'Adj Close' in df.columns:
             df['Close'] = df['Adj Close']
-            
         if 'Close' in df.columns:
             df['Returns'] = df['Close'].pct_change()
             df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
@@ -1370,25 +977,21 @@ def load_data(ticker, start, end, interval='1d'):
         st.error(f"Error loading data for {ticker}: {e}")
         return None
 
-@st.cache_data(ttl=3600) # Macro data changes weekly, cache for 1 hour
+
+@st.cache_data(ttl=3600)
 def load_fred_data(series_id):
-    """
-    Robust FRED data loader using direct CSV fetching.
-    No API key required.
-    """
     try:
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         df = pd.read_csv(url)
         df['DATE'] = pd.to_datetime(df['DATE'])
         df.set_index('DATE', inplace=True)
-        # Handle '.' as NaN frequently found in FRED weekly data
         df[series_id] = pd.to_numeric(df[series_id], errors='coerce')
         return df
     except Exception as e:
         print(f"Error loading FRED {series_id}: {e}")
         return None
 
-# FED Balance Sheet Series Definitions
+
 FED_ASSETS = {
     "WGCAL": "Gold Certificate Account",
     "SDRACL": "Special Drawing Rights Certificate Account",
@@ -1414,16 +1017,16 @@ FED_LIABILITIES = {
 
 
 def robust_fetch_csv(url, sep="|", timeout=10):
-    """Reliably fetches CSV data with custom headers and timeout."""
     import requests
     import io
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         response = requests.get(url, headers=headers, timeout=timeout)
         response.raise_for_status()
         return pd.read_csv(io.StringIO(response.text), sep=sep, skipfooter=1, engine='python')
     except Exception as e:
         raise e
+
 
 @st.cache_data(ttl=3600*24)
 def get_sp500_tickers():
@@ -1434,6 +1037,7 @@ def get_sp500_tickers():
         return df['Symbol'].tolist()
     except:
         pass
+
 
 @st.cache_data(ttl=3600*24)
 def get_nasdaq100_tickers():
@@ -1446,18 +1050,17 @@ def get_nasdaq100_tickers():
         return [
             "AAPL", "MSFT", "AMZN", "GOOG", "NVDA", "META", "TSLA", "PEP", "AVGO", "COST",
             "AZN", "CSCO", "TMUS", "ADBE", "TXN", "CMCSA", "QCOM", "AMGN", "HON", "INTU",
-            "INTC", "SBUX", "AMD", "AMD", "GILD", "VRTX", "MDLZ", "REGN", "ISRG", "ADI",
-            "BKNG", "AMAT", "ADP", "PDD", "PYPL", "MU", "VRSK", "MELI", "KDP", "LUK"
+            "INTC", "SBUX", "AMD", "GILD", "VRTX", "MDLZ", "REGN", "ISRG", "ADI",
+            "BKNG", "AMAT", "ADP", "PDD", "PYPL", "MU", "VRSK", "MELI", "KDP"
         ]
+
 
 @st.cache_data(ttl=3600*24)
 def get_total_us_stocks():
-    """Retrieves all listed US stocks with multi-source failover."""
     sources = [
         "http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
-        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full_tickers.txt" # Secondary mirror
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full_tickers.txt"
     ]
-    
     for url in sources:
         try:
             nasdaq = robust_fetch_csv(url, sep="|" if "ftp.nasdaqtrader" in url else ",")
@@ -1466,120 +1069,103 @@ def get_total_us_stocks():
                 tickers = nasdaq['Symbol'].tolist()
             else:
                 tickers = nasdaq['symbol'].tolist() if 'symbol' in nasdaq.columns else nasdaq.iloc[:, 0].tolist()
-            
-            # Get "Other" listed (NYSE/AMEX)
             other_url = "http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
             try:
                 other = robust_fetch_csv(other_url, sep="|")
                 other = other[(other['Test Issue'] == 'N') & (other['ETF'] == 'N')]
                 tickers += other['NASDAQ Symbol'].tolist()
             except:
-                pass # Continue with what we have
-                
+                pass
             res = sorted(list(set([str(t).strip() for t in tickers if str(t).strip() and len(str(t)) < 6])))
-            if len(res) > 500: return res
+            if len(res) > 500:
+                return res
         except:
             continue
-
-    st.warning("⚠️ Total Market Connection Issue. Using expanded internal mid-cap universe (Top 500).")
-    # Massive internal fallback (Top 200+ symbols)
+    st.warning("⚠️ Total Market Connection Issue. Using expanded internal universe.")
     return get_sp500_tickers() + ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "SQ", "PYPL", "COIN", "MARA", "RIOT"]
+
 
 @st.cache_data(ttl=3600*24)
 def get_total_us_etfs():
-    """Retrieves US ETFs with robust failover."""
     try:
         url = "http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
         data = robust_fetch_csv(url, sep="|")
         etfs = data[(data['Test Issue'] == 'N') & (data['ETF'] == 'Y')]
         res = sorted(list(set([str(t).strip() for t in etfs['NASDAQ Symbol'].tolist()])))
-        if len(res) > 100: return res
+        if len(res) > 100:
+            return res
     except:
         pass
-    
-    st.warning("⚠️ ETF Universe Connection Issue. Using expanded fallback list.")
-    return get_etf_universe()
+    st.warning("⚠️ ETF Universe Connection Issue.")
+    return []
 
 
 def get_market_cap(ticker):
-    """Fetches approximate market cap in USD."""
     try:
         t = yf.Ticker(ticker)
-        mcap = t.info.get('marketCap', 0)
-        return mcap
+        return t.info.get('marketCap', 0)
     except:
         return 0
 
+
 def get_analyst_target(ticker):
-    """Fetches 1-year price target from Yahoo Finance."""
     try:
         t = yf.Ticker(ticker)
         info = t.info
         target = info.get('targetMeanPrice')
         current = info.get('currentPrice') or info.get('previousClose')
-        
         if target and current:
-            implied_return = np.log(target / current) # Log return for consistency
+            implied_return = np.log(target / current)
             return target, implied_return
         return None, None
     except:
         return None, None
 
+
 def calculate_beta(ticker_returns, benchmark_ticker='SPY', lookback_years=2):
-    """Calculates Beta against a benchmark."""
     try:
         end = datetime.now()
         start = end - timedelta(days=lookback_years*365)
         bench = yf.download(benchmark_ticker, start=start, end=end, progress=False)
-        
-        # Handle MultiIndex for Benchmark
         if isinstance(bench.columns, pd.MultiIndex):
-             if benchmark_ticker in bench.columns.get_level_values(1):
-                 bench = bench.xs(benchmark_ticker, axis=1, level=1, drop_level=True)
-             elif 'Close' in bench.columns:
-                 bench.columns = bench.columns.droplevel(1)
-
+            if benchmark_ticker in bench.columns.get_level_values(1):
+                bench = bench.xs(benchmark_ticker, axis=1, level=1, drop_level=True)
+            elif 'Close' in bench.columns:
+                bench.columns = bench.columns.droplevel(1)
         if 'Close' not in bench.columns and 'Adj Close' in bench.columns:
             bench['Close'] = bench['Adj Close']
-            
         bench_ret = bench['Close'].pct_change().dropna()
-        
-        # Align data
         common_idx = ticker_returns.index.intersection(bench_ret.index)
-        if len(common_idx) < 30: return 1.0 # Fallback
-        
+        if len(common_idx) < 30:
+            return 1.0
         y = ticker_returns.loc[common_idx]
         x = bench_ret.loc[common_idx]
-        
         cov = np.cov(y, x)[0, 1]
         var = np.var(x)
         return cov / var
     except:
-        return 1.0 # Fallback to market beta
+        return 1.0
+
 
 class ReportGenerator:
-    """
-    Handles PDF and Excel generation for the quant report.
-    """
     def __init__(self, ticker, start_date, end_date):
         self.ticker = ticker
         self.start_date = start_date
         self.end_date = end_date
-        self.data_store = {} # Stores dataframes and dicts for Excel
-        self.plots = {} # Stores IO buffers for plots
+        self.data_store = {}
+        self.plots = {}
 
     def add_data(self, key, df_or_dict):
         self.data_store[key] = df_or_dict
 
     def add_plot(self, key, fig):
         buf = io.BytesIO()
-        if hasattr(fig, 'savefig'): # Matplotlib
+        if hasattr(fig, 'savefig'):
             fig.savefig(buf, format='png', bbox_inches='tight')
-        elif hasattr(fig, 'write_image'): # Plotly
+        elif hasattr(fig, 'write_image'):
             try:
                 fig.write_image(buf, format='png', engine='kaleido')
             except Exception as e:
-                # Fallback if kaleido fails
                 print(f"Plotly export failed: {e}")
                 return
         else:
@@ -1592,7 +1178,6 @@ class ReportGenerator:
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             for key, data in self.data_store.items():
                 if isinstance(data, pd.DataFrame):
-                    # Clean sheet name (max 31 chars, no invalid chars)
                     sheet_name = "".join([c for c in key if c.isalnum() or c in (" ", "_")])[:31]
                     data.to_excel(writer, sheet_name=sheet_name)
                 elif isinstance(data, dict):
@@ -1605,35 +1190,25 @@ class ReportGenerator:
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
-        
-        # Title
         pdf.set_font("Arial", 'B', 24)
-        pdf.set_text_color(44, 62, 80) # Dark Blue
+        pdf.set_text_color(44, 62, 80)
         pdf.cell(0, 20, f"Unified Quant Analysis Report", ln=True, align='C')
-        
         pdf.set_font("Arial", 'B', 16)
         pdf.cell(0, 10, f"Asset: {self.ticker}", ln=True, align='C')
-        
         pdf.set_font("Arial", size=10)
         pdf.set_text_color(100, 100, 100)
         pdf.cell(0, 10, f"Analysis Period: {self.start_date} to {self.end_date}", ln=True, align='C')
         pdf.cell(0, 10, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align='C')
         pdf.ln(10)
-        
-        # Track which plots have been printed
         printed_plots = set()
-
-        # 1. First print all Data Store items (and their matching plots)
         for key, data in self.data_store.items():
             pdf.set_font("Arial", 'B', 14)
-            pdf.set_text_color(31, 119, 180) # Theme blue
+            pdf.set_text_color(31, 119, 180)
             pdf.cell(0, 10, f"SECTION: {key}", ln=True)
             pdf.line(pdf.get_x(), pdf.get_y(), pdf.get_x() + 190, pdf.get_y())
             pdf.ln(2)
-            
             pdf.set_font("Arial", size=10)
             pdf.set_text_color(0, 0, 0)
-            
             if isinstance(data, dict):
                 for k, v in data.items():
                     val_str = f"{v:.4f}" if isinstance(v, (float, np.float64, np.float32)) else str(v)
@@ -1643,30 +1218,21 @@ class ReportGenerator:
                 pdf.set_font("Arial", 'I', 10)
                 pdf.cell(0, 7, f"Data Table: {len(data)} rows. (See Excel for full dataset)", ln=True)
                 pdf.set_font("Arial", size=10)
-            
-            # Add corresponding plot if exists
             if key in self.plots:
                 pdf.ln(2)
                 pdf.image(self.plots[key], x=15, w=180)
                 printed_plots.add(key)
                 pdf.ln(5)
-            
             pdf.ln(10)
-            
-            # Add page break if near bottom
             if pdf.get_y() > 230:
                 pdf.add_page()
-
-        # 2. Print any remaining plots that weren't matched to data_store keys
         remaining_plots = [k for k in self.plots.keys() if k not in printed_plots]
         if remaining_plots:
-            if pdf.get_y() > 100: # New page if not much room
+            if pdf.get_y() > 100:
                 pdf.add_page()
-                
             pdf.set_font("Arial", 'B', 16)
             pdf.cell(0, 10, "Additional Visualizations", ln=True)
             pdf.ln(5)
-            
             for key in remaining_plots:
                 pdf.set_font("Arial", 'B', 12)
                 pdf.cell(0, 10, key, ln=True)
@@ -1674,26 +1240,24 @@ class ReportGenerator:
                 pdf.ln(10)
                 if pdf.get_y() > 230:
                     pdf.add_page()
-            
-        # fpdf2 returns bytearray by default when no dest is provided
         pdf_raw = pdf.output()
         if isinstance(pdf_raw, bytearray):
             return bytes(pdf_raw)
         return pdf_raw
+
 
 # ==========================================
 # 3. SIDEBAR CONTROLS
 # ==========================================
 with st.sidebar:
     st.header("Thesis Parameters")
-    
-    # Market Region Selector
+
     market_region = st.selectbox("Market Region", [
-        "US Market (USD)", 
-        "Indian Market (INR)", 
+        "US Market (USD)",
+        "Indian Market (INR)",
         "Futures / Commodities (USD)"
     ])
-    
+
     if market_region == "Indian Market (INR)":
         CURRENCY = "₹"
         BENCHMARK = "^NSEI"
@@ -1701,53 +1265,47 @@ with st.sidebar:
         SUFFIX = ".NS"
     elif market_region == "Futures / Commodities (USD)":
         CURRENCY = "$"
-        BENCHMARK = "GC=F" # Gold Futures (Comex) as default safe haven benchmark
+        BENCHMARK = "GC=F"
         DEFAULT_RF = 4.0
-        SUFFIX = "" # User requested no default suffix (allows specific contracts like SIH26.CMX)
+        SUFFIX = ""
     else:
         CURRENCY = "$"
         BENCHMARK = "SPY"
         DEFAULT_RF = 4.0
         SUFFIX = ""
 
-    # Ticker Inputs
     col_t1, col_t2 = st.columns(2)
     with col_t1:
         raw_ticker = st.text_input("Main Ticker", "RELIANCE" if market_region == "Indian Market (INR)" else "AAPL").upper()
     with col_t2:
         raw_pair = st.text_input("Pair Ticker", "").upper()
-    
-    # Auto-append suffix if needed
+
     TICKER = raw_ticker + SUFFIX if (SUFFIX and not raw_ticker.endswith(SUFFIX)) else raw_ticker
     PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
-    
+
     st.caption(f"Active Ticker: {TICKER}")
-    
-    # DEBUG: Temporary visualization to prove logic
-    with st.expander("🛠️ Debug Info (Remove Later)", expanded=True):
+
+    with st.expander("🛠️ Debug Info", expanded=False):
         st.write(f"Region: {market_region}")
         st.code(f"SUFFIX = '{SUFFIX}'")
         st.code(f"Raw Ticker = '{raw_ticker}'")
         st.code(f"Final TICKER = '{TICKER}'")
-    
+
     start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
     end_date = st.date_input("End Date", datetime.now())
-    
+
     st.subheader("Model Settings")
     rf_rate = st.number_input("Risk Free Rate (%)", 0.0, 20.0, DEFAULT_RF) / 100
     st.info(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
 
     st.divider()
     st.header("🔬 Model Configuration")
-    regime_mode = st.selectbox("Regime Detection Mode", 
-                               ["Fixed: 4 States (Inst.)", 
-                                "Fixed: 2 States (Bull/Bear)", 
+    regime_mode = st.selectbox("Regime Detection Mode",
+                               ["Fixed: 4 States (Inst.)",
+                                "Fixed: 2 States (Bull/Bear)",
                                 "Fixed: 3 States (Bull/Neut/Bear)",
                                 "Auto: Best Fit (AIC/BIC)"],
-                               index=0,
-                               help="Standard: 4-states. Auto: Tries 2, 3, and 4 states for each asset and picks the best fit.")
-    
-    # Map to parameter
+                               index=0)
     regime_val_map = {
         "Fixed: 4 States (Inst.)": 4,
         "Fixed: 2 States (Bull/Bear)": 2,
@@ -1768,10 +1326,10 @@ with st.sidebar:
 
     st.divider()
     st.header("⚡ Live Decision Mode")
-    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
+    live_mode = st.toggle("Enable Live Data", value=False)
     if live_mode:
         data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
-        st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
+        st.info("Live mode uses a shorter window and higher frequency data.")
         if st.button("🔄 Refresh Live Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
@@ -1781,18 +1339,15 @@ with st.sidebar:
     st.subheader("Report Export")
     if not EXPORT_AVAILABLE:
         st.error("📥 Export libraries missing.")
-        st.info("To enable PDF/Excel exports, add `fpdf2` and `xlsxwriter` to your `requirements.txt` or run: `pip install fpdf2 xlsxwriter`")
+        st.info("Run: `pip install fpdf2 xlsxwriter`")
     else:
         if 'report_gen' not in st.session_state:
             st.session_state.report_gen = None
-
         if st.session_state.report_gen:
             col_ex1, col_ex2 = st.columns(2)
             with col_ex1:
                 try:
                     raw_pdf = st.session_state.report_gen.generate_pdf()
-                    
-                    # Hyper-robust conversion to bytes
                     if isinstance(raw_pdf, bytes):
                         pdf_bytes = raw_pdf
                     elif isinstance(raw_pdf, bytearray):
@@ -1801,24 +1356,18 @@ with st.sidebar:
                         pdf_bytes = raw_pdf.encode('latin1')
                     else:
                         pdf_bytes = bytes(raw_pdf)
-                        
                     st.download_button(
-                        label="📥 PDF Report",
-                        data=pdf_bytes,
+                        label="📥 PDF Report", data=pdf_bytes,
                         file_name=f"Quant_Report_{TICKER}.pdf",
-                        mime="application/pdf",
-                        key="pdf_download_btn"
+                        mime="application/pdf", key="pdf_download_btn"
                     )
                 except Exception as e:
                     st.error(f"PDF Error: {str(e)}")
-                    st.info(f"Debug Info: Type of data is {type(raw_pdf) if 'raw_pdf' in locals() else 'Unknown'}")
-                    st.caption(f"Active File: {__file__}")
             with col_ex2:
                 try:
                     excel_bytes = st.session_state.report_gen.generate_excel()
                     st.download_button(
-                        label="📥 Excel Data",
-                        data=excel_bytes,
+                        label="📥 Excel Data", data=excel_bytes,
                         file_name=f"Quant_Data_{TICKER}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
@@ -1830,12 +1379,9 @@ with st.sidebar:
 # ==========================================
 # 4. DATA LOADING
 # ==========================================
-# Standardize current time to the nearest minute for robust caching
 now_rounded = datetime.now().replace(second=0, microsecond=0)
 
 if live_mode:
-    # Intraday limits: 1m (7d), 5m-15m (60d), 60m (730d)
-    # We use 30d as a robust default for decision support models to have enough history
     lookback_days = 7 if data_interval == '1m' else 30
     df_main = load_data(TICKER, now_rounded - timedelta(days=lookback_days), now_rounded, interval=data_interval)
 else:
@@ -1843,14 +1389,15 @@ else:
 
 st.subheader("Asset & Macro Analysis Suite")
 
+# ==========================================
 # 5. UNIFIED TAB ARCHITECTURE
 # ==========================================
 tabs = st.tabs([
     "💡 Decision Summary",
-    "Volatility (GARCH)", 
-    "Regime Switching", 
-    "Stochastic (Heston/Jump)", 
-    "Kalman Filter", 
+    "Volatility (GARCH)",
+    "Regime Switching",
+    "Stochastic (Heston/Jump)",
+    "Kalman Filter",
     "Macro Factors",
     "Structural",
     "Backtest",
@@ -1864,27 +1411,24 @@ tabs = st.tabs([
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = tabs
 
 if df_main is not None:
-    # Initialize Report Generator
     st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
     st.session_state.report_gen.add_data("Historical Data", df_main.tail(100))
-    
-    # 6. UNIFIED DECISION ENGINE (Global Signals)
-    # ==========================================
+
     with st.sidebar:
         st.divider()
         st.caption("🔍 Processing Model Signals...")
         prog_bar = st.progress(0)
-    
-    analysis = get_master_signal(TICKER, df_main, 
-                                  n_regimes=regime_param, 
-                                  freq='Daily', 
-                                  opt_goal=reg_opt_goal,
-                                  stability=reg_stability,
-                                  switch_vol=reg_switch_vol,
-                                  switch_trend=reg_switch_trend,
-                                  engine=reg_engine_param,
-                                  initial_cap=initial_cap,
-                                  trailing_stop=trailing_stop)
+
+    analysis = get_master_signal(TICKER, df_main,
+                                 n_regimes=regime_param,
+                                 freq='Daily',
+                                 opt_goal=reg_opt_goal,
+                                 stability=reg_stability,
+                                 switch_vol=reg_switch_vol,
+                                 switch_trend=reg_switch_trend,
+                                 engine=reg_engine_param,
+                                 initial_cap=initial_cap,
+                                 trailing_stop=trailing_stop)
     if analysis:
         regime_sig = analysis['regime_sig']
         regime_label = analysis['regime_label']
@@ -1896,12 +1440,11 @@ if df_main is not None:
         curr_vol = analysis['curr_vol']
         jump_detected = analysis['jump_detected']
         sentiment_score = analysis['sentiment_score']
-        # For Tab 1 diagnostics
         res_sum = analysis['garch_res']
         prog_bar.progress(100)
         prog_bar.empty()
     else:
-        st.sidebar.error("Decision Engine Error: Statistical convergence failed.")
+        st.sidebar.error("Decision Engine Error.")
         regime_sig, regime_data = "N/A", {'label': 'Error', 'confidence': 0.0}
         regime_label = "N/A"
         trend_diff = 0.0
@@ -1912,7 +1455,6 @@ if df_main is not None:
         res_sum = None
         prog_bar.empty()
 else:
-    # No ticker loaded state
     regime_sig, regime_label, sentiment_score = "N/A", "N/A", 0
     regime_data = {'label': 'N/A', 'confidence': 0.0}
     trend_diff = 0.0
@@ -1926,28 +1468,22 @@ else:
 # ==========================================
 with tab0:
     if df_main is None:
-        st.info("💡 **Welcome to the Quant Suite**. Currently, no ticker is loaded. Enter a ticker in the sidebar and enable 'Load Data' to begin technical and statistical analysis.")
-        st.write("Meanwhile, you can explore the **🏦 FED Balance Sheet** tab for macroeconomic context.")
+        st.info("💡 **Welcome**. Enter a ticker in the sidebar to begin.")
     else:
         st.write("### 🧠 Executive Decision Dashboard")
     st.markdown(f"**Unified Quant Signal for {TICKER}** | Interval: `{data_interval}` | Mode: {'Live' if live_mode else 'Historical'}")
-    
-    # 2. DASHBOARD DISPLAY
-    # --------------------
+
     col_dec1, col_dec2, col_dec3 = st.columns(3)
-    
     with col_dec1:
         st.metric("Institutional Regime", regime_label, f"{regime_data['confidence']:.1%} Conf")
         if "BULL" in regime_label: st.success(f"**Action**: {regime_sig}")
         elif "BEAR" in regime_label: st.error(f"**Action**: {regime_sig}")
         else: st.info("Market in transition.")
-
     with col_dec2:
         st.metric("Trend (Kalman)", f"{trend_diff:+.2%}", "Vs Trend Line")
         if trend_diff > 0.02: st.success("Price trending above support.")
         elif trend_diff < -0.02: st.warning("Trend breakdown in progress.")
         else: st.info("Consolidating at trend line.")
-
     with col_dec3:
         st.metric("Volatility Regime", vol_state, f"{curr_vol:.2f} (Daily %)")
         if vol_state == "HIGH": st.warning("High Vol: Reduce Position Size.")
@@ -1955,15 +1491,10 @@ with tab0:
         else: st.info("Standard risk environment.")
 
     st.divider()
-    
-    # 3. MASTER SENTIMENT GAUGE
-    # Score already calculated in global decision engine via get_master_signal
-    
     m_col1, m_col2 = st.columns([1, 2])
     with m_col1:
         st.write("#### Master Quant Score")
-        # Score range approx -5 to +4
-        if sentiment_score >= 2: 
+        if sentiment_score >= 2:
             st.header(f"🟢 BULLISH ({sentiment_score})")
             st.button("🚀 EXECUTE BUY", use_container_width=True, type="primary")
         elif sentiment_score <= -2:
@@ -1972,22 +1503,18 @@ with tab0:
         else:
             st.header(f"🟡 NEUTRAL ({sentiment_score})")
             st.button("⚖️ MAINTAIN NEUTRAL", use_container_width=True)
-            
     with m_col2:
         st.write("#### Risk Alerts")
         if jump_detected:
-            st.error("🚨 **FAT TAIL RISK**: Significant price jumps detected. Stochastic models (Heston/Jump) recommended for testing tail risk.")
+            st.error("🚨 **FAT TAIL RISK**: Significant price jumps detected.")
         else:
-            st.success("✅ **SMOOTH DYNAMICS**: No significant jumps. Gaussian models are stable.")
-        
+            st.success("✅ **SMOOTH DYNAMICS**: No significant jumps.")
         if vol_state == "HIGH":
-            st.warning("⚠️ **VOL CLUSTERING**: Recent shocks are likely to trigger further volatility. See Hawkes tab.")
-        
-        # Recommendation
-        st.info(f"**Recommendation**: {regime_sig}. Target Exposure: {min(1.0, 0.5 + 0.1*sentiment_score):.0%} of risk parity weight.")
+            st.warning("⚠️ **VOL CLUSTERING**: Recent shocks are likely to trigger further volatility.")
+        st.info(f"**Recommendation**: {regime_sig}. Target Exposure: {min(1.0, 0.5 + 0.1*sentiment_score):.0%}")
 
     st.divider()
-    st.caption("This summary aggregates deep statistical models. For detailed justification, visit the respective tabs.")
+    st.caption("This summary aggregates deep statistical models. Visit respective tabs for details.")
 
 # ==========================================
 # TAB 1: VOLATILITY (GARCH/Risk)
@@ -1997,18 +1524,16 @@ with tab1:
         st.warning("Please load a ticker to view Volatility models.")
     else:
         st.write("### 📉 Advanced Volatility Analysis")
-    # --- MODEL VERDICT BANNER ---
+
     if res_sum is not None:
         latest_vol = res_sum.conditional_volatility.iloc[-1]
         vol_msg = f"Volatility is currently **{vol_state}** ({latest_vol:.2f}% daily)."
         if vol_state == "HIGH": st.error(f"🎯 **MODEL VERDICT**: {vol_msg} Defensive sizing recommended.")
         else: st.success(f"🎯 **MODEL VERDICT**: {vol_msg} Risk environment is stable.")
-    
-    if ARCH_AVAILABLE:
-        returns_pct = df_main['Returns'] * 100 # Rescale for better optimization
-        
-        # 1. CONFIGURATION
-        # ---------------------------
+
+    if ARCH_AVAILABLE and df_main is not None:
+        returns_pct = df_main['Returns'] * 100
+
         with st.expander("⚙️ Model Configuration", expanded=True):
             c_mdl1, c_mdl2, c_mdl3 = st.columns(3)
             with c_mdl1:
@@ -2018,21 +1543,15 @@ with tab1:
             with c_mdl3:
                 vol_lag = st.slider("GARCH Lag (p, q)", 1, 3, 1)
 
-        # Map inputs to arch arguments
         vol_map = {"GARCH": "Garch", "GJR-GARCH": "Garch", "EGARCH": "EGarch"}
         dist_map = {"Normal": "Normal", "Student's t": "t", "Skewed Student's t": "skewt"}
-        
         o_param = 1 if vol_model_type == "GJR-GARCH" else 0
-        
-        # Fit Model
+
         try:
             am = arch_model(returns_pct, vol=vol_map[vol_model_type], p=vol_lag, o=o_param, q=vol_lag, dist=dist_map[dist_type])
             res = am.fit(disp='off')
-            
-            # 2. MAIN RESULTS DISPLAY
-            # ---------------------------
+
             col_res1, col_res2 = st.columns([2, 1])
-            
             with col_res1:
                 st.subheader("Conditional Volatility")
                 fig_v, ax_v = plt.subplots(figsize=(10, 4))
@@ -2042,7 +1561,7 @@ with tab1:
                 format_plot_dates(ax_v, returns_pct.index)
                 st.pyplot(fig_v)
                 st.session_state.report_gen.add_plot("GARCH Volatility", fig_v)
-                
+
             with col_res2:
                 params_df = pd.DataFrame({
                     "Param": res.params.index,
@@ -2052,52 +1571,41 @@ with tab1:
                 st.subheader("Model Parameters")
                 st.dataframe(params_df.style.format("{:.4f}"))
                 st.session_state.report_gen.add_data("GARCH Parameters", params_df)
-                
                 st.markdown("### Analysis")
-                
-                # 1. Persistence & Half-Life
-                # standard GARCH persistence = alpha + beta
+
                 pers_val = np.nan
                 if 'beta[1]' in res.params and 'alpha[1]' in res.params:
                     pers_val = res.params['alpha[1]'] + res.params['beta[1]']
                     if vol_model_type == 'GJR-GARCH' and 'gamma[1]' in res.params:
-                         # GJR Persistence approx = alpha + beta + gamma/2
-                         pers_val += res.params['gamma[1]'] / 2
-                
+                        pers_val += res.params['gamma[1]'] / 2
+
                 if not np.isnan(pers_val):
-                    st.metric("Persistence", f"{pers_val:.4f}", help="Closer to 1 = Volatility shocks last longer.")
+                    st.metric("Persistence", f"{pers_val:.4f}")
                     if pers_val < 1:
                         half_life = np.log(0.5) / np.log(pers_val)
-                        st.metric("Half-Life (Days)", f"{half_life:.1f}", help="Days for a shock to initially decay by 50%.")
+                        st.metric("Half-Life (Days)", f"{half_life:.1f}")
                     else:
                         st.caption("Non-stationary (Persistence >= 1)")
 
-                # 2. Leverage Effect
                 if 'gamma[1]' in res.params:
                     gamma_val = res.params['gamma[1]']
                     st.metric("Leverage (Gamma)", f"{gamma_val:.4f}")
                     if gamma_val > 0.05:
-                        st.success("✅ Leverage Effect Confirmed: Market drops increase volatility more than rises.")
+                        st.success("✅ Leverage Effect Confirmed.")
                     elif gamma_val < -0.05:
                         st.info("Inverse Leverage Structure.")
                     else:
                         st.caption("No significant asymmetry.")
-                        
+
                 st.markdown("---")
                 st.metric("AIC", f"{res.aic:.2f}")
                 st.metric("BIC", f"{res.bic:.2f}")
 
-            # 3. DIAGNOSTICS & FORECASTING
-            # ---------------------------
             tab_diag, tab_cast, tab_risk = st.tabs(["🔍 Diagnostics", "🔮 Forecasting", "🛡️ Risk Management"])
-            
-            # --- A. DIAGNOSTICS ---
+
             with tab_diag:
                 d_col1, d_col2 = st.columns(2)
-                
                 std_resid = res.std_resid
-                
-                # 1. Standardized Residuals Plot
                 with d_col1:
                     st.markdown("**Standardized Residuals**")
                     fig_r, ax_r = plt.subplots(figsize=(8, 4))
@@ -2105,126 +1613,87 @@ with tab1:
                     ax_r.axhline(0, color='black', linestyle='--')
                     format_plot_dates(ax_r, returns_pct.index)
                     st.pyplot(fig_r)
-                    
-                # 2. QQ Plot
                 with d_col2:
                     st.markdown("**Q-Q Plot (vs Normal)**")
                     fig_qq = plt.figure(figsize=(8, 4))
                     ax_qq = fig_qq.add_subplot(111)
                     stats.probplot(std_resid, dist="norm", plot=ax_qq)
                     st.pyplot(fig_qq)
-                    
-                # 3. Serial Correlation Tests
-                st.markdown("**Residual Diagnostics (Autocorrelation)**")
+
+                st.markdown("**Residual Diagnostics**")
                 lb_test = acorr_ljungbox(std_resid, lags=[10], return_df=True)
                 arch_test = het_arch(std_resid)
-                
                 diag_data = {
                     "Test": ["Ljung-Box (No Serial Corr)", "ARCH-LM (No ARCH Effect)"],
                     "p-value": [lb_test['lb_pvalue'].iloc[0], arch_test[1]],
                     "Conclusion": [
-                        "Fail to Reject H0 (Good)" if lb_test['lb_pvalue'].iloc[0] > 0.05 else "Reject H0 (Bad - Autocorr exists)",
-                        "Fail to Reject H0 (Good)" if arch_test[1] > 0.05 else "Reject H0 (Bad - ARCH exists)"
+                        "Fail to Reject H0 (Good)" if lb_test['lb_pvalue'].iloc[0] > 0.05 else "Reject H0 (Bad)",
+                        "Fail to Reject H0 (Good)" if arch_test[1] > 0.05 else "Reject H0 (Bad)"
                     ]
                 }
                 st.table(pd.DataFrame(diag_data).set_index("Test"))
 
-            # --- B. FORECASTING ---
             with tab_cast:
                 f_horizon = st.slider("Forecast Horizon (Days)", 1, 63, 21)
-                
                 try:
                     forecasts = res.forecast(horizon=f_horizon, reindex=False)
                 except ValueError:
-                    # Fallback for models/distributions where analytic is not supported (e.g. EGARCH/Skewt)
                     forecasts = res.forecast(horizon=f_horizon, method='simulation', simulations=1000, reindex=False)
-                
+
                 var_forecast = forecasts.variance.iloc[-1]
                 vol_forecast = np.sqrt(var_forecast)
-                
-                st.write(f"**Volatility Forecast for next {f_horizon} days**")
-                
-                # Plot Forecast
+
                 fig_f, ax_f = plt.subplots(figsize=(10, 4))
-                # History
                 last_days = 60
                 hist_dates = returns_pct.index[-last_days:]
                 hist_vol = res.conditional_volatility[-last_days:]
-                
                 ax_f.plot(hist_dates, hist_vol, color='black', alpha=0.5, label='Historical Vol')
-                
-                # Forecast
                 fut_dates = [returns_pct.index[-1] + timedelta(days=i) for i in range(1, f_horizon+1)]
                 ax_f.plot(fut_dates, vol_forecast, color='red', marker='o', linestyle='--', label='Forecast Vol')
-                
                 ax_f.set_title("Volatility Term Structure Forecast")
-                format_plot_dates(ax_f, hist_dates) # Basic formatting for history part
+                format_plot_dates(ax_f, hist_dates)
                 ax_f.legend()
                 st.pyplot(fig_f)
-                
-                # Term Structure Comment
-                current_vol = res.conditional_volatility[-1]
-                lt_vol = np.sqrt(res.params['omega'] / (1 - res.params['alpha[1]'] - res.params['beta[1]'])) if 'beta[1]' in res.params else current_vol
-                
-                if vol_forecast.iloc[-1] < current_vol:
-                     st.success(f"Mean Reversion: Volatility expected to DECLINE towards long-term avg.")
-                else:
-                     st.warning(f"Mean Reversion: Volatility expected to RISE towards long-term avg.")
 
-            # --- C. RISK MANAGEMENT ---
+                current_vol_v = res.conditional_volatility[-1]
+                if vol_forecast.iloc[-1] < current_vol_v:
+                    st.success("Mean Reversion: Volatility expected to DECLINE.")
+                else:
+                    st.warning("Mean Reversion: Volatility expected to RISE.")
+
             with tab_risk:
-                st.markdown("**Value at Risk (VaR) & Sizing**")
-                
                 r_col1, r_col2 = st.columns(2)
-                
                 with r_col1:
                     acc_size = st.number_input("Portfolio Value", 1000, 10000000, 100000)
                     conf_level = st.selectbox("Confidence Level", [0.95, 0.99])
-                    
-                    # Calculate VaR
-                    # One-day ahead VaR based on model
-                    # VaR = mean + sigma * q(alpha)
-                    
-                    next_vol = np.sqrt(forecasts.variance.iloc[-1].iloc[0]) / 100 # Convert back to decimal
-                    
-                    # Quantile depends on distribution
+                    try:
+                        forecasts_risk = res.forecast(horizon=1, reindex=False)
+                    except ValueError:
+                        forecasts_risk = res.forecast(horizon=1, method='simulation', simulations=1000, reindex=False)
+                    next_vol = np.sqrt(forecasts_risk.variance.iloc[-1].iloc[0]) / 100
                     if dist_type == "Normal":
-                        q = stats.norm.ppf(1-conf_level) # e.g. -1.645 for 95%
+                        q = stats.norm.ppf(1-conf_level)
                     elif dist_type == "Student's t":
                         nu = res.params.get('nu')
                         q = stats.t.ppf(1-conf_level, df=nu)
-                        
-                    elif dist_type == "Skewed Student's t":
-                         # Skewed T expects 2 parameters: nu (degree of freedom) and lambda (skew)
-                         nu = res.params.get('nu')
-                         lam = res.params.get('lambda')
-                         
-                         if nu is not None and lam is not None:
-                             dist_inst = am.distribution
-                             # arch distribution ppf expects params as a list/array
-                             q = dist_inst.ppf(1-conf_level, [nu, lam])
-                         else:
-                             # Fallback to normal if params missing (unlikely if converged)
-                             q = stats.norm.ppf(1-conf_level)
-
-                    var_pct = -q * next_vol # Positive number representing loss
+                    else:
+                        nu = res.params.get('nu')
+                        lam = res.params.get('lambda')
+                        if nu is not None and lam is not None:
+                            dist_inst = am.distribution
+                            q = dist_inst.ppf(1-conf_level, [nu, lam])
+                        else:
+                            q = stats.norm.ppf(1-conf_level)
+                    var_pct = -q * next_vol
                     var_val = var_pct * acc_size
-                    
                     st.metric(f"1-Day VaR ({conf_level:.0%})", f"{CURRENCY}{var_val:,.2f}", f"-{var_pct*100:.2f}%")
-                    st.caption("Estimated maximum loss for tomorrow with selected confidence.")
 
                 with r_col2:
                     target_vol = st.slider("Target Annual Volatility (%)", 5, 50, 15) / 100
-                    
-                    # Position Sizing
-                    # Size = (Target Vol / Current Vol) * Capital
-                    
                     current_ann_vol = next_vol * np.sqrt(252)
                     lev_factor = target_vol / current_ann_vol
                     rec_exposure = acc_size * lev_factor
-                    
                     st.metric("Vol-Targeted Exposure", f"{CURRENCY}{rec_exposure:,.0f}", f"Leverage: {lev_factor:.2f}x")
-                    
                     if lev_factor > 1.0:
                         st.warning("Requires Leverage (Margin)")
                     else:
@@ -2232,10 +1701,9 @@ with tab1:
 
         except Exception as e:
             st.error(f"Model Fit Failed: {e}")
-            st.info("Try a different distribution or simpler model (GARCH).")
-            
-    else:
-        st.warning("⚠️ 'arch' library not found. Please run `pip install arch`.")
+
+    elif not ARCH_AVAILABLE:
+        st.warning("⚠️ 'arch' library not found. Run `pip install arch`.")
 
 # ==========================================
 # TAB 2: REGIME SWITCHING
@@ -2245,618 +1713,365 @@ with tab2:
         st.warning("Please load a ticker to view Regime Switching models.")
     else:
         st.write("### Markov Regime Switching Model")
-    # --- MODEL VERDICT BANNER ---
-    if "LONG" in regime_sig: st.success(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}** in {regime_data['label']}. High conviction for bullish exposure.")
+
+    if "LONG" in regime_sig: st.success(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}** in {regime_data['label']}.")
     elif "SHORT" in regime_sig: st.error(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}**. Market risk is elevated.")
-    else: st.info(f"🎯 **MODEL VERDICT**: {regime_sig}. Await confirmation of a clear regime shift.")
+    else: st.info(f"🎯 **MODEL VERDICT**: {regime_sig}. Await confirmation.")
 
-    st.markdown("""
-    Identifies hidden market states (e.g., Bull vs Bear) from return dynamics.  
-    Each regime has distinct mean return and volatility characteristics.
-    """)
-    st.markdown("[Reference: Regime Switching Models (James D. Hamilton)](https://econweb.ucsd.edu/~jhamilton/palgrave.pdf)")
-    
-    # ===== CONFIGURATION =====
-    col_config1, col_config2, col_config3 = st.columns(3)
-    
-    with col_config1:
-        # CHANGED: Default index 1 is Weekly (0=Daily, 1=Weekly)
-        regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=1)
-    with col_config2:
-        # CHANGED: Default value 2
-        lookback_years = st.slider("Lookback Period (Years)", 1, 10, 2)
-    with col_config3:
-        n_regimes = st.slider("Number of Regimes", 2, 4, 2)
-    
-    # New: Signal Stability Control
-    # CHANGED: Default value 4
-    stability = st.slider("Signal Stability (Pre-Smoothing)", 0, 10, 4, 
-                          help="0 = Raw Data (Fastest), 10 = Very Smooth (Lagged). Higher values filter out noise.")
-    
-    # New: High-Conviction Threshold
-    conviction_thresh = st.slider("High-Conviction Threshold", 0.5, 0.95, 0.7, step=0.05, 
-                                  help="Minimum probability required to confirm a regime signal.")
-    
-    col_sw1, col_sw2 = st.columns(2)
-    with col_sw1:
-        switch_trend = st.checkbox("Switching Mean (Trend)", value=True,
-                                    help="Uncheck if convergence fails")
-    with col_sw2:
-        switch_vol = st.checkbox("Switching Volatility", value=True,
-                                  help="Uncheck to focus ONLY on Trend (ignore volatility changes)")
-    
-    # ===== PRE-FLIGHT CHECKS =====
-    warnings = []
-    if lookback_years <= 1:
-        warnings.append("⚠️ Very short history - consider 3+ years for stable regimes")
-        if regime_freq == "Weekly":
-            warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
-            regime_freq = "Daily"
-    
-    if regime_freq == "Daily" and switch_trend and lookback_years < 3:
-        warnings.append("⚠️ Daily + Switching Trend needs 3+ years. Disabling...")
-        switch_trend = False
-    
-    if warnings:
-        for w in warnings:
+    if df_main is not None:
+        col_config1, col_config2, col_config3 = st.columns(3)
+        with col_config1:
+            regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=1)
+        with col_config2:
+            lookback_years = st.slider("Lookback Period (Years)", 1, 10, 2)
+        with col_config3:
+            n_regimes = st.slider("Number of Regimes", 2, 4, 2)
+
+        stability = st.slider("Signal Stability (Pre-Smoothing)", 0, 10, 4)
+        conviction_thresh = st.slider("High-Conviction Threshold", 0.5, 0.95, 0.7, step=0.05)
+
+        col_sw1, col_sw2 = st.columns(2)
+        with col_sw1:
+            switch_trend = st.checkbox("Switching Mean (Trend)", value=True)
+        with col_sw2:
+            switch_vol = st.checkbox("Switching Volatility", value=True)
+
+        warnings_list = []
+        if lookback_years <= 1:
+            warnings_list.append("⚠️ Very short history - consider 3+ years for stable regimes")
+            if regime_freq == "Weekly":
+                warnings_list.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
+                regime_freq = "Daily"
+        if regime_freq == "Daily" and switch_trend and lookback_years < 3:
+            warnings_list.append("⚠️ Daily + Switching Trend needs 3+ years. Disabling...")
+            switch_trend = False
+        for w in warnings_list:
             st.warning(w)
-    
-    # ===== DATA PREPARATION =====
-    start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
-    df_regime = load_data(TICKER, start_dt_regime, end_date)
-    
-    if df_regime is None:
-        st.error("Could not load data")
-        st.stop()
-    
-    # Prepare data
-    if regime_freq == "Weekly":
-        returns = df_regime['Returns'].resample('W').sum()
-    else:
-        returns = df_regime['Returns']
-    
-    # Apply Pre-Smoothing (EWMA) if requested
-    if stability > 0:
-        returns = returns.ewm(span=stability, adjust=False).mean()
-        st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
-    
-    # FIX: Ensure data is strictly 1D Series with Float dtype
-    try:
-        model_data = returns.dropna() * 100
-        
-        # Reconstruct Series to guarantee 1D structure
-        # This handles (N,1) DataFrames, Series, etc.
-        if len(model_data) < 10:
-            st.error("Insufficient data points for modeling (>10 required).")
-            st.stop()
-            
-        model_data = pd.Series(
-            model_data.values.flatten().astype(float), 
-            index=model_data.index
-        )
-        
-        if model_data.ndim != 1:
-            st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
-            st.stop()
-             
-    except Exception as e:
-        st.error(f"Data Prep Error: {e}")
-        st.stop()
-    
-    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {start_dt_regime.date()}")
-    
-    # ===== MODEL FITTING =====
-    with st.spinner(f"Fitting {n_regimes}-regime model..."):
-        res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
-        
-    if res_markov is None:
-        st.error("Model fitting failed (fit_regime_model returned None).")
-        st.stop()
-        
-    # Verify convergence implicitly via success return
 
-        
-    # ===== CONVERGENCE CHECKS =====
-    if not res_markov.mle_retvals['converged']:
-        st.error("⛔ Model did not converge. Try longer history or simpler model.")
-        st.stop()
-    
-    trans_matrix = np.squeeze(res_markov.regime_transition)
-    
-    # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
-    if trans_matrix.ndim < 2:
-         trans_matrix = np.atleast_2d(trans_matrix)
-    
-    # Check for degenerate regimes
-    if np.any(trans_matrix > 0.99):
-        st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
-    
-    # ===== REGIME CHARACTERIZATION =====
-    regime_stats = []
-    for i in range(n_regimes):
-        # Handle case where switching_trend=False (single 'const')
-        if f'const[{i}]' in res_markov.params:
-            mean_val = res_markov.params[f'const[{i}]']
-        else:
-            mean_val = res_markov.params.get('const', 0.0)
-        
-        # Handle case where switching_variance=False (single 'sigma2')
-        if f'sigma2[{i}]' in res_markov.params:
-            vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
-        else:
-            vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
-            
-        regime_stats.append({
-            'regime': i,
-            'mean': float(mean_val),
-            'vol': float(vol_val),
-            'persistence': float(trans_matrix[i, i])
-        })
-    
-    # Sort by mean (high to low)
-    regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
-    
-    # ===== DISPLAY REGIMES =====
-    st.write("### 📊 Identified Regimes")
-    
-    cols = st.columns(n_regimes)
-    labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
-    
-    for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
-        with col:
-            st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
-            st.metric("Mean Return", f"{regime['mean']:.2f}%")
-            st.metric("Volatility", f"{regime['vol']:.2f}%")
-            st.metric("Persistence", f"{regime['persistence']:.1%}")
-            
-            avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
-            st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
-    
-    st.session_state.report_gen.add_data("Regime Statistics", pd.DataFrame(regime_stats))
-    
-    # ===== CURRENT STATE =====
-    # Use .iloc[-1] to get the probabilities at the LAST time step
-    last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
-    current_regime = np.argmax(last_probs)
-    current_prob = last_probs.iloc[current_regime]
-    
-    regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
-    
-    # Conviction Logic
-    is_conviction = current_prob >= conviction_thresh
-    
-    # Calculate Stability Score (Mean Persistence)
-    stability_score = np.mean([r['persistence'] for r in regime_stats])
-    
-    # Display Dashboard
-    st.divider()
-    c_dash1, c_dash2, c_dash3 = st.columns(3)
-    
-    with c_dash1:
-        st.caption("Current State")
-        if is_conviction:
-            st.subheader(f"{regime_label}")
-            st.success(f"High Conviction ({current_prob:.1%})")
-        else:
-            st.subheader("⚪ Mixed / Uncertain")
-            st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
-    
-    with c_dash2:
-        st.caption("Dominance Score (Confidence)")
-        # Spread between 1st and 2nd highest probability
-        sorted_probs = sorted(last_probs.values, reverse=True)
-        spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
-        
-        st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
-        st.progress(max(0.0, min(1.0, float(spread))))
-        
-    with c_dash3:
-        st.caption("Regime Stability Metrics")
-        st.metric("Avg Persistence", f"{stability_score:.1%}")
-        # Switch Frequency (proxy)
-        expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
-        st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
+        start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
+        df_regime = load_data(TICKER, start_dt_regime, end_date)
 
-    st.write(f"**As of:** {model_data.index[-1].date()}")
-    st.divider()
-    
-    # ===== VISUALIZATION =====
-    st.write("### 📈 Regime Analysis (Real-time / Filtered)")
-    
-    fig_m, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-    
-    # Plot 1: Returns with regime shading
-    axes[0].plot(model_data.index, model_data, color='black', alpha=0.6, linewidth=1)
-    
-    for i, regime in enumerate(regime_stats):
-        # Use .iloc for robust column access
-        # CHANGED: Use filtered probabilities to avoid look-ahead bias
-        probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-        # Invert color map: i=0 (Bull) -> 1.0 (Green), i=N (Bear) -> 0.0 (Red)
-        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-        color = plt.cm.RdYlGn(color_idx)
-        
-        axes[0].fill_between(model_data.index, model_data.min(), model_data.max(),
-                              where=(probs > 0.6),
-                              alpha=0.15, color=color, label=labels[i])
-    
-    axes[0].set_title(f"{TICKER} Returns with Regime Periods")
-    axes[0].legend(loc='upper left')
-    axes[0].set_ylabel("Return (%)")
-    
-    # Plot 2: Probabilities
-    # Option to smooth the probability line itself for readability
-    smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
-    
-    for i, regime in enumerate(regime_stats):
-        # Invert color map
-        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-        color = plt.cm.RdYlGn(color_idx)
-        
-        regime = regime_stats[i] # get back regime obj
-        # Get raw probabilities
-        # CHANGED: Use filtered probabilities
-        raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-        
-        # Apply smoothing if requested
-        if smooth_probs:
-            plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
-        else:
-            plot_probs = raw_probs
-        
-        # Use fill_between (Area Chart) for better readability than just lines
-        axes[1].fill_between(model_data.index, 0, plot_probs, 
-                             color=color, alpha=0.3, label=labels[i])
-        axes[1].plot(model_data.index, plot_probs, color=color, linewidth=1.5)
+        if df_regime is not None:
+            if regime_freq == "Weekly":
+                returns = df_regime['Returns'].resample('W').sum()
+            else:
+                returns = df_regime['Returns']
 
-    axes[1].axhline(1/n_regimes, color='gray', linestyle='--', alpha=0.4, 
-                    label='Equal probability')
-    axes[1].set_title("Regime Probabilities (Filtered/Real-time)")
-    axes[1].set_ylabel("Probability")
-    axes[1].set_ylim([0, 1])
-    axes[1].legend()
-    
-    # Plot 3: Expected Return
-    # Helper to safely get const
-    def get_const(i):
-        # Check for regime specific const first, then global const
-        if f'const[{i}]' in res_markov.params:
-            return float(res_markov.params[f'const[{i}]'])
-        return float(res_markov.params.get('const', 0.0))
+            if stability > 0:
+                returns = returns.ewm(span=stability, adjust=False).mean()
+                st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability})")
 
-    # Initialize expected_ret as a Series with the correct index
-    expected_ret = pd.Series(0.0, index=model_data.index)
-    
-    for i in range(n_regimes):
-        # CHANGED: Use filtered probabilities
-        prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
-        const_val = get_const(i)
-        expected_ret += prob * const_val
-    
-    axes[2].plot(model_data.index, expected_ret, color='darkblue', linewidth=2)
-    axes[2].axhline(0, color='black', linestyle='-', alpha=0.3)
-    
-    # Fill between requires numpy arrays for 'where' sometimes, or robust Series
-    axes[2].fill_between(model_data.index, 0, expected_ret,
-                          where=(expected_ret > 0), color='green', alpha=0.3)
-    axes[2].fill_between(model_data.index, 0, expected_ret,
-                          where=(expected_ret < 0), color='red', alpha=0.3)
-    axes[2].set_title("Regime-Weighted Expected Return")
-    axes[2].set_ylabel("Expected Return (%)")
-    
-    # Format dates for ALL axes and ensure labels are visible
-    # Format dates: Only for the last axis to avoid overlap
-    format_plot_dates(axes[-1], model_data.index)
-    axes[-1].tick_params(labelbottom=True)
-    
-    # Ensure other axes don't show labels (redundant with sharex but safe)
-    for ax in axes[:-1]:
-        ax.tick_params(labelbottom=False)
-        
-    st.pyplot(fig_m)
-    st.session_state.report_gen.add_plot("Regime Switching Analysis", fig_m)
-    
-    # ===== PARAMETERS TABLE =====
-    with st.expander("📋 Technical Parameters"):
-        summary_data = {
-            "Parameter": res_markov.params.index,
-            "Value": res_markov.params.values.astype(float),
-            "Std Error": res_markov.bse.values.astype(float),
-            "P-Value": res_markov.pvalues.values.astype(float)
-        }
-        df_summary = pd.DataFrame(summary_data)
-        # Format only numeric columns to avoid error with "Parameter" string column
-        st.dataframe(df_summary.style.format({
-            "Value": "{:.4f}",
-            "Std Error": "{:.4f}",
-            "P-Value": "{:.4f}"
-        }))
-        
-        st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
-    
+            try:
+                model_data = returns.dropna() * 100
+                if len(model_data) < 10:
+                    st.error("Insufficient data points (>10 required).")
+                    st.stop()
+                model_data = pd.Series(model_data.values.flatten().astype(float), index=model_data.index)
+            except Exception as e:
+                st.error(f"Data Prep Error: {e}")
+                st.stop()
 
+            st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {start_dt_regime.date()}")
 
+            with st.spinner(f"Fitting {n_regimes}-regime model..."):
+                res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
+
+            if res_markov is None:
+                st.error("Model fitting failed.")
+                st.stop()
+
+            if not res_markov.mle_retvals['converged']:
+                st.error("⛔ Model did not converge.")
+                st.stop()
+
+            trans_matrix = np.squeeze(res_markov.regime_transition)
+            if trans_matrix.ndim < 2:
+                trans_matrix = np.atleast_2d(trans_matrix)
+
+            if np.any(trans_matrix > 0.99):
+                st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
+
+            regime_stats = []
+            for i in range(n_regimes):
+                if f'const[{i}]' in res_markov.params:
+                    mean_val = res_markov.params[f'const[{i}]']
+                else:
+                    mean_val = res_markov.params.get('const', 0.0)
+                if f'sigma2[{i}]' in res_markov.params:
+                    vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
+                else:
+                    vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
+                regime_stats.append({
+                    'regime': i, 'mean': float(mean_val),
+                    'vol': float(vol_val), 'persistence': float(trans_matrix[i, i])
+                })
+
+            regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
+
+            st.write("### 📊 Identified Regimes")
+            cols = st.columns(n_regimes)
+            labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
+            for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
+                with col:
+                    st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
+                    st.metric("Mean Return", f"{regime['mean']:.2f}%")
+                    st.metric("Volatility", f"{regime['vol']:.2f}%")
+                    st.metric("Persistence", f"{regime['persistence']:.1%}")
+                    avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
+                    st.caption(f"Avg duration: {avg_duration:.1f} periods")
+
+            st.session_state.report_gen.add_data("Regime Statistics", pd.DataFrame(regime_stats))
+
+            last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
+            current_regime = np.argmax(last_probs)
+            current_prob = last_probs.iloc[current_regime]
+            regime_label_tab2 = labels[[r['regime'] for r in regime_stats].index(current_regime)]
+            is_conviction = current_prob >= conviction_thresh
+            stability_score = np.mean([r['persistence'] for r in regime_stats])
+
+            st.divider()
+            c_dash1, c_dash2, c_dash3 = st.columns(3)
+            with c_dash1:
+                st.caption("Current State")
+                if is_conviction:
+                    st.subheader(f"{regime_label_tab2}")
+                    st.success(f"High Conviction ({current_prob:.1%})")
+                else:
+                    st.subheader("⚪ Mixed / Uncertain")
+                    st.warning(f"Low Conviction ({current_prob:.1%})")
+            with c_dash2:
+                sorted_probs = sorted(last_probs.values, reverse=True)
+                spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+                st.metric("Probability Spread", f"{spread:.1%}")
+                st.progress(max(0.0, min(1.0, float(spread))))
+            with c_dash3:
+                st.metric("Avg Persistence", f"{stability_score:.1%}")
+                expected_switches = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
+                st.caption(f"Exp. Switches/Year: ~{expected_switches:.1f}")
+
+            st.write(f"**As of:** {model_data.index[-1].date()}")
+            st.divider()
+
+            fig_m, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+            axes[0].plot(model_data.index, model_data, color='black', alpha=0.6, linewidth=1)
+            for i, regime in enumerate(regime_stats):
+                probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+                color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+                color = plt.cm.RdYlGn(color_idx)
+                axes[0].fill_between(model_data.index, model_data.min(), model_data.max(),
+                                     where=(probs > 0.6), alpha=0.15, color=color, label=labels[i])
+            axes[0].set_title(f"{TICKER} Returns with Regime Periods")
+            axes[0].legend(loc='upper left')
+            axes[0].set_ylabel("Return (%)")
+
+            smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
+            for i, regime in enumerate(regime_stats):
+                color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+                color = plt.cm.RdYlGn(color_idx)
+                raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+                plot_probs = raw_probs.rolling(window=4, min_periods=1).mean() if smooth_probs else raw_probs
+                axes[1].fill_between(model_data.index, 0, plot_probs, color=color, alpha=0.3, label=labels[i])
+                axes[1].plot(model_data.index, plot_probs, color=color, linewidth=1.5)
+            axes[1].axhline(1/n_regimes, color='gray', linestyle='--', alpha=0.4)
+            axes[1].set_title("Regime Probabilities (Filtered)")
+            axes[1].set_ylabel("Probability")
+            axes[1].set_ylim([0, 1])
+            axes[1].legend()
+
+            def get_const(i):
+                if f'const[{i}]' in res_markov.params:
+                    return float(res_markov.params[f'const[{i}]'])
+                return float(res_markov.params.get('const', 0.0))
+
+            expected_ret = pd.Series(0.0, index=model_data.index)
+            for i in range(n_regimes):
+                prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
+                expected_ret += prob * get_const(i)
+
+            axes[2].plot(model_data.index, expected_ret, color='darkblue', linewidth=2)
+            axes[2].axhline(0, color='black', linestyle='-', alpha=0.3)
+            axes[2].fill_between(model_data.index, 0, expected_ret, where=(expected_ret > 0), color='green', alpha=0.3)
+            axes[2].fill_between(model_data.index, 0, expected_ret, where=(expected_ret < 0), color='red', alpha=0.3)
+            axes[2].set_title("Regime-Weighted Expected Return")
+            axes[2].set_ylabel("Expected Return (%)")
+
+            format_plot_dates(axes[-1], model_data.index)
+            axes[-1].tick_params(labelbottom=True)
+            for ax in axes[:-1]:
+                ax.tick_params(labelbottom=False)
+
+            st.pyplot(fig_m)
+            st.session_state.report_gen.add_plot("Regime Switching Analysis", fig_m)
+
+            with st.expander("📋 Technical Parameters"):
+                summary_data = {
+                    "Parameter": res_markov.params.index,
+                    "Value": res_markov.params.values.astype(float),
+                    "Std Error": res_markov.bse.values.astype(float),
+                    "P-Value": res_markov.pvalues.values.astype(float)
+                }
+                df_summary = pd.DataFrame(summary_data)
+                st.dataframe(df_summary.style.format({"Value": "{:.4f}", "Std Error": "{:.4f}", "P-Value": "{:.4f}"}))
+                st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
 
 # ==========================================
-# TAB 3: STOCHASTIC MODELS (Heston/Jump)
+# TAB 3: STOCHASTIC MODELS
 # ==========================================
 with tab3:
     if df_main is None:
         st.warning("Please load a ticker to view Stochastic/Jump models.")
     else:
         st.write("### Advanced Stochastic Simulations")
-    
-    col_conf1, col_conf2 = st.columns(2)
-    with col_conf1:
-        sim_type = st.radio("Select Model", ["Merton Jump Diffusion", "Heston Stochastic Volatility"])
-    with col_conf2:
-        drift_type = st.radio("Drift Strategy", [
-            "Risk-Neutral (Risk-Free Rate)", 
-            "Historical Mean (Real World)",
-            "CAPM (Expected Return)",
-            "Analyst Consensus (1Y Target)",
-            "Custom View"
-        ])
-        
-    # Determine Drift
-    if drift_type == "Risk-Neutral (Risk-Free Rate)":
-        mu_drift = rf_rate
-        st.caption(f"Using Risk-Free Rate: {rf_rate*100:.2f}% (Standard for Pricing)")
-        
-    elif drift_type == "Historical Mean (Real World)":
-        hist_mu = df_main['Log_Returns'].mean() * 252
-        mu_drift = hist_mu
-        st.caption(f"Using Historical Mean: {hist_mu*100:.2f}% (Past Performance)")
-        
-    elif drift_type == "CAPM (Expected Return)":
-        beta = calculate_beta(df_main['Returns'], benchmark_ticker=BENCHMARK)
-        mkt_return = 0.08 # Assumed 8% market return
-        capm_ret = rf_rate + beta * (mkt_return - rf_rate)
-        # Convert simple return to log return approx
-        mu_drift = np.log(1 + capm_ret)
-        st.metric("CAPM Beta", f"{beta:.2f}")
-        st.caption(f"CAPM Expected Return: {capm_ret*100:.2f}% (Beta: {beta:.2f} vs {BENCHMARK})")
-        
-    elif drift_type == "Analyst Consensus (1Y Target)":
-        target, implied_ret = get_analyst_target(TICKER)
-        if target:
-            mu_drift = implied_ret
-            st.metric("Analyst Target", f"{CURRENCY}{target:.2f}")
-            st.caption(f"Implied Drift: {implied_ret*100:.2f}% (from Consensus)")
+
+    if df_main is not None:
+        col_conf1, col_conf2 = st.columns(2)
+        with col_conf1:
+            sim_type = st.radio("Select Model", ["Merton Jump Diffusion", "Heston Stochastic Volatility"])
+        with col_conf2:
+            drift_type = st.radio("Drift Strategy", [
+                "Risk-Neutral (Risk-Free Rate)",
+                "Historical Mean (Real World)",
+                "CAPM (Expected Return)",
+                "Analyst Consensus (1Y Target)",
+                "Custom View"
+            ])
+
+        if drift_type == "Risk-Neutral (Risk-Free Rate)":
+            mu_drift = rf_rate
+        elif drift_type == "Historical Mean (Real World)":
+            hist_mu = df_main['Log_Returns'].mean() * 252
+            mu_drift = hist_mu
+        elif drift_type == "CAPM (Expected Return)":
+            beta = calculate_beta(df_main['Returns'], benchmark_ticker=BENCHMARK)
+            mkt_return = 0.08
+            capm_ret = rf_rate + beta * (mkt_return - rf_rate)
+            mu_drift = np.log(1 + capm_ret)
+            st.metric("CAPM Beta", f"{beta:.2f}")
+        elif drift_type == "Analyst Consensus (1Y Target)":
+            target, implied_ret = get_analyst_target(TICKER)
+            if target:
+                mu_drift = implied_ret
+                st.metric("Analyst Target", f"{CURRENCY}{target:.2f}")
+            else:
+                st.warning("No Analyst Target found. Reverting to Historical.")
+                mu_drift = df_main['Log_Returns'].mean() * 252
         else:
-            st.warning("No Analyst Target found. Reverting to Historical.")
-            mu_drift = df_main['Log_Returns'].mean() * 252
-            
-    elif drift_type == "Custom View":
-        custom_ret = st.number_input("Expected Annual Return (%)", -50.0, 100.0, 10.0) / 100
-        mu_drift = np.log(1 + custom_ret)
-        st.caption(f"Using Custom Drift: {custom_ret*100:.2f}%")
+            custom_ret = st.number_input("Expected Annual Return (%)", -50.0, 100.0, 10.0) / 100
+            mu_drift = np.log(1 + custom_ret)
 
-    # Helper to generate future dates
-    last_date = df_main.index[-1]
-    future_dates = [last_date + timedelta(days=i) for i in range(253)] # 0 to 252
-    
-    import plotly.graph_objects as go
-    
-    # Random Seed for Reproducibility
-    seed = st.number_input("Random Seed (Fixes the simulation)", 1, 10000, 42)
-    np.random.seed(seed)
-    
-    if sim_type == "Merton Jump Diffusion":
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.markdown("**Parameters**")
-            mj_lam = st.slider("Jump Intensity (Lambda)", 0.1, 10.0, 1.0, help="Avg jumps per year")
-            mj_mu = st.slider("Jump Mean Size", -0.5, 0.5, -0.1)
-            mj_sigma = st.slider("Jump Std Dev", 0.01, 0.5, 0.1)
-            mj_vol = st.slider("Diffusive Volatility", 0.05, 1.0, 0.2)
-        
-        with col2:
-            current_price = df_main['Close'].iloc[-1]
-            # Pass mu_drift instead of rf_rate
-            paths = merton_jump_diffusion(current_price, 1.0, mu_drift, mj_vol, mj_lam, mj_mu, mj_sigma, 252, 50)
-            
-            # Calculate Statistics
-            mean_path = paths.mean(axis=1)
-            median_path = np.median(paths, axis=1)
-            p05_path = np.percentile(paths, 5, axis=1)
-            p95_path = np.percentile(paths, 95, axis=1)
-            
-            final_mean = mean_path[-1]
-            final_median = median_path[-1]
-            
-            m1, m2 = st.columns(2)
-            m1.metric("Projected Mean (Avg)", f"{CURRENCY}{final_mean:,.2f}")
-            m2.metric("Projected Median (50th %)", f"{CURRENCY}{final_median:,.2f}")
-            
-            # Plotly Chart
-            fig = go.Figure()
-            
-            # Add Cone of Uncertainty (5th-95th)
-            fig.add_trace(go.Scatter(
-                x=future_dates + future_dates[::-1],
-                y=np.concatenate([p95_path, p05_path[::-1]]),
-                fill='toself',
-                fillcolor='rgba(100, 100, 255, 0.2)',
-                line=dict(color='rgba(255,255,255,0)'),
-                name='90% Confidence Interval',
-                showlegend=True
-            ))
-            
-            # Add individual paths (lightly) - Reduced count for clarity
-            for i in range(min(20, paths.shape[1])):
+        last_date = df_main.index[-1]
+        future_dates = [last_date + timedelta(days=i) for i in range(253)]
+
+        import plotly.graph_objects as go
+
+        seed = st.number_input("Random Seed", 1, 10000, 42)
+        np.random.seed(seed)
+
+        if sim_type == "Merton Jump Diffusion":
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.markdown("**Parameters**")
+                mj_lam = st.slider("Jump Intensity (Lambda)", 0.1, 10.0, 1.0)
+                mj_mu = st.slider("Jump Mean Size", -0.5, 0.5, -0.1)
+                mj_sigma = st.slider("Jump Std Dev", 0.01, 0.5, 0.1)
+                mj_vol = st.slider("Diffusive Volatility", 0.05, 1.0, 0.2)
+            with col2:
+                current_price = df_main['Close'].iloc[-1]
+                paths = merton_jump_diffusion(current_price, 1.0, mu_drift, mj_vol, mj_lam, mj_mu, mj_sigma, 252, 50)
+                mean_path = paths.mean(axis=1)
+                median_path = np.median(paths, axis=1)
+                p05_path = np.percentile(paths, 5, axis=1)
+                p95_path = np.percentile(paths, 95, axis=1)
+                final_mean = mean_path[-1]
+                final_median = median_path[-1]
+                m1, m2 = st.columns(2)
+                m1.metric("Projected Mean", f"{CURRENCY}{final_mean:,.2f}")
+                m2.metric("Projected Median", f"{CURRENCY}{final_median:,.2f}")
+                fig = go.Figure()
                 fig.add_trace(go.Scatter(
-                    x=future_dates, 
-                    y=paths[:, i], 
-                    mode='lines', 
-                    line=dict(color='rgba(100, 100, 255, 0.05)', width=1),
-                    showlegend=False,
-                    hoverinfo='skip'
+                    x=future_dates + future_dates[::-1],
+                    y=np.concatenate([p95_path, p05_path[::-1]]),
+                    fill='toself', fillcolor='rgba(100,100,255,0.2)',
+                    line=dict(color='rgba(255,255,255,0)'), name='90% CI'
                 ))
-                
-            # Add Mean Path
-            fig.add_trace(go.Scatter(
-                x=future_dates, 
-                y=mean_path, 
-                mode='lines', 
-                name='Mean Path',
-                line=dict(color='orange', width=3),
-                hovertemplate=f'Mean: {CURRENCY}%{{y:.2f}}'
-            ))
-            
-            # Add Median Path
-            fig.add_trace(go.Scatter(
-                x=future_dates, 
-                y=median_path, 
-                mode='lines', 
-                name='Median Path',
-                line=dict(color='white', width=3, dash='dash'),
-                hovertemplate=f'Median: {CURRENCY}%{{y:.2f}}'
-            ))
-            
-            fig.update_layout(
-                title=f"Merton Jump Diffusion: 1 Year Projection ({TICKER})",
-                xaxis_title="Date",
-                yaxis_title="Price",
-                template="plotly_dark",
-                hovermode="x unified"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            st.session_state.report_gen.add_plot("Merton Jump Diffusion", fig)
-            st.session_state.report_gen.add_data("Merton Metrics", {"Mean": final_mean, "Median": final_median})
+                for i in range(min(20, paths.shape[1])):
+                    fig.add_trace(go.Scatter(
+                        x=future_dates, y=paths[:, i], mode='lines',
+                        line=dict(color='rgba(100,100,255,0.05)', width=1),
+                        showlegend=False, hoverinfo='skip'
+                    ))
+                fig.add_trace(go.Scatter(x=future_dates, y=mean_path, mode='lines', name='Mean Path', line=dict(color='orange', width=3)))
+                fig.add_trace(go.Scatter(x=future_dates, y=median_path, mode='lines', name='Median Path', line=dict(color='white', width=3, dash='dash')))
+                fig.update_layout(title=f"Merton Jump Diffusion: {TICKER}", template="plotly_dark", hovermode="x unified")
+                st.plotly_chart(fig, use_container_width=True)
+                st.session_state.report_gen.add_data("Merton Metrics", {"Mean": final_mean, "Median": final_median})
 
-    elif sim_type == "Heston Stochastic Volatility":
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.markdown("**Heston Params**")
-            
-            # Initialize Session State for Heston Params if not present
-            if 'h_kappa' not in st.session_state: st.session_state.h_kappa = 2.0
-            if 'h_theta' not in st.session_state: st.session_state.h_theta = 0.04
-            if 'h_xi' not in st.session_state: st.session_state.h_xi = 0.3
-            if 'h_rho' not in st.session_state: st.session_state.h_rho = -0.7
-            if 'h_v0' not in st.session_state: st.session_state.h_v0 = 0.04
-
-            # Calibration Button
-            st.caption("Methodology: Historical Proxy Calibration (GARCH-based)")
-            if st.button("Calibrate from History (Proxy)"):
-                with st.spinner("Calibrating Heston Model..."):
-                    try:
-                        calib_res = Calibrator.calibrate_heston(df_main['Log_Returns'])
-                        st.session_state.h_kappa = float(calib_res['kappa'])
-                        st.session_state.h_theta = float(calib_res['theta'])
-                        st.session_state.h_xi = float(calib_res['xi'])
-                        st.session_state.h_rho = float(calib_res['rho'])
-                        st.session_state.h_v0 = float(calib_res['v0'])
-                        st.success("Calibration Successful!")
-                    except Exception as e:
-                        st.error(f"Calibration Failed: {e}")
-
-            # Sliders using Session State Keys Directly
-            # Sliders using Session State Keys Directly
-            # Increased max values to accommodate calibration results
-            h_kappa = st.number_input("Kappa (Mean Rev Speed)", 0.01, 1000.0, key='h_kappa', format="%.4f")
-            h_theta = st.number_input("Theta (Long Term Vol)", 0.0, 5.0, key='h_theta', format="%.6f")
-            h_xi = st.number_input("Xi (Vol of Vol)", 0.01, 100.0, key='h_xi', format="%.4f")
-            h_rho = st.slider("Rho (Correlation)", -0.99, 0.99, key='h_rho')
-            h_v0 = st.number_input("Initial Variance", 0.0, 5.0, key='h_v0', format="%.6f")
-
-            # Session state is automatically updated by the widgets via keys
-
-        with col2:
-            current_price = df_main['Close'].iloc[-1]
-            # Pass mu_drift instead of rf_rate
-            sim_prices, sim_vols = simulate_heston(current_price, 1.0, mu_drift, h_kappa, h_theta, h_xi, h_rho, h_v0, 252, 50)
-            
-            # Calculate Statistics
-            mean_path = sim_prices.mean(axis=1)
-            median_path = np.median(sim_prices, axis=1)
-            p05_path = np.percentile(sim_prices, 5, axis=1)
-            p95_path = np.percentile(sim_prices, 95, axis=1)
-            
-            final_mean = mean_path[-1]
-            final_median = median_path[-1]
-            
-            m1, m2 = st.columns(2)
-            m1.metric("Projected Mean (Avg)", f"{CURRENCY}{final_mean:,.2f}")
-            m2.metric("Projected Median (50th %)", f"{CURRENCY}{final_median:,.2f}")
-            
-            # Plotly Chart for Prices
-            fig_h = go.Figure()
-            
-            # Add Cone of Uncertainty (5th-95th)
-            fig_h.add_trace(go.Scatter(
-                x=future_dates + future_dates[::-1],
-                y=np.concatenate([p95_path, p05_path[::-1]]),
-                fill='toself',
-                fillcolor='rgba(100, 100, 255, 0.2)',
-                line=dict(color='rgba(255,255,255,0)'),
-                name='90% Confidence Interval',
-                showlegend=True
-            ))
-            
-            # Add individual paths
-            for i in range(min(20, sim_prices.shape[1])):
+        elif sim_type == "Heston Stochastic Volatility":
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.markdown("**Heston Params**")
+                if 'h_kappa' not in st.session_state: st.session_state.h_kappa = 2.0
+                if 'h_theta' not in st.session_state: st.session_state.h_theta = 0.04
+                if 'h_xi' not in st.session_state: st.session_state.h_xi = 0.3
+                if 'h_rho' not in st.session_state: st.session_state.h_rho = -0.7
+                if 'h_v0' not in st.session_state: st.session_state.h_v0 = 0.04
+                st.caption("Methodology: Historical Proxy Calibration (GARCH-based)")
+                if st.button("Calibrate from History"):
+                    with st.spinner("Calibrating..."):
+                        try:
+                            calib_res = Calibrator.calibrate_heston(df_main['Log_Returns'])
+                            st.session_state.h_kappa = float(calib_res['kappa'])
+                            st.session_state.h_theta = float(calib_res['theta'])
+                            st.session_state.h_xi = float(calib_res['xi'])
+                            st.session_state.h_rho = float(calib_res['rho'])
+                            st.session_state.h_v0 = float(calib_res['v0'])
+                            st.success("Calibration Successful!")
+                        except Exception as e:
+                            st.error(f"Calibration Failed: {e}")
+                h_kappa = st.number_input("Kappa (Mean Rev Speed)", 0.01, 1000.0, key='h_kappa', format="%.4f")
+                h_theta = st.number_input("Theta (Long Term Vol)", 0.0, 5.0, key='h_theta', format="%.6f")
+                h_xi = st.number_input("Xi (Vol of Vol)", 0.01, 100.0, key='h_xi', format="%.4f")
+                h_rho = st.slider("Rho (Correlation)", -0.99, 0.99, key='h_rho')
+                h_v0 = st.number_input("Initial Variance", 0.0, 5.0, key='h_v0', format="%.6f")
+            with col2:
+                current_price = df_main['Close'].iloc[-1]
+                sim_prices, sim_vols = simulate_heston(current_price, 1.0, mu_drift, h_kappa, h_theta, h_xi, h_rho, h_v0, 252, 50)
+                mean_path = sim_prices.mean(axis=1)
+                median_path = np.median(sim_prices, axis=1)
+                p05_path = np.percentile(sim_prices, 5, axis=1)
+                p95_path = np.percentile(sim_prices, 95, axis=1)
+                final_mean = mean_path[-1]
+                final_median = median_path[-1]
+                m1, m2 = st.columns(2)
+                m1.metric("Projected Mean", f"{CURRENCY}{final_mean:,.2f}")
+                m2.metric("Projected Median", f"{CURRENCY}{final_median:,.2f}")
+                fig_h = go.Figure()
                 fig_h.add_trace(go.Scatter(
-                    x=future_dates, 
-                    y=sim_prices[:, i], 
-                    mode='lines', 
-                    line=dict(color='rgba(100, 100, 255, 0.05)', width=1),
-                    showlegend=False,
-                    hoverinfo='skip'
+                    x=future_dates + future_dates[::-1],
+                    y=np.concatenate([p95_path, p05_path[::-1]]),
+                    fill='toself', fillcolor='rgba(100,100,255,0.2)',
+                    line=dict(color='rgba(255,255,255,0)'), name='90% CI'
                 ))
-                
-            # Add Mean Path
-            fig_h.add_trace(go.Scatter(
-                x=future_dates, 
-                y=mean_path, 
-                mode='lines', 
-                name='Mean Path',
-                line=dict(color='orange', width=3),
-                hovertemplate=f'Mean: {CURRENCY}%{{y:.2f}}'
-            ))
-            
-            # Add Median Path
-            fig_h.add_trace(go.Scatter(
-                x=future_dates, 
-                y=median_path, 
-                mode='lines', 
-                name='Median Path',
-                line=dict(color='white', width=3, dash='dash'),
-                hovertemplate=f'Median: {CURRENCY}%{{y:.2f}}'
-            ))
-            
-            fig_h.update_layout(
-                title=f"Heston Price Paths ({TICKER})",
-                xaxis_title="Date",
-                yaxis_title="Price",
-                template="plotly_dark",
-                hovermode="x unified"
-            )
-            st.plotly_chart(fig_h, use_container_width=True)
-            st.session_state.report_gen.add_plot("Heston Price Simulation", fig_h)
-            st.session_state.report_gen.add_data("Heston Metrics", {"Mean": final_mean, "Median": final_median})
-            
-            # Volatility Plot (Optional, keep simple or upgrade too)
-            st.write("**Stochastic Volatility Paths**")
-            fig_v = go.Figure()
-            for i in range(min(20, sim_vols.shape[1])):
-                 fig_v.add_trace(go.Scatter(
-                    x=future_dates, 
-                    y=np.sqrt(sim_vols[:, i]), 
-                    mode='lines', 
-                    line=dict(color='rgba(255, 165, 0, 0.3)', width=1),
-                    showlegend=False
-                ))
-            fig_v.update_layout(
-                title="Volatility Process (Sigma)",
-                xaxis_title="Date",
-                yaxis_title="Volatility",
-                template="plotly_dark",
-                height=300
-            )
-            st.plotly_chart(fig_v, use_container_width=True)
-            st.session_state.report_gen.add_plot("Heston Volatility Process", fig_v)
+                for i in range(min(20, sim_prices.shape[1])):
+                    fig_h.add_trace(go.Scatter(
+                        x=future_dates, y=sim_prices[:, i], mode='lines',
+                        line=dict(color='rgba(100,100,255,0.05)', width=1),
+                        showlegend=False, hoverinfo='skip'
+                    ))
+                fig_h.add_trace(go.Scatter(x=future_dates, y=mean_path, mode='lines', name='Mean Path', line=dict(color='orange', width=3)))
+                fig_h.add_trace(go.Scatter(x=future_dates, y=median_path, mode='lines', name='Median Path', line=dict(color='white', width=3, dash='dash')))
+                fig_h.update_layout(title=f"Heston Price Paths ({TICKER})", template="plotly_dark", hovermode="x unified")
+                st.plotly_chart(fig_h, use_container_width=True)
+                st.session_state.report_gen.add_data("Heston Metrics", {"Mean": final_mean, "Median": final_median})
+                st.write("**Stochastic Volatility Paths**")
+                fig_v = go.Figure()
+                for i in range(min(20, sim_vols.shape[1])):
+                    fig_v.add_trace(go.Scatter(
+                        x=future_dates, y=np.sqrt(sim_vols[:, i]), mode='lines',
+                        line=dict(color='rgba(255,165,0,0.3)', width=1), showlegend=False
+                    ))
+                fig_v.update_layout(title="Volatility Process (Sigma)", template="plotly_dark", height=300)
+                st.plotly_chart(fig_v, use_container_width=True)
 
 # ==========================================
 # TAB 4: KALMAN FILTER
@@ -2866,134 +2081,100 @@ with tab4:
         st.warning("Please load a ticker to view Kalman Filter dynamics.")
     else:
         st.write("### Kalman Filter Analysis")
-    # --- MODEL VERDICT BANNER ---
-    if trend_diff > 0.03: st.success(f"🎯 **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend. Structural uptrend intact.")
-    elif trend_diff < -0.03: st.error(f"🎯 **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend. Structural breakdown in progress.")
-    else: st.info(f"🎯 **MODEL VERDICT**: Price is trading within **{abs(trend_diff):.1%}** of the Kalman Trend (Neutral/Consolidation).")
 
-    
-    kf_mode = st.radio("Analysis Mode", ["Pairs Trading (Relative Value)", "Single Asset (Trend)"])
-    
-    if kf_mode == "Pairs Trading (Relative Value)":
-        st.write(f"**{TICKER} vs {PAIR_TICKER}**")
-        df_pair = load_data(PAIR_TICKER, start_date, end_date)
-        
-        if df_pair is not None:
-            # Align data
-            common_idx = df_main.index.intersection(df_pair.index)
-            y = df_main.loc[common_idx, 'Close'].values
-            x = df_pair.loc[common_idx, 'Close'].values
-            
-            if len(y) > 10:
-                kf = KalmanFilterReg(delta=1e-4, R=1e-3)
-                state_means, state_covs = kf.run_filter(y, x)
-                
-                alpha = state_means[:, 0]
-                beta = state_means[:, 1]
-                
-                # Plot Beta
-                fig_k, (ax_k1, ax_k2) = plt.subplots(2, 1, figsize=(12,8), sharex=True)
-                
-                dates = common_idx
-                ax_k1.plot(dates, beta, color='darkblue', label=f"Dynamic Beta ({TICKER}/{PAIR_TICKER})")
-                ax_k1.set_title("Kalman Estimated Hedge Ratio (Beta)")
-                ax_k1.legend()
-                format_plot_dates(ax_k1, dates) # Apply Date Formatting
-                
-                # Spread Analysis
-                spread_series = y - (alpha + beta * x)
-                z_score = (spread_series - np.mean(spread_series)) / np.std(spread_series)
-                
-                ax_k2.plot(dates, z_score, color='purple', label="Spread Z-Score")
-                ax_k2.axhline(2.0, color='red', linestyle='--')
-                ax_k2.axhline(-2.0, color='green', linestyle='--')
-                ax_k2.set_title("Kalman Residual Z-Score (Mean Reversion Signal)")
-                ax_k2.legend()
-                format_plot_dates(ax_k2, dates) # Apply Date Formatting
-                
-                st.pyplot(fig_k)
-                st.session_state.report_gen.add_plot("Kalman Pairs Analysis", fig_k)
-                st.session_state.report_gen.add_data("Kalman Hedge Ratio", {"Beta": beta[-1]})
-                st.write(f"Current Hedge Ratio: **{beta[-1]:.4f}** (Long 1 {TICKER}, Short {beta[-1]:.4f} {PAIR_TICKER})")
+    if df_main is not None:
+        if trend_diff > 0.03: st.success(f"🎯 **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend.")
+        elif trend_diff < -0.03: st.error(f"🎯 **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend.")
+        else: st.info(f"🎯 **MODEL VERDICT**: Price is within **{abs(trend_diff):.1%}** of the Kalman Trend.")
+
+        kf_mode = st.radio("Analysis Mode", ["Pairs Trading (Relative Value)", "Single Asset (Trend)"])
+
+        if kf_mode == "Pairs Trading (Relative Value)":
+            st.write(f"**{TICKER} vs {PAIR_TICKER}**")
+            df_pair = load_data(PAIR_TICKER, start_date, end_date)
+            if df_pair is not None:
+                common_idx = df_main.index.intersection(df_pair.index)
+                y = df_main.loc[common_idx, 'Close'].values
+                x = df_pair.loc[common_idx, 'Close'].values
+                if len(y) > 10:
+                    kf = KalmanFilterReg(delta=1e-4, R=1e-3)
+                    state_means, state_covs = kf.run_filter(y, x)
+                    alpha = state_means[:, 0]
+                    beta = state_means[:, 1]
+                    fig_k, (ax_k1, ax_k2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+                    dates = common_idx
+                    ax_k1.plot(dates, beta, color='darkblue', label=f"Dynamic Beta ({TICKER}/{PAIR_TICKER})")
+                    ax_k1.set_title("Kalman Estimated Hedge Ratio (Beta)")
+                    ax_k1.legend()
+                    format_plot_dates(ax_k1, dates)
+                    spread_series = y - (alpha + beta * x)
+                    z_score = (spread_series - np.mean(spread_series)) / np.std(spread_series)
+                    ax_k2.plot(dates, z_score, color='purple', label="Spread Z-Score")
+                    ax_k2.axhline(2.0, color='red', linestyle='--')
+                    ax_k2.axhline(-2.0, color='green', linestyle='--')
+                    ax_k2.set_title("Kalman Residual Z-Score")
+                    ax_k2.legend()
+                    format_plot_dates(ax_k2, dates)
+                    st.pyplot(fig_k)
+                    st.session_state.report_gen.add_plot("Kalman Pairs Analysis", fig_k)
+                    st.write(f"Current Hedge Ratio: **{beta[-1]:.4f}**")
+                else:
+                    st.error("Not enough overlapping data.")
             else:
-                st.error("Not enough overlapping data for pairs analysis.")
-        else:
-            st.error(f"Could not load data for {PAIR_TICKER}")
-            
-    elif kf_mode == "Single Asset (Trend)":
-        st.write(f"**{TICKER} Trend Detection**")
-        st.caption("Uses a Kalman Filter (Local Level Model) to separate the 'True' Price Trend from Market Noise.")
-        st.markdown("[Reference: Time Series Analysis by State Space Methods (Durbin & Koopman)](https://global.oup.com/academic/product/time-series-analysis-by-state-space-methods-9780199641178)")
-        
-        # Parameters
-        col_k1, col_k2, col_k3 = st.columns(3)
-        with col_k1:
-            proc_noise = st.select_slider("Trend Flexibility (Process Noise)", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-4)
-        with col_k2:
-            meas_noise = st.select_slider("Noise Tolerance (Measurement Noise)", options=[1e-3, 1e-2, 1e-1, 1.0], value=1e-2)
-        with col_k3:
-            model_mode = st.radio("Model Type", ["Smoothed (New)", "Standard (Old)", "Compare Both"])
-        
-        prices = df_main['Close'].values
-        kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
-        
-        # Calculate based on mode
-        if model_mode == "Standard (Old)":
-            est_trend, _ = kf_trend.filter(prices)
-            label_trend = "Kalman Trend (Standard)"
-            color_trend = "blue"
-        elif model_mode == "Smoothed (New)":
-            est_trend, _ = kf_trend.smooth(prices)
-            label_trend = "Kalman Trend (Smoothed)"
-            color_trend = "purple"
-        else: # Compare Both
-            est_trend_smooth, _ = kf_trend.smooth(prices)
-            est_trend_std, _ = kf_trend.filter(prices)
-        
-        # Plot
-        fig_kt, ax_kt = plt.subplots(figsize=(12, 6))
-        ax_kt.plot(df_main.index, prices, color='gray', alpha=0.5, label='Actual Price')
-        
-        if model_mode == "Compare Both":
-            ax_kt.plot(df_main.index, est_trend_std, color='blue', linewidth=1.5, linestyle='--', label='Standard (Causal)')
-            ax_kt.plot(df_main.index, est_trend_smooth, color='purple', linewidth=2, label='Smoothed (RTS)')
-            current_trend = est_trend_smooth[-1] # Use smooth for metrics
-        else:
-            ax_kt.plot(df_main.index, est_trend, color=color_trend, linewidth=2, label=label_trend)
-            current_trend = est_trend[-1]
+                st.error(f"Could not load data for {PAIR_TICKER}")
 
-        ax_kt.set_title(f"Kalman Filter Trend: {TICKER}")
-        ax_kt.legend()
-        format_plot_dates(ax_kt, df_main.index) # Apply Date Formatting
-        
-        # Improve Y-Axis Ticks (Equal Intervals)
-        from matplotlib.ticker import MaxNLocator
-        ax_kt.yaxis.set_major_locator(MaxNLocator(nbins=15)) # Force more granular ticks
-        ax_kt.grid(True, which='major', linestyle='--', alpha=0.5)
-        
-        st.pyplot(fig_kt)
-        st.session_state.report_gen.add_plot("Kalman Trend Analysis", fig_kt)
-        # Signal & Metrics
-        current_price = prices[-1]
-        diff_pct = (current_price - current_trend) / current_trend * 100
+        elif kf_mode == "Single Asset (Trend)":
+            col_k1, col_k2, col_k3 = st.columns(3)
+            with col_k1:
+                proc_noise = st.select_slider("Trend Flexibility", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-4)
+            with col_k2:
+                meas_noise = st.select_slider("Noise Tolerance", options=[1e-3, 1e-2, 1e-1, 1.0], value=1e-2)
+            with col_k3:
+                model_mode = st.radio("Model Type", ["Smoothed (New)", "Standard (Old)", "Compare Both"])
 
-        st.session_state.report_gen.add_data("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
-        
-        # Display Current Values
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Current Price", f"{CURRENCY}{current_price:.2f}")
-        with c2:
-            st.metric("Current Trend", f"{CURRENCY}{current_trend:.2f}")
-        with c3:
-            st.metric("Deviation", f"{diff_pct:.2f}%", delta=f"{diff_pct:.2f}%", delta_color="inverse")
+            prices = df_main['Close'].values
+            kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
 
-        if diff_pct > 5.0:
-            st.warning("Price significantly ABOVE Trend (Potential Overbought)")
-        elif diff_pct < -5.0:
-            st.success("Price significantly BELOW Trend (Potential Oversold)")
-        else:
-            st.info("Price near Trend (Neutral)")
+            if model_mode == "Standard (Old)":
+                est_trend, _ = kf_trend.filter(prices)
+                label_trend = "Kalman Trend (Standard)"
+                color_trend = "blue"
+            elif model_mode == "Smoothed (New)":
+                est_trend, _ = kf_trend.smooth(prices)
+                label_trend = "Kalman Trend (Smoothed)"
+                color_trend = "purple"
+            else:
+                est_trend_smooth, _ = kf_trend.smooth(prices)
+                est_trend_std, _ = kf_trend.filter(prices)
+
+            fig_kt, ax_kt = plt.subplots(figsize=(12, 6))
+            ax_kt.plot(df_main.index, prices, color='gray', alpha=0.5, label='Actual Price')
+            if model_mode == "Compare Both":
+                ax_kt.plot(df_main.index, est_trend_std, color='blue', linewidth=1.5, linestyle='--', label='Standard (Causal)')
+                ax_kt.plot(df_main.index, est_trend_smooth, color='purple', linewidth=2, label='Smoothed (RTS)')
+                current_trend = est_trend_smooth[-1]
+            else:
+                ax_kt.plot(df_main.index, est_trend, color=color_trend, linewidth=2, label=label_trend)
+                current_trend = est_trend[-1]
+
+            ax_kt.set_title(f"Kalman Filter Trend: {TICKER}")
+            ax_kt.legend()
+            format_plot_dates(ax_kt, df_main.index)
+            from matplotlib.ticker import MaxNLocator
+            ax_kt.yaxis.set_major_locator(MaxNLocator(nbins=15))
+            ax_kt.grid(True, which='major', linestyle='--', alpha=0.5)
+            st.pyplot(fig_kt)
+            st.session_state.report_gen.add_plot("Kalman Trend Analysis", fig_kt)
+
+            current_price = prices[-1]
+            diff_pct = (current_price - current_trend) / current_trend * 100
+            c1, c2, c3 = st.columns(3)
+            with c1: st.metric("Current Price", f"{CURRENCY}{current_price:.2f}")
+            with c2: st.metric("Current Trend", f"{CURRENCY}{current_trend:.2f}")
+            with c3: st.metric("Deviation", f"{diff_pct:.2f}%", delta=f"{diff_pct:.2f}%", delta_color="inverse")
+            if diff_pct > 5.0: st.warning("Price significantly ABOVE Trend (Potential Overbought)")
+            elif diff_pct < -5.0: st.success("Price significantly BELOW Trend (Potential Oversold)")
+            else: st.info("Price near Trend (Neutral)")
 
 # ==========================================
 # TAB 5: MACRO FACTORS
@@ -3003,64 +2184,40 @@ with tab5:
         st.warning("Please load a ticker to view Factor analysis.")
     else:
         st.write("### Macro Factor Sensitivity")
-    st.markdown("Correlation of returns against key structural drivers.")
-    
-    macro_tickers = {
-        'Crude Oil': 'CL=F',
-        'Gold': 'GC=F',
-        '10Y Yield': '^TNX',
-        'US Dollar': 'DX-Y.NYB',
-        'S&P 500': '^GSPC'
-    }
-    
-    macro_data = {}
-    for name, sym in macro_tickers.items():
-        m_df = load_data(sym, start_date, end_date)
-        if m_df is not None:
-            macro_data[name] = m_df['Returns']
-    
-    # Add main ticker
-    macro_data[TICKER] = df_main['Returns']
-    
-    df_macro = pd.DataFrame(macro_data).dropna()
-    
-    if not df_macro.empty:
-        corr_matrix = df_macro.corr()
-        
-        # Simple Heatmap using matplotlib
-        fig_hm, ax_hm = plt.subplots(figsize=(8,6))
-        cax = ax_hm.matshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
-        fig_hm.colorbar(cax)
-        
-        ticks = np.arange(len(corr_matrix.columns))
-        ax_hm.set_xticks(ticks)
-        ax_hm.set_yticks(ticks)
-        ax_hm.set_xticklabels(corr_matrix.columns, rotation=45)
-        ax_hm.set_yticklabels(corr_matrix.columns)
-        
-        for (i, j), z in np.ndenumerate(corr_matrix):
-            ax_hm.text(j, i, '{:0.2f}'.format(z), ha='center', va='center')
-            
-        ax_hm.set_title("Asset Class Correlations")
-        st.pyplot(fig_hm)
-        st.session_state.report_gen.add_plot("Macro Correlations", fig_hm)
-        st.session_state.report_gen.add_data("Correlation Matrix", corr_matrix)
-        
-        st.write(f"**Structural Thesis Check:**")
-        oil_corr = corr_matrix.loc[TICKER, 'Crude Oil']
-        rate_corr = corr_matrix.loc[TICKER, '10Y Yield']
-        
-        if oil_corr > 0.3:
-            st.success(f"High correlation with Energy ({oil_corr:.2f}). Commodity cycle model relevant.")
-        elif oil_corr < -0.3:
-            st.info(f"Inverse correlation with Energy ({oil_corr:.2f}).")
-        else:
-            st.warning(f"Low sensitivity to Energy prices ({oil_corr:.2f}).")
-        
-        st.session_state.report_gen.add_data("Macro Sensitivity Thesis", {
-            "Oil Correlation": oil_corr,
-            "Rate Correlation": rate_corr
-        })
+
+    if df_main is not None:
+        macro_tickers = {
+            'Crude Oil': 'CL=F', 'Gold': 'GC=F', '10Y Yield': '^TNX',
+            'US Dollar': 'DX-Y.NYB', 'S&P 500': '^GSPC'
+        }
+        macro_data = {}
+        for name, sym in macro_tickers.items():
+            m_df = load_data(sym, start_date, end_date)
+            if m_df is not None:
+                macro_data[name] = m_df['Returns']
+        macro_data[TICKER] = df_main['Returns']
+        df_macro = pd.DataFrame(macro_data).dropna()
+        if not df_macro.empty:
+            corr_matrix = df_macro.corr()
+            fig_hm, ax_hm = plt.subplots(figsize=(8, 6))
+            cax = ax_hm.matshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+            fig_hm.colorbar(cax)
+            ticks = np.arange(len(corr_matrix.columns))
+            ax_hm.set_xticks(ticks)
+            ax_hm.set_yticks(ticks)
+            ax_hm.set_xticklabels(corr_matrix.columns, rotation=45)
+            ax_hm.set_yticklabels(corr_matrix.columns)
+            for (i, j), z in np.ndenumerate(corr_matrix):
+                ax_hm.text(j, i, '{:0.2f}'.format(z), ha='center', va='center')
+            ax_hm.set_title("Asset Class Correlations")
+            st.pyplot(fig_hm)
+            st.session_state.report_gen.add_plot("Macro Correlations", fig_hm)
+            st.session_state.report_gen.add_data("Correlation Matrix", corr_matrix)
+            oil_corr = corr_matrix.loc[TICKER, 'Crude Oil']
+            rate_corr = corr_matrix.loc[TICKER, '10Y Yield']
+            if oil_corr > 0.3: st.success(f"High correlation with Energy ({oil_corr:.2f}).")
+            elif oil_corr < -0.3: st.info(f"Inverse correlation with Energy ({oil_corr:.2f}).")
+            else: st.warning(f"Low sensitivity to Energy prices ({oil_corr:.2f}).")
 
 # ==========================================
 # TAB 6: STRUCTURAL
@@ -3070,26 +2227,20 @@ with tab6:
         st.warning("Please load a ticker to view Structural Decomposition.")
     else:
         st.write("### Structural Decomposition")
-    # Need freq for decomposition. 
-    # Business days ~ 5 (weekly), 21 (monthly), 252 (yearly)
-    period = st.selectbox("Seasonality Period", [5, 21, 63, 252], index=1)
-    
-    if len(df_main) > period * 2:
-        decomp = seasonal_decompose(df_main['Close'], model='multiplicative', period=period)
-        
-        fig_dec, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-        
-        decomp.trend.plot(ax=ax1, title='Trend')
-        decomp.seasonal.plot(ax=ax2, title='Seasonal Component')
-        decomp.resid.plot(ax=ax3, title='Residuals')
-        
-        format_plot_dates(ax3, df_main.index) # Apply Date Formatting to the shared x-axis
-        
-        st.pyplot(fig_dec)
-        st.session_state.report_gen.add_plot("Structural Decomposition", fig_dec)
-        st.session_state.report_gen.add_data("Decomposition Period", {"Period": period})
-    else:
-        st.warning("Insufficient data for decomposition with selected period.")
+
+    if df_main is not None:
+        period = st.selectbox("Seasonality Period", [5, 21, 63, 252], index=1)
+        if len(df_main) > period * 2:
+            decomp = seasonal_decompose(df_main['Close'], model='multiplicative', period=period)
+            fig_dec, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+            decomp.trend.plot(ax=ax1, title='Trend')
+            decomp.seasonal.plot(ax=ax2, title='Seasonal Component')
+            decomp.resid.plot(ax=ax3, title='Residuals')
+            format_plot_dates(ax3, df_main.index)
+            st.pyplot(fig_dec)
+            st.session_state.report_gen.add_plot("Structural Decomposition", fig_dec)
+        else:
+            st.warning("Insufficient data for decomposition with selected period.")
 
 # ==========================================
 # TAB 7: BACKTEST
@@ -3099,183 +2250,143 @@ with tab7:
         st.warning("Please load a ticker to run Backtests.")
     else:
         st.write("### 🛠️ Strategy Backtest")
-    
-    # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross"], horizontal=True)
-    
-    # Date Selection
-    col_b3 = st.container()
-    with col_b3:
-        default_start = datetime.now() - timedelta(days=365)
-        bt_start_date = st.date_input("Backtest Start", default_start)
-        bt_end_date = st.date_input("Backtest End", datetime.now())
 
-    # Data Prep
-    if live_mode:
-         # Use the global live data for backtest scope
-         df_bt = df_main
-         bt_msg = f"Live Backtest ({data_interval})"
-    else:
-        if bt_start_date >= bt_end_date:
-            st.error("Start date must be before end date.")
+    if df_main is not None:
+        strategy_type = st.radio(
+            "Select Strategy",
+            [
+                "Regime Switching (Trend Following)",
+                "Kalman Filter (Trend Crossover)",
+                "Momentum Hedge (EMA/SMA Cross)",
+                "MAD Trend Modes",
+                "Dual MA Cross",
+                "Ehlers SuperSmoother"
+            ],
+            horizontal=True
+        )
+
+        col_b3 = st.container()
+        with col_b3:
+            default_start = datetime.now() - timedelta(days=365)
+            bt_start_date = st.date_input("Backtest Start", default_start)
+            bt_end_date = st.date_input("Backtest End", datetime.now())
+
+        if live_mode:
+            df_bt = df_main
+        else:
+            if bt_start_date >= bt_end_date:
+                st.error("Start date must be before end date.")
+                st.stop()
+            df_bt = load_data(TICKER, bt_start_date, bt_end_date, interval='1d')
+
+        if df_bt is None or df_bt.empty:
+            st.error("Could not load data for backtest.")
             st.stop()
-        df_bt = load_data(TICKER, bt_start_date, bt_end_date, interval='1d')
-        bt_msg = "Historical Backtest (1d)"
-    
-    if df_bt is None or df_bt.empty:
-        st.error("Could not load data for backtest. Check dates and ticker.")
-        st.stop()
-        
-    returns_bt = df_bt['Returns']
-    prices_bt = df_bt['Close']
-    model_data_bt = returns_bt.dropna() * 100
-    
-    signals = None
-    strat_prices = prices_bt
-    
-    if strategy_type == "Regime Switching (Trend Following)":
-        
-        # Regime Parameters
-        col_r1, col_r2, col_r3 = st.columns(3)
-        with col_r1:
-            bt_n_regimes = st.slider("Number of Regimes", 2, 4, 2, key="bt_n_regimes")
-        with col_r2:
-            bt_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4, key="bt_stability")
-        with col_r3:
-            bt_freq = st.selectbox("Frequency", ["Weekly", "Daily"], key="bt_freq")
-        
-        col_r4, col_r5 = st.columns(2)
-        with col_r4:
-            bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
-        with col_r5:
-            bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
-        # Signal Method Selection
-        signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"], horizontal=True)
+        returns_bt = df_bt['Returns']
+        prices_bt = df_bt['Close']
+        model_data_bt = returns_bt.dropna() * 100
+        signals = None
+        strat_prices = prices_bt
 
-        if signal_method == "Regime Weighted Expected Return":
-            st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
-        elif signal_method == "Regime Probability":
-            st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
-        else:
-            st.markdown("**Strategy:** Long immediately when entering **Bull Regime**. Sell immediately when exiting.")
+        # ─────────────────────────────────────────────
+        # STRATEGY: Regime Switching
+        # ─────────────────────────────────────────────
+        if strategy_type == "Regime Switching (Trend Following)":
+            col_r1, col_r2, col_r3 = st.columns(3)
+            with col_r1:
+                bt_n_regimes = st.slider("Number of Regimes", 2, 4, 2, key="bt_n_regimes")
+            with col_r2:
+                bt_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4, key="bt_stability")
+            with col_r3:
+                bt_freq = st.selectbox("Frequency", ["Weekly", "Daily"], key="bt_freq")
 
-        # --- MODEL FITNESS INFO ---
-        st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'Compare Fitness' button below to find the best fit.")
+            col_r4, col_r5 = st.columns(2)
+            with col_r4:
+                bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
+            with col_r5:
+                bt_switch_vol = st.checkbox("Switching Volatility", value=True, key="bt_switch_vol")
 
-        if st.button("📊 Compare Regime Fitness (N=2,3,4)", use_container_width=True):
-            with st.spinner("Analyzing model complexity and performance..."):
-                comp_results = []
-                # Setup local data context
-                loc_prices = prices_bt.resample('W').last().dropna() if bt_freq == "Weekly" else prices_bt
-                loc_returns = loc_prices.pct_change().dropna()
-                if bt_stability > 0:
-                    loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
-                else:
-                    loc_model_data = loc_returns.dropna() * 100
-                
-                for n in [2, 3, 4]:
-                    r = fit_regime_model(loc_model_data, n, bt_switch_vol, bt_switch_trend)
-                    if r:
-                        # 1. Identify Bull Regime
-                        r_means = []
-                        for i in range(n):
-                            m_val = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
-                            r_means.append((i, m_val))
-                        bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
-                        
-                        # 2. Generate Signals
-                        p_df = r.filtered_marginal_probabilities
-                        if signal_method == "Regime Weighted Expected Return":
-                            e_ret = pd.Series(0.0, index=loc_model_data.index)
+            signal_method = st.radio("Signal Method", [
+                "Regime Weighted Expected Return",
+                "Regime Probability",
+                "Regime Switching Period"
+            ], horizontal=True)
+
+            st.info("💡 **Pro Tip**: Blue-chips often favor **2 states**. High-beta tech often favors **3 states**.")
+
+            if st.button("📊 Compare Regime Fitness (N=2,3,4)", use_container_width=True):
+                with st.spinner("Analyzing model complexity..."):
+                    comp_results = []
+                    loc_prices = prices_bt.resample('W').last().dropna() if bt_freq == "Weekly" else prices_bt
+                    loc_returns = loc_prices.pct_change().dropna()
+                    if bt_stability > 0:
+                        loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
+                    else:
+                        loc_model_data = loc_returns.dropna() * 100
+
+                    for n in [2, 3, 4]:
+                        r = fit_regime_model(loc_model_data, n, bt_switch_vol, bt_switch_trend)
+                        if r:
+                            r_means = []
                             for i in range(n):
-                                m = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
-                                e_ret += p_df.iloc[:, i] * m
-                            sigs = (e_ret > 0).astype(int)
-                        elif signal_method == "Regime Probability":
-                            dom = p_df.idxmax(axis=1)
-                            sigs = (dom == bull_idx).astype(int)
-                        else: # Period
-                            dom = p_df.idxmax(axis=1)
-                            sigs = (dom == bull_idx).astype(int)
-                        
-                        # 3. Run Backtest
-                        common_idx = loc_prices.index.intersection(sigs.index)
-                        bt_res = BacktestEngine.run_strategy(loc_prices.loc[common_idx], sigs.loc[common_idx], initial_cap, trailing_stop)
-                        
-                        comp_results.append({
-                            "Regimes": n, 
-                            "AIC": r.aic, 
-                            "BIC": r.bic, 
-                            "Total Return %": (bt_res['equity_curve'].iloc[-1] / initial_cap - 1) * 100
-                        })
-                
-                if comp_results:
-                    comp_df = pd.DataFrame(comp_results)
-                    best_aic = comp_df.loc[comp_df['AIC'].idxmin(), 'Regimes']
-                    best_bic = comp_df.loc[comp_df['BIC'].idxmin(), 'Regimes']
-                    best_pnl = comp_df.loc[comp_df['Total Return %'].idxmax(), 'Regimes']
-                    
-                    st.write("#### Comparison Results")
-                    st.table(comp_df.style.highlight_min(subset=['AIC', 'BIC'], color='lightgreen')
-                                       .highlight_max(subset=['Total Return %'], color='lightgreen'))
-                    
-                    c_fit, c_perf = st.columns(2)
-                    with c_fit:
-                        st.success(f"⚖️ **Robustness**: {best_bic} Regimes (Best BIC)")
-                    with c_perf:
-                        st.success(f"🚀 **Performance**: {best_pnl} Regimes (Best PnL)")
-                    
-                    if best_bic != best_pnl:
-                        st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
+                                m_val = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
+                                r_means.append((i, m_val))
+                            bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
+                            p_df = r.filtered_marginal_probabilities
+                            if signal_method == "Regime Weighted Expected Return":
+                                e_ret = pd.Series(0.0, index=loc_model_data.index)
+                                for i in range(n):
+                                    m = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
+                                    e_ret += p_df.iloc[:, i] * m
+                                sigs = (e_ret > 0).astype(int)
+                            else:
+                                dom = p_df.idxmax(axis=1)
+                                sigs = (dom == bull_idx).astype(int)
+                            common_idx = loc_prices.index.intersection(sigs.index)
+                            bt_res = BacktestEngine.run_strategy(loc_prices.loc[common_idx], sigs.loc[common_idx], initial_cap, trailing_stop)
+                            comp_results.append({
+                                "Regimes": n, "AIC": r.aic, "BIC": r.bic,
+                                "Total Return %": (bt_res['equity_curve'].iloc[-1] / initial_cap - 1) * 100
+                            })
 
+                    if comp_results:
+                        comp_df = pd.DataFrame(comp_results)
+                        best_bic = comp_df.loc[comp_df['BIC'].idxmin(), 'Regimes']
+                        best_pnl = comp_df.loc[comp_df['Total Return %'].idxmax(), 'Regimes']
+                        st.table(comp_df.style.highlight_min(subset=['AIC', 'BIC'], color='lightgreen')
+                                            .highlight_max(subset=['Total Return %'], color='lightgreen'))
+                        c_fit, c_perf = st.columns(2)
+                        with c_fit: st.success(f"⚖️ **Robustness**: {best_bic} Regimes (Best BIC)")
+                        with c_perf: st.success(f"🚀 **Performance**: {best_pnl} Regimes (Best PnL)")
 
-        # Resample if Weekly
-        if bt_freq == "Weekly":
-            # Resample Prices to Weekly (Last Close)
-            prices_bt_resampled = prices_bt.resample('W').last().dropna()
-            # Recalculate Returns from resampled prices
-            returns_bt_resampled = prices_bt_resampled.pct_change().dropna()
-            strat_prices = prices_bt_resampled
-        else:
-            prices_bt_resampled = prices_bt
-            returns_bt_resampled = returns_bt
+            if bt_freq == "Weekly":
+                prices_bt_resampled = prices_bt.resample('W').last().dropna()
+                returns_bt_resampled = prices_bt_resampled.pct_change().dropna()
+                strat_prices = prices_bt_resampled
+            else:
+                prices_bt_resampled = prices_bt
+                returns_bt_resampled = returns_bt
 
-        # Apply Smoothing if requested
-        if bt_stability > 0:
-            model_data_bt = returns_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
-        else:
-            model_data_bt = returns_bt_resampled.dropna() * 100
+            if bt_stability > 0:
+                model_data_bt = returns_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
+            else:
+                model_data_bt = returns_bt_resampled.dropna() * 100
 
-        # FIX: Robust 1D Series reconstruction
-        if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
-            model_data_bt = pd.Series(
-                model_data_bt.values.flatten().astype(float),
-                index=model_data_bt.index
-            )
-        
-        if len(model_data_bt) < 10:
-             st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
-             st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
-             if live_mode and bt_freq == "Weekly":
-                 st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
-             elif not live_mode:
-                 st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
-        else:
-            with st.spinner("Fitting Regime Model..."):
-                # Fit Model
-                res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
-                
+            if len(model_data_bt) > 5:
+                model_data_bt = pd.Series(model_data_bt.values.flatten().astype(float), index=model_data_bt.index)
+
+            if len(model_data_bt) < 10:
+                st.error(f"❌ Insufficient data ({len(model_data_bt)} points). Increase date range.")
+            else:
+                with st.spinner("Fitting Regime Model..."):
+                    res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
+
                 if res_bt:
-                    # --- DISPLAY FITNESS METRICS ---
                     fit_col1, fit_col2 = st.columns(2)
-                    with fit_col1:
-                        st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
-                    with fit_col2:
-                        st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
-                    st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
-                    
-                    # Identify Regimes (Sort by Mean)
+                    with fit_col1: st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
+                    with fit_col2: st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
+
                     regime_means = []
                     for i in range(bt_n_regimes):
                         if f'const[{i}]' in res_bt.params:
@@ -3283,743 +2394,684 @@ with tab7:
                         else:
                             mean_val = res_bt.params.get('const', 0.0)
                         regime_means.append((i, mean_val))
-                    
-                    # Sort regimes by mean return (High to Low) -> Index 0 is Bull
                     sorted_regimes = sorted(regime_means, key=lambda x: x[1], reverse=True)
                     bull_regime_idx = sorted_regimes[0][0]
-                    
-                    # Get Filtered Probabilities
                     probs_df = res_bt.filtered_marginal_probabilities
-                    
+
                     if signal_method == "Regime Weighted Expected Return":
-                        # Calculate Expected Return
                         expected_ret = pd.Series(0.0, index=model_data_bt.index)
                         for i in range(bt_n_regimes):
-                            # Get Regime Mean
                             if f'const[{i}]' in res_bt.params:
                                 mean_val = res_bt.params[f'const[{i}]']
                             else:
                                 mean_val = res_bt.params.get('const', 0.0)
-                                
-                            # Get Filtered Probability
                             prob = probs_df.iloc[:, i]
                             expected_ret += prob * mean_val
-                        
-                        # Align indices
                         common_idx = strat_prices.index.intersection(expected_ret.index)
                         expected_ret = expected_ret.loc[common_idx]
-                        
-                        # Generate Signals (1 = Long if Exp Ret > 0, else 0)
                         signals = (expected_ret > 0).astype(int)
-                        
-                        # Plot Context
                         with st.expander("See Strategy Context"):
                             fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
                             ax_ctx.plot(expected_ret.index, expected_ret, color='purple', label='Expected Return')
                             ax_ctx.axhline(0, color='black', linestyle='--', linewidth=1)
-                            ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret>0), color='green', alpha=0.3, label='Long Zone')
-                            ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret<0), color='red', alpha=0.3, label='Cash/Short Zone')
+                            ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret>0), color='green', alpha=0.3)
+                            ax_ctx.fill_between(expected_ret.index, 0, expected_ret, where=(expected_ret<0), color='red', alpha=0.3)
                             format_plot_dates(ax_ctx, expected_ret.index)
-                            ax_ctx.set_title("Regime-Weighted Expected Return")
                             ax_ctx.legend()
                             st.pyplot(fig_ctx)
 
                     elif signal_method == "Regime Probability":
-                        # Logic: Long if Bull Probability is the highest (Dominant)
-                        # Or specifically: Bull > Bear (and Bull > Normal)
-                        
                         bull_probs = probs_df.iloc[:, bull_regime_idx]
-                        
-                        # Determine if Bull is dominant
-                        # We can just check if argmax is the bull index
-                        dominant_regime = probs_df.idxmax(axis=1) # Returns column name (0, 1, etc)
-                        
-                        # Align indices
+                        dominant_regime = probs_df.idxmax(axis=1)
                         common_idx = strat_prices.index.intersection(dominant_regime.index)
                         dominant_regime = dominant_regime.loc[common_idx]
                         bull_probs = bull_probs.loc[common_idx]
-                        
-                        # Signal: 1 if Dominant Regime is Bull, else 0
                         signals = (dominant_regime == bull_regime_idx).astype(int)
-                        
-                        # Plot Context
                         with st.expander("See Strategy Context"):
                             fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
-                            
-                            # Plot Bull Probability
                             ax_ctx.plot(bull_probs.index, bull_probs, color='green', label='Bull Probability')
-                            
-                            # Plot Others
-                            for r_idx, r_mean in sorted_regimes:
-                                if r_idx != bull_regime_idx:
-                                    other_probs = probs_df.iloc[:, r_idx].loc[common_idx]
-                                    ax_ctx.plot(other_probs.index, other_probs, linestyle='--', alpha=0.6, label=f'Regime {r_idx} Prob')
-                            
-                            # Highlight Long Zones
-                            ax_ctx.fill_between(bull_probs.index, 0, 1, where=(signals==1), color='green', alpha=0.1, label='Long Signal')
-                            
+                            ax_ctx.fill_between(bull_probs.index, 0, 1, where=(signals==1), color='green', alpha=0.1)
                             format_plot_dates(ax_ctx, bull_probs.index)
-                            ax_ctx.set_title(f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})")
                             ax_ctx.legend()
                             st.pyplot(fig_ctx)
 
-                    else: # Regime Switching Period
-                        # Logic: Long if Bull Probability is the highest (Dominant)
-                        # This is similar to 'Regime Probability' but framed as "Period"
-                        # We ensure it's strictly 1 or 0 based on dominance.
-                        
+                    else:
                         dominant_regime = probs_df.idxmax(axis=1)
-                        
-                        # Align indices
                         common_idx = strat_prices.index.intersection(dominant_regime.index)
                         dominant_regime = dominant_regime.loc[common_idx]
-                        
-                        # Signal: 1 if Dominant Regime is Bull
                         signals = (dominant_regime == bull_regime_idx).astype(int)
-                        
-                        # Plot Context
                         with st.expander("See Strategy Context"):
                             fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
-                            
-                            # Plot Price
                             strat_prices_aligned = strat_prices.loc[common_idx]
-                            ax_ctx.plot(strat_prices_aligned.index, strat_prices_aligned, color='gray', alpha=0.5, label='Price')
-                            
-                            # Highlight Bull Periods
-                            ax_ctx.fill_between(strat_prices_aligned.index, strat_prices_aligned.min(), strat_prices_aligned.max(), 
-                                                where=(signals==1), color='green', alpha=0.2, label='Bull Regime Period')
-                            
+                            ax_ctx.plot(strat_prices_aligned.index, strat_prices_aligned, color='gray', alpha=0.5)
+                            ax_ctx.fill_between(strat_prices_aligned.index, strat_prices_aligned.min(), strat_prices_aligned.max(),
+                                                where=(signals==1), color='green', alpha=0.2, label='Bull Period')
                             format_plot_dates(ax_ctx, strat_prices_aligned.index)
-                            ax_ctx.set_title(f"Regime Switching Periods (Bull Regime: {bull_regime_idx})")
                             ax_ctx.legend()
                             st.pyplot(fig_ctx)
 
-                    # Debug Dataframe
                     with st.expander("🔍 Debug: Signal Details"):
-                        debug_df = pd.DataFrame({
-                            "Price": strat_prices,
-                            "Signal": signals
-                        }).dropna()
-                        st.dataframe(debug_df.style.format({
-                            "Price": "{:.2f}",
-                            "Signal": "{:.0f}"
-                        }), use_container_width=True)
-                        
+                        debug_df = pd.DataFrame({"Price": strat_prices, "Signal": signals}).dropna()
+                        st.dataframe(debug_df.style.format({"Price": "{:.2f}", "Signal": "{:.0f}"}), use_container_width=True)
                 else:
                     st.error("Regime model fitting failed.")
 
-    elif strategy_type == "Kalman Filter (Trend Crossover)":
-        st.markdown("**Strategy:** Long when Price crosses **ABOVE** Kalman Trend. Sell when Price crosses **BELOW**.")
-        
-        col_k1, col_k2 = st.columns(2)
-        with col_k1:
-            kf_noise = st.select_slider("Trend Sensitivity", options=[1e-5, 1e-4, 1e-3], value=1e-4, 
-                                        format_func=lambda x: f"{x} (Standard)" if x==1e-4 else str(x))
-        with col_k2:
-            confirm_days = st.slider("Signal Confirmation (Days)", 1, 5, 1, help="Consecutive days required to confirm a trend change.")
+        # ─────────────────────────────────────────────
+        # STRATEGY: Kalman Filter
+        # ─────────────────────────────────────────────
+        elif strategy_type == "Kalman Filter (Trend Crossover)":
+            st.markdown("**Strategy:** Long when Price crosses **ABOVE** Kalman Trend. Sell when Price crosses **BELOW**.")
+            col_k1, col_k2 = st.columns(2)
+            with col_k1:
+                kf_noise = st.select_slider("Trend Sensitivity", options=[1e-5, 1e-4, 1e-3], value=1e-4)
+            with col_k2:
+                confirm_days = st.slider("Signal Confirmation (Days)", 1, 5, 1)
 
-        with st.spinner("Running Kalman Filter..."):
-            # Run Kalman Filter (Standard/Causal to avoid lookahead)
-            kf = KalmanFilterTrend(process_noise=kf_noise, measurement_noise=1e-2)
-            trend_est, _ = kf.filter(prices_bt.values)
-            trend_series = pd.Series(trend_est, index=prices_bt.index)
-            
-            # Generate Signals with Confirmation Logic
-            sig_list = []
-            position = 0
-            
-            # Counters for consecutive days
-            days_above = 0
-            days_below = 0
-            
-            for price, trend in zip(prices_bt, trend_series):
-                if price > trend:
-                    days_above += 1
-                    days_below = 0
-                else:
-                    days_below += 1
-                    days_above = 0
-                
-                # Trading Logic
-                if position == 0:
-                    if days_above >= confirm_days:
-                        position = 1 # Buy
-                elif position == 1:
-                    if days_below >= confirm_days:
-                        position = 0 # Sell
-                        
-                sig_list.append(position)
-            
-            signals = pd.Series(sig_list, index=prices_bt.index)
-            
-            # Plot Strategy Context
-            with st.expander("See Strategy Context"):
-                fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
-                ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
-                ax_ctx.plot(trend_series.index, trend_series, color='blue', label='Kalman Trend')
-                
-                # Highlight Long Zones
-                ax_ctx.fill_between(trend_series.index, prices_bt.min(), prices_bt.max(), 
-                                    where=(signals==1), color='green', alpha=0.1, label='Long Zone')
-                
-                format_plot_dates(ax_ctx, prices_bt.index)
-                ax_ctx.legend()
-                st.pyplot(fig_ctx)
-
-    elif strategy_type == "Momentum Hedge (EMA/SMA Cross)":
-        st.markdown("**Strategy:** Long when **Short EMA > Med SMA**. Cash/Hedge when **Short EMA < Med SMA**.")
-        
-        c_h1, c_h2 = st.columns(2)
-        with c_h1:
-            short_len = st.slider("Short EMA Length", 5, 50, 20)
-        with c_h2:
-            med_len = st.slider("Medium SMA Length", 20, 200, 60)
-            
-        with st.spinner("Calculating Momentum Hedge Signals..."):
-            # Calculate Indicators
-            short_ema = prices_bt.ewm(span=short_len, adjust=False).mean()
-            med_sma = prices_bt.rolling(window=med_len).mean()
-            
-            # Generate Signals
-            # Logic: Flag = 1 when Short < Med (Hedge active). So Long Signal = 1 when Not Flagged (Short >= Med).
-            # To match exactly: flag = shortMA < medMA ? 1.0 : 0.0
-            signals = (short_ema >= med_sma).astype(int)
-            
-            # Plot Context
-            with st.expander("See Strategy Context"):
-                fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
-                ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
-                ax_ctx.plot(short_ema.index, short_ema, color='orange', linewidth=1.5, label=f'Short EMA ({short_len})')
-                ax_ctx.plot(med_sma.index, med_sma, color='blue', linewidth=1.5, label=f'Med SMA ({med_len})')
-                
-                # Highlight Long Zones (Green)
-                ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
-                                    where=(signals==1), color='green', alpha=0.1, label='Long Zone')
-                # Highlight Hedge Zones (Red)
-                ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
-                                    where=(signals==0), color='red', alpha=0.1, label='Hedge Zone (Active Flag)')
-                
-                format_plot_dates(ax_ctx, prices_bt.index)
-                ax_ctx.set_title("Momentum Hedge Signal (EMA/SMA Cross)")
-                ax_ctx.legend()
-                st.pyplot(fig_ctx)
-
-    elif strategy_type == "MAD Trend Modes":
-        st.markdown("### 📊 MAD Trend Modes Settings")
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            sig_mode = st.selectbox("Signal Mode", ["Bollinger Bands", "For Loop", "Combined Signal"])
-            ma_type = st.selectbox("MA Type", ["EMA", "SMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"])
-        with col_m2:
-            mad_len = st.number_input("MAD Length", 5, 100, 25)
-            
-        mad_params = {'signal_mode': sig_mode, 'bb_ma_type': ma_type, 'bb_len': mad_len}
-        
-        if sig_mode == "Bollinger Bands":
-            col_bb1, col_bb2 = st.columns(2)
-            with col_bb1:
-                mult_p = st.number_input("+ Multiplier", 0.1, 5.0, 1.4)
-            with col_bb2:
-                mult_n = st.number_input("- Multiplier", 0.1, 5.0, 1.0)
-            mad_params.update({'bb_mult_p': mult_p, 'bb_mult_n': mult_n})
-            
-        elif sig_mode == "For Loop":
-            col_fl1, col_fl2, col_fl3 = st.columns(3)
-            with col_fl1:
-                fl_a = st.number_input("From", 1, 100, 10)
-            with col_fl2:
-                fl_b = st.number_input("To", 1, 200, 60)
-            with col_fl3:
-                fl_len = st.number_input("Loop MA Length", 1, 50, 10)
-            col_fl4, col_fl5 = st.columns(2)
-            with col_fl4:
-                thresh_l = st.number_input("Threshold Long", 1, 100, 23)
-            with col_fl5:
-                thresh_s = st.number_input("Threshold Short", -100, 100, 3)
-            mad_params.update({
-                'fl_ma_type': ma_type,
-                'fl_len': fl_len,
-                'fl_a': fl_a,
-                'fl_b': fl_b,
-                'fl_thresh_l': thresh_l,
-                'fl_thresh_s': thresh_s
-            })
-        else: # Combined Signal
-            col_c1, col_c2 = st.columns(2)
-            with col_c1:
-                c_thresh_l = st.number_input("Threshold Long (Combined)", -1.0, 1.0, 0.0, step=0.01)
-            with col_c2:
-                c_thresh_s = st.number_input("Threshold Short (Combined)", -1.0, 1.0, 0.0, step=0.01)
-            mad_params.update({
-                'c_thresh_l': c_thresh_l,
-                'c_thresh_s': c_thresh_s
-            })
-
-        if st.button("🚀 Run MAD Backtest", use_container_width=True):
-            with st.spinner("Generating MAD Trend signals..."):
-                signals = MADTrendModes.get_signals(df_bt, mad_params)
-                
-                # Plot Context
-                with st.expander("See Strategy Context", expanded=True):
+            with st.spinner("Running Kalman Filter..."):
+                kf = KalmanFilterTrend(process_noise=kf_noise, measurement_noise=1e-2)
+                trend_est, _ = kf.filter(prices_bt.values)
+                trend_series = pd.Series(trend_est, index=prices_bt.index)
+                sig_list = []
+                position = 0
+                days_above = 0
+                days_below = 0
+                for price, trend in zip(prices_bt, trend_series):
+                    if price > trend:
+                        days_above += 1
+                        days_below = 0
+                    else:
+                        days_below += 1
+                        days_above = 0
+                    if position == 0:
+                        if days_above >= confirm_days:
+                            position = 1
+                    elif position == 1:
+                        if days_below >= confirm_days:
+                            position = 0
+                    sig_list.append(position)
+                signals = pd.Series(sig_list, index=prices_bt.index)
+                with st.expander("See Strategy Context"):
                     fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
                     ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
-                    # Highlight Long Zones (Green)
-                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
+                    ax_ctx.plot(trend_series.index, trend_series, color='blue', label='Kalman Trend')
+                    ax_ctx.fill_between(trend_series.index, prices_bt.min(), prices_bt.max(),
                                         where=(signals==1), color='green', alpha=0.1, label='Long Zone')
-                    
                     format_plot_dates(ax_ctx, prices_bt.index)
-                    ax_ctx.set_title(f"MAD Trend Modes Signal ({sig_mode})")
                     ax_ctx.legend()
                     st.pyplot(fig_ctx)
 
-    elif strategy_type == "Dual MA Cross":
-        st.markdown("### 🔀 Dual Moving Average Cross Settings")
-        ma_options = ["SMA", "EMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"]
-        
-        c_ma1, c_ma2 = st.columns(2)
-        with c_ma1:
-            st.subheader("Fast MA (Short-term)")
-            f_ma_type = st.selectbox("Fast MA Type", ma_options, index=1) # Default EMA
-            f_ma_len = st.number_input("Fast MA Length", 1, 250, 20)
-        with c_ma2:
-            st.subheader("Slow MA (Long-term)")
-            s_ma_type = st.selectbox("Slow MA Type", ma_options, index=0) # Default SMA
-            s_ma_len = st.number_input("Slow MA Length", 1, 250, 50)
-            
-        if st.button("🚀 Run Dual MA Backtest", use_container_width=True):
-            if f_ma_len >= s_ma_len:
-                st.warning("Fast MA length is typically shorter than Slow MA length. Results may be inverted.")
-                
-            with st.spinner("Calculating Moving Average Crossovers..."):
-                # Calculate MAs
-                fast_ma = MADTrendModes.ma_switch(prices_bt, f_ma_len, f_ma_type)
-                slow_ma = MADTrendModes.ma_switch(prices_bt, s_ma_len, s_ma_type)
-                
-                # Generate Signals: Long when Fast > Slow, Cash when Fast < Slow
-                # Using stateful ffill logic for consistency
-                long_cond = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
-                short_cond = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
-                
-                def get_stateful_ma_signal(l_cond, s_cond, index):
-                    sig = pd.Series(np.nan, index=index)
-                    sig.loc[l_cond] = 1
-                    sig.loc[s_cond] = 0
-                    return sig.ffill().fillna(0)
-                
-                signals = get_stateful_ma_signal(long_cond, short_cond, prices_bt.index)
-                
-                # Plot Context
-                with st.expander("See Strategy Context", expanded=True):
+        # ─────────────────────────────────────────────
+        # STRATEGY: Momentum Hedge
+        # ─────────────────────────────────────────────
+        elif strategy_type == "Momentum Hedge (EMA/SMA Cross)":
+            st.markdown("**Strategy:** Long when **Short EMA > Med SMA**. Cash/Hedge otherwise.")
+            c_h1, c_h2 = st.columns(2)
+            with c_h1:
+                short_len = st.slider("Short EMA Length", 5, 50, 20)
+            with c_h2:
+                med_len = st.slider("Medium SMA Length", 20, 200, 60)
+
+            with st.spinner("Calculating Momentum Hedge Signals..."):
+                short_ema = prices_bt.ewm(span=short_len, adjust=False).mean()
+                med_sma = prices_bt.rolling(window=med_len).mean()
+                signals = (short_ema >= med_sma).astype(int)
+                with st.expander("See Strategy Context"):
                     fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
                     ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
-                    ax_ctx.plot(fast_ma.index, fast_ma, label=f'Fast {f_ma_type} ({f_ma_len})', color='orange', alpha=0.8)
-                    ax_ctx.plot(slow_ma.index, slow_ma, label=f'Slow {s_ma_type} ({s_ma_len})', color='blue', alpha=0.8)
-                    
-                    # Highlight Long Zones (Green)
-                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(), 
+                    ax_ctx.plot(short_ema.index, short_ema, color='orange', linewidth=1.5, label=f'Short EMA ({short_len})')
+                    ax_ctx.plot(med_sma.index, med_sma, color='blue', linewidth=1.5, label=f'Med SMA ({med_len})')
+                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(),
                                         where=(signals==1), color='green', alpha=0.1, label='Long Zone')
-                    
+                    ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(),
+                                        where=(signals==0), color='red', alpha=0.1, label='Hedge Zone')
                     format_plot_dates(ax_ctx, prices_bt.index)
-                    ax_ctx.set_title(f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})")
                     ax_ctx.legend()
                     st.pyplot(fig_ctx)
 
-    # Run Backtest Engine if signals exist
-    if signals is not None:
-        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop)
-        
-        # --- STRATEGY SIGNAL BANNER ---
-        last_sig = signals.iloc[-1]
-        last_dt = signals.index[-1]
-        st.divider()
-        if last_sig == 1:
-            st.success(f"🚀 **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Action: **HOLD LONG**")
-        else:
-            st.error(f"🛑 **STRATEGY SIGNAL (CASH)** | Last Update: {last_dt} | Action: **STAY IN CASH / HEDGE**")
-        
-        # Metrics
-        strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
-        bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
-        
-        # Display Metrics
-        st.write("#### 📊 Performance Metrics")
-        met_col1, met_col2, met_col3, met_col4 = st.columns(4)
-        
-        with met_col1:
-            st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
-        with met_col2:
-            st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
-        with met_col3:
-            st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
-        with met_col4:
-            st.metric("Benchmark Return", f"{(bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
-            
-        # Equity Curve Plot
-        st.write("#### 📈 Equity Curve")
-        fig_bt, ax_bt = plt.subplots(figsize=(12, 6))
-        ax_bt.plot(bt_results['equity_curve'], label=f'Strategy ({strategy_type})', color='green', linewidth=2)
-        ax_bt.plot(bt_results['benchmark_curve'], label='Buy & Hold (Benchmark)', color='gray', linestyle='--', alpha=0.7)
-        ax_bt.set_title(f"Strategy Performance: {TICKER}")
-        ax_bt.legend()
-        format_plot_dates(ax_bt, bt_results['equity_curve'].index)
-        st.pyplot(fig_bt)
-        st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
-        st.session_state.report_gen.add_data("Backtest Metrics", strat_metrics)
-        
-        # Trade Log
-        st.write("#### 📝 Trade Log")
-        trades_df = bt_results['trades']
-        if not trades_df.empty:
-            # Format dates
-            trades_df['Entry Date'] = pd.to_datetime(trades_df['Entry Date']).dt.date
-            trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).apply(lambda x: x.date() if pd.notnull(x) else "Open")
-            
-            st.dataframe(trades_df.style.format({
-                "Buy Price": "{:.2f}",
-                "Sell Price": "{:.2f}",
-                "PnL (%)": "{:.2f}%"
-            }), use_container_width=True)
-        else:
-            st.info("No closed trades generated by the strategy.")
+        # ─────────────────────────────────────────────
+        # STRATEGY: MAD Trend Modes
+        # ─────────────────────────────────────────────
+        elif strategy_type == "MAD Trend Modes":
+            st.markdown("### 📊 MAD Trend Modes Settings")
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                sig_mode = st.selectbox("Signal Mode", ["Bollinger Bands", "For Loop", "Combined Signal"])
+                ma_type = st.selectbox("MA Type", ["EMA", "SMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"])
+            with col_m2:
+                mad_len = st.number_input("MAD Length", 5, 100, 25)
 
+            mad_params = {'signal_mode': sig_mode, 'bb_ma_type': ma_type, 'bb_len': mad_len}
+            if sig_mode == "Bollinger Bands":
+                col_bb1, col_bb2 = st.columns(2)
+                with col_bb1: mult_p = st.number_input("+ Multiplier", 0.1, 5.0, 1.4)
+                with col_bb2: mult_n = st.number_input("- Multiplier", 0.1, 5.0, 1.0)
+                mad_params.update({'bb_mult_p': mult_p, 'bb_mult_n': mult_n})
+            elif sig_mode == "For Loop":
+                col_fl1, col_fl2, col_fl3 = st.columns(3)
+                with col_fl1: fl_a = st.number_input("From", 1, 100, 10)
+                with col_fl2: fl_b = st.number_input("To", 1, 200, 60)
+                with col_fl3: fl_len = st.number_input("Loop MA Length", 1, 50, 10)
+                col_fl4, col_fl5 = st.columns(2)
+                with col_fl4: thresh_l = st.number_input("Threshold Long", 1, 100, 23)
+                with col_fl5: thresh_s = st.number_input("Threshold Short", -100, 100, 3)
+                mad_params.update({
+                    'fl_ma_type': ma_type, 'fl_len': fl_len,
+                    'fl_a': fl_a, 'fl_b': fl_b,
+                    'fl_thresh_l': thresh_l, 'fl_thresh_s': thresh_s
+                })
+            else:
+                col_c1, col_c2 = st.columns(2)
+                with col_c1: c_thresh_l = st.number_input("Threshold Long (Combined)", -1.0, 1.0, 0.0, step=0.01)
+                with col_c2: c_thresh_s = st.number_input("Threshold Short (Combined)", -1.0, 1.0, 0.0, step=0.01)
+                mad_params.update({'c_thresh_l': c_thresh_l, 'c_thresh_s': c_thresh_s})
 
+            if st.button("🚀 Run MAD Backtest", use_container_width=True):
+                with st.spinner("Generating MAD Trend signals..."):
+                    signals = MADTrendModes.get_signals(df_bt, mad_params)
+                    with st.expander("See Strategy Context", expanded=True):
+                        fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                        ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
+                        ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(),
+                                            where=(signals==1), color='green', alpha=0.1, label='Long Zone')
+                        format_plot_dates(ax_ctx, prices_bt.index)
+                        ax_ctx.set_title(f"MAD Trend Modes Signal ({sig_mode})")
+                        ax_ctx.legend()
+                        st.pyplot(fig_ctx)
+
+        # ─────────────────────────────────────────────
+        # STRATEGY: Dual MA Cross
+        # ─────────────────────────────────────────────
+        elif strategy_type == "Dual MA Cross":
+            st.markdown("### 🔀 Dual Moving Average Cross Settings")
+            ma_options = ["SMA", "EMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"]
+            c_ma1, c_ma2 = st.columns(2)
+            with c_ma1:
+                st.subheader("Fast MA (Short-term)")
+                f_ma_type = st.selectbox("Fast MA Type", ma_options, index=1)
+                f_ma_len = st.number_input("Fast MA Length", 1, 250, 20)
+            with c_ma2:
+                st.subheader("Slow MA (Long-term)")
+                s_ma_type = st.selectbox("Slow MA Type", ma_options, index=0)
+                s_ma_len = st.number_input("Slow MA Length", 1, 250, 50)
+
+            if st.button("🚀 Run Dual MA Backtest", use_container_width=True):
+                if f_ma_len >= s_ma_len:
+                    st.warning("Fast MA length is typically shorter than Slow MA length.")
+                with st.spinner("Calculating Moving Average Crossovers..."):
+                    fast_ma = MADTrendModes.ma_switch(prices_bt, f_ma_len, f_ma_type)
+                    slow_ma = MADTrendModes.ma_switch(prices_bt, s_ma_len, s_ma_type)
+                    long_cond = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
+                    short_cond = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
+
+                    def get_stateful_ma_signal(l_cond, s_cond, index):
+                        sig = pd.Series(np.nan, index=index)
+                        sig.loc[l_cond] = 1
+                        sig.loc[s_cond] = 0
+                        return sig.ffill().fillna(0)
+
+                    signals = get_stateful_ma_signal(long_cond, short_cond, prices_bt.index)
+                    with st.expander("See Strategy Context", expanded=True):
+                        fig_ctx, ax_ctx = plt.subplots(figsize=(10, 4))
+                        ax_ctx.plot(prices_bt.index, prices_bt, color='gray', alpha=0.5, label='Price')
+                        ax_ctx.plot(fast_ma.index, fast_ma, label=f'Fast {f_ma_type} ({f_ma_len})', color='orange', alpha=0.8)
+                        ax_ctx.plot(slow_ma.index, slow_ma, label=f'Slow {s_ma_type} ({s_ma_len})', color='blue', alpha=0.8)
+                        ax_ctx.fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(),
+                                            where=(signals==1), color='green', alpha=0.1, label='Long Zone')
+                        format_plot_dates(ax_ctx, prices_bt.index)
+                        ax_ctx.set_title(f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})")
+                        ax_ctx.legend()
+                        st.pyplot(fig_ctx)
+
+        # ─────────────────────────────────────────────
+        # STRATEGY: Ehlers SuperSmoother ← NEW
+        # ─────────────────────────────────────────────
+        elif strategy_type == "Ehlers SuperSmoother":
+            st.markdown("### 🌀 Ehlers SuperSmoother Filter (Original 2-Pole)")
+            st.caption(
+                "John Ehlers' original SuperSmoother from *Cybernetic Analysis for Stocks and Futures* (2004). "
+                "Eliminates aliasing noise below the Nyquist frequency using a 2-pole recursive IIR filter. "
+                "Unlike simple MAs, it has minimal lag while aggressively attenuating high-frequency noise."
+            )
+
+            col_ss1, col_ss2 = st.columns(2)
+            with col_ss1:
+                ss_period_choice = st.selectbox(
+                    "SuperSmoother Period (Preset)",
+                    [20, 50, 100, 150, 200, 250],
+                    index=1,
+                    help="Cutoff period. Higher = smoother but more lag. Common: 50, 100, 200."
+                )
+                ss_custom_period = st.number_input(
+                    "Custom Period Override (overrides preset if changed)",
+                    min_value=5, max_value=500, value=int(ss_period_choice),
+                    help="Enter any integer period. This value takes priority over the preset above."
+                )
+                final_ss_period = int(ss_custom_period)
+
+            with col_ss2:
+                ss_signal_type = st.selectbox(
+                    "Signal Generation Method",
+                    [
+                        "Price vs SuperSmoother (Crossover)",
+                        "SuperSmoother Slope (Direction)",
+                        "Dual SuperSmoother Cross (Fast/Slow)"
+                    ],
+                    help=(
+                        "Crossover: Long when price is above the filter. "
+                        "Slope: Long when filter is rising. "
+                        "Dual: Long when fast SS is above slow SS."
+                    )
+                )
+
+            # Extra controls for dual SS
+            ss_fast_period = None
+            ss_slow_period = None
+            if ss_signal_type == "Dual SuperSmoother Cross (Fast/Slow)":
+                col_ss3, col_ss4 = st.columns(2)
+                with col_ss3:
+                    ss_fast_period = st.number_input(
+                        "Fast SS Period", min_value=5, max_value=200,
+                        value=max(5, final_ss_period // 2),
+                        help="Short-term SuperSmoother (triggers first)"
+                    )
+                with col_ss4:
+                    ss_slow_period = st.number_input(
+                        "Slow SS Period", min_value=10, max_value=500,
+                        value=final_ss_period,
+                        help="Long-term SuperSmoother (acts as trend filter)"
+                    )
+
+            # Info box about the math
+            with st.expander("📐 How the Ehlers SuperSmoother Works"):
+                st.markdown("""
+**2-Pole Recursive IIR Filter Coefficients:**
+```
+a1 = exp(-1.414 × π / Period)
+b1 = 2 × a1 × cos(1.414 × 180° / Period)
+c2 = b1
+c3 = -a1²
+c1 = 1 - c2 - c3
+```
+**Recursive Formula:**
+```
+SS[i] = c1 × (Price[i] + Price[i-1]) / 2  +  c2 × SS[i-1]  +  c3 × SS[i-2]
+```
+- **Period** controls the cutoff frequency — frequencies above Nyquist (Period/2) are eliminated
+- **Two-pole** design provides steeper roll-off than a single-pole (EMA-like) filter
+- The filter is **causal** (no look-ahead bias) — safe for backtesting
+                """)
+
+            if st.button("🚀 Run SuperSmoother Backtest", use_container_width=True, type="primary"):
+                with st.spinner(f"Applying Ehlers SuperSmoother (Period={final_ss_period})..."):
+
+                    # Compute main SS
+                    ss_main = MADTrendModes.ehlers_supersmoother(prices_bt, final_ss_period)
+
+                    if ss_signal_type == "Price vs SuperSmoother (Crossover)":
+                        # Stateful crossover: Long when price crosses above SS, cash when below
+                        long_cond  = (prices_bt > ss_main) & (prices_bt.shift(1) <= ss_main.shift(1))
+                        short_cond = (prices_bt < ss_main) & (prices_bt.shift(1) >= ss_main.shift(1))
+                        sig_raw = pd.Series(np.nan, index=prices_bt.index)
+                        sig_raw.loc[long_cond]  = 1
+                        sig_raw.loc[short_cond] = 0
+                        signals = sig_raw.ffill().fillna(0).astype(int)
+
+                    elif ss_signal_type == "SuperSmoother Slope (Direction)":
+                        # Long when SS is rising (positive slope), cash when falling
+                        slope = ss_main.diff()
+                        signals = (slope > 0).astype(int)
+
+                    else:  # Dual SuperSmoother Cross
+                        ss_fast_series = MADTrendModes.ehlers_supersmoother(prices_bt, int(ss_fast_period))
+                        ss_slow_series = MADTrendModes.ehlers_supersmoother(prices_bt, int(ss_slow_period))
+                        long_cond  = (ss_fast_series > ss_slow_series) & (ss_fast_series.shift(1) <= ss_slow_series.shift(1))
+                        short_cond = (ss_fast_series < ss_slow_series) & (ss_fast_series.shift(1) >= ss_slow_series.shift(1))
+                        sig_raw = pd.Series(np.nan, index=prices_bt.index)
+                        sig_raw.loc[long_cond]  = 1
+                        sig_raw.loc[short_cond] = 0
+                        signals = sig_raw.ffill().fillna(0).astype(int)
+
+                    # ── Strategy Context Chart ──────────────────────────────
+                    with st.expander("📊 See Strategy Context", expanded=True):
+                        fig_ctx, axes_ss = plt.subplots(2, 1, figsize=(13, 7), sharex=True,
+                                                         gridspec_kw={'height_ratios': [3, 1]})
+
+                        # Panel 1: Price + SS lines
+                        axes_ss[0].plot(prices_bt.index, prices_bt, color='gray', alpha=0.55,
+                                        linewidth=1, label='Price')
+                        axes_ss[0].plot(ss_main.index, ss_main, color='royalblue', linewidth=2.2,
+                                        label=f'SuperSmoother ({final_ss_period})')
+
+                        if ss_signal_type == "Dual SuperSmoother Cross (Fast/Slow)":
+                            axes_ss[0].plot(ss_fast_series.index, ss_fast_series,
+                                            color='darkorange', linewidth=1.6, linestyle='--',
+                                            label=f'Fast SS ({int(ss_fast_period)})')
+                            axes_ss[0].plot(ss_slow_series.index, ss_slow_series,
+                                            color='darkgreen', linewidth=1.6, linestyle=':',
+                                            label=f'Slow SS ({int(ss_slow_period)})')
+
+                        axes_ss[0].fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(),
+                                                where=(signals == 1), color='limegreen', alpha=0.12, label='Long Zone')
+                        axes_ss[0].fill_between(prices_bt.index, prices_bt.min(), prices_bt.max(),
+                                                where=(signals == 0), color='tomato', alpha=0.07, label='Cash Zone')
+                        axes_ss[0].set_title(f"Ehlers SuperSmoother — {ss_signal_type} | {TICKER}")
+                        axes_ss[0].legend(fontsize='small', loc='upper left')
+                        axes_ss[0].set_ylabel("Price")
+
+                        # Panel 2: Signal bar
+                        axes_ss[1].fill_between(prices_bt.index, 0, signals,
+                                                color='limegreen', alpha=0.5, step='pre', label='Long=1 / Cash=0')
+                        axes_ss[1].set_ylim(-0.1, 1.4)
+                        axes_ss[1].set_yticks([0, 1])
+                        axes_ss[1].set_yticklabels(['Cash', 'Long'])
+                        axes_ss[1].set_title("Signal")
+                        axes_ss[1].legend(fontsize='small')
+
+                        format_plot_dates(axes_ss[1], prices_bt.index)
+                        plt.tight_layout()
+                        st.pyplot(fig_ctx)
+
+                    # Filter comparison chart (optional insight)
+                    with st.expander("🔬 Filter Comparison: SS vs EMA vs SMA"):
+                        fig_cmp, ax_cmp = plt.subplots(figsize=(13, 5))
+                        ax_cmp.plot(prices_bt.index, prices_bt, color='gray', alpha=0.4, linewidth=0.8, label='Price')
+                        ax_cmp.plot(ss_main.index, ss_main, color='royalblue', linewidth=2, label=f'SuperSmoother ({final_ss_period})')
+                        ema_cmp = prices_bt.ewm(span=final_ss_period, adjust=False).mean()
+                        sma_cmp = prices_bt.rolling(window=final_ss_period).mean()
+                        ax_cmp.plot(ema_cmp.index, ema_cmp, color='orange', linewidth=1.5, linestyle='--', label=f'EMA ({final_ss_period})')
+                        ax_cmp.plot(sma_cmp.index, sma_cmp, color='green', linewidth=1.5, linestyle=':', label=f'SMA ({final_ss_period})')
+                        ax_cmp.set_title(f"SuperSmoother vs Traditional MAs (Period={final_ss_period})")
+                        ax_cmp.legend(fontsize='small')
+                        format_plot_dates(ax_cmp, prices_bt.index)
+                        st.pyplot(fig_cmp)
+                        st.caption(
+                            "SuperSmoother typically tracks the trend more closely than SMA and has less lag than SMA "
+                            "while still suppressing noise more aggressively than EMA."
+                        )
+
+        # ─────────────────────────────────────────────
+        # BACKTEST ENGINE — runs for all strategies
+        # ─────────────────────────────────────────────
+        if signals is not None:
+            bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop)
+
+            last_sig = signals.iloc[-1]
+            last_dt = signals.index[-1]
+            st.divider()
+            if last_sig == 1:
+                st.success(f"🚀 **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Action: **HOLD LONG**")
+            else:
+                st.error(f"🛑 **STRATEGY SIGNAL (CASH)** | Last Update: {last_dt} | Action: **STAY IN CASH / HEDGE**")
+
+            strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
+            bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
+
+            st.write("#### 📊 Performance Metrics")
+            met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+            with met_col1:
+                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+            with met_col2:
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+            with met_col3:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col4:
+                st.metric("Benchmark Return", f"{(bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+
+            st.write("#### 📈 Equity Curve")
+            fig_bt, ax_bt = plt.subplots(figsize=(12, 6))
+            ax_bt.plot(bt_results['equity_curve'], label=f'Strategy ({strategy_type})', color='green', linewidth=2)
+            ax_bt.plot(bt_results['benchmark_curve'], label='Buy & Hold (Benchmark)', color='gray', linestyle='--', alpha=0.7)
+            ax_bt.set_title(f"Strategy Performance: {TICKER}")
+            ax_bt.legend()
+            format_plot_dates(ax_bt, bt_results['equity_curve'].index)
+            st.pyplot(fig_bt)
+            st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+            st.session_state.report_gen.add_data("Backtest Metrics", strat_metrics)
+
+            st.write("#### 📝 Trade Log")
+            trades_df = bt_results['trades']
+            if not trades_df.empty:
+                trades_df['Entry Date'] = pd.to_datetime(trades_df['Entry Date']).dt.date
+                trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).apply(
+                    lambda x: x.date() if pd.notnull(x) else "Open"
+                )
+                st.dataframe(trades_df.style.format({
+                    "Buy Price": "{:.2f}", "Sell Price": "{:.2f}", "PnL (%)": "{:.2f}%"
+                }), use_container_width=True)
+            else:
+                st.info("No closed trades generated by the strategy.")
+
+# ==========================================
+# TAB 8: VOLATILITY CLUSTERING
+# ==========================================
 with tab8:
     if df_main is None:
         st.warning("Please load a ticker to view Volatility Clustering.")
     else:
         st.write("### 🌩️ Volatility Clustering & Jump Analysis")
-    
-    # --- CALCULATION FOR VERDICT ---
-    returns_arr = df_main['Returns'].values
-    rv = RealizedVolatility.realized_variance(returns_arr)
-    hawkes = HawkesVolatility().fit(returns_arr)
-    br = hawkes.branching_ratio()
 
-    # --- MODEL VERDICT BANNER ---
-    latest_rv = np.sqrt(rv)*np.sqrt(252)
-    if jump_detected: st.error(f"🎯 **MODEL VERDICT**: Significant **JUMPS** detected. Continuous volatility ({latest_rv:.1%}) is secondary to structural shocks. Use Merton/Heston models.")
-    elif br > 0.8: st.warning(f"🎯 **MODEL VERDICT**: High **Volatility Clustering** (Branching Ratio: {br:.2f}). Recent shocks are likely to trigger further volatility.")
-    else: st.success(f"🎯 **MODEL VERDICT**: Volatility is **Stable**. No significant clustering or jumps detected.")
+    if df_main is not None:
+        returns_arr = df_main['Returns'].values
+        rv = RealizedVolatility.realized_variance(returns_arr)
+        hawkes = HawkesVolatility().fit(returns_arr)
+        br = hawkes.branching_ratio()
+        latest_rv = np.sqrt(rv)*np.sqrt(252)
 
-    st.caption("Institutional analysis of volatility properties using High-Frequency logic applied to Daily data.")
-    
-    # 1. Realized Measures
-    bv = RealizedVolatility.bipower_variation(returns_arr)
-    jump_res = RealizedVolatility.jump_component(returns_arr)
-    
-    col_v1, col_v2, col_v3 = st.columns(3)
-    with col_v1:
-        st.metric("Total Volatility (RV)", f"{np.sqrt(rv)*np.sqrt(252):.2%}")
-    with col_v2:
-        st.metric("Continuous Vol (BV)", f"{np.sqrt(bv)*np.sqrt(252):.2%}", help="Jump-Robust Volatility")
-    with col_v3:
-        st.metric("Jump Ratio", f"{jump_res['jump_ratio']:.1%}", 
-                  help="Proportion of variance due to jumps")
-        if jump_res['p_value'] < 0.05:
-            st.error("Significant Jumps Detected")
-        else:
-            st.success("No Significant Jumps")
-    
-    # 2. Hawkes Process
-    st.divider()
-    st.write("#### Self-Exciting Volatility (Hawkes Process)")
-    
-    # hawkes and br already calculated above for the banner
-    h_col1, h_col2, h_col3 = st.columns(3)
-    with h_col1:
-        st.metric("Branching Ratio", f"{br:.2f}", help="> 1 means explosive/unstable volatility")
-    with h_col2:
-        hl = hawkes.half_life()
-        st.metric("Vol Cluster Half-Life", f"{hl:.1f} days")
-    with h_col3:
-        st.metric("Baseline Intensity", f"{hawkes.mu:.4f}")
+        if jump_detected: st.error(f"🎯 **MODEL VERDICT**: Significant **JUMPS** detected.")
+        elif br > 0.8: st.warning(f"🎯 **MODEL VERDICT**: High **Volatility Clustering** (Branching Ratio: {br:.2f}).")
+        else: st.success(f"🎯 **MODEL VERDICT**: Volatility is **Stable**.")
 
-    if br > 0.9:
-        st.warning("⚠️ Critical Instability: Volatility is self-reinforcing rapidly.")
-    elif br > 0.5:
-        st.info("Moderate Clustering: Recent shocks affect near-term future.")
-    else:
-        st.success("Stable: Volatility mean-reverts quickly.")
+        bv = RealizedVolatility.bipower_variation(returns_arr)
+        jump_res = RealizedVolatility.jump_component(returns_arr)
 
-    st.session_state.report_gen.add_data("Volatility Clustering Metrics", {
-        "RV": rv, "BV": bv, "Jump Ratio": jump_res['jump_ratio'],
-        "Branching Ratio": br, "Half-Life": hl
-    })
+        col_v1, col_v2, col_v3 = st.columns(3)
+        with col_v1: st.metric("Total Volatility (RV)", f"{np.sqrt(rv)*np.sqrt(252):.2%}")
+        with col_v2: st.metric("Continuous Vol (BV)", f"{np.sqrt(bv)*np.sqrt(252):.2%}")
+        with col_v3:
+            st.metric("Jump Ratio", f"{jump_res['jump_ratio']:.1%}")
+            if jump_res['p_value'] < 0.05: st.error("Significant Jumps Detected")
+            else: st.success("No Significant Jumps")
 
-    # Visualization
-    st.subheader("Volatility Clustering Visuals")
-    
-    # 1. Squared Returns (Volatility Proxy)
-    fig_vol, ax_vol = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    
-    # Plot Returns
-    ax_vol[0].plot(df_main.index, df_main['Returns'], color='gray', alpha=0.6, linewidth=0.8, label="Returns")
-    ax_vol[0].set_title(f"{TICKER} Returns Series")
-    ax_vol[0].legend(loc='upper right')
-    
-    # Plot Squared Returns (Clustering)
-    squared_rets = df_main['Returns']**2
-    ax_vol[1].plot(df_main.index, squared_rets, color='orange', alpha=0.8, linewidth=0.8, label="Squared Returns (Vol Proxy)")
-    
-    # Highlight high vol
-    threshold = squared_rets.mean() + 2 * squared_rets.std()
-    ax_vol[1].axhline(threshold, color='red', linestyle='--', linewidth=0.8, label="2-Sigma Threshold")
-    
-    ax_vol[1].set_title("Volatility Clustering (Squared Returns)")
-    ax_vol[1].legend(loc='upper right')
-    
-    format_plot_dates(ax_vol[1], df_main.index)
-    st.pyplot(fig_vol)
-    st.session_state.report_gen.add_plot("Volatility Clustering Visuals", fig_vol)
+        st.divider()
+        st.write("#### Self-Exciting Volatility (Hawkes Process)")
+        h_col1, h_col2, h_col3 = st.columns(3)
+        with h_col1: st.metric("Branching Ratio", f"{br:.2f}")
+        with h_col2:
+            hl = hawkes.half_life()
+            st.metric("Vol Cluster Half-Life", f"{hl:.1f} days")
+        with h_col3: st.metric("Baseline Intensity", f"{hawkes.mu:.4f}")
+
+        if br > 0.9: st.warning("⚠️ Critical Instability: Volatility is self-reinforcing.")
+        elif br > 0.5: st.info("Moderate Clustering: Recent shocks affect near-term future.")
+        else: st.success("Stable: Volatility mean-reverts quickly.")
+
+        st.session_state.report_gen.add_data("Volatility Clustering Metrics", {
+            "RV": rv, "BV": bv, "Jump Ratio": jump_res['jump_ratio'],
+            "Branching Ratio": br, "Half-Life": hl
+        })
+
+        fig_vol, ax_vol = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        ax_vol[0].plot(df_main.index, df_main['Returns'], color='gray', alpha=0.6, linewidth=0.8, label="Returns")
+        ax_vol[0].set_title(f"{TICKER} Returns Series")
+        ax_vol[0].legend(loc='upper right')
+        squared_rets = df_main['Returns']**2
+        ax_vol[1].plot(df_main.index, squared_rets, color='orange', alpha=0.8, linewidth=0.8, label="Squared Returns")
+        threshold = squared_rets.mean() + 2 * squared_rets.std()
+        ax_vol[1].axhline(threshold, color='red', linestyle='--', linewidth=0.8, label="2-Sigma Threshold")
+        ax_vol[1].set_title("Volatility Clustering (Squared Returns)")
+        ax_vol[1].legend(loc='upper right')
+        format_plot_dates(ax_vol[1], df_main.index)
+        st.pyplot(fig_vol)
+        st.session_state.report_gen.add_plot("Volatility Clustering Visuals", fig_vol)
 
 # ==========================================
-# TAB 9: INSTITUTIONAL REGIME DETECTION
+# TAB 9: ADVANCED REGIME
 # ==========================================
 with tab9:
     if df_main is None:
         st.warning("Please load a ticker to view Advanced Regime diagnostics.")
     else:
         st.write("### 🧠 Pro Regime Detection (Multi-Factor)")
-    
-    if not SKLEARN_AVAILABLE:
-        st.error("⚠️ `scikit-learn` library is missing. Institutional upgrade requires it.")
-    elif pro_detector is None:
-        st.info("🏛️ **Active Engine**: Markov Switching Model (High Accuracy)")
-        st.write(f"The current analysis is using the **Markov Regression** engine. This model identifies the current state based on transition probabilities and filtered marginals.")
-        st.success(f"Current State: **{regime_label}** ({regime_prob:.1%} confidence)")
-        st.caption(f"Number of States: {regime_data.get('n_states', 'Unknown')}")
-        st.caption("Note: GMM-specific feature plots are disabled for Markov models.")
-    else:
-        st.caption("Institutional model using Returns, Volatility, and Trend Deviation via Multivariate GMM.")
-        # Use the global pro_detector fitted in the decision engine
-        m_col1, m_col2 = st.columns(2)
-        with m_col1:
-            st.metric("Regime Label", regime_label, f"{regime_prob:.1%} Confidence")
-        with m_col2:
-            st.metric("Model AIC", f"{pro_detector.metrics.get('aic', 0):.0f}")
-        
-        st.write("#### 🌊 Regime Probability Stream")
-        fig_pro, ax_pro = plt.subplots(figsize=(10, 4))
-        probs = pro_detector.regimes['probs']
-        # Map ids to labels for the legend
-        labels = [pro_detector.state_labels.get(i, f"State {i}") for i in range(probs.shape[1])]
-        ax_pro.stackplot(df_main.index, probs.T, labels=labels, alpha=0.6)
-        ax_pro.legend(loc='upper left', fontsize='x-small')
-        ax_pro.set_title("Multi-Factor Regime Probabilities")
-        format_plot_dates(ax_pro, df_main.index)
-        st.pyplot(fig_pro)
-        st.session_state.report_gen.add_plot("Institutional Regime Probabilities", fig_pro)
-        
-        # Feature breakdown
-        st.write("#### 📊 Institutional Feature Space")
-        feat_df = pd.DataFrame(pro_detector.features, columns=['Momentum', 'Vol_Z', 'Trend_Dev'], index=df_main.index)
-        fig_feat, ax_feat = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-        feat_df['Momentum'].plot(ax=ax_feat[0], title='Feature 1: Momentum (Returns)', color='blue', alpha=0.7)
-        feat_df['Vol_Z'].plot(ax=ax_feat[1], title='Feature 2: Volatility (Z-Score)', color='orange', alpha=0.7)
-        feat_df['Trend_Dev'].plot(ax=ax_feat[2], title='Feature 2: Structural Dev (Kalman)', color='green', alpha=0.7)
-        ax_feat[0].axhline(0, color='black', lw=0.5)
-        ax_feat[1].axhline(0, color='black', lw=0.5)
-        ax_feat[2].axhline(0, color='black', lw=0.5)
-        format_plot_dates(ax_feat[2], df_main.index)
-        plt.tight_layout()
-        st.pyplot(fig_feat)
-        st.session_state.report_gen.add_plot("Regime Feature Space", fig_feat)
 
+    if df_main is not None:
+        if not SKLEARN_AVAILABLE:
+            st.error("⚠️ `scikit-learn` library is missing.")
+        elif pro_detector is None:
+            st.info("🏛️ **Active Engine**: Markov Switching Model (High Accuracy)")
+            st.success(f"Current State: **{regime_label}** ({regime_prob:.1%} confidence)")
+            st.caption(f"Number of States: {regime_data.get('n_states', 'Unknown')}")
+        else:
+            m_col1, m_col2 = st.columns(2)
+            with m_col1: st.metric("Regime Label", regime_label, f"{regime_prob:.1%} Confidence")
+            with m_col2: st.metric("Model AIC", f"{pro_detector.metrics.get('aic', 0):.0f}")
+
+            fig_pro, ax_pro = plt.subplots(figsize=(10, 4))
+            probs = pro_detector.regimes['probs']
+            labels_pro = [pro_detector.state_labels.get(i, f"State {i}") for i in range(probs.shape[1])]
+            ax_pro.stackplot(df_main.index, probs.T, labels=labels_pro, alpha=0.6)
+            ax_pro.legend(loc='upper left', fontsize='x-small')
+            ax_pro.set_title("Multi-Factor Regime Probabilities")
+            format_plot_dates(ax_pro, df_main.index)
+            st.pyplot(fig_pro)
+            st.session_state.report_gen.add_plot("Institutional Regime Probabilities", fig_pro)
+
+            feat_df = pd.DataFrame(pro_detector.features, columns=['Momentum', 'Vol_Z', 'Trend_Dev'], index=df_main.index)
+            fig_feat, ax_feat = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+            feat_df['Momentum'].plot(ax=ax_feat[0], title='Feature 1: Momentum', color='blue', alpha=0.7)
+            feat_df['Vol_Z'].plot(ax=ax_feat[1], title='Feature 2: Volatility (Z-Score)', color='orange', alpha=0.7)
+            feat_df['Trend_Dev'].plot(ax=ax_feat[2], title='Feature 3: Structural Dev', color='green', alpha=0.7)
+            for a in ax_feat: a.axhline(0, color='black', lw=0.5)
+            format_plot_dates(ax_feat[2], df_main.index)
+            plt.tight_layout()
+            st.pyplot(fig_feat)
 
 # ==========================================
-# TAB 10: SML & ALPHA (CAPM)
+# TAB 10: SML & ALPHA
 # ==========================================
 with tab10:
     if df_main is None:
         st.warning("Please load a ticker to view SML/Alpha analysis.")
     else:
         st.write("### 📐 Securities Market Line (SML) & Alpha Analysis")
-    st.caption("Institutional Factor Analysis: Rolling Beta, Jensen's Alpha, and Mispricing Spreads (Robust OLS).")
 
-    # Configuration
-    col_sml1, col_sml2 = st.columns(2)
-    with col_sml1:
-        bench_ticker = st.selectbox("Benchmark Index", ["SPY", "QQQ", "IWM", "VT", "^NSEI"] if market_region != "Indian Market (INR)" else ["^NSEI", "^NSEBANK", "SPY"])
-    with col_sml2:
-        roll_win = st.slider("Rolling Window (Days)", 30, 252, 90)
+    if df_main is not None:
+        col_sml1, col_sml2 = st.columns(2)
+        with col_sml1:
+            bench_ticker = st.selectbox("Benchmark Index", ["SPY", "QQQ", "IWM", "VT", "^NSEI"] if market_region != "Indian Market (INR)" else ["^NSEI", "^NSEBANK", "SPY"])
+        with col_sml2:
+            roll_win = st.slider("Rolling Window (Days)", 30, 252, 90)
 
-    if st.button("Run Alpha Analysis"):
-        with st.spinner(f"Calibrating CAPM against {bench_ticker} (HAC Robust Errors)..."):
-            # Load Benchmark Data
-            df_bench = load_data(bench_ticker, start_date, end_date)
-            
-            if df_bench is not None:
-                # Initialize Analyzer
-                analyzer = SMLAnalyzer(df_main['Returns'], df_bench['Returns'], rf_annual=rf_rate)
-                res_sml = analyzer.calculate_metrics(window=roll_win)
-                
-                # 1. METRICS DASHBOARD
-                # --------------------
-                last_row = res_sml.iloc[-1]
-                
-                m_c1, m_c2, m_c3, m_c4 = st.columns(4)
-                with m_c1:
-                    st.metric("Current Beta", f"{last_row['Beta']:.2f}", help="Sensitivity to Market")
-                with m_c2:
-                    st.metric("Jensen's Alpha", f"{last_row['Alpha_Daily']*252:.2%}", help="Annualized Excess Return vs Risk-Adjusted Exp")
-                with m_c3:
-                    st.metric("SML Exp Return", f"{last_row['SML_Exp_Return']:.2%}", help="Fair return for this level of risk")
-                with m_c4:
-                    mispricing = last_row['Mispricing_Spread']
-                    st.metric("Mispricing Spread", f"{mispricing*100:.2f}%", 
-                              delta="Undervalued" if mispricing > 0 else "Overvalued",
-                              delta_color="normal")
+        if st.button("Run Alpha Analysis"):
+            with st.spinner(f"Calibrating CAPM against {bench_ticker}..."):
+                df_bench = load_data(bench_ticker, start_date, end_date)
+                if df_bench is not None:
+                    analyzer = SMLAnalyzer(df_main['Returns'], df_bench['Returns'], rf_annual=rf_rate)
+                    res_sml = analyzer.calculate_metrics(window=roll_win)
+                    last_row = res_sml.iloc[-1]
+                    m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+                    with m_c1: st.metric("Current Beta", f"{last_row['Beta']:.2f}")
+                    with m_c2: st.metric("Jensen's Alpha", f"{last_row['Alpha_Daily']*252:.2%}")
+                    with m_c3: st.metric("SML Exp Return", f"{last_row['SML_Exp_Return']:.2%}")
+                    with m_c4:
+                        mispricing = last_row['Mispricing_Spread']
+                        st.metric("Mispricing Spread", f"{mispricing*100:.2f}%",
+                                  delta="Undervalued" if mispricing > 0 else "Overvalued")
 
-                # 2. VISUALIZATION
-                # --------------------
-                st.divider()
-                
-                # A. SML SCATTER PLOT
-                st.write("#### 1. Security Market Line (SML)")
-                
-                # Calculate aggregate risk/return for scatter
-                # We'll plot Rolling periods as points
-                
-                fig_sml, ax_sml = plt.subplots(figsize=(10, 6))
-                
-                # SML Line: x = Beta, y = Rf + Beta * (Rm - Rf)
-                # We use the AVERAGE market excess return over the period for the theoretical line
-                avg_mkt_excess = res_sml['mkt_ex'].mean() * 252
-                
-                betas_line = np.linspace(0, max(res_sml['Beta'].max(), 2.0), 100)
-                sml_y = rf_rate + betas_line * avg_mkt_excess
-                
-                ax_sml.plot(betas_line, sml_y, color='black', linestyle='--', linewidth=2, label='Security Market Line (SML)')
-                
-                # Current Asset Point
-                curr_beta = last_row['Beta']
-                curr_ret = last_row['Actual_Return_Ann']
-                
-                ax_sml.scatter(curr_beta, curr_ret, color='blue', s=100, zorder=5, label=f'{TICKER} (Current)')
-                
-                # Historic Points (Cloud)
-                ax_sml.scatter(res_sml['Beta'], res_sml['Actual_Return_Ann'], 
-                               c=range(len(res_sml)), cmap='Blues', alpha=0.3, s=20, label='Historical Path')
-                
-                # Benchmark (Beta 1, Mkt Return)
-                mkt_ret_tot = (res_sml['mkt_ex'].mean() * 252) + rf_rate
-                ax_sml.scatter(1.0, mkt_ret_tot, color='red', marker='D', s=80, label='Market')
-                
-                # Formatting
-                ax_sml.set_xlabel("Systematic Risk (Beta)")
-                ax_sml.set_ylabel("Annualized Expected Return")
-                ax_sml.set_title("Risk-Reward Profile vs Equilibrium")
-                ax_sml.legend()
-                ax_sml.grid(True, alpha=0.3)
-                
-                st.pyplot(fig_sml)
-                
-                # B. ROLLING ALPHA & BETA
-                st.write("#### 2. Rolling Factor Dynamics")
-                
-                fig_dyn, ax_dyn = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-                
-                # Beta
-                ax_dyn[0].plot(res_sml.index, res_sml['Beta'], color='purple', label='Rolling Beta')
-                ax_dyn[0].axhline(1.0, color='gray', linestyle='--')
-                ax_dyn[0].set_title(f"Systematic Risk (Beta) - {roll_win} Day Window")
-                ax_dyn[0].legend()
-                
-                # Alpha
-                ax_dyn[1].plot(res_sml.index, res_sml['Alpha_Daily'] * 252, color='green', label='Annualized Alpha')
-                ax_dyn[1].axhline(0, color='gray', linestyle='--')
-                ax_dyn[1].fill_between(res_sml.index, 0, res_sml['Alpha_Daily'] * 252, where=(res_sml['Alpha_Daily']>0), color='green', alpha=0.1)
-                ax_dyn[1].fill_between(res_sml.index, 0, res_sml['Alpha_Daily'] * 252, where=(res_sml['Alpha_Daily']<0), color='red', alpha=0.1)
-                ax_dyn[1].set_title("Manager Skill / Mispricing (Alpha)")
-                ax_dyn[1].legend()
-                
-                format_plot_dates(ax_dyn[1], res_sml.index)
-                st.pyplot(fig_dyn)
-                st.session_state.report_gen.add_plot("SML Factor Dynamics", fig_dyn)
-                st.session_state.report_gen.add_data("SML Analysis Results", res_sml.tail(100))
-                st.session_state.report_gen.add_data("Current SML Metrics", last_row.to_dict())
+                    st.divider()
+                    fig_sml, ax_sml = plt.subplots(figsize=(10, 6))
+                    avg_mkt_excess = res_sml['mkt_ex'].mean() * 252
+                    betas_line = np.linspace(0, max(res_sml['Beta'].max(), 2.0), 100)
+                    sml_y = rf_rate + betas_line * avg_mkt_excess
+                    ax_sml.plot(betas_line, sml_y, color='black', linestyle='--', linewidth=2, label='SML')
+                    curr_beta = last_row['Beta']
+                    curr_ret = last_row['Actual_Return_Ann']
+                    ax_sml.scatter(curr_beta, curr_ret, color='blue', s=100, zorder=5, label=f'{TICKER} (Current)')
+                    ax_sml.scatter(res_sml['Beta'], res_sml['Actual_Return_Ann'],
+                                   c=range(len(res_sml)), cmap='Blues', alpha=0.3, s=20, label='Historical Path')
+                    mkt_ret_tot = (res_sml['mkt_ex'].mean() * 252) + rf_rate
+                    ax_sml.scatter(1.0, mkt_ret_tot, color='red', marker='D', s=80, label='Market')
+                    ax_sml.set_xlabel("Systematic Risk (Beta)")
+                    ax_sml.set_ylabel("Annualized Expected Return")
+                    ax_sml.set_title("Risk-Reward Profile vs Equilibrium")
+                    ax_sml.legend()
+                    ax_sml.grid(True, alpha=0.3)
+                    st.pyplot(fig_sml)
 
-            else:
-                st.error(f"Could not load data for Benchmark: {bench_ticker}")
-
+                    fig_dyn, ax_dyn = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+                    ax_dyn[0].plot(res_sml.index, res_sml['Beta'], color='purple', label='Rolling Beta')
+                    ax_dyn[0].axhline(1.0, color='gray', linestyle='--')
+                    ax_dyn[0].set_title(f"Beta - {roll_win} Day Window")
+                    ax_dyn[0].legend()
+                    ax_dyn[1].plot(res_sml.index, res_sml['Alpha_Daily'] * 252, color='green', label='Annualized Alpha')
+                    ax_dyn[1].axhline(0, color='gray', linestyle='--')
+                    ax_dyn[1].fill_between(res_sml.index, 0, res_sml['Alpha_Daily'] * 252, where=(res_sml['Alpha_Daily']>0), color='green', alpha=0.1)
+                    ax_dyn[1].fill_between(res_sml.index, 0, res_sml['Alpha_Daily'] * 252, where=(res_sml['Alpha_Daily']<0), color='red', alpha=0.1)
+                    ax_dyn[1].set_title("Manager Skill / Alpha")
+                    ax_dyn[1].legend()
+                    format_plot_dates(ax_dyn[1], res_sml.index)
+                    st.pyplot(fig_dyn)
+                    st.session_state.report_gen.add_plot("SML Factor Dynamics", fig_dyn)
+                    st.session_state.report_gen.add_data("SML Analysis Results", res_sml.tail(100))
+                else:
+                    st.error(f"Could not load data for Benchmark: {bench_ticker}")
 
 # ==========================================
-# TAB 11: INSTITUTIONAL TOTAL MARKET SCANNER
+# TAB 11: MULTI-ASSET SCAN
 # ==========================================
 with tab11:
     st.write("### 📡 Institutional Total Market Scanner")
     st.markdown("""
-    **Massive Scale Quant Discovery**. Scan the entire US listing universe (~9,000+ assets). 
+    **Massive Scale Quant Discovery**. Scan the entire US listing universe (~9,000+ assets).
     Categorize every stock and ETF into **Long (Open)** vs **Cash (Closed)** lists using the Master Quant Score.
     """)
-    
+
     scan_col1, scan_col2, scan_col3 = st.columns(3)
-    
     with scan_col1:
-        universe_type = st.selectbox("Market Universe", 
-                                   ["Total US Stocks (6,000+)", "Total US ETFs (3,000+)", 
-                                    "S&P 500", "NASDAQ 100", "Custom Watchlist"])
-        
+        universe_type = st.selectbox("Market Universe",
+                                     ["Total US Stocks (6,000+)", "Total US ETFs (3,000+)",
+                                      "S&P 500", "NASDAQ 100", "Custom Watchlist"])
     with scan_col2:
-        mcap_filter = st.select_slider("Size Filter (Market Cap)", 
-                                    options=["All", "$500M (Micro+)", "$2B (Small+)", "$10B (Mid+)", "$50B (Large+)", "$200B (Mega+)"],
-                                    value="All")
-        mcap_map = {
-            "All": 0, 
-            "$500M (Micro+)": 5e8,
-            "$2B (Small+)": 2e9,
-            "$10B (Mid+)": 1e10, 
-            "$50B (Large+)": 5e10, 
-            "$200B (Mega+)": 2e11
-        }
-        
+        mcap_filter = st.select_slider("Size Filter (Market Cap)",
+                                       options=["All", "$500M (Micro+)", "$2B (Small+)", "$10B (Mid+)", "$50B (Large+)", "$200B (Mega+)"],
+                                       value="All")
+        mcap_map = {"All": 0, "$500M (Micro+)": 5e8, "$2B (Small+)": 2e9,
+                    "$10B (Mid+)": 1e10, "$50B (Large+)": 5e10, "$200B (Mega+)": 2e11}
     with scan_col3:
-        scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=10000, value=50, 
-                                    help="Limits number of tickers to scan for speed. 50-100 is recommended for 'Auto' mode.")
+        scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=10000, value=50)
         if scan_depth > 500:
-            st.warning("⚠️ High Depth: Scanning thousands of assets with deep quant models can take 30+ minutes.")
-    
+            st.warning("⚠️ High Depth: Scanning thousands of assets can take 30+ minutes.")
+
     scan_col1b, scan_col2b, scan_col3b = st.columns(3)
     with scan_col1b:
-        scan_regime_mode = st.selectbox("Scanner Regime Mode", 
-                                       ["Fixed: 4 States", "Fixed: 2 States", "Fixed: 3 States", "Auto: Best Fit"],
-                                       index=0)
+        scan_regime_mode = st.selectbox("Scanner Regime Mode",
+                                        ["Fixed: 4 States", "Fixed: 2 States", "Fixed: 3 States", "Auto: Best Fit"], index=0)
         scan_reg_map = {"Fixed: 4 States": 4, "Fixed: 2 States": 2, "Fixed: 3 States": 3, "Auto: Best Fit": "Auto"}
         scan_reg_param = scan_reg_map[scan_regime_mode]
     with scan_col2b:
         scan_opt_goal = st.selectbox("Optimization Goal", ["Robustness (BIC)", "Performance (PnL)"], index=0)
     with scan_col3b:
         scan_freq = st.selectbox("Scanner Frequency", ["Daily", "Weekly"], index=0)
-        if scan_regime_mode == "Auto: Best Fit":
-            st.info("💡 Auto-Performance mode ensures results match best historical backtest.")
-        
-    with st.expander("🛠️ Advanced Model Sync (Backtest Alignment)", expanded=False):
+
+    with st.expander("🛠️ Advanced Model Sync", expanded=False):
         async_col1, async_col2, async_col3 = st.columns(3)
         with async_col1:
-            scan_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=1,
-                                     help="Markov engine matches Backtest Tab exactly but is slower for large lists.")
+            scan_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=1)
             scan_engine_param = "Markov" if "Markov" in scan_engine else "GMM"
             scan_initial_cap = st.number_input("Backtest Capital ($)", 1000, 1000000, 10000)
         with async_col2:
-            scan_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4, 
-                                      help="Matches 'Signal Stability' in Backtest Tab. Smoothes data before fitting.")
+            scan_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4)
             scan_trailing_stop = st.slider("Trailing Stop (%)", 0.0, 20.0, 0.0, step=0.5) / 100
         with async_col3:
             scan_switch_vol = st.toggle("Switching Volatility", value=True)
             scan_switch_trend = st.toggle("Switching Mean", value=True)
 
-    if live_mode and scan_freq == "Weekly":
-        st.warning("⚠️ **Invalid Combo**: Weekly frequency on Live Intraday data typically has too few bars (< 15) for the models. Scanner may skip all assets. Switch Frequency to 'Daily' or disable 'Live Mode'.")
-
-    # Custom list area only shows if needed
     custom_input = ""
     if universe_type == "Custom Watchlist":
         custom_input = st.text_area("Ticker List (Comma separated)", "AAPL, TSLA, BTC-USD, GC=F")
 
     st.divider()
-    
+
     if st.button("🚀 EXECUTE TOTAL MARKET SCAN", use_container_width=True, type="primary"):
-        # Determine Tickers
         if universe_type == "Total US Stocks (6,000+)":
             full_list = get_total_us_stocks()
         elif universe_type == "Total US ETFs (3,000+)":
@@ -4031,47 +3083,32 @@ with tab11:
         else:
             full_list = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
 
-        # Apply Depth
         tickers_to_scan = full_list[:scan_depth]
-        
         long_list = []
         cash_list = []
-        
-        st.session_state.scanner_results = None # Reset previous
+        st.session_state.scanner_results = None
         scan_prog = st.progress(0)
         status_text = st.empty()
-        
-        # -- Worker Function for Multithreading --
+
         def process_ticker_worker(tick):
             try:
-                # 1. Market Cap Check
                 mcap = get_market_cap(tick)
                 if mcap_filter != "All" and mcap < mcap_map[mcap_filter]:
                     return None
-                
-                # 2. Fetch Data
                 s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
                 if s_df is None or s_df.empty:
                     return None
-                
-                # 3. Analyze
-                s_analysis = get_master_signal(tick, s_df, 
-                                              n_regimes=scan_reg_param, 
-                                              freq=scan_freq, 
-                                              opt_goal=scan_opt_goal,
-                                              stability=scan_stability,
-                                              switch_vol=scan_switch_vol,
-                                              switch_trend=scan_switch_trend,
-                                              engine=scan_engine_param,
-                                              initial_cap=scan_initial_cap,
-                                              trailing_stop=scan_trailing_stop)
+                s_analysis = get_master_signal(tick, s_df,
+                                               n_regimes=scan_reg_param, freq=scan_freq,
+                                               opt_goal=scan_opt_goal, stability=scan_stability,
+                                               switch_vol=scan_switch_vol, switch_trend=scan_switch_trend,
+                                               engine=scan_engine_param, initial_cap=scan_initial_cap,
+                                               trailing_stop=scan_trailing_stop)
                 if not s_analysis:
                     return None
-                    
                 s_price = s_df['Close'].iloc[-1]
                 return {
-                    'Ticker': tick,
-                    'Price': round(s_price, 2),
+                    'Ticker': tick, 'Price': round(s_price, 2),
                     'Mkt Cap ($B)': round(mcap / 1e9, 2),
                     'Regimes (N)': s_analysis['regime_data'].get('n_states', 4),
                     'Score': s_analysis['sentiment_score'],
@@ -4082,123 +3119,102 @@ with tab11:
             except:
                 return None
 
-        # Start Parallel Scan
         from concurrent.futures import as_completed
-        
-        # We use a reasonable number of workers to balance I/O and CPU
-        # yfinance is I/O bound (network), models are CPU bound. 
         max_workers = 10 if scan_engine_param == "Markov" else 20
-        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_tick = {executor.submit(process_ticker_worker, t): t for t in tickers_to_scan}
-            
             for i, future in enumerate(as_completed(future_to_tick)):
                 tick = future_to_tick[future]
                 status_text.text(f"Processing {tick}... ({i+1}/{len(tickers_to_scan)})")
-                
                 result = future.result()
                 if result:
                     if result['Score'] >= 1:
                         long_list.append(result)
                     else:
                         cash_list.append(result)
-                
                 scan_prog.progress((i + 1) / len(tickers_to_scan))
-        
-        # Store in session state for persistence
-        st.session_state.scanner_results = {'long': long_list, 'cash': cash_list, 'universe': universe_type, 'count': len(tickers_to_scan)}
 
-    # Always display results from session state if they exist
+        st.session_state.scanner_results = {'long': long_list, 'cash': cash_list,
+                                             'universe': universe_type, 'count': len(tickers_to_scan)}
+
     if 'scanner_results' in st.session_state and st.session_state.scanner_results:
         res = st.session_state.scanner_results
         long_list = res['long']
         cash_list = res['cash']
-        
-        # Display Results
         res_col1, res_col2 = st.columns(2)
-        
         with res_col1:
             st.subheader(f"🚀 LONG / OPEN ({len(long_list)})")
             if long_list:
                 ldf = pd.DataFrame(long_list).sort_values(by='Score', ascending=False)
                 st.dataframe(ldf.style.background_gradient(subset=['Score'], cmap='Greens'), use_container_width=True)
             else:
-                st.info("No bullish signals found in current scan window.")
-                
+                st.info("No bullish signals found.")
         with res_col2:
-            st.subheader(f"🛑 CLOSED / CASH / HEDGE ({len(cash_list)})")
+            st.subheader(f"🛑 CLOSED / CASH ({len(cash_list)})")
             if cash_list:
                 cdf = pd.DataFrame(cash_list).sort_values(by='Score', ascending=True)
                 st.dataframe(cdf.style.background_gradient(subset=['Score'], cmap='Reds'), use_container_width=True)
             else:
-                st.info("No bearish/neutral signals found in current scan window.")
-
+                st.info("No bearish/neutral signals found.")
         st.divider()
-        st.success(f"✅ **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
+        st.success(f"✅ **Scan Complete**: Analyzed {res['count']} assets from `{res['universe']}`.")
 
+# ==========================================
+# TAB 12: FED BALANCE SHEET
+# ==========================================
 with tab12:
     st.write("### 🏦 Federal Reserve Balance Sheet (Assets & Liabilities)")
     st.caption("Macroeconomic dashboard tracking FED liquidity and monetary policy shifts via FRED.")
-    
-    fed_date_col1, fed_date_col2 = st.columns(2)
+
+    fed_date_col1, _ = st.columns(2)
     with fed_date_col1:
         fed_start_date = st.date_input("FED History Start", datetime(2010, 1, 1))
-    
+
     @st.fragment
     def render_fed_dashboard():
         with st.status("Fetching FRED Macro Data...", expanded=True) as status:
-            # 1. Load Assets
             asset_dfs = {}
             for sid, name in FED_ASSETS.items():
                 status.update(label=f"Loading Asset: {name}...")
                 df = load_fred_data(sid)
                 if df is not None:
                     asset_dfs[name] = df[sid]
-            
-            # 2. Load Liabilities
+
             liab_dfs = {}
             for sid, name in FED_LIABILITIES.items():
                 status.update(label=f"Loading Liability: {name}...")
                 df = load_fred_data(sid)
                 if df is not None:
                     liab_dfs[name] = df[sid]
-            
+
             status.update(label="All Macro data synchronized!", state="complete", expanded=False)
-        
+
         if asset_dfs:
-            # Use fillna(0) to handle different start dates or frequencies
             assets_master = pd.DataFrame(asset_dfs).fillna(0)
             assets_master = assets_master[assets_master.index >= pd.Timestamp(fed_start_date)]
-            
-            # Total Assets Plot
             st.subheader("Federal Reserve Assets (Stacked)")
             fig_assets, ax_assets = plt.subplots(figsize=(12, 6))
-            # Plot in Billions (original data is in Millions)
             (assets_master / 1e3).plot.area(ax=ax_assets, alpha=0.7, stacked=True, cmap='tab20')
             ax_assets.set_ylabel("Amount (Billions $)")
             ax_assets.set_title("FED Assets: Detailed Breakdown")
             ax_assets.legend(loc='upper left', fontsize='x-small', ncol=2)
             st.pyplot(fig_assets)
-            
-            # Total Balance Sheet Weekly Changes
+
             st.subheader("Weekly Change in Total Assets (WALCL)")
             walcl = load_fred_data("WALCL")
             if walcl is not None:
                 walcl = walcl[walcl.index >= pd.Timestamp(fed_start_date)]
-                # Weekly change in Billions
                 walcl_diff = walcl.diff().dropna() / 1e3
                 fig_diff, ax_diff = plt.subplots(figsize=(12, 4))
-                # Color bars based on pos/neg
                 colors = ['green' if x >= 0 else 'red' for x in walcl_diff['WALCL']]
                 ax_diff.bar(walcl_diff.index, walcl_diff['WALCL'], color=colors, width=7, alpha=0.6)
                 ax_diff.set_ylabel("Change (Billions $)")
                 ax_diff.set_title("FED Balance Sheet: Weekly Expansion/Contraction")
                 st.pyplot(fig_diff)
-        
+
         if liab_dfs:
             liabs_master = pd.DataFrame(liab_dfs).fillna(0)
             liabs_master = liabs_master[liabs_master.index >= pd.Timestamp(fed_start_date)]
-            
             st.subheader("Federal Reserve Liabilities (Stacked)")
             fig_liabs, ax_liabs = plt.subplots(figsize=(12, 6))
             (liabs_master / 1e3).plot.area(ax=ax_liabs, alpha=0.7, stacked=True, cmap='Set3')
@@ -4206,11 +3222,9 @@ with tab12:
             ax_liabs.set_title("FED Liabilities & Capital Accounts")
             ax_liabs.legend(loc='upper left', fontsize='x-small', ncol=2)
             st.pyplot(fig_liabs)
-    
-    render_fed_dashboard()
 
+    render_fed_dashboard()
 
 # Footer
 st.markdown("---")
-st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
-
+st.caption("Quant Thesis Dashboard | Ehlers SuperSmoother + Multi-Model Suite")
