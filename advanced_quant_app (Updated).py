@@ -578,57 +578,65 @@ class MADTrendModes:
     @staticmethod
     def ehlers_simple_decycler(series, hp_period, upper_thresh=0.5, lower_thresh=0.5):
         """
-        Ehlers Simple Decycler — from John Ehlers' 'Cycle Analytics for Traders' (2013).
+        Ehlers Simple Decycler — exact ThinkorSwim / original Ehlers formula.
+        Source: Ehlers 'Cycle Analytics for Traders' (2013), Chapter 8.
+        Also matches the ThinkorSwim built-in EhlersSimpleDecycler study.
 
-        Concept:
-          The Decycler removes the dominant cycle component from price by
-          subtracting a High-Pass (HP) filter output from price itself:
-              Decycler[i] = Price[i] - HP[i]
+        ── 1-Pole High-Pass Filter ─────────────────────────────────────────
+        The key insight: use a 1-POLE (not 2-pole) HP filter.
 
-          This leaves only the trend (low-frequency) component — like the
-          orange line in TradingView's EhlersSimpleDecycler indicator.
+          alpha = (1 - sin(2π / Period)) / cos(2π / Period)
 
-        High-Pass Filter (1-pole):
-          alpha = (cos(2*pi/hp_period) + sin(2*pi/hp_period) - 1) / cos(2*pi/hp_period)
-          HP[i] = (1 - alpha/2)^2 * (Price[i] - 2*Price[i-1] + Price[i-2])
-                + 2*(1-alpha)*HP[i-1] - (1-alpha)^2 * HP[i-2]
+          HP[i] = ((1 + alpha) / 2) * (Price[i] - Price[i-1])
+                + alpha * HP[i-1]
 
-        Signals (mirroring TradingView indicator):
-          BUY  when Decycler crosses ABOVE  (Price * (1 - upper_thresh/100))
-          SELL when Decycler crosses BELOW  (Price * (1 - lower_thresh/100))
+        ── Decycler ────────────────────────────────────────────────────────
+          Decycler[i] = Price[i] - HP[i]
 
-          In practice with thresh=0: BUY when price crosses above Decycler line,
-          SELL when price crosses below Decycler line.
+        This produces a very smooth, slow-moving trend line that sits well
+        below/above price during trends — exactly matching the orange line
+        in ThinkorSwim's EhlersSimpleDecycler at (CLOSE, 125, 0.5, 0.5).
+
+        ── Signal bands (matching TOS 0.5, 0.5 params) ────────────────────
+          Upper = Decycler * (1 + upper_thresh/100)
+          Lower = Decycler * (1 - lower_thresh/100)
+          BUY  when Price crosses ABOVE Upper band
+          SELL when Price crosses BELOW Lower band
         """
         import math
         vals = series.values.astype(float)
         n = len(vals)
 
-        # ── High-Pass filter coefficients ──────────────────────────────────
+        # ── 1-pole HP coefficients (Ehlers exact formula) ──────────────────
         hp_period = max(hp_period, 2)
-        angle = 2.0 * math.pi / hp_period
-        cos_a = math.cos(math.radians(360.0 / hp_period))
-        sin_a = math.sin(math.radians(360.0 / hp_period))
-        alpha = (cos_a + sin_a - 1.0) / cos_a   # Ehlers 1-pole HP alpha
+        angle_rad = 2.0 * math.pi / float(hp_period)
+        sin_v = math.sin(angle_rad)
+        cos_v = math.cos(angle_rad)
+
+        # alpha: controls how much of the cycle is removed
+        # Large period → alpha near 1 → very little HP signal → smooth Decycler
+        alpha = (1.0 - sin_v) / cos_v
+
+        # 1-pole HP coefficients
+        coef_curr =  (1.0 + alpha) / 2.0   # coefficient for (Price[i] - Price[i-1])
+        coef_prev =  alpha                  # coefficient for HP[i-1]
 
         hp  = np.zeros(n)
         dec = np.zeros(n)
 
         for i in range(n):
             p0 = vals[i]
-            p1 = vals[i-1] if i >= 1 else p0
-            p2 = vals[i-2] if i >= 2 else p0
-            hp1 = hp[i-1] if i >= 1 else 0.0
-            hp2 = hp[i-2] if i >= 2 else 0.0
+            p1 = vals[i - 1] if i >= 1 else p0
+            hp1 = hp[i - 1] if i >= 1 else 0.0
 
-            hp[i] = ((1.0 - alpha / 2.0) ** 2) * (p0 - 2.0 * p1 + p2) \
-                    + 2.0 * (1.0 - alpha) * hp1 \
-                    - ((1.0 - alpha) ** 2) * hp2
+            # 1-pole high-pass: removes slow cycles, passes fast ones
+            hp[i]  = coef_curr * (p0 - p1) + coef_prev * hp1
 
-            dec[i] = p0 - hp[i]   # Decycler = Price - HighPass
+            # Decycler = what's LEFT after removing the fast cycles
+            dec[i] = p0 - hp[i]
 
-        decycler = pd.Series(dec, index=series.index)
-        hp_series = pd.Series(hp, index=series.index)
+        decycler  = pd.Series(dec, index=series.index)
+        hp_series = pd.Series(hp,  index=series.index)
         return decycler, hp_series
 
     @staticmethod
@@ -2925,30 +2933,36 @@ SS[i] = c1 × (Price[i] + Price[i-1]) / 2  +  c2 × SS[i-1]  +  c3 × SS[i-2]
                     )
 
             # How it works expander
-            with st.expander("📐 How the Ehlers Simple Decycler Works"):
+            with st.expander("📐 How the Ehlers Simple Decycler Works (TOS-exact formula)"):
                 st.markdown(f"""
-**Step 1 — 1-Pole High-Pass Filter:**
-```
-angle  = 360 / HP_Period  (degrees)
-alpha  = (cos(angle) + sin(angle) - 1) / cos(angle)
+**Exact formula matching ThinkorSwim `EhlersSimpleDecycler(CLOSE, {final_dc_period}, 0.5, 0.5)`:**
 
-HP[i]  = (1 - alpha/2)² × (Price[i] - 2×Price[i-1] + Price[i-2])
-        + 2×(1-alpha)×HP[i-1]
-        - (1-alpha)²×HP[i-2]
+**Step 1 — 1-Pole High-Pass Filter coefficients:**
+```
+angle = 2π / Period
+alpha = (1 - sin(angle)) / cos(angle)
+
+coef_curr = (1 + alpha) / 2      ← applied to (Price[i] - Price[i-1])
+coef_prev = alpha                 ← applied to HP[i-1]
 ```
 
-**Step 2 — Subtract to get Decycler (trend):**
+**Step 2 — Compute HP recursively:**
+```
+HP[i] = coef_curr × (Price[i] - Price[i-1])  +  coef_prev × HP[i-1]
+```
+
+**Step 3 — Subtract to get the Decycler (the orange line):**
 ```
 Decycler[i] = Price[i] - HP[i]
 ```
 
-**Interpretation:**
-- The HP filter extracts **short-cycle (high-frequency) noise**
-- Subtracting it leaves the **trend (low-frequency) component**
-- At HP Period = **{final_dc_period}**: cycles shorter than ~{final_dc_period} bars are removed
-- The orange line in the TradingView chart is exactly this output
-- **Buy** when price is above/crosses above the Decycler line
-- **Sell** when price is below/crosses below the Decycler line
+**Why it produces such a smooth line:**
+- At Period = **{final_dc_period}**: alpha ≈ {(1 - __import__('math').sin(2*__import__('math').pi/final_dc_period)) / __import__('math').cos(2*__import__('math').pi/final_dc_period):.4f}
+- A large alpha (close to 1) means HP carries very little signal → Decycler ≈ Price
+- The filter removes cycles **shorter than {final_dc_period} bars** — only the slow trend remains
+- This is why the line barely moves compared to an EMA — it's not averaging, it's **subtracting cycles**
+
+**TOS parameters `(CLOSE, 125, 0.5, 0.5)` = source, HP period, upper band %, lower band %**
                 """)
 
             if st.button("🚀 Run Decycler Backtest", use_container_width=True, type="primary"):
@@ -2994,85 +3008,130 @@ Decycler[i] = Price[i] - HP[i]
                         sig_raw.loc[short_cond] = 0
                         signals = sig_raw.ffill().fillna(0).astype(int)
 
-                    # ── Context Chart (mirrors TV screenshot) ───────────────────
-                    with st.expander("📊 Decycler Chart (TV-style)", expanded=True):
+                    # ── Context Chart (ThinkorSwim-style) ───────────────────────
+                    with st.expander("📊 Decycler Chart (TOS-style)", expanded=True):
                         fig_dc, axes_dc = plt.subplots(
                             3, 1, figsize=(14, 9), sharex=True,
                             gridspec_kw={'height_ratios': [3.5, 1.2, 0.8]}
                         )
+                        fig_dc.patch.set_facecolor('#1a1a2e')
+                        for ax in axes_dc:
+                            ax.set_facecolor('#1a1a2e')
+                            ax.tick_params(colors='#cccccc', labelsize=8)
+                            ax.yaxis.label.set_color('#cccccc')
+                            ax.title.set_color('#cccccc')
+                            for spine in ax.spines.values():
+                                spine.set_edgecolor('#333355')
 
-                        # ── Panel 1: Price + Decycler line ──────────────────────
-                        # Candlestick-style: colour bars green/red by daily return
-                        ret_colours = ['#26a69a' if r >= 0 else '#ef5350'
-                                       for r in prices_bt.pct_change().fillna(0)]
-                        axes_dc[0].bar(prices_bt.index, prices_bt, color=ret_colours,
-                                       alpha=0.55, width=0.8, label='Price')
+                        # ── Panel 1: Price line + Decycler (TOS orange) ──────────
+                        # Draw price as a thin grey line — TOS candlestick feel
+                        axes_dc[0].plot(prices_bt.index, prices_bt,
+                                        color='#aaaaaa', linewidth=0.9,
+                                        alpha=0.75, label='Price', zorder=2)
+
+                        # Shade long/cash zones FIRST (behind everything)
+                        axes_dc[0].fill_between(
+                            prices_bt.index,
+                            prices_bt.min() * 0.97, prices_bt.max() * 1.03,
+                            where=(signals == 1),
+                            color='#26a69a', alpha=0.08, label='Long Zone', zorder=1
+                        )
+                        axes_dc[0].fill_between(
+                            prices_bt.index,
+                            prices_bt.min() * 0.97, prices_bt.max() * 1.03,
+                            where=(signals == 0),
+                            color='#ef5350', alpha=0.05, label='Cash Zone', zorder=1
+                        )
+
+                        # The orange Decycler line — matches TOS exactly
                         axes_dc[0].plot(dec_main.index, dec_main,
-                                        color='#f5a623', linewidth=2.2,
-                                        label=f'Decycler (HP={final_dc_period})')
+                                        color='#f5a623', linewidth=2.5,
+                                        label=f'Decycler (HP={final_dc_period})', zorder=4)
 
                         if dc_signal_mode == "Dual Decycler Cross (Fast/Slow)":
                             axes_dc[0].plot(dec_fast.index, dec_fast,
-                                            color='#00bcd4', linewidth=1.5, linestyle='--',
-                                            label=f'Fast Decycler (HP={int(dc_fast_period)})')
+                                            color='#00e5ff', linewidth=1.6, linestyle='--',
+                                            label=f'Fast Decycler (HP={int(dc_fast_period)})', zorder=3)
                             axes_dc[0].plot(dec_slow.index, dec_slow,
-                                            color='#ab47bc', linewidth=1.5, linestyle=':',
-                                            label=f'Slow Decycler (HP={int(dc_slow_period)})')
+                                            color='#ce93d8', linewidth=1.6, linestyle=':',
+                                            label=f'Slow Decycler (HP={int(dc_slow_period)})', zorder=3)
 
                         if dc_signal_mode == "Price Band (Upper/Lower Threshold)":
                             axes_dc[0].plot(upper_band.index, upper_band,
-                                            color='#4caf50', linewidth=1, linestyle='--', alpha=0.7, label='Upper Band')
+                                            color='#4caf50', linewidth=1.2, linestyle='--',
+                                            alpha=0.8, label='Upper Band', zorder=3)
                             axes_dc[0].plot(lower_band.index, lower_band,
-                                            color='#f44336', linewidth=1, linestyle='--', alpha=0.7, label='Lower Band')
+                                            color='#f44336', linewidth=1.2, linestyle='--',
+                                            alpha=0.8, label='Lower Band', zorder=3)
 
-                        # Shade long/cash zones
-                        axes_dc[0].fill_between(
-                            prices_bt.index, prices_bt.min() * 0.98, prices_bt.max() * 1.02,
-                            where=(signals == 1), color='#26a69a', alpha=0.10, label='Long Zone'
-                        )
-                        axes_dc[0].fill_between(
-                            prices_bt.index, prices_bt.min() * 0.98, prices_bt.max() * 1.02,
-                            where=(signals == 0), color='#ef5350', alpha=0.06, label='Cash Zone'
-                        )
-
-                        # Buy/Sell markers
+                        # Buy/Sell markers ON price line
                         sig_changes = signals.diff().fillna(0)
-                        buy_dates  = prices_bt.index[sig_changes == 1]
+                        buy_dates  = prices_bt.index[sig_changes ==  1]
                         sell_dates = prices_bt.index[sig_changes == -1]
-                        axes_dc[0].scatter(buy_dates,  prices_bt.loc[buy_dates]  * 0.985,
-                                           marker='^', color='#26a69a', s=80, zorder=5, label='Buy')
-                        axes_dc[0].scatter(sell_dates, prices_bt.loc[sell_dates] * 1.015,
-                                           marker='v', color='#ef5350',  s=80, zorder=5, label='Sell')
+                        if len(buy_dates) > 0:
+                            axes_dc[0].scatter(
+                                buy_dates, prices_bt.loc[buy_dates] * 0.982,
+                                marker='^', color='#26a69a', s=90, zorder=6,
+                                label=f'Buy ({len(buy_dates)})'
+                            )
+                        if len(sell_dates) > 0:
+                            axes_dc[0].scatter(
+                                sell_dates, prices_bt.loc[sell_dates] * 1.018,
+                                marker='v', color='#ef5350', s=90, zorder=6,
+                                label=f'Sell ({len(sell_dates)})'
+                            )
 
                         axes_dc[0].set_title(
-                            f"Ehlers Simple Decycler — {dc_signal_mode} | {TICKER}",
-                            fontsize=11
+                            f"Ehlers Simple Decycler — {dc_signal_mode} | {TICKER}  "
+                            f"(HP={final_dc_period})",
+                            fontsize=10, color='#eeeeee'
                         )
-                        axes_dc[0].legend(fontsize='x-small', loc='upper left', ncol=3)
-                        axes_dc[0].set_ylabel("Price")
+                        axes_dc[0].legend(
+                            fontsize='x-small', loc='upper left', ncol=4,
+                            facecolor='#1a1a2e', edgecolor='#444466',
+                            labelcolor='#cccccc'
+                        )
+                        axes_dc[0].set_ylabel("Price", color='#cccccc')
+                        axes_dc[0].grid(True, alpha=0.12, color='#444466')
 
-                        # ── Panel 2: HP Filter (cycle component) ───────────────
+                        # ── Panel 2: HP Filter oscillator ───────────────────────
                         axes_dc[1].plot(hp_main.index, hp_main,
-                                        color='#7e57c2', linewidth=1.2, label='High-Pass (Cycle)')
-                        axes_dc[1].axhline(0, color='white', linewidth=0.6, alpha=0.4)
-                        axes_dc[1].fill_between(hp_main.index, 0, hp_main,
-                                                where=(hp_main >= 0), color='#26a69a', alpha=0.25)
-                        axes_dc[1].fill_between(hp_main.index, 0, hp_main,
-                                                where=(hp_main < 0),  color='#ef5350',  alpha=0.25)
-                        axes_dc[1].set_title("High-Pass Filter Output (Removed Cycle Component)", fontsize=9)
-                        axes_dc[1].set_ylabel("HP Value")
-                        axes_dc[1].legend(fontsize='x-small')
+                                        color='#7e57c2', linewidth=1.3,
+                                        label='High-Pass (Cycle Component)')
+                        axes_dc[1].axhline(0, color='#666688', linewidth=0.8, alpha=0.6)
+                        axes_dc[1].fill_between(
+                            hp_main.index, 0, hp_main,
+                            where=(hp_main >= 0), color='#26a69a', alpha=0.20
+                        )
+                        axes_dc[1].fill_between(
+                            hp_main.index, 0, hp_main,
+                            where=(hp_main <  0), color='#ef5350', alpha=0.20
+                        )
+                        axes_dc[1].set_title(
+                            "High-Pass Filter Output (Removed Cycle Component)",
+                            fontsize=9, color='#cccccc'
+                        )
+                        axes_dc[1].set_ylabel("HP Value", color='#cccccc')
+                        axes_dc[1].legend(
+                            fontsize='x-small', facecolor='#1a1a2e',
+                            edgecolor='#444466', labelcolor='#cccccc'
+                        )
+                        axes_dc[1].grid(True, alpha=0.12, color='#444466')
 
                         # ── Panel 3: Signal bar ─────────────────────────────────
-                        axes_dc[2].fill_between(prices_bt.index, 0, signals,
-                                                color='#26a69a', alpha=0.6, step='pre')
-                        axes_dc[2].set_ylim(-0.1, 1.4)
+                        axes_dc[2].fill_between(
+                            prices_bt.index, 0, signals,
+                            color='#26a69a', alpha=0.65, step='pre'
+                        )
+                        axes_dc[2].set_ylim(-0.15, 1.35)
                         axes_dc[2].set_yticks([0, 1])
-                        axes_dc[2].set_yticklabels(['Cash', 'Long'], fontsize=8)
-                        axes_dc[2].set_title("Strategy Signal", fontsize=9)
+                        axes_dc[2].set_yticklabels(['Cash', 'Long'],
+                                                    fontsize=8, color='#cccccc')
+                        axes_dc[2].set_title("Strategy Signal", fontsize=9, color='#cccccc')
+                        axes_dc[2].grid(True, alpha=0.12, color='#444466')
 
                         format_plot_dates(axes_dc[2], prices_bt.index)
-                        plt.tight_layout(h_pad=0.5)
+                        plt.tight_layout(h_pad=0.4)
                         st.pyplot(fig_dc)
 
                     # ── Decycler vs SuperSmoother comparison ─────────────────────
