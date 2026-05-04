@@ -3527,19 +3527,18 @@ with tab7:
                 'c_thresh_s': c_thresh_s
             })
 
-        if st.button("🚀 Run MAD Backtest", use_container_width=True):
-            with st.spinner("Generating MAD Trend signals..."):
-                signals = MADTrendModes.get_signals(df_bt, mad_params)
-                
-                # Plot Context
-                with st.expander("See Strategy Context", expanded=True):
-                    fig_ctx = go.Figure()
-                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-                    
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-                    
-                    fig_ctx.update_layout(title=f"MAD Trend Modes Signal ({sig_mode})", hovermode="x unified", template="plotly_dark", height=400)
-                    st.plotly_chart(fig_ctx, use_container_width=True)
+        # Auto-run MAD Trend Backtest
+        signals = MADTrendModes.get_signals(df_bt, mad_params)
+        
+        # Plot Context
+        with st.expander("See Strategy Context", expanded=True):
+            fig_ctx = go.Figure()
+            fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
+            
+            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+            
+            fig_ctx.update_layout(title=f"MAD Trend Modes Signal ({sig_mode})", hovermode="x unified", template="plotly_dark", height=400)
+            st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Dual MA Cross":
         st.markdown("### 🔀 Dual Moving Average Cross Settings")
@@ -3555,87 +3554,84 @@ with tab7:
             s_ma_type = st.selectbox("Slow MA Type", ma_options, index=0) # Default SMA
             s_ma_len = st.number_input("Slow MA Length", 1, 250, 50)
             
-        if st.button("🚀 Run Dual MA Backtest", use_container_width=True):
-            if f_ma_len >= s_ma_len:
-                st.warning("Fast MA length is typically shorter than Slow MA length. Results may be inverted.")
-                
-            with st.spinner("Calculating Moving Average Crossovers..."):
-                # Calculate MAs
-                fast_ma = MADTrendModes.ma_switch(prices_bt, f_ma_len, f_ma_type)
-                slow_ma = MADTrendModes.ma_switch(prices_bt, s_ma_len, s_ma_type)
-                
-                # Generate Signals: Long when Fast > Slow, Cash when Fast < Slow
-                # Using stateful ffill logic for consistency
-                long_cond = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
-                short_cond = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
-                
-                def get_stateful_ma_signal(l_cond, s_cond, index):
-                    sig = pd.Series(np.nan, index=index)
-                    sig.loc[l_cond] = 1
-                    sig.loc[s_cond] = 0
-                    return sig.ffill().fillna(0)
-                
-                signals = get_stateful_ma_signal(long_cond, short_cond, prices_bt.index)
-                
-                # Plot Context
-                with st.expander("See Strategy Context", expanded=True):
-                    fig_ctx = go.Figure()
-                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-                    fig_ctx.add_trace(go.Scatter(x=fast_ma.index, y=fast_ma, mode='lines', line=dict(color='orange'), opacity=0.8, name=f'Fast {f_ma_type} ({f_ma_len})'))
-                    fig_ctx.add_trace(go.Scatter(x=slow_ma.index, y=slow_ma, mode='lines', line=dict(color='blue'), opacity=0.8, name=f'Slow {s_ma_type} ({s_ma_len})'))
-                    
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-                    
-                    fig_ctx.update_layout(title=f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})", hovermode="x unified", template="plotly_dark", height=400)
-                    st.plotly_chart(fig_ctx, use_container_width=True)
+        if f_ma_len >= s_ma_len:
+            st.warning("Fast MA length is typically shorter than Slow MA length. Results may be inverted.")
+            
+        # Auto-run Dual MA
+        # Calculate MAs
+        fast_ma = MADTrendModes.ma_switch(prices_bt, f_ma_len, f_ma_type)
+        slow_ma = MADTrendModes.ma_switch(prices_bt, s_ma_len, s_ma_type)
+        
+        # Generate Signals: Long when Fast > Slow, Cash when Fast < Slow
+        # Using stateful ffill logic for consistency
+        long_cond = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
+        short_cond = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
+        
+        def get_stateful_ma_signal(l_cond, s_cond, index):
+            sig = pd.Series(np.nan, index=index)
+            sig.loc[l_cond] = 1
+            sig.loc[s_cond] = 0
+            return sig.ffill().fillna(0)
+        
+        signals = get_stateful_ma_signal(long_cond, short_cond, prices_bt.index)
+        
+        # Plot Context
+        with st.expander("See Strategy Context", expanded=True):
+            fig_ctx = go.Figure()
+            fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
+            fig_ctx.add_trace(go.Scatter(x=fast_ma.index, y=fast_ma, mode='lines', line=dict(color='orange'), opacity=0.8, name=f'Fast {f_ma_type} ({f_ma_len})'))
+            fig_ctx.add_trace(go.Scatter(x=slow_ma.index, y=slow_ma, mode='lines', line=dict(color='blue'), opacity=0.8, name=f'Slow {s_ma_type} ({s_ma_len})'))
+            
+            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+            
+            fig_ctx.update_layout(title=f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})", hovermode="x unified", template="plotly_dark", height=400)
+            st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Ehlers SuperSmoother":
         st.markdown("### 🌊 Ehlers SuperSmoother Settings")
         st.markdown("Filters high frequency noise to create a zero-lag trendline.")
         
-        ss_period = st.slider("SuperSmoother Period", 5, 50, 15)
+        ss_period = st.slider("SuperSmoother Period", 5, 252, 15)
         
-        if st.button("🚀 Run SuperSmoother Backtest", use_container_width=True):
-            with st.spinner("Calculating Ehlers SuperSmoother..."):
-                ss_series = EhlersFilters.super_smoother(prices_bt, ss_period)
-                
-                # Signal logic: Long when Price > SuperSmoother, else Hedge (0)
-                signals = (prices_bt > ss_series).astype(int)
-                
-                with st.expander("See Strategy Context", expanded=True):
-                    fig_ctx = go.Figure()
-                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-                    fig_ctx.add_trace(go.Scatter(x=ss_series.index, y=ss_series, mode='lines', line=dict(color='magenta', width=2), name=f'SuperSmoother ({ss_period})'))
-                    
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-                    highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
-                    
-                    fig_ctx.update_layout(title="Ehlers SuperSmoother Signal", hovermode="x unified", template="plotly_dark", height=400)
-                    st.plotly_chart(fig_ctx, use_container_width=True)
+        # Auto-run SuperSmoother
+        ss_series = EhlersFilters.super_smoother(prices_bt, ss_period)
+        
+        # Signal logic: Long when Price > SuperSmoother, else Hedge (0)
+        signals = (prices_bt > ss_series).astype(int)
+        
+        with st.expander("See Strategy Context", expanded=True):
+            fig_ctx = go.Figure()
+            fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
+            fig_ctx.add_trace(go.Scatter(x=ss_series.index, y=ss_series, mode='lines', line=dict(color='magenta', width=2), name=f'SuperSmoother ({ss_period})'))
+            
+            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+            highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
+            
+            fig_ctx.update_layout(title="Ehlers SuperSmoother Signal", hovermode="x unified", template="plotly_dark", height=400)
+            st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Ehlers Simple Decycler":
         st.markdown("### 🧲 Ehlers Simple Decycler Settings")
         st.markdown("Isolates the underlying low-frequency trend by removing market cycles.")
         
-        dec_period = st.slider("Decycler High-Pass Period", 20, 120, 60)
+        dec_period = st.slider("Decycler High-Pass Period", 20, 252, 60)
         
-        if st.button("🚀 Run Decycler Backtest", use_container_width=True):
-            with st.spinner("Calculating Ehlers Simple Decycler..."):
-                decycler_series = EhlersFilters.simple_decycler(prices_bt, dec_period)
-                
-                # Signal logic: Long when Price > Decycler, else Hedge (0)
-                signals = (prices_bt > decycler_series).astype(int)
-                
-                with st.expander("See Strategy Context", expanded=True):
-                    fig_ctx = go.Figure()
-                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-                    fig_ctx.add_trace(go.Scatter(x=decycler_series.index, y=decycler_series, mode='lines', line=dict(color='orange', width=2), name=f'Decycler ({dec_period})'))
-                    
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-                    highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
-                    
-                    fig_ctx.update_layout(title="Ehlers Simple Decycler Signal", hovermode="x unified", template="plotly_dark", height=400)
-                    st.plotly_chart(fig_ctx, use_container_width=True)
+        # Auto-run Decycler
+        decycler_series = EhlersFilters.simple_decycler(prices_bt, dec_period)
+        
+        # Signal logic: Long when Price > Decycler, else Hedge (0)
+        signals = (prices_bt > decycler_series).astype(int)
+        
+        with st.expander("See Strategy Context", expanded=True):
+            fig_ctx = go.Figure()
+            fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
+            fig_ctx.add_trace(go.Scatter(x=decycler_series.index, y=decycler_series, mode='lines', line=dict(color='orange', width=2), name=f'Decycler ({dec_period})'))
+            
+            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+            highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
+            
+            fig_ctx.update_layout(title="Ehlers Simple Decycler Signal", hovermode="x unified", template="plotly_dark", height=400)
+            st.plotly_chart(fig_ctx, use_container_width=True)
 
     # Run Backtest Engine if signals exist
     if signals is not None:
