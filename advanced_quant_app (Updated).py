@@ -88,6 +88,24 @@ def format_plot_dates(ax, dates):
         
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center', fontsize=8)
 
+def highlight_plotly_zones(fig, mask, color, opacity=0.15, row=None, col=None):
+    """
+    Highlights contiguous boolean True blocks in Plotly charts using vertical rectangles.
+    """
+    if not isinstance(mask, pd.Series) or not mask.any():
+        return
+    blocks = (~mask).cumsum()
+    for _, group in mask[mask].groupby(blocks[mask]):
+        if len(group) > 0:
+            x0 = group.index[0]
+            x1 = group.index[-1]
+            if x0 == x1:
+                x1 = x0 + pd.Timedelta(days=1)
+            if row is not None and col is not None:
+                fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=opacity, layer="below", line_width=0, row=row, col=col)
+            else:
+                fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=opacity, layer="below", line_width=0)
+
 class Calibrator:
     @staticmethod
     def calibrate_heston(returns):
@@ -2476,12 +2494,7 @@ with tab2:
         probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
         # Shading regions where prob > 0.6
         mask = probs > 0.6
-        y_high = pd.Series(np.nan, index=model_data.index)
-        y_high[mask] = model_data.max()
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=y_high, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor=hex_color, opacity=0.15, name=labels[i], showlegend=False), row=1, col=1)
-        y_low = pd.Series(np.nan, index=model_data.index)
-        y_low[mask] = model_data.min()
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=y_low, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor=hex_color, opacity=0.15, showlegend=False), row=1, col=1)
+        highlight_plotly_zones(fig_m, mask, hex_color, opacity=0.15, row=1, col=1)
 
     smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
     
@@ -3254,10 +3267,10 @@ with tab7:
                             fig_ctx = go.Figure()
                             fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
                             fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
-                            exp_pos = expected_ret.copy(); exp_pos[exp_pos < 0] = 0
-                            fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=exp_pos, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.3, name="Long Zone", showlegend=False))
-                            exp_neg = expected_ret.copy(); exp_neg[exp_neg > 0] = 0
-                            fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=exp_neg, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.3, name="Cash/Short Zone", showlegend=False))
+                            
+                            highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.3)
+                            highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.3)
+                            
                             fig_ctx.update_layout(title="Regime-Weighted Expected Return", hovermode="x unified", template="plotly_dark", height=400)
                             st.plotly_chart(fig_ctx, use_container_width=True)
 
@@ -3287,9 +3300,9 @@ with tab7:
                                 if r_idx != bull_regime_idx:
                                     other_probs = probs_df.iloc[:, r_idx].loc[common_idx]
                                     fig_ctx.add_trace(go.Scatter(x=other_probs.index, y=other_probs, mode='lines', line=dict(dash='dash'), opacity=0.6, name=f'Regime {r_idx} Prob'))
-                            y_high = pd.Series(np.nan, index=bull_probs.index)
-                            y_high[signals==1] = 1
-                            fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=y_high, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.1, name='Long Signal', showlegend=False))
+                            
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+                            
                             fig_ctx.update_layout(title=f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})", hovermode="x unified", template="plotly_dark", height=400)
                             st.plotly_chart(fig_ctx, use_container_width=True)
 
@@ -3312,9 +3325,9 @@ with tab7:
                             fig_ctx = go.Figure()
                             strat_prices_aligned = strat_prices.loc[common_idx]
                             fig_ctx.add_trace(go.Scatter(x=strat_prices_aligned.index, y=strat_prices_aligned, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-                            y_high = pd.Series(np.nan, index=strat_prices_aligned.index)
-                            y_high[signals==1] = strat_prices_aligned.max()
-                            fig_ctx.add_trace(go.Scatter(x=strat_prices_aligned.index, y=y_high, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.2, name='Bull Regime Period', showlegend=False))
+                            
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.2)
+                            
                             fig_ctx.update_layout(title=f"Regime Switching Periods (Bull Regime: {bull_regime_idx})", hovermode="x unified", template="plotly_dark", height=400)
                             st.plotly_chart(fig_ctx, use_container_width=True)
 
@@ -3381,9 +3394,9 @@ with tab7:
                 fig_ctx = go.Figure()
                 fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
                 fig_ctx.add_trace(go.Scatter(x=trend_series.index, y=trend_series, mode='lines', line=dict(color='blue'), name='Kalman Trend'))
-                y_high = pd.Series(np.nan, index=trend_series.index)
-                y_high[signals==1] = prices_bt.max()
-                fig_ctx.add_trace(go.Scatter(x=trend_series.index, y=y_high, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.1, name='Long Zone', showlegend=False))
+                
+                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+                
                 fig_ctx.update_layout(title="Strategy Context", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
@@ -3412,10 +3425,10 @@ with tab7:
                 fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
                 fig_ctx.add_trace(go.Scatter(x=short_ema.index, y=short_ema, mode='lines', line=dict(color='orange', width=1.5), name=f'Short EMA ({short_len})'))
                 fig_ctx.add_trace(go.Scatter(x=med_sma.index, y=med_sma, mode='lines', line=dict(color='blue', width=1.5), name=f'Med SMA ({med_len})'))
-                y_high_green = pd.Series(np.nan, index=prices_bt.index); y_high_green[signals==1] = prices_bt.max()
-                fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=y_high_green, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.1, name='Long Zone', showlegend=False))
-                y_high_red = pd.Series(np.nan, index=prices_bt.index); y_high_red[signals==0] = prices_bt.max()
-                fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=y_high_red, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.1, name='Hedge Zone (Active Flag)', showlegend=False))
+                
+                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+                highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
+                
                 fig_ctx.update_layout(title="Momentum Hedge Signal (EMA/SMA Cross)", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
@@ -3478,8 +3491,9 @@ with tab7:
                 with st.expander("See Strategy Context", expanded=True):
                     fig_ctx = go.Figure()
                     fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-                    y_high_green = pd.Series(np.nan, index=prices_bt.index); y_high_green[signals==1] = prices_bt.max()
-                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=y_high_green, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.1, name='Long Zone', showlegend=False))
+                    
+                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+                    
                     fig_ctx.update_layout(title=f"MAD Trend Modes Signal ({sig_mode})", hovermode="x unified", template="plotly_dark", height=400)
                     st.plotly_chart(fig_ctx, use_container_width=True)
 
@@ -3525,8 +3539,9 @@ with tab7:
                     fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
                     fig_ctx.add_trace(go.Scatter(x=fast_ma.index, y=fast_ma, mode='lines', line=dict(color='orange'), opacity=0.8, name=f'Fast {f_ma_type} ({f_ma_len})'))
                     fig_ctx.add_trace(go.Scatter(x=slow_ma.index, y=slow_ma, mode='lines', line=dict(color='blue'), opacity=0.8, name=f'Slow {s_ma_type} ({s_ma_len})'))
-                    y_high_green = pd.Series(np.nan, index=prices_bt.index); y_high_green[signals==1] = prices_bt.max()
-                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=y_high_green, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.1, name='Long Zone', showlegend=False))
+                    
+                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+                    
                     fig_ctx.update_layout(title=f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})", hovermode="x unified", template="plotly_dark", height=400)
                     st.plotly_chart(fig_ctx, use_container_width=True)
 
