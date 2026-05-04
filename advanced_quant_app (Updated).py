@@ -961,6 +961,50 @@ class MADTrendModes:
             
         return (final_score == 1).astype(int)
 
+class EhlersFilters:
+    @staticmethod
+    def super_smoother(prices, period=15):
+        """
+        Ehlers SuperSmoother Filter (2-pole Butterworth with SMA)
+        """
+        a1 = np.exp(-1.414 * np.pi / period)
+        b1 = 2 * a1 * np.cos(1.414 * np.pi / period)
+        c2 = b1
+        c3 = -a1 * a1
+        c1 = 1 - c2 - c3
+        
+        filt = np.zeros(len(prices))
+        prices_vals = prices.values
+        
+        for i in range(len(prices)):
+            if i < 2:
+                filt[i] = prices_vals[i]
+            else:
+                filt[i] = c1 * (prices_vals[i] + prices_vals[i-1]) / 2 + c2 * filt[i-1] + c3 * filt[i-2]
+                
+        return pd.Series(filt, index=prices.index)
+        
+    @staticmethod
+    def simple_decycler(prices, period=60):
+        """
+        Ehlers Simple Decycler
+        Removes high frequency components to leave underlying trend
+        """
+        alpha1 = (np.cos(0.707 * 2 * np.pi / period) + np.sin(0.707 * 2 * np.pi / period) - 1) / np.cos(0.707 * 2 * np.pi / period)
+        
+        hp = np.zeros(len(prices))
+        prices_vals = prices.values
+        
+        for i in range(len(prices)):
+            if i < 2:
+                hp[i] = 0
+            else:
+                hp[i] = ((1 - alpha1 / 2)**2) * (prices_vals[i] - 2 * prices_vals[i-1] + prices_vals[i-2]) + \
+                        2 * (1 - alpha1) * hp[i-1] - ((1 - alpha1)**2) * hp[i-2]
+                        
+        decycler = prices_vals - hp
+        return pd.Series(decycler, index=prices.index)
+
 class BacktestEngine:
     """
     Handles simple vectorised backtesting for regime-based strategies.
@@ -3051,7 +3095,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -3543,6 +3587,54 @@ with tab7:
                     highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
                     
                     fig_ctx.update_layout(title=f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})", hovermode="x unified", template="plotly_dark", height=400)
+                    st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "Ehlers SuperSmoother":
+        st.markdown("### 🌊 Ehlers SuperSmoother Settings")
+        st.markdown("Filters high frequency noise to create a zero-lag trendline.")
+        
+        ss_period = st.slider("SuperSmoother Period", 5, 50, 15)
+        
+        if st.button("🚀 Run SuperSmoother Backtest", use_container_width=True):
+            with st.spinner("Calculating Ehlers SuperSmoother..."):
+                ss_series = EhlersFilters.super_smoother(prices_bt, ss_period)
+                
+                # Signal logic: Long when Price > SuperSmoother, else Hedge (0)
+                signals = (prices_bt > ss_series).astype(int)
+                
+                with st.expander("See Strategy Context", expanded=True):
+                    fig_ctx = go.Figure()
+                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
+                    fig_ctx.add_trace(go.Scatter(x=ss_series.index, y=ss_series, mode='lines', line=dict(color='magenta', width=2), name=f'SuperSmoother ({ss_period})'))
+                    
+                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+                    highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
+                    
+                    fig_ctx.update_layout(title="Ehlers SuperSmoother Signal", hovermode="x unified", template="plotly_dark", height=400)
+                    st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "Ehlers Simple Decycler":
+        st.markdown("### 🧲 Ehlers Simple Decycler Settings")
+        st.markdown("Isolates the underlying low-frequency trend by removing market cycles.")
+        
+        dec_period = st.slider("Decycler High-Pass Period", 20, 120, 60)
+        
+        if st.button("🚀 Run Decycler Backtest", use_container_width=True):
+            with st.spinner("Calculating Ehlers Simple Decycler..."):
+                decycler_series = EhlersFilters.simple_decycler(prices_bt, dec_period)
+                
+                # Signal logic: Long when Price > Decycler, else Hedge (0)
+                signals = (prices_bt > decycler_series).astype(int)
+                
+                with st.expander("See Strategy Context", expanded=True):
+                    fig_ctx = go.Figure()
+                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
+                    fig_ctx.add_trace(go.Scatter(x=decycler_series.index, y=decycler_series, mode='lines', line=dict(color='orange', width=2), name=f'Decycler ({dec_period})'))
+                    
+                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
+                    highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
+                    
+                    fig_ctx.update_layout(title="Ehlers Simple Decycler Signal", hovermode="x unified", template="plotly_dark", height=400)
                     st.plotly_chart(fig_ctx, use_container_width=True)
 
     # Run Backtest Engine if signals exist
