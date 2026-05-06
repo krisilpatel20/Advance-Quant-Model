@@ -3867,7 +3867,7 @@ with tab7:
 
     elif strategy_type == "Institutional Hurst Exponent":
         st.markdown("### 🎲 Institutional Hurst Exponent (Trend vs Mean-Reversion)")
-        st.markdown("Trade the asset based on its mathematical persistence. Long when Hurst > Threshold (Trending). Cash when Hurst < 0.5 (Mean-Reverting/Random).")
+        st.markdown("Trade the asset based on its mathematical persistence. \n* **Trending Regime (H > Threshold):** Buy via Momentum (EMA Cross).\n* **Mean-Reverting Regime (H < Threshold):** Buy via Mean Reversion (Bollinger Bands).")
         
         col_h1, col_h2 = st.columns(2)
         with col_h1:
@@ -3878,9 +3878,25 @@ with tab7:
         with st.spinner("Calculating Rolling Hurst Exponent..."):
             try:
                 hurst_series = rolling_hurst(prices_bt, window=int(hurst_window))
-                raw_signals = (hurst_series > hurst_threshold).astype(int)
                 
-                signals = pd.Series(np.nan, index=prices_bt.index)
+                # 1. Trend Signal (EMA Cross)
+                ema_fast = prices_bt.ewm(span=20, adjust=False).mean()
+                ema_slow = prices_bt.ewm(span=50, adjust=False).mean()
+                trend_signal = (ema_fast > ema_slow).astype(int)
+                
+                # 2. Mean Reversion Signal (Bollinger Bands)
+                bb_ma = prices_bt.rolling(window=20).mean()
+                bb_std = prices_bt.rolling(window=20).std()
+                bb_lower = bb_ma - (2 * bb_std)
+                mr_signal = pd.Series(get_stateful_signal(prices_bt < bb_lower, prices_bt > bb_ma, prices_bt.index), index=prices_bt.index)
+                
+                # 3. Regime Allocator
+                is_trending = (hurst_series > hurst_threshold)
+                
+                raw_signals = pd.Series(0, index=prices_bt.index)
+                raw_signals[is_trending] = trend_signal[is_trending]
+                raw_signals[~is_trending] = mr_signal[~is_trending]
+                
                 signals = raw_signals.fillna(0)
                 
                 with st.expander("See Strategy Context", expanded=True):
