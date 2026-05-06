@@ -961,6 +961,16 @@ class MADTrendModes:
             
         return (final_score == 1).astype(int)
 
+def rolling_hurst(prices, window=100, max_lag=20):
+    """Calculates the rolling Hurst Exponent using log-variance approximation."""
+    def hurst_val(x):
+        lags = range(2, max_lag)
+        tau = [np.std(x[lag:] - x[:-lag]) for lag in lags]
+        tau = [t if t > 0 else 1e-8 for t in tau]
+        poly = np.polyfit(np.log(lags), np.log(tau), 1)
+        return poly[0]
+    return prices.rolling(window).apply(hurst_val, raw=True)
+
 class EhlersFilters:
     @staticmethod
     def super_smoother(prices, period=15):
@@ -1954,10 +1964,11 @@ tabs = st.tabs([
     "SML & Alpha",
     "📡 Multi-Asset Scan",
     "🏦 FED Balance Sheet",
-    "🎲 Options IV Surface"
+    "🎲 Options IV Surface",
+    "🎲 Hurst Exponent"
 ])
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = tabs
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14 = tabs
 
 if df_main is not None:
     # Initialize Report Generator
@@ -3128,7 +3139,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -3852,6 +3863,43 @@ with tab7:
                 st.error(f"Error loading ^VIX data: {str(e)}")
                 signals = None
 
+    elif strategy_type == "Institutional Hurst Exponent":
+        st.markdown("### 🎲 Institutional Hurst Exponent (Trend vs Mean-Reversion)")
+        st.markdown("Trade the asset based on its mathematical persistence. Long when Hurst > Threshold (Trending). Cash when Hurst < 0.5 (Mean-Reverting/Random).")
+        
+        col_h1, col_h2 = st.columns(2)
+        with col_h1:
+            hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=100, step=10)
+        with col_h2:
+            hurst_threshold = st.number_input("Trend Threshold (Long >)", min_value=0.5, max_value=0.8, value=0.55, step=0.01)
+            
+        with st.spinner("Calculating Rolling Hurst Exponent..."):
+            try:
+                hurst_series = rolling_hurst(prices_bt, window=int(hurst_window))
+                raw_signals = (hurst_series > hurst_threshold).astype(int)
+                
+                signals = pd.Series(np.nan, index=prices_bt.index)
+                signals = raw_signals.fillna(0)
+                
+                with st.expander("See Strategy Context", expanded=True):
+                    fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+                    
+                    fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
+                    
+                    fig_ctx.add_trace(go.Scatter(x=hurst_series.index, y=hurst_series, mode='lines', line=dict(color='cyan'), name='Hurst (H)'), row=2, col=1)
+                    fig_ctx.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="Random Walk (0.5)")
+                    fig_ctx.add_hline(y=hurst_threshold, line_dash="dash", line_color="green", row=2, col=1, annotation_text=f"Trend Entry ({hurst_threshold})")
+                    
+                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
+                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
+                    
+                    fig_ctx.update_layout(title="Hurst Exponent Strategy", hovermode="x unified", template="plotly_dark", height=500)
+                    st.plotly_chart(fig_ctx, use_container_width=True)
+                    
+            except Exception as e:
+                st.error(f"Error calculating Hurst Exponent: {str(e)}")
+                signals = None
+
     # Run Backtest Engine if signals exist
     if signals is not None:
         bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
@@ -4474,6 +4522,50 @@ with tab13:
                         st.warning("Not enough liquid options data to construct a surface.")
             except Exception as e:
                 st.error(f"Error fetching options: {e}")
+
+# ==========================================
+# TAB 14: HURST EXPONENT
+# ==========================================
+with tab14:
+    if df_main is None:
+        st.warning("Please load a ticker to view Hurst Exponent Analysis.")
+    else:
+        st.write("### 🎲 Institutional Hurst Exponent")
+        st.markdown("The Hurst Exponent (H) measures the long-term memory of a time series. \n* **H < 0.5**: Mean-Reverting (Anti-persistent)\n* **H = 0.5**: Random Walk (Geometric Brownian Motion)\n* **H > 0.5**: Trending (Persistent)")
+        
+        col_h1, col_h2 = st.columns(2)
+        with col_h1:
+            h_window = st.slider("Rolling Window (Bars)", min_value=20, max_value=252, value=100, step=10, key="tab14_h_window")
+        with col_h2:
+            h_trend_thresh = st.slider("Trending Threshold (H >)", min_value=0.5, max_value=0.8, value=0.55, step=0.01, key="tab14_h_thresh")
+            
+        with st.spinner("Calculating Rolling Hurst Exponent..."):
+            try:
+                hurst_series = rolling_hurst(df_main['Close'], window=h_window)
+                
+                fig_hurst = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+                
+                fig_hurst.add_trace(go.Scatter(x=df_main.index, y=df_main['Close'], mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
+                
+                fig_hurst.add_trace(go.Scatter(x=hurst_series.index, y=hurst_series, mode='lines', line=dict(color='cyan'), name='Hurst (H)'), row=2, col=1)
+                fig_hurst.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="Random Walk (0.5)")
+                fig_hurst.add_hline(y=h_trend_thresh, line_dash="dash", line_color="green", row=2, col=1, annotation_text=f"Trend Entry ({h_trend_thresh})")
+                
+                # Highlight trending
+                is_trending = (hurst_series > h_trend_thresh)
+                highlight_plotly_zones(fig_hurst, is_trending, 'green', opacity=0.1, row=1, col=1)
+                highlight_plotly_zones(fig_hurst, is_trending, 'green', opacity=0.1, row=2, col=1)
+                
+                # Highlight mean reverting
+                is_mean_rev = (hurst_series < 0.5)
+                highlight_plotly_zones(fig_hurst, is_mean_rev, 'purple', opacity=0.1, row=1, col=1)
+                highlight_plotly_zones(fig_hurst, is_mean_rev, 'purple', opacity=0.1, row=2, col=1)
+                
+                fig_hurst.update_layout(title="Asset Memory & Persistence Profile", hovermode="x unified", template="plotly_dark", height=600)
+                st.plotly_chart(fig_hurst, use_container_width=True)
+                
+            except Exception as e:
+                st.error(f"Error calculating Hurst Exponent: {str(e)}")
 
 # Footer
 st.markdown("---")
