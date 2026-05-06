@@ -1854,8 +1854,12 @@ with st.sidebar:
         reg_switch_vol = st.toggle("Switching Volatility", value=True)
         reg_switch_trend = st.toggle("Switching Mean", value=True)
         initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000)
-        trailing_stop = st.slider("Trailing Stop Loss (%)", 0.0, 20.0, 0.0, step=0.5) / 100
-        stop_loss = st.slider("Hard Stop Loss (%)", 0.0, 30.0, 8.0, step=0.5) / 100
+        
+        use_trailing_stop = st.toggle("Enable Trailing Stop Loss", value=False)
+        trailing_stop = st.slider("Trailing Stop Loss (%)", 0.0, 20.0, 5.0, step=0.5) / 100 if use_trailing_stop else 0.0
+        
+        use_stop_loss = st.toggle("Enable Hard Stop Loss", value=True)
+        stop_loss = st.slider("Hard Stop Loss (%)", 0.0, 30.0, 8.0, step=0.5) / 100 if use_stop_loss else 0.0
 
     st.divider()
     st.header("⚡ Live Decision Mode")
@@ -4192,7 +4196,12 @@ with tab11:
         with async_col2:
             scan_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4, 
                                       help="Matches 'Signal Stability' in Backtest Tab. Smoothes data before fitting.")
-            scan_trailing_stop = st.slider("Trailing Stop (%)", 0.0, 20.0, 0.0, step=0.5) / 100
+            
+            use_scan_trailing = st.toggle("Enable Trailing Stop Loss", value=False, key="scan_ts_toggle")
+            scan_trailing_stop = st.slider("Trailing Stop (%)", 0.0, 20.0, 5.0, step=0.5) / 100 if use_scan_trailing else 0.0
+            
+            use_scan_stop = st.toggle("Enable Hard Stop Loss", value=True, key="scan_sl_toggle")
+            scan_stop_loss = st.slider("Hard Stop Loss (%)", 0.0, 30.0, 8.0, step=0.5) / 100 if use_scan_stop else 0.0
         with async_col3:
             scan_switch_vol = st.toggle("Switching Volatility", value=True)
             scan_switch_trend = st.toggle("Switching Mean", value=True)
