@@ -3757,14 +3757,14 @@ with tab7:
                 signals = None
 
     elif strategy_type == "Implied Volatility Proxy (^VIX)":
-        st.markdown("### 🎲 Implied Volatility Proxy (^VIX) Settings")
-        st.markdown("Trade the asset based on general market fear. Long when IV is low/stable, hedge when IV spikes.")
+        st.markdown("### 🎲 Adaptive Implied Volatility Bands (^VIX)")
+        st.markdown("Instantly exit to cash when the VIX spikes relative to its dynamic baseline, dodging sudden crashes.")
         
         col_vx1, col_vx2 = st.columns(2)
         with col_vx1:
-            vix_entry = st.number_input("Entry VIX Threshold (Long when <)", min_value=10.0, max_value=80.0, value=20.0, step=1.0)
+            vix_ma_len = st.number_input("VIX Baseline (MA Length)", min_value=5, max_value=200, value=20, step=1)
         with col_vx2:
-            vix_exit = st.number_input("Exit VIX Threshold (Cash when >)", min_value=15.0, max_value=100.0, value=30.0, step=1.0)
+            vix_z = st.number_input("VIX Spike Threshold (Z-Score)", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
             
         with st.spinner("Fetching ^VIX data..."):
             try:
@@ -3780,17 +3780,22 @@ with tab7:
                     vix_prices = vix_df['Close']
                     common_idx = prices_bt.index.intersection(vix_prices.index)
                     
-                    if len(common_idx) < 5:
-                        st.error("Not enough overlapping data between asset and ^VIX.")
+                    if len(common_idx) < vix_ma_len:
+                        st.error("Not enough overlapping data between asset and ^VIX to calculate bands.")
                         signals = None
                     else:
                         aligned_vix = vix_prices.loc[common_idx]
                         
-                        # Stateful signal: Long (1) when VIX < entry, Cash (0) when VIX > exit
-                        raw_signals = pd.Series(np.nan, index=common_idx)
-                        raw_signals[aligned_vix < vix_entry] = 1
-                        raw_signals[aligned_vix > vix_exit] = 0
-                        raw_signals = raw_signals.ffill().fillna(0) # Forward fill states
+                        # Calculate Adaptive Bands
+                        vix_ma = aligned_vix.rolling(window=int(vix_ma_len)).mean()
+                        vix_std = aligned_vix.rolling(window=int(vix_ma_len)).std()
+                        vix_upper = vix_ma + (vix_z * vix_std)
+                        
+                        # Stateful signal: Long (1) when VIX < Upper Band, Cash (0) when VIX > Upper Band
+                        # Where moving average is NaN (beginning of series), we can default to Long (1) or Cash (0).
+                        # We'll set it to 1 initially since there is no spike detected.
+                        raw_signals = (aligned_vix < vix_upper).astype(int)
+                        raw_signals.loc[vix_upper.isna()] = 1
                         
                         signals = pd.Series(np.nan, index=prices_bt.index)
                         signals.loc[common_idx] = raw_signals
@@ -3800,15 +3805,15 @@ with tab7:
                             fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
                             
                             fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
                             
-                            fig_ctx.add_hline(y=vix_entry, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Entry Threshold")
-                            fig_ctx.add_hline(y=vix_exit, line_dash="dash", line_color="red", row=2, col=1, annotation_text="Exit Threshold")
+                            fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
+                            fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'Baseline MA ({vix_ma_len})'), row=2, col=1)
+                            fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Spike Threshold (+{vix_z}σ)'), row=2, col=1)
                             
                             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
                             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
                             
-                            fig_ctx.update_layout(title="Implied Volatility Proxy Signals", hovermode="x unified", template="plotly_dark", height=500)
+                            fig_ctx.update_layout(title="Adaptive Volatility Spike Detection", hovermode="x unified", template="plotly_dark", height=500)
                             st.plotly_chart(fig_ctx, use_container_width=True)
                             
             except Exception as e:
