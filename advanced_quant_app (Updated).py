@@ -2068,7 +2068,7 @@ with tab1:
         if vol_state == "HIGH": st.error(f"🎯 **MODEL VERDICT**: {vol_msg} Defensive sizing recommended.")
         else: st.success(f"🎯 **MODEL VERDICT**: {vol_msg} Risk environment is stable.")
     
-    if ARCH_AVAILABLE:
+    if ARCH_AVAILABLE and df_main is not None:
         returns_pct = df_main['Returns'] * 100 # Rescale for better optimization
         
         # 1. CONFIGURATION
