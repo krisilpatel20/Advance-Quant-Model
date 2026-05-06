@@ -1010,11 +1010,12 @@ class BacktestEngine:
     Handles simple vectorised backtesting for regime-based strategies.
     """
     @staticmethod
-    def run_strategy(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0):
+    def run_strategy(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0):
         """
         prices: Series of asset prices
         signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
         trailing_stop_pct: Float (e.g., 0.05 for 5%). If > 0, applies trailing stop.
+        stop_loss_pct: Float (e.g., 0.08 for 8%). If > 0, applies a hard stop loss.
         """
         # Align
         common_idx = prices.index.intersection(signals.index)
@@ -1037,40 +1038,61 @@ class BacktestEngine:
         cash = initial_capital
         holdings = 0
         
+        waiting_for_new_signal = False
+        
         for date, price, signal in zip(prices.index, prices, signals):
+            # Cooldown logic to prevent stop-loss bleed
+            if waiting_for_new_signal:
+                if signal == 0:
+                    waiting_for_new_signal = False # Reset when indicator drops to cash
+            
             # Mark to Market
             if position == 1:
                 current_val = cash + holdings * price
                 
-                # Check Trailing Stop
-                if trailing_stop_pct > 0:
+                stop_out = False
+                status_msg = ""
+                
+                # 1. Check Hard Stop Loss
+                if stop_loss_pct > 0:
+                    hard_stop_price = entry_price * (1 - stop_loss_pct)
+                    if price <= hard_stop_price:
+                        stop_out = True
+                        status_msg = 'Stop Loss'
+                
+                # 2. Check Trailing Stop
+                if not stop_out and trailing_stop_pct > 0:
                     max_price_since_entry = max(max_price_since_entry, price)
                     stop_price = max_price_since_entry * (1 - trailing_stop_pct)
                     
-                    if price < stop_price:
-                        # Trigger Stop Loss
-                        position = 0
-                        exit_price = price
-                        cash = holdings * exit_price
-                        holdings = 0
+                    if price <= stop_price:
+                        stop_out = True
+                        status_msg = 'Trailing Stop'
                         
-                        pnl = (exit_price - entry_price) / entry_price
-                        trades.append({
-                            'Side': 'Long',
-                            'Entry Date': entry_date,
-                            'Exit Date': date,
-                            'Buy Price': entry_price,
-                            'Sell Price': exit_price,
-                            'PnL (%)': pnl * 100,
-                            'Status': 'Trailing Stop'
-                        })
-                        equity_curve.append(cash)
-                        continue # Skip normal signal processing for this bar
+                if stop_out:
+                    position = 0
+                    exit_price = price
+                    cash = holdings * exit_price
+                    holdings = 0
+                    
+                    pnl = (exit_price - entry_price) / entry_price
+                    trades.append({
+                        'Side': 'Long',
+                        'Entry Date': entry_date,
+                        'Exit Date': date,
+                        'Buy Price': entry_price,
+                        'Sell Price': exit_price,
+                        'PnL (%)': pnl * 100,
+                        'Status': status_msg
+                    })
+                    equity_curve.append(cash)
+                    waiting_for_new_signal = True # Lock out new positions until reset
+                    continue # Skip normal signal processing for this bar
             else:
                 current_val = cash
             
             # Signal Processing
-            if position == 0 and signal == 1:
+            if position == 0 and signal == 1 and not waiting_for_new_signal:
                 # Buy
                 position = 1
                 entry_price = price
@@ -1097,7 +1119,10 @@ class BacktestEngine:
                     'Status': 'Closed'
                 })
             
-            equity_curve.append(current_val)
+            if position == 1:
+                equity_curve.append(cash + holdings * price)
+            else:
+                equity_curve.append(cash)
             
         # Capture Open Position
         if position == 1:
@@ -1223,7 +1248,7 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_rep
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)', stability=0, switch_vol=True, switch_trend=True, engine='Markov', initial_cap=10000.0, trailing_stop=0.0):
+def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustness (BIC)', stability=0, switch_vol=True, switch_trend=True, engine='Markov', initial_cap=10000.0, trailing_stop=0.0, stop_loss=0.0):
     """
     Unified Decision Logic for a single asset.
     Returns a dictionary of all quant metrics and the final Master Sentiment Score.
@@ -1275,7 +1300,7 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
                                 dom = p_df.idxmax(axis=1)
                                 sigs = (dom == bull_idx).astype(int)
                                 
-                                bt_res = BacktestEngine.run_strategy(df['Close'], sigs, initial_cap, trailing_stop)
+                                bt_res = BacktestEngine.run_strategy(df['Close'], sigs, initial_cap, trailing_stop, stop_loss)
                                 pnl = (bt_res['equity_curve'].iloc[-1] / initial_cap - 1)
                                 
                                 if pnl > best_score:
@@ -1829,6 +1854,7 @@ with st.sidebar:
         reg_switch_trend = st.toggle("Switching Mean", value=True)
         initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000)
         trailing_stop = st.slider("Trailing Stop Loss (%)", 0.0, 20.0, 0.0, step=0.5) / 100
+        stop_loss = st.slider("Hard Stop Loss (%)", 0.0, 30.0, 8.0, step=0.5) / 100
 
     st.divider()
     st.header("⚡ Live Decision Mode")
@@ -1949,7 +1975,8 @@ if df_main is not None:
                                   switch_trend=reg_switch_trend,
                                   engine=reg_engine_param,
                                   initial_cap=initial_cap,
-                                  trailing_stop=trailing_stop)
+                                  trailing_stop=trailing_stop,
+                                  stop_loss=stop_loss)
     if analysis:
         regime_sig = analysis['regime_sig']
         regime_label = analysis['regime_label']
@@ -3196,7 +3223,7 @@ with tab7:
                         
                         # 3. Run Backtest
                         common_idx = loc_prices.index.intersection(sigs.index)
-                        bt_res = BacktestEngine.run_strategy(loc_prices.loc[common_idx], sigs.loc[common_idx], initial_cap, trailing_stop)
+                        bt_res = BacktestEngine.run_strategy(loc_prices.loc[common_idx], sigs.loc[common_idx], initial_cap, trailing_stop, stop_loss)
                         
                         comp_results.append({
                             "Regimes": n, 
@@ -3822,7 +3849,7 @@ with tab7:
 
     # Run Backtest Engine if signals exist
     if signals is not None:
-        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop)
+        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
         
         # --- STRATEGY SIGNAL BANNER ---
         last_sig = signals.iloc[-1]
@@ -4225,7 +4252,8 @@ with tab11:
                                               switch_trend=scan_switch_trend,
                                               engine=scan_engine_param,
                                               initial_cap=scan_initial_cap,
-                                              trailing_stop=scan_trailing_stop)
+                                              trailing_stop=scan_trailing_stop,
+                                              stop_loss=scan_stop_loss)
                 if not s_analysis:
                     return None
                     
