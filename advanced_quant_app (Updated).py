@@ -3095,7 +3095,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -3690,6 +3690,70 @@ with tab7:
                 
                 fig_ctx.update_layout(title="Institutional Mean Reversion (Z-Score) Signal", hovermode="x unified", template="plotly_dark", height=600)
                 st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "Relative Strength Ratio (vs Benchmark)":
+        st.markdown("### ⚖️ Relative Strength Ratio (vs Benchmark) Settings")
+        st.markdown("Momentum strategy: Long when the asset is gaining relative strength against a benchmark, Cash when losing.")
+        
+        col_rs1, col_rs2 = st.columns(2)
+        with col_rs1:
+            bench_ticker = st.text_input("Benchmark Ticker", "SPY")
+        with col_rs2:
+            rs_ma_len = st.slider("RS Smoothing MA Length", 5, 200, 50)
+            
+        with st.spinner(f"Fetching Benchmark Data ({bench_ticker})..."):
+            try:
+                if live_mode:
+                    bench_df = load_data(bench_ticker, start_date, end_date, interval=data_interval)
+                else:
+                    bench_df = load_data(bench_ticker, bt_start_date, bt_end_date, interval='1d')
+                    
+                if bench_df is None or bench_df.empty:
+                    st.error("Could not fetch benchmark data. Please check ticker.")
+                    signals = None
+                else:
+                    bench_prices = bench_df['Close']
+                    
+                    # Align indices
+                    common_idx = prices_bt.index.intersection(bench_prices.index)
+                    if len(common_idx) < rs_ma_len:
+                        st.error("Not enough overlapping data between the asset and benchmark to calculate moving averages.")
+                        signals = None
+                    else:
+                        aligned_prices = prices_bt.loc[common_idx]
+                        aligned_bench = bench_prices.loc[common_idx]
+                        
+                        # Calculate RS Ratio and MA
+                        rs_ratio = aligned_prices / aligned_bench
+                        rs_ma = rs_ratio.rolling(window=rs_ma_len).mean()
+                        
+                        # Signal: Long when RS Ratio > RS MA
+                        signals_aligned = (rs_ratio > rs_ma).astype(int)
+                        
+                        # Re-index back to full bt_prices length, ffill signals
+                        signals = pd.Series(np.nan, index=prices_bt.index)
+                        signals.loc[common_idx] = signals_aligned
+                        signals = signals.ffill().fillna(0)
+                        
+                        # Plot Context
+                        with st.expander("See Strategy Context", expanded=True):
+                            fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+                            
+                            # Top Chart: Price
+                            fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
+                            
+                            # Bottom Chart: RS Ratio
+                            fig_ctx.add_trace(go.Scatter(x=rs_ratio.index, y=rs_ratio, mode='lines', line=dict(color='magenta'), name=f'RS Ratio vs {bench_ticker}'), row=2, col=1)
+                            fig_ctx.add_trace(go.Scatter(x=rs_ma.index, y=rs_ma, mode='lines', line=dict(color='blue', dash='dash'), name=f'RS MA ({rs_ma_len})'), row=2, col=1)
+                            
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
+                            
+                            fig_ctx.update_layout(title=f"Relative Strength Ratio ({TICKER} vs {bench_ticker})", hovermode="x unified", template="plotly_dark", height=500)
+                            st.plotly_chart(fig_ctx, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error loading benchmark data: {str(e)}")
+                signals = None
 
     # Run Backtest Engine if signals exist
     if signals is not None:
