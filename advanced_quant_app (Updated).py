@@ -3095,7 +3095,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -3632,6 +3632,64 @@ with tab7:
             
             fig_ctx.update_layout(title="Ehlers Simple Decycler Signal", hovermode="x unified", template="plotly_dark", height=400)
             st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "Institutional Mean Reversion (Z-Score)":
+        st.markdown("### 📉 Institutional Mean Reversion (Z-Score) Settings")
+        st.markdown("Statistical arbitrage approach: Buy when asset is significantly oversold relative to its rolling mean, and exit when it reverts.")
+        
+        col_mr1, col_mr2, col_mr3 = st.columns(3)
+        with col_mr1:
+            mr_lookback = st.slider("Lookback Window", 5, 252, 20)
+        with col_mr2:
+            mr_entry_z = st.number_input("Entry Z-Score (Long)", 0.1, 5.0, 2.0, step=0.1)
+        with col_mr3:
+            mr_exit_z = st.number_input("Exit Z-Score (Close Long)", -2.0, 2.0, 0.0, step=0.1)
+            
+        with st.spinner("Calculating Z-Scores..."):
+            # Calculate rolling stats
+            mr_ma = prices_bt.rolling(window=mr_lookback).mean()
+            mr_std = prices_bt.rolling(window=mr_lookback).std()
+            mr_z = (prices_bt - mr_ma) / (mr_std + 1e-9)
+            
+            # Generate Signals: Long when Z < -entry_z, Exit when Z > -exit_z
+            long_cond = mr_z < -mr_entry_z
+            exit_cond = mr_z > -mr_exit_z
+            
+            # Stateful logic
+            def get_stateful_mr_signal(l_cond, e_cond, index):
+                sig = pd.Series(np.nan, index=index)
+                sig.loc[l_cond] = 1
+                sig.loc[e_cond] = 0
+                return sig.ffill().fillna(0)
+            
+            signals = get_stateful_mr_signal(long_cond, exit_cond, prices_bt.index)
+            
+            # Dynamic bands for context plot
+            upper_band = mr_ma + (mr_std * mr_entry_z)
+            lower_band = mr_ma - (mr_std * mr_entry_z)
+            exit_band = mr_ma - (mr_std * mr_exit_z)
+            
+            # Plot Context
+            with st.expander("See Strategy Context", expanded=True):
+                fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+                
+                # Top Chart: Price and Bands
+                fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
+                fig_ctx.add_trace(go.Scatter(x=mr_ma.index, y=mr_ma, mode='lines', line=dict(color='blue', dash='dash'), name=f'Mean ({mr_lookback})'), row=1, col=1)
+                fig_ctx.add_trace(go.Scatter(x=lower_band.index, y=lower_band, mode='lines', line=dict(color='green', width=1), opacity=0.5, name=f'Entry Band (-{mr_entry_z}σ)'), row=1, col=1)
+                fig_ctx.add_trace(go.Scatter(x=exit_band.index, y=exit_band, mode='lines', line=dict(color='yellow', width=1), opacity=0.5, name=f'Exit Band (-{mr_exit_z}σ)'), row=1, col=1)
+                
+                # Bottom Chart: Z-Score
+                fig_ctx.add_trace(go.Scatter(x=mr_z.index, y=mr_z, mode='lines', line=dict(color='orange'), name='Z-Score'), row=2, col=1)
+                fig_ctx.add_hline(y=-mr_entry_z, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Entry")
+                fig_ctx.add_hline(y=-mr_exit_z, line_dash="dash", line_color="yellow", row=2, col=1, annotation_text="Exit")
+                fig_ctx.add_hline(y=0, line_color="white", opacity=0.3, row=2, col=1)
+                
+                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
+                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
+                
+                fig_ctx.update_layout(title="Institutional Mean Reversion (Z-Score) Signal", hovermode="x unified", template="plotly_dark", height=600)
+                st.plotly_chart(fig_ctx, use_container_width=True)
 
     # Run Backtest Engine if signals exist
     if signals is not None:
