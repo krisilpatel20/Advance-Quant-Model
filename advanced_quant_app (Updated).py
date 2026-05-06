@@ -963,7 +963,7 @@ class MADTrendModes:
 
 class EhlersFilters:
     @staticmethod
-    def super_smoother(prices, period=15):
+    def super_smoother(prices, period=75):
         """
         Ehlers SuperSmoother Filter (2-pole Butterworth with SMA)
         """
