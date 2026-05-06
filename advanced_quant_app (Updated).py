@@ -963,7 +963,7 @@ class MADTrendModes:
 
 class EhlersFilters:
     @staticmethod
-    def super_smoother(prices, period=75):
+    def super_smoother(prices, period=15):
         """
         Ehlers SuperSmoother Filter (2-pole Butterworth with SMA)
         """
@@ -1922,10 +1922,11 @@ tabs = st.tabs([
     "Advanced Regime",
     "SML & Alpha",
     "📡 Multi-Asset Scan",
-    "🏦 FED Balance Sheet"
+    "🏦 FED Balance Sheet",
+    "🎲 Options IV Surface"
 ])
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = tabs
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = tabs
 
 if df_main is not None:
     # Initialize Report Generator
@@ -3095,7 +3096,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -3755,6 +3756,65 @@ with tab7:
                 st.error(f"Error loading benchmark data: {str(e)}")
                 signals = None
 
+    elif strategy_type == "Implied Volatility Proxy (^VIX)":
+        st.markdown("### 🎲 Implied Volatility Proxy (^VIX) Settings")
+        st.markdown("Trade the asset based on general market fear. Long when IV is low/stable, hedge when IV spikes.")
+        
+        col_vx1, col_vx2 = st.columns(2)
+        with col_vx1:
+            vix_entry = st.number_input("Entry VIX Threshold (Long when <)", min_value=10.0, max_value=80.0, value=20.0, step=1.0)
+        with col_vx2:
+            vix_exit = st.number_input("Exit VIX Threshold (Cash when >)", min_value=15.0, max_value=100.0, value=30.0, step=1.0)
+            
+        with st.spinner("Fetching ^VIX data..."):
+            try:
+                if live_mode:
+                    vix_df = load_data('^VIX', start_date, end_date, interval=data_interval)
+                else:
+                    vix_df = load_data('^VIX', bt_start_date, bt_end_date, interval='1d')
+                    
+                if vix_df is None or vix_df.empty:
+                    st.error("Could not fetch ^VIX data. Strategy cannot proceed.")
+                    signals = None
+                else:
+                    vix_prices = vix_df['Close']
+                    common_idx = prices_bt.index.intersection(vix_prices.index)
+                    
+                    if len(common_idx) < 5:
+                        st.error("Not enough overlapping data between asset and ^VIX.")
+                        signals = None
+                    else:
+                        aligned_vix = vix_prices.loc[common_idx]
+                        
+                        # Stateful signal: Long (1) when VIX < entry, Cash (0) when VIX > exit
+                        raw_signals = pd.Series(np.nan, index=common_idx)
+                        raw_signals[aligned_vix < vix_entry] = 1
+                        raw_signals[aligned_vix > vix_exit] = 0
+                        raw_signals = raw_signals.ffill().fillna(0) # Forward fill states
+                        
+                        signals = pd.Series(np.nan, index=prices_bt.index)
+                        signals.loc[common_idx] = raw_signals
+                        signals = signals.ffill().fillna(0)
+                        
+                        with st.expander("See Strategy Context", expanded=True):
+                            fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+                            
+                            fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
+                            fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
+                            
+                            fig_ctx.add_hline(y=vix_entry, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Entry Threshold")
+                            fig_ctx.add_hline(y=vix_exit, line_dash="dash", line_color="red", row=2, col=1, annotation_text="Exit Threshold")
+                            
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
+                            
+                            fig_ctx.update_layout(title="Implied Volatility Proxy Signals", hovermode="x unified", template="plotly_dark", height=500)
+                            st.plotly_chart(fig_ctx, use_container_width=True)
+                            
+            except Exception as e:
+                st.error(f"Error loading ^VIX data: {str(e)}")
+                signals = None
+
     # Run Backtest Engine if signals exist
     if signals is not None:
         bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop)
@@ -4300,6 +4360,77 @@ with tab12:
     
     render_fed_dashboard()
 
+
+# ==========================================
+# TAB 13: OPTIONS IV SURFACE
+# ==========================================
+with tab13:
+    st.write("### 🎲 3D Implied Volatility Surface")
+    st.markdown("Visualizes the Volatility Smile and Term Structure using live options data.")
+    
+    if df_main is None:
+        st.warning("Please load a ticker to view its options surface.")
+    else:
+        with st.spinner(f"Fetching Live Options Chain for {TICKER}..."):
+            try:
+                tk = yf.Ticker(TICKER)
+                expirations = tk.options
+                if not expirations:
+                    st.error(f"No options data available for {TICKER}.")
+                else:
+                    max_exp = st.slider("Max Expirations to Fetch", 1, min(20, len(expirations)), min(8, len(expirations)))
+                    
+                    surface_data = []
+                    current_price = df_main['Close'].iloc[-1]
+                    
+                    for exp in expirations[:max_exp]:
+                        opt = tk.option_chain(exp)
+                        calls = opt.calls
+                        
+                        exp_date = datetime.strptime(exp, "%Y-%m-%d")
+                        dte = (exp_date - datetime.now()).days
+                        if dte < 1: dte = 1
+                        
+                        for _, row in calls.iterrows():
+                            if row['impliedVolatility'] > 0 and row['volume'] > 0:
+                                moneyness = row['strike'] / current_price
+                                surface_data.append({
+                                    'DTE': dte,
+                                    'Moneyness': moneyness,
+                                    'IV': row['impliedVolatility']
+                                })
+                                
+                    if len(surface_data) > 0:
+                        df_surf = pd.DataFrame(surface_data)
+                        df_surf['Moneyness_Bin'] = df_surf['Moneyness'].round(2)
+                        surf_pivot = df_surf.groupby(['DTE', 'Moneyness_Bin'])['IV'].mean().unstack()
+                        
+                        # Interpolate to fill grid
+                        surf_pivot = surf_pivot.interpolate(method='linear', axis=1).fillna(method='bfill', axis=1).fillna(method='ffill', axis=1)
+                        surf_pivot = surf_pivot.interpolate(method='linear', axis=0).fillna(method='bfill', axis=0).fillna(method='ffill', axis=0)
+                        
+                        fig_3d = go.Figure(data=[go.Surface(
+                            z=surf_pivot.values,
+                            x=surf_pivot.columns,
+                            y=surf_pivot.index,
+                            colorscale='Viridis'
+                        )])
+                        
+                        fig_3d.update_layout(
+                            title=f"{TICKER} Implied Volatility Surface (Calls)",
+                            scene=dict(
+                                xaxis_title='Moneyness (Strike/Price)',
+                                yaxis_title='Days to Expiration (DTE)',
+                                zaxis_title='Implied Volatility'
+                            ),
+                            template="plotly_dark",
+                            height=700
+                        )
+                        st.plotly_chart(fig_3d, use_container_width=True)
+                    else:
+                        st.warning("Not enough liquid options data to construct a surface.")
+            except Exception as e:
+                st.error(f"Error fetching options: {e}")
 
 # Footer
 st.markdown("---")
