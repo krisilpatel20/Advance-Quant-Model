@@ -963,13 +963,15 @@ class MADTrendModes:
 
 def rolling_hurst(prices, window=100, max_lag=20):
     """Calculates the rolling Hurst Exponent using log-variance approximation."""
+    # Use log prices for accurate variance scaling of returns
+    log_prices = np.log(prices)
     def hurst_val(x):
         lags = range(2, max_lag)
         tau = [np.std(x[lag:] - x[:-lag]) for lag in lags]
         tau = [t if t > 0 else 1e-8 for t in tau]
         poly = np.polyfit(np.log(lags), np.log(tau), 1)
         return poly[0]
-    return prices.rolling(window).apply(hurst_val, raw=True)
+    return log_prices.rolling(window).apply(hurst_val, raw=True)
 
 class EhlersFilters:
     @staticmethod
@@ -3871,7 +3873,7 @@ with tab7:
         with col_h1:
             hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=100, step=10)
         with col_h2:
-            hurst_threshold = st.number_input("Trend Threshold (Long >)", min_value=0.5, max_value=0.8, value=0.55, step=0.01)
+            hurst_threshold = st.number_input("Trend Threshold (Long >)", min_value=0.4, max_value=0.7, value=0.50, step=0.01)
             
         with st.spinner("Calculating Rolling Hurst Exponent..."):
             try:
@@ -4537,7 +4539,7 @@ with tab14:
         with col_h1:
             h_window = st.slider("Rolling Window (Bars)", min_value=20, max_value=252, value=100, step=10, key="tab14_h_window")
         with col_h2:
-            h_trend_thresh = st.slider("Trending Threshold (H >)", min_value=0.5, max_value=0.8, value=0.55, step=0.01, key="tab14_h_thresh")
+            h_trend_thresh = st.slider("Trending Threshold (H >)", min_value=0.4, max_value=0.7, value=0.50, step=0.01, key="tab14_h_thresh")
             
         with st.spinner("Calculating Rolling Hurst Exponent..."):
             try:
