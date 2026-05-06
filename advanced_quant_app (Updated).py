@@ -516,7 +516,7 @@ class AdvancedRegimeDetector:
         Fast proxy for changepoint probability using rolling volatility regime shifts.
         True BCP is computationally heavy for Streamlit.
         """
-        vol = pd.Series(data).rolling(window=22).std().fillna(method='bfill')
+        vol = pd.Series(data).rolling(window=22).std().bfill()
         
         # Detect shifts in volatility (Z-score of vol change)
         vol_change = vol.diff().abs()
@@ -598,7 +598,7 @@ class ProRegimeDetector:
         f1 = self.returns.rolling(window=5).mean().fillna(0)
         
         # 2. Volatility Cluster (Z-scored 20d Vol)
-        vol = self.returns.rolling(window=20).std().fillna(method='bfill')
+        vol = self.returns.rolling(window=20).std().bfill()
         v_mean = vol.rolling(252, min_periods=20).mean()
         v_std = vol.rolling(252, min_periods=20).std()
         f2 = (vol - v_mean) / (v_std + 1e-9)
@@ -4449,8 +4449,8 @@ with tab13:
                         surf_pivot = df_surf.groupby(['DTE', 'Moneyness_Bin'])['IV'].mean().unstack()
                         
                         # Interpolate to fill grid
-                        surf_pivot = surf_pivot.interpolate(method='linear', axis=1).fillna(method='bfill', axis=1).fillna(method='ffill', axis=1)
-                        surf_pivot = surf_pivot.interpolate(method='linear', axis=0).fillna(method='bfill', axis=0).fillna(method='ffill', axis=0)
+                        surf_pivot = surf_pivot.interpolate(method='linear', axis=1).bfill(axis=1).ffill(axis=1)
+                        surf_pivot = surf_pivot.interpolate(method='linear', axis=0).bfill(axis=0).ffill(axis=0)
                         
                         fig_3d = go.Figure(data=[go.Surface(
                             z=surf_pivot.values,
