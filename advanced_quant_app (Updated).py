@@ -1038,13 +1038,14 @@ class BacktestEngine:
         cash = initial_capital
         holdings = 0
         
-        waiting_for_new_signal = False
+        cooldown_bars = 0
         
         for date, price, signal in zip(prices.index, prices, signals):
             # Cooldown logic to prevent stop-loss bleed
-            if waiting_for_new_signal:
+            if cooldown_bars > 0:
+                cooldown_bars -= 1
                 if signal == 0:
-                    waiting_for_new_signal = False # Reset when indicator drops to cash
+                    cooldown_bars = 0 # Early reset if indicator drops to cash naturally
             
             # Mark to Market
             if position == 1:
@@ -1086,13 +1087,13 @@ class BacktestEngine:
                         'Status': status_msg
                     })
                     equity_curve.append(cash)
-                    waiting_for_new_signal = True # Lock out new positions until reset
+                    cooldown_bars = 5 # Lock out new positions for 5 bars to prevent immediate re-entry bleed
                     continue # Skip normal signal processing for this bar
             else:
                 current_val = cash
             
             # Signal Processing
-            if position == 0 and signal == 1 and not waiting_for_new_signal:
+            if position == 0 and signal == 1 and cooldown_bars == 0:
                 # Buy
                 position = 1
                 entry_price = price
