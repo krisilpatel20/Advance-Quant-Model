@@ -3888,7 +3888,11 @@ with tab7:
                 bb_ma = prices_bt.rolling(window=20).mean()
                 bb_std = prices_bt.rolling(window=20).std()
                 bb_lower = bb_ma - (2 * bb_std)
-                mr_signal = pd.Series(get_stateful_signal(prices_bt < bb_lower, prices_bt > bb_ma, prices_bt.index), index=prices_bt.index)
+                # Stateful MR inline
+                mr_sig = pd.Series(np.nan, index=prices_bt.index)
+                mr_sig.loc[prices_bt < bb_lower] = 1
+                mr_sig.loc[prices_bt > bb_ma] = 0
+                mr_signal = mr_sig.ffill().fillna(0)
                 
                 # 3. Regime Allocator
                 is_trending = (hurst_series > hurst_threshold)
