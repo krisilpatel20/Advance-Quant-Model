@@ -4605,17 +4605,24 @@ with tab15:
     st.write("### 🔥 Daily Top 10 (Hot Stocks)")
     st.markdown("High-speed pre-scanner for identifying the best tactical momentum plays across the entire US market.")
     
-    scan_col1, scan_col2, scan_col3 = st.columns(3)
+    scan_col1, scan_col2, scan_col3, scan_col4 = st.columns(4)
     with scan_col1:
-        hot_universe = st.selectbox("Market Universe", ["Total US Stocks (6,000+)"], key="hot_univ")
+        hot_universe = st.selectbox("Market Universe", ["Total US Stocks (10,000+)", "S&P 500", "NASDAQ 100"], key="hot_univ")
     with scan_col2:
         hot_min_price = st.number_input("Minimum Price ($)", value=5.0, min_value=0.1)
     with scan_col3:
         vix_multiplier = st.number_input("VIX Volatility Multiplier", value=1.5, min_value=0.5, step=0.1, help="Required daily return relative to VIX implied daily move.")
+    with scan_col4:
+        top_n_buys = st.number_input("Target Top 'Buys'", value=10, min_value=1, max_value=50, step=1)
         
-    if st.button("🚀 SCAN ENTIRE US MARKET (HOT 10)", use_container_width=True, type="primary", key="hot_scan_btn"):
-        with st.spinner("Fetching full market universe..."):
-            all_tickers = get_total_us_stocks()
+    if st.button("🚀 SCAN MARKET (HOT LIST)", use_container_width=True, type="primary", key="hot_scan_btn"):
+        with st.spinner(f"Fetching {hot_universe} universe..."):
+            if hot_universe == "S&P 500":
+                all_tickers = get_sp500_tickers()
+            elif hot_universe == "NASDAQ 100":
+                all_tickers = get_nasdaq100_tickers()
+            else:
+                all_tickers = get_total_us_stocks()
             
         with st.spinner(f"Bulk downloading intraday market data for {len(all_tickers)} assets + ^VIX... (This may take 30-60 seconds)"):
             try:
@@ -4708,12 +4715,12 @@ with tab15:
                             final_hot_list = []
                             prog = st.progress(0)
                             
-                            # Scan all momentum candidates until we find 10 strict buys
+                            # Scan all momentum candidates until we find our target number of strict buys
                             search_list = top_tickers
                             
                             for i, t in enumerate(search_list):
-                                if len(final_hot_list) >= 10:
-                                    break # We found our top 10 verified buys!
+                                if len(final_hot_list) >= top_n_buys:
+                                    break # We found our top N verified buys!
                                     
                                 prog.progress((i+1)/len(search_list))
                                 
