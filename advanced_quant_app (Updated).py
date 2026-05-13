@@ -4793,8 +4793,8 @@ with tab15:
                 cron_job = f"15 8 * * 1-5 SENDER_EMAIL='{sender_email}' SENDER_PASSWORD='{sender_pass}' RECEIVER_EMAIL='{receiver_email}' {python_bin} {script_path} >> {os.path.dirname(__file__)}/scanner.log 2>&1"
                 
                 try:
-                    # Read existing crontab
-                    crontab_out = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+                    # Read existing crontab using absolute path to prevent PATH errors
+                    crontab_out = subprocess.run(['/usr/bin/crontab', '-l'], capture_output=True, text=True)
                     existing_cron = crontab_out.stdout if crontab_out.returncode == 0 else ""
                     
                     # Remove any existing scanner jobs to prevent duplicates if they update credentials
@@ -4804,7 +4804,7 @@ with tab15:
                     new_cron += f"\n{cron_job}\n"
                     
                     # Write back to system crontab
-                    process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+                    process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
                     process.communicate(new_cron)
                     
                     st.success("✅ **Automation scheduled!** Your Mac will now silently run the scan every weekday at 8:15 AM and email you the results. You do not need to keep the app open.")
