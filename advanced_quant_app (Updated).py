@@ -4680,36 +4680,56 @@ with tab15:
                         if not hot_results:
                             st.warning("No stocks met the criteria today.")
                         else:
-                            # Rank and select Top 10
-                            hot_df = pd.DataFrame(hot_results).sort_values(by="VIX Multiple", ascending=False).head(10)
+                            st.write("#### 🧠 Institutional Deep Verification (Strict BUY Filter)")
+                            st.caption("Running the advanced Regime Model on high-momentum candidates. Only displaying confirmed pure BUY signals...")
                             
-                            st.success(f"🔥 Found Top 10 Hot Stocks out of {len(all_tickers)} scanned!")
-                            st.dataframe(hot_df.style.background_gradient(subset=["Daily Return %", "VIX Multiple"], cmap="YlOrRd"), use_container_width=True)
-                            
-                            st.write("#### 🧠 Institutional Deep Verification")
-                            st.caption("Running the advanced Regime Model on the Top 10 winners to identify risk states...")
+                            # Rank ALL candidates by momentum
+                            hot_df_all = pd.DataFrame(hot_results).sort_values(by="VIX Multiple", ascending=False)
+                            top_tickers = hot_df_all["Ticker"].tolist()
                             
                             verif_results = []
+                            final_hot_list = []
                             prog = st.progress(0)
-                            top_tickers = hot_df["Ticker"].tolist()
                             
-                            for i, t in enumerate(top_tickers):
-                                # Load full history for deep quant on winners
+                            # Cap the search at top 50 momentum candidates to prevent extreme wait times
+                            search_list = top_tickers[:50]
+                            
+                            for i, t in enumerate(search_list):
+                                if len(final_hot_list) >= 10:
+                                    break # We found our top 10 verified buys!
+                                    
+                                prog.progress((i+1)/len(search_list))
+                                
+                                # Load full history for deep quant
                                 t_df = load_data(t, datetime.now() - timedelta(days=730), datetime.now(), interval='1d')
                                 if t_df is not None and not t_df.empty:
                                     ans = get_master_signal(t, t_df, engine="GMM") # Use GMM for speed
                                     if ans:
-                                        verif_results.append({
-                                            "Ticker": t,
-                                            "Regime": ans['regime_label'],
-                                            "Trend Deviation": f"{ans['trend_diff']:+.2%}",
-                                            "Institutional Verdict": ans['regime_sig']
-                                        })
-                                prog.progress((i+1)/len(top_tickers))
+                                        sig = str(ans.get('regime_sig', '')).upper()
+                                        # Strict BUY check
+                                        if "LONG" in sig or "BUY" in sig or "ACCUMULATE" in sig:
+                                            verif_results.append({
+                                                "Ticker": t,
+                                                "Regime": ans['regime_label'],
+                                                "Trend Deviation": f"{ans['trend_diff']:+.2%}",
+                                                "Institutional Verdict": ans['regime_sig']
+                                            })
+                                            # Add the original momentum stats to the final display list
+                                            stock_row = hot_df_all[hot_df_all["Ticker"] == t].iloc[0].to_dict()
+                                            final_hot_list.append(stock_row)
+                                            
+                            prog.progress(1.0)
+                            
+                            if final_hot_list:
+                                st.success(f"🔥 Found {len(final_hot_list)} Institutional-Grade BUY Stocks out of the top momentum leaders!")
+                                final_df = pd.DataFrame(final_hot_list)
+                                st.dataframe(final_df.style.background_gradient(subset=["Daily Return %", "VIX Multiple"], cmap="YlOrRd"), use_container_width=True)
                                 
-                            if verif_results:
+                                st.write("##### Deep Verification Details")
                                 vdf = pd.DataFrame(verif_results)
                                 st.dataframe(vdf, use_container_width=True)
+                            else:
+                                st.error("❌ No momentum candidates passed the strict Institutional BUY Verification today. Cash is a position.")
                     else:
                         st.warning("Not enough data returned from API to compute metrics.")
             except Exception as e:
