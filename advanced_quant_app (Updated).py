@@ -4759,6 +4759,195 @@ with tab15:
             except Exception as e:
                 st.error(f"Error during bulk scan: {e}")
 
+    st.markdown("---")
+    with st.expander("📧 Automated Email Reporter (Full Market Scan)"):
+        st.markdown("Run the complete 3-universe scan (S&P 500, NASDAQ 100, Total Market) and dispatch the final Institutional Hot List directly to your inbox.")
+        
+        email_col1, email_col2 = st.columns(2)
+        with email_col1:
+            sender_email = st.text_input("Sender Email (e.g., your Gmail)", key="email_sender")
+            sender_pass = st.text_input("App Password", type="password", help="Use a 16-character App Password if using Gmail.", key="email_pass")
+        with email_col2:
+            receiver_email = st.text_input("Receiver Email", key="email_receiver")
+            email_top_n = st.number_input("Target Top Buys per Universe", value=20, min_value=1, max_value=50, key="email_top_n")
+            
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            run_manual = st.button("📨 Run Deep Scan & Send Email Report", use_container_width=True, type="primary")
+        with col_btn2:
+            run_auto = st.button("⏰ Schedule Daily 8:15 AM Automation", use_container_width=True)
+            
+        if run_auto:
+            if not sender_email or not sender_pass or not receiver_email:
+                st.error("Please fill in all email credential fields before scheduling.")
+            else:
+                import sys
+                import os
+                import subprocess
+                
+                # Get the python executable and the exact path to the automated script I built
+                python_bin = sys.executable
+                script_path = os.path.join(os.path.dirname(__file__), "daily_email_scanner.py")
+                
+                # The cron string (15 8 * * 1-5 = 8:15 AM Mon-Fri)
+                cron_job = f"15 8 * * 1-5 SENDER_EMAIL='{sender_email}' SENDER_PASSWORD='{sender_pass}' RECEIVER_EMAIL='{receiver_email}' {python_bin} {script_path} >> {os.path.dirname(__file__)}/scanner.log 2>&1"
+                
+                try:
+                    # Read existing crontab
+                    crontab_out = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+                    existing_cron = crontab_out.stdout if crontab_out.returncode == 0 else ""
+                    
+                    # Remove any existing scanner jobs to prevent duplicates if they update credentials
+                    new_cron = "\n".join([line for line in existing_cron.split('\n') if "daily_email_scanner.py" not in line and line.strip() != ""])
+                    
+                    # Append the brand new 8:15 AM job
+                    new_cron += f"\n{cron_job}\n"
+                    
+                    # Write back to system crontab
+                    process = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+                    process.communicate(new_cron)
+                    
+                    st.success("✅ **Automation scheduled!** Your Mac will now silently run the scan every weekday at 8:15 AM and email you the results. You do not need to keep the app open.")
+                except Exception as e:
+                    st.error(f"Failed to schedule automation. Error: {e}")
+                    
+        if run_manual:
+            if not sender_email or not sender_pass or not receiver_email:
+                st.error("Please fill in all email credential fields.")
+            else:
+                st.info("Executing 3-Universe Deep Quant Scan... (This will take a few minutes. Do not refresh the page.)")
+                
+                # Define headless scan function for the emailer
+                def scan_universe_headless(universe_name, top_n_buys, min_price, vix_mult):
+                    import gc
+                    if universe_name == "S&P 500":
+                        all_tick = get_sp500_tickers()
+                    elif universe_name == "NASDAQ 100":
+                        all_tick = get_nasdaq100_tickers()
+                    else:
+                        all_tick = get_total_us_stocks()
+                        
+                    dl_tickers = all_tick + ["^VIX"] if "^VIX" not in all_tick else all_tick
+                    chunk_size = 2000
+                    dfs = []
+                    
+                    for i in range(0, len(dl_tickers), chunk_size):
+                        chunk = dl_tickers[i:i+chunk_size]
+                        chunk_df = yf.download(chunk, period="2d", threads=True, progress=False)
+                        dfs.append(chunk_df)
+                        gc.collect()
+                        
+                    if not dfs: return pd.DataFrame()
+                    
+                    df_bulk = pd.concat(dfs, axis=1) if len(dfs) > 1 else dfs[0]
+                    closes = df_bulk['Close'].ffill()
+                    vols = df_bulk['Volume'].ffill() if 'Volume' in df_bulk else None
+                    if len(closes) < 2: return pd.DataFrame()
+                    
+                    latest_vix = float(closes["^VIX"].dropna().iloc[-1]) if "^VIX" in closes.columns and len(closes["^VIX"].dropna()) > 0 else 15.0
+                    vix_daily_move_pct = (latest_vix / np.sqrt(252)) / 100
+                    adaptive_thresh = vix_daily_move_pct * vix_mult
+                    
+                    last_close = closes.iloc[-1]
+                    prev_close = closes.iloc[-2]
+                    daily_ret = (last_close - prev_close) / prev_close
+                    
+                    valid_mask = ((last_close >= min_price) & (daily_ret > adaptive_thresh)).fillna(False)
+                    valid_tickers = valid_mask[valid_mask].index.tolist()
+                    if "^VIX" in valid_tickers: valid_tickers.remove("^VIX")
+                    
+                    hot_results = []
+                    for tick in valid_tickers:
+                        try:
+                            score = float(daily_ret[tick]) / float(adaptive_thresh)
+                            v = int(vols.iloc[-1][tick]) if vols is not None and pd.notna(vols.iloc[-1][tick]) else 0
+                            hot_results.append({
+                                "Ticker": str(tick),
+                                "Price": round(float(last_close[tick]), 2),
+                                "Daily Return %": round(float(daily_ret[tick]) * 100, 2),
+                                "VIX Multiple": round(float(score), 2),
+                                "Volume": v
+                            })
+                        except: pass
+                        
+                    if not hot_results: return pd.DataFrame()
+                    
+                    hot_df_all = pd.DataFrame(hot_results).sort_values(by="VIX Multiple", ascending=False)
+                    top_tickers = hot_df_all["Ticker"].tolist()
+                    final_hot_list = []
+                    
+                    for t in top_tickers:
+                        if len(final_hot_list) >= top_n_buys: break
+                        t_df = load_data(t, datetime.now() - timedelta(days=730), datetime.now(), interval='1d')
+                        if t_df is not None and not t_df.empty:
+                            ans = get_master_signal(t, t_df, engine="GMM")
+                            if ans:
+                                sig = str(ans.get('regime_sig', '')).upper()
+                                if "LONG" in sig or "BUY" in sig or "ACCUMULATE" in sig:
+                                    stock_row = hot_df_all[hot_df_all["Ticker"] == t].iloc[0].to_dict()
+                                    stock_row["Regime"] = ans['regime_label']
+                                    stock_row["Trend Deviation"] = f"{ans['trend_diff']:+.2%}"
+                                    stock_row["Verdict"] = ans['regime_sig']
+                                    final_hot_list.append(stock_row)
+                                    
+                    return pd.DataFrame(final_hot_list)
+
+                # Run the scans
+                universes = {"S&P 500": email_top_n, "NASDAQ 100": email_top_n, "Total US Market": email_top_n}
+                results = {}
+                
+                scan_prog = st.progress(0)
+                for idx, (univ, n_buys) in enumerate(universes.items()):
+                    st.write(f"🔍 Scanning {univ}...")
+                    results[univ] = scan_universe_headless(univ, n_buys, 5.0, 1.5)
+                    scan_prog.progress((idx + 1) / len(universes))
+                    
+                # Format HTML Email
+                html = f"""
+                <html>
+                  <head>
+                    <style>
+                      body {{ font-family: sans-serif; background-color: #f4f7f6; color: #333; padding: 20px; }}
+                      h2 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+                      h3 {{ color: #2980b9; margin-top: 30px; }}
+                      table {{ width: 100%; border-collapse: collapse; background-color: #fff; }}
+                      th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }}
+                      th {{ background-color: #34495e; color: #fff; }}
+                    </style>
+                  </head>
+                  <body>
+                    <h2>Institutional Hot List - Daily Momentum Scan</h2>
+                    <p>Generated on: <strong>{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</strong></p>
+                """
+                for univ_name, df in results.items():
+                    html += f"<h3>{univ_name} (Top {len(df)} Confirmed Setups)</h3>"
+                    if df.empty:
+                        html += "<p><em>No actionable institutional setups found. Cash is a position.</em></p>"
+                    else:
+                        html += df.to_html(index=False, border=0)
+                html += "</body></html>"
+                
+                # Send Email
+                try:
+                    import smtplib
+                    from email.mime.multipart import MIMEMultipart
+                    from email.mime.text import MIMEText
+                    
+                    msg = MIMEMultipart('alternative')
+                    msg['Subject'] = f"🚀 Institutional Hot List: {datetime.now().strftime('%Y-%m-%d')}"
+                    msg['From'] = sender_email
+                    msg['To'] = receiver_email
+                    msg.attach(MIMEText(html, 'html'))
+                    
+                    server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+                    server.login(sender_email, sender_pass)
+                    server.sendmail(sender_email, receiver_email, msg.as_string())
+                    server.quit()
+                    
+                    st.success(f"✅ Full report successfully emailed to {receiver_email}!")
+                except Exception as e:
+                    st.error(f"Failed to send email. Check credentials. Error: {str(e)}")
+
 # Footer
 st.markdown("---")
 st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
