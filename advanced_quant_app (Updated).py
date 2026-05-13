@@ -1967,10 +1967,11 @@ tabs = st.tabs([
     "📡 Multi-Asset Scan",
     "🏦 FED Balance Sheet",
     "🎲 Options IV Surface",
-    "🎲 Hurst Exponent"
+    "🎲 Hurst Exponent",
+    "🔥 Hot 10 (Daily)"
 ])
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14 = tabs
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15 = tabs
 
 if df_main is not None:
     # Initialize Report Generator
@@ -4589,7 +4590,102 @@ with tab14:
             except Exception as e:
                 st.error(f"Error calculating Hurst Exponent: {str(e)}")
 
+# TAB 15: HOT 10 (DAILY)
+# ==========================================
+with tab15:
+    st.write("### 🔥 Daily Top 10 (Hot Stocks)")
+    st.markdown("High-speed pre-scanner for identifying the best tactical momentum plays across the entire US market.")
+    
+    scan_col1, scan_col2, scan_col3 = st.columns(3)
+    with scan_col1:
+        hot_universe = st.selectbox("Market Universe", ["Total US Stocks (6,000+)"], key="hot_univ")
+    with scan_col2:
+        hot_min_price = st.number_input("Minimum Price ($)", value=5.0, min_value=0.1)
+    with scan_col3:
+        hot_min_vol = st.number_input("Minimum Volume", value=1000000, min_value=0, step=100000)
+        
+    if st.button("🚀 SCAN ENTIRE US MARKET (HOT 10)", use_container_width=True, type="primary", key="hot_scan_btn"):
+        with st.spinner("Fetching full market universe..."):
+            all_tickers = get_total_us_stocks()
+            
+        with st.spinner(f"Bulk downloading 5-day data for {len(all_tickers)} assets... (This may take 1-2 minutes)"):
+            try:
+                # Optimized vectorized bulk download
+                df_bulk = yf.download(all_tickers, period="5d", threads=True, progress=False)
+                
+                if df_bulk.empty:
+                    st.error("Failed to fetch market data.")
+                else:
+                    closes = df_bulk['Close']
+                    vols = df_bulk['Volume']
+                    
+                    if len(closes) >= 2:
+                        # Vectorized calculations across all 6000+ assets instantly
+                        last_close = closes.iloc[-1]
+                        prev_close = closes.iloc[-2]
+                        last_vol = vols.iloc[-1]
+                        avg_vol = vols.mean()
+                        
+                        daily_ret = (last_close - prev_close) / prev_close
+                        rvol = last_vol / avg_vol
+                        
+                        # Apply Filters
+                        valid_mask = (last_close >= hot_min_price) & (last_vol >= hot_min_vol) & (rvol > 1.2) & (daily_ret > 0)
+                        valid_tickers = valid_mask[valid_mask].index.tolist()
+                        
+                        hot_results = []
+                        for tick in valid_tickers:
+                            try:
+                                score = daily_ret[tick] * 100 * rvol[tick]
+                                hot_results.append({
+                                    "Ticker": str(tick),
+                                    "Price": round(float(last_close[tick]), 2),
+                                    "Daily Return %": round(float(daily_ret[tick]) * 100, 2),
+                                    "RVOL": round(float(rvol[tick]), 2),
+                                    "Volume": int(last_vol[tick]),
+                                    "Score": round(float(score), 2)
+                                })
+                            except:
+                                pass
+                                
+                        if not hot_results:
+                            st.warning("No stocks met the criteria today.")
+                        else:
+                            # Rank and select Top 10
+                            hot_df = pd.DataFrame(hot_results).sort_values(by="Score", ascending=False).head(10)
+                            
+                            st.success(f"🔥 Found Top 10 Hot Stocks out of {len(all_tickers)} scanned!")
+                            st.dataframe(hot_df.style.background_gradient(subset=["Daily Return %", "RVOL", "Score"], cmap="YlOrRd"), use_container_width=True)
+                            
+                            st.write("#### 🧠 Institutional Deep Verification")
+                            st.caption("Running the advanced Regime Model on the Top 10 winners to identify risk states...")
+                            
+                            verif_results = []
+                            prog = st.progress(0)
+                            top_tickers = hot_df["Ticker"].tolist()
+                            
+                            for i, t in enumerate(top_tickers):
+                                # Load full history for deep quant on winners
+                                t_df = load_data(t, datetime.now() - timedelta(days=730), datetime.now(), interval='1d')
+                                if t_df is not None and not t_df.empty:
+                                    ans = get_master_signal(t, t_df, engine="GMM") # Use GMM for speed
+                                    if ans:
+                                        verif_results.append({
+                                            "Ticker": t,
+                                            "Regime": ans['regime_label'],
+                                            "Trend Deviation": f"{ans['trend_diff']:+.2%}",
+                                            "Institutional Verdict": ans['regime_sig']
+                                        })
+                                prog.progress((i+1)/len(top_tickers))
+                                
+                            if verif_results:
+                                vdf = pd.DataFrame(verif_results)
+                                st.dataframe(vdf, use_container_width=True)
+                    else:
+                        st.warning("Not enough data returned from API to compute metrics.")
+            except Exception as e:
+                st.error(f"Error during bulk scan: {e}")
+
 # Footer
 st.markdown("---")
 st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
-
