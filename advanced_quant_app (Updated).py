@@ -4628,13 +4628,14 @@ with tab15:
                 if df_bulk.empty:
                     st.error("Failed to fetch market data.")
                 else:
-                    closes = df_bulk['Close']
-                    vols = df_bulk['Volume'] if 'Volume' in df_bulk else None
+                    closes = df_bulk['Close'].ffill()
+                    vols = df_bulk['Volume'].ffill() if 'Volume' in df_bulk else None
                     
                     if len(closes) >= 2:
                         # Extract VIX
                         if "^VIX" in closes.columns:
-                            latest_vix = closes["^VIX"].iloc[-1]
+                            vix_series = closes["^VIX"].dropna()
+                            latest_vix = float(vix_series.iloc[-1]) if len(vix_series) > 0 else 15.0
                         else:
                             latest_vix = 15.0 # Fallback
                             
@@ -4651,7 +4652,7 @@ with tab15:
                         daily_ret = (last_close - prev_close) / prev_close
                         
                         # Apply Filters (Price > Min Price, Return > VIX Adaptive Threshold)
-                        valid_mask = (last_close >= hot_min_price) & (daily_ret > adaptive_thresh)
+                        valid_mask = ((last_close >= hot_min_price) & (daily_ret > adaptive_thresh)).fillna(False)
                         valid_tickers = valid_mask[valid_mask].index.tolist()
                         
                         if "^VIX" in valid_tickers:
@@ -4660,8 +4661,12 @@ with tab15:
                         hot_results = []
                         for tick in valid_tickers:
                             try:
-                                score = daily_ret[tick] / adaptive_thresh # Ratio of return vs expected move
-                                vol_val = int(vols.iloc[-1][tick]) if vols is not None else 0
+                                score = float(daily_ret[tick]) / float(adaptive_thresh)
+                                if vols is not None and pd.notna(vols.iloc[-1][tick]):
+                                    vol_val = int(vols.iloc[-1][tick])
+                                else:
+                                    vol_val = 0
+                                    
                                 hot_results.append({
                                     "Ticker": str(tick),
                                     "Price": round(float(last_close[tick]), 2),
