@@ -4833,7 +4833,7 @@ with tab15:
                     
                     for i in range(0, len(dl_tickers), chunk_size):
                         chunk = dl_tickers[i:i+chunk_size]
-                        chunk_df = yf.download(chunk, period="2d", threads=True, progress=False)
+                        chunk_df = yf.download(chunk, period="2d", threads=False, progress=False)
                         dfs.append(chunk_df)
                         gc.collect()
                         
