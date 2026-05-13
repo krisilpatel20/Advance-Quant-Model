@@ -1555,9 +1555,27 @@ def get_nasdaq100_tickers():
 @st.cache_data(ttl=3600*24)
 def get_total_us_stocks():
     """Retrieves all listed US stocks with multi-source failover."""
+    import requests
+    
+    # Primary Source: SEC Company Tickers (Extremely reliable, 10,000+ US tickers)
+    try:
+        url = "https://www.sec.gov/files/company_tickers.json"
+        headers = {'User-Agent': 'QuantApp/1.0 (admin@quantapp.local)'}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            tickers = [v['ticker'] for k, v in data.items()]
+            # Filter valid common stock tickers
+            tickers = sorted(list(set([str(t).strip() for t in tickers if str(t).strip() and len(str(t)) <= 5 and '-' not in str(t)])))
+            if len(tickers) > 5000:
+                return tickers
+    except:
+        pass
+
+    # Secondary Source: NASDAQ FTP
     sources = [
         "http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
-        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full_tickers.txt" # Secondary mirror
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full_tickers.txt"
     ]
     
     for url in sources:
@@ -1569,22 +1587,13 @@ def get_total_us_stocks():
             else:
                 tickers = nasdaq['symbol'].tolist() if 'symbol' in nasdaq.columns else nasdaq.iloc[:, 0].tolist()
             
-            # Get "Other" listed (NYSE/AMEX)
-            other_url = "http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-            try:
-                other = robust_fetch_csv(other_url, sep="|")
-                other = other[(other['Test Issue'] == 'N') & (other['ETF'] == 'N')]
-                tickers += other['NASDAQ Symbol'].tolist()
-            except:
-                pass # Continue with what we have
-                
             res = sorted(list(set([str(t).strip() for t in tickers if str(t).strip() and len(str(t)) < 6])))
             if len(res) > 500: return res
         except:
             continue
 
     st.warning("⚠️ Total Market Connection Issue. Using expanded internal mid-cap universe (Top 500).")
-    # Massive internal fallback (Top 200+ symbols)
+    # Massive internal fallback
     return get_sp500_tickers() + ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "SQ", "PYPL", "COIN", "MARA", "RIOT"]
 
 @st.cache_data(ttl=3600*24)
@@ -4608,13 +4617,13 @@ with tab15:
         with st.spinner("Fetching full market universe..."):
             all_tickers = get_total_us_stocks()
             
-        with st.spinner(f"Bulk downloading 5-day data for {len(all_tickers)} assets + ^VIX... (This may take 1-2 minutes)"):
+        with st.spinner(f"Bulk downloading intraday market data for {len(all_tickers)} assets + ^VIX... (This may take 30-60 seconds)"):
             try:
                 # Add VIX
                 dl_tickers = all_tickers + ["^VIX"] if "^VIX" not in all_tickers else all_tickers
                 
-                # Optimized vectorized bulk download
-                df_bulk = yf.download(dl_tickers, period="5d", threads=True, progress=False)
+                # Optimized vectorized bulk download for Day Trading (2 days to get Prev Close and Live Price)
+                df_bulk = yf.download(dl_tickers, period="2d", threads=True, progress=False)
                 
                 if df_bulk.empty:
                     st.error("Failed to fetch market data.")
