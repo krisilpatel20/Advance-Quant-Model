@@ -1535,7 +1535,7 @@ def get_sp500_tickers():
         df = table[0]
         return df['Symbol'].tolist()
     except:
-        pass
+        return ["AAPL", "MSFT", "AMZN", "GOOG", "NVDA", "META", "TSLA", "BRK.B", "UNH", "JNJ"]
 
 @st.cache_data(ttl=3600*24)
 def get_nasdaq100_tickers():
@@ -4602,48 +4602,63 @@ with tab15:
     with scan_col2:
         hot_min_price = st.number_input("Minimum Price ($)", value=5.0, min_value=0.1)
     with scan_col3:
-        hot_min_vol = st.number_input("Minimum Volume", value=1000000, min_value=0, step=100000)
+        vix_multiplier = st.number_input("VIX Volatility Multiplier", value=1.5, min_value=0.5, step=0.1, help="Required daily return relative to VIX implied daily move.")
         
     if st.button("🚀 SCAN ENTIRE US MARKET (HOT 10)", use_container_width=True, type="primary", key="hot_scan_btn"):
         with st.spinner("Fetching full market universe..."):
             all_tickers = get_total_us_stocks()
             
-        with st.spinner(f"Bulk downloading 5-day data for {len(all_tickers)} assets... (This may take 1-2 minutes)"):
+        with st.spinner(f"Bulk downloading 5-day data for {len(all_tickers)} assets + ^VIX... (This may take 1-2 minutes)"):
             try:
+                # Add VIX
+                dl_tickers = all_tickers + ["^VIX"] if "^VIX" not in all_tickers else all_tickers
+                
                 # Optimized vectorized bulk download
-                df_bulk = yf.download(all_tickers, period="5d", threads=True, progress=False)
+                df_bulk = yf.download(dl_tickers, period="5d", threads=True, progress=False)
                 
                 if df_bulk.empty:
                     st.error("Failed to fetch market data.")
                 else:
                     closes = df_bulk['Close']
-                    vols = df_bulk['Volume']
+                    vols = df_bulk['Volume'] if 'Volume' in df_bulk else None
                     
                     if len(closes) >= 2:
+                        # Extract VIX
+                        if "^VIX" in closes.columns:
+                            latest_vix = closes["^VIX"].iloc[-1]
+                        else:
+                            latest_vix = 15.0 # Fallback
+                            
+                        # Expected Daily Market Move (implied by VIX) = VIX / sqrt(252)
+                        vix_daily_move_pct = (latest_vix / np.sqrt(252)) / 100
+                        adaptive_thresh = vix_daily_move_pct * vix_multiplier
+                        
+                        st.info(f"📈 Market VIX is {latest_vix:.2f}. Adaptive Daily Move Threshold: {adaptive_thresh*100:.2f}%")
+                        
                         # Vectorized calculations across all 6000+ assets instantly
                         last_close = closes.iloc[-1]
                         prev_close = closes.iloc[-2]
-                        last_vol = vols.iloc[-1]
-                        avg_vol = vols.mean()
                         
                         daily_ret = (last_close - prev_close) / prev_close
-                        rvol = last_vol / avg_vol
                         
-                        # Apply Filters
-                        valid_mask = (last_close >= hot_min_price) & (last_vol >= hot_min_vol) & (rvol > 1.2) & (daily_ret > 0)
+                        # Apply Filters (Price > Min Price, Return > VIX Adaptive Threshold)
+                        valid_mask = (last_close >= hot_min_price) & (daily_ret > adaptive_thresh)
                         valid_tickers = valid_mask[valid_mask].index.tolist()
+                        
+                        if "^VIX" in valid_tickers:
+                            valid_tickers.remove("^VIX")
                         
                         hot_results = []
                         for tick in valid_tickers:
                             try:
-                                score = daily_ret[tick] * 100 * rvol[tick]
+                                score = daily_ret[tick] / adaptive_thresh # Ratio of return vs expected move
+                                vol_val = int(vols.iloc[-1][tick]) if vols is not None else 0
                                 hot_results.append({
                                     "Ticker": str(tick),
                                     "Price": round(float(last_close[tick]), 2),
                                     "Daily Return %": round(float(daily_ret[tick]) * 100, 2),
-                                    "RVOL": round(float(rvol[tick]), 2),
-                                    "Volume": int(last_vol[tick]),
-                                    "Score": round(float(score), 2)
+                                    "VIX Multiple": round(float(score), 2),
+                                    "Volume": vol_val
                                 })
                             except:
                                 pass
@@ -4652,10 +4667,10 @@ with tab15:
                             st.warning("No stocks met the criteria today.")
                         else:
                             # Rank and select Top 10
-                            hot_df = pd.DataFrame(hot_results).sort_values(by="Score", ascending=False).head(10)
+                            hot_df = pd.DataFrame(hot_results).sort_values(by="VIX Multiple", ascending=False).head(10)
                             
                             st.success(f"🔥 Found Top 10 Hot Stocks out of {len(all_tickers)} scanned!")
-                            st.dataframe(hot_df.style.background_gradient(subset=["Daily Return %", "RVOL", "Score"], cmap="YlOrRd"), use_container_width=True)
+                            st.dataframe(hot_df.style.background_gradient(subset=["Daily Return %", "VIX Multiple"], cmap="YlOrRd"), use_container_width=True)
                             
                             st.write("#### 🧠 Institutional Deep Verification")
                             st.caption("Running the advanced Regime Model on the Top 10 winners to identify risk states...")
