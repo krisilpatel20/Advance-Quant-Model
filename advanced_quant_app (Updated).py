@@ -4622,12 +4622,24 @@ with tab15:
                 # Add VIX
                 dl_tickers = all_tickers + ["^VIX"] if "^VIX" not in all_tickers else all_tickers
                 
-                # Optimized vectorized bulk download for Day Trading (2 days to get Prev Close and Live Price)
-                df_bulk = yf.download(dl_tickers, period="2d", threads=True, progress=False)
+                # Chunk the list to avoid OS thread limit ("can't start new thread")
+                chunk_size = 500
+                dfs = []
+                progress_text = st.empty()
+                for i in range(0, len(dl_tickers), chunk_size):
+                    chunk = dl_tickers[i:i+chunk_size]
+                    progress_text.text(f"Downloading batch {i//chunk_size + 1}/{(len(dl_tickers)//chunk_size) + 1}...")
+                    chunk_df = yf.download(chunk, period="2d", threads=True, progress=False)
+                    dfs.append(chunk_df)
                 
-                if df_bulk.empty:
+                progress_text.empty()
+                
+                if not dfs:
                     st.error("Failed to fetch market data.")
                 else:
+                    # Combine all downloaded chunks
+                    df_bulk = pd.concat(dfs, axis=1) if len(dfs) > 1 else dfs[0]
+                    
                     closes = df_bulk['Close'].ffill()
                     vols = df_bulk['Volume'].ffill() if 'Volume' in df_bulk else None
                     
@@ -4691,8 +4703,8 @@ with tab15:
                             final_hot_list = []
                             prog = st.progress(0)
                             
-                            # Cap the search at top 50 momentum candidates to prevent extreme wait times
-                            search_list = top_tickers[:50]
+                            # Scan all momentum candidates until we find 10 strict buys
+                            search_list = top_tickers
                             
                             for i, t in enumerate(search_list):
                                 if len(final_hot_list) >= 10:
