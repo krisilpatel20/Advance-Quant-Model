@@ -4622,17 +4622,24 @@ with tab15:
                 # Add VIX
                 dl_tickers = all_tickers + ["^VIX"] if "^VIX" not in all_tickers else all_tickers
                 
-                # Chunk the list to avoid OS thread limit ("can't start new thread")
-                chunk_size = 500
+                # Chunk the list and use a shared session to prevent OS thread/socket exhaustion
+                import requests
+                import gc
+                shared_session = requests.Session()
+                chunk_size = 1000
                 dfs = []
                 progress_text = st.empty()
+                
                 for i in range(0, len(dl_tickers), chunk_size):
                     chunk = dl_tickers[i:i+chunk_size]
                     progress_text.text(f"Downloading batch {i//chunk_size + 1}/{(len(dl_tickers)//chunk_size) + 1}...")
-                    chunk_df = yf.download(chunk, period="2d", threads=True, progress=False)
+                    # Share session to prevent massive TCP socket leaks which cause 'can't start new thread'
+                    chunk_df = yf.download(chunk, period="2d", threads=True, session=shared_session, progress=False)
                     dfs.append(chunk_df)
+                    gc.collect() # Force cleanup of dangling threads/sockets
                 
                 progress_text.empty()
+                shared_session.close()
                 
                 if not dfs:
                     st.error("Failed to fetch market data.")
