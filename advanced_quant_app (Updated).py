@@ -4630,22 +4630,18 @@ with tab15:
                 dl_tickers = all_tickers + ["^VIX"] if "^VIX" not in all_tickers else all_tickers
                 
                 import gc
-                import concurrent.futures
                 chunk_size = 500
                 dfs = []
                 progress_text = st.empty()
                 
-                chunks = [dl_tickers[i:i+chunk_size] for i in range(0, len(dl_tickers), chunk_size)]
-                
-                def fetch_chunk(c):
-                    return yf.download(c, period="20d", threads=False, progress=False)
+                for i in range(0, len(dl_tickers), chunk_size):
+                    chunk = dl_tickers[i:i+chunk_size]
+                    progress_text.text(f"Downloading batch {i//chunk_size + 1}/{(len(dl_tickers)//chunk_size) + 1} (High-Speed Mode)...")
                     
-                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                    for i, res in enumerate(executor.map(fetch_chunk, chunks)):
-                        progress_text.text(f"Downloading batch {i + 1}/{len(chunks)} (Safe Multithreaded)...")
-                        if not res.empty:
-                            dfs.append(res)
-                        gc.collect()
+                    # By passing chunks of 500 with threads=True, we safely cap the OS threads to 500, preventing crashes while maximizing speed
+                    chunk_df = yf.download(chunk, period="20d", threads=True, progress=False)
+                    dfs.append(chunk_df)
+                    gc.collect()
                 
                 progress_text.empty()
                 
@@ -4860,19 +4856,15 @@ with tab15:
                         all_tick = get_total_us_stocks()
                         
                     dl_tickers = all_tick + ["^VIX"] if "^VIX" not in all_tick else all_tick
-                    import concurrent.futures
+                    import gc
                     chunk_size = 500
                     dfs = []
-                    chunks = [dl_tickers[i:i+chunk_size] for i in range(0, len(dl_tickers), chunk_size)]
                     
-                    def fetch_chunk(c):
-                        return yf.download(c, period="20d", threads=False, progress=False)
-                        
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                        for res in executor.map(fetch_chunk, chunks):
-                            if not res.empty:
-                                dfs.append(res)
-                            gc.collect()
+                    for i in range(0, len(dl_tickers), chunk_size):
+                        chunk = dl_tickers[i:i+chunk_size]
+                        chunk_df = yf.download(chunk, period="20d", threads=True, progress=False)
+                        dfs.append(chunk_df)
+                        gc.collect()
                         
                     if not dfs: return pd.DataFrame()
                     
