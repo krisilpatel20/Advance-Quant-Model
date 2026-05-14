@@ -3815,11 +3815,16 @@ with tab7:
         st.markdown("### 🎲 Adaptive Implied Volatility Bands (^VIX)")
         st.markdown("Instantly exit to cash when the VIX spikes relative to its dynamic baseline, dodging sudden crashes.")
         
-        col_vx1, col_vx2 = st.columns(2)
+        col_vx1, col_vx2, col_vx3, col_vx4 = st.columns(4)
         with col_vx1:
             vix_ma_len = st.number_input("VIX Baseline (MA Length)", min_value=5, max_value=200, value=20, step=1)
         with col_vx2:
-            vix_z = st.number_input("VIX Spike Threshold (Z-Score)", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
+            vix_z = st.number_input("Risk-Off Spike (Z-Score)", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
+        with col_vx3:
+            vix_cap_z = st.number_input("Capitulation Buy (Z-Score)", min_value=1.0, max_value=6.0, value=3.5, step=0.1)
+        with col_vx4:
+            st.write("Asset Trend Filter")
+            use_trend_filter = st.checkbox("Only Sell if Asset < 50-SMA", value=True)
             
         with st.spinner("Fetching ^VIX data..."):
             try:
@@ -3845,30 +3850,69 @@ with tab7:
                         vix_ma = aligned_vix.rolling(window=int(vix_ma_len)).mean()
                         vix_std = aligned_vix.rolling(window=int(vix_ma_len)).std()
                         vix_upper = vix_ma + (vix_z * vix_std)
+                        vix_cap = vix_ma + (vix_cap_z * vix_std)
                         
-                        # Stateful signal: Long (1) when VIX < Upper Band, Cash (0) when VIX > Upper Band
-                        # Where moving average is NaN (beginning of series), we can default to Long (1) or Cash (0).
-                        # We'll set it to 1 initially since there is no spike detected.
-                        raw_signals = (aligned_vix < vix_upper).astype(int)
-                        raw_signals.loc[vix_upper.isna()] = 1
+                        asset_prices = prices_bt.loc[common_idx]
+                        asset_sma = asset_prices.rolling(window=50).mean()
                         
+                        raw_signals = np.ones(len(aligned_vix)) # Default LONG
+                        current_state = 1 # 1 = LONG, 0 = CASH
+                        
+                        for i in range(len(aligned_vix)):
+                            if pd.isna(vix_upper.iloc[i]):
+                                raw_signals[i] = 1
+                                continue
+                                
+                            v_val = aligned_vix.iloc[i]
+                            v_ma = vix_ma.iloc[i]
+                            v_up = vix_upper.iloc[i]
+                            v_cp = vix_cap.iloc[i]
+                            
+                            asset_val = asset_prices.iloc[i]
+                            a_sma = asset_sma.iloc[i]
+                            
+                            # 1. Capitulation Panic Buy (Extreme Z-Score Mean Reversion)
+                            if v_val >= v_cp:
+                                current_state = 1
+                            # 2. Risk-Off Spike Exit
+                            elif v_val >= v_up:
+                                # Check Trend Filter
+                                if use_trend_filter and not pd.isna(a_sma):
+                                    if asset_val < a_sma:
+                                        current_state = 0 # Asset breaking down -> CASH
+                                    else:
+                                        pass # Asset strong -> Ignore VIX noise
+                                else:
+                                    current_state = 0 # No filter -> CASH
+                            # 3. Hysteresis Re-entry (Wait for VIX to drop fully below MA)
+                            elif v_val < v_ma:
+                                current_state = 1
+                            # 4. The "Chop Zone" between MA and Upper Band -> Maintain State
+                            else:
+                                pass 
+                                
+                            raw_signals[i] = current_state
+                            
                         signals = pd.Series(np.nan, index=prices_bt.index)
                         signals.loc[common_idx] = raw_signals
-                        signals = signals.ffill().fillna(0)
+                        signals = signals.ffill().fillna(1)
                         
                         with st.expander("See Strategy Context", expanded=True):
                             fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
                             
-                            fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
-                            
+                            fig_ctx.add_trace(go.Scatter(x=asset_prices.index, y=asset_prices, mode='lines', line=dict(color='gray'), opacity=0.8, name='Asset Price'), row=1, col=1)
+                            if use_trend_filter:
+                                fig_ctx.add_trace(go.Scatter(x=asset_sma.index, y=asset_sma, mode='lines', line=dict(color='yellow', dash='dot'), opacity=0.5, name='Asset 50-SMA'), row=1, col=1)
+                                
                             fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
                             fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'Baseline MA ({vix_ma_len})'), row=2, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Spike Threshold (+{vix_z}σ)'), row=2, col=1)
+                            fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Threshold (+{vix_z}σ)'), row=2, col=1)
+                            fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Buy (+{vix_cap_z}σ)'), row=2, col=1)
                             
-                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
-                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
+                            highlight_plotly_zones(fig_ctx, pd.Series(raw_signals, index=common_idx) == 1, 'green', opacity=0.1, row=1, col=1)
+                            highlight_plotly_zones(fig_ctx, pd.Series(raw_signals, index=common_idx) == 1, 'green', opacity=0.1, row=2, col=1)
                             
-                            fig_ctx.update_layout(title="Adaptive Volatility Spike Detection", hovermode="x unified", template="plotly_dark", height=500)
+                            fig_ctx.update_layout(title="Institutional VIX Regime Model (Hysteresis + Capitulation)", hovermode="x unified", template="plotly_dark", height=600)
                             st.plotly_chart(fig_ctx, use_container_width=True)
                             
             except Exception as e:
