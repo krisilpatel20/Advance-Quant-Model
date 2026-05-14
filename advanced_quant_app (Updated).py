@@ -4629,20 +4629,23 @@ with tab15:
                 # Add VIX
                 dl_tickers = all_tickers + ["^VIX"] if "^VIX" not in all_tickers else all_tickers
                 
-                # Chunk the list to prevent OS thread/socket exhaustion, let YF handle the session natively
                 import gc
-                chunk_size = 2000
+                import concurrent.futures
+                chunk_size = 500
                 dfs = []
                 progress_text = st.empty()
                 
-                for i in range(0, len(dl_tickers), chunk_size):
-                    chunk = dl_tickers[i:i+chunk_size]
-                    progress_text.text(f"Downloading batch {i//chunk_size + 1}/{(len(dl_tickers)//chunk_size) + 1}...")
+                chunks = [dl_tickers[i:i+chunk_size] for i in range(0, len(dl_tickers), chunk_size)]
+                
+                def fetch_chunk(c):
+                    return yf.download(c, period="20d", threads=False, progress=False)
                     
-                    # Do not pass a custom session, let yfinance use its native curl_cffi session to bypass bot protection
-                    chunk_df = yf.download(chunk, period="2d", threads=True, progress=False)
-                    dfs.append(chunk_df)
-                    gc.collect() # Force cleanup of dangling threads/sockets
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    for i, res in enumerate(executor.map(fetch_chunk, chunks)):
+                        progress_text.text(f"Downloading batch {i + 1}/{len(chunks)} (Safe Multithreaded)...")
+                        if not res.empty:
+                            dfs.append(res)
+                        gc.collect()
                 
                 progress_text.empty()
                 
@@ -4653,6 +4656,7 @@ with tab15:
                     df_bulk = pd.concat(dfs, axis=1) if len(dfs) > 1 else dfs[0]
                     
                     closes = df_bulk['Close'].ffill()
+                    opens = df_bulk['Open'].ffill() if 'Open' in df_bulk else None
                     vols = df_bulk['Volume'].ffill() if 'Volume' in df_bulk else None
                     
                     if len(closes) >= 2:
@@ -4672,8 +4676,24 @@ with tab15:
                         # Vectorized calculations across all 6000+ assets instantly
                         last_close = closes.iloc[-1]
                         prev_close = closes.iloc[-2]
+                        last_open = opens.iloc[-1] if opens is not None else prev_close
                         
                         daily_ret = (last_close - prev_close) / prev_close
+                        gap_pct = (last_open - prev_close) / prev_close
+                        intraday_pct = (last_close - last_open) / last_open
+                        
+                        if vols is not None:
+                            last_vol = vols.iloc[-1]
+                            if len(vols) >= 20:
+                                avg_vol = vols.rolling(window=20).mean().iloc[-1]
+                            else:
+                                avg_vol = vols.mean()
+                            rvol = last_vol / (avg_vol + 1)
+                        else:
+                            last_vol = pd.Series(0, index=closes.columns)
+                            rvol = pd.Series(0, index=closes.columns)
+                            
+                        dollar_vol = last_close * last_vol
                         
                         # Apply Filters (Price > Min Price, Return > VIX Adaptive Threshold)
                         valid_mask = ((last_close >= hot_min_price) & (daily_ret > adaptive_thresh)).fillna(False)
@@ -4686,17 +4706,29 @@ with tab15:
                         for tick in valid_tickers:
                             try:
                                 score = float(daily_ret[tick]) / float(adaptive_thresh)
-                                if vols is not None and pd.notna(vols.iloc[-1][tick]):
-                                    vol_val = int(vols.iloc[-1][tick])
+                                v = int(last_vol[tick]) if tick in last_vol and pd.notna(last_vol[tick]) else 0
+                                rv = float(rvol[tick]) if tick in rvol and pd.notna(rvol[tick]) else 0.0
+                                dv = float(dollar_vol[tick]) if tick in dollar_vol and pd.notna(dollar_vol[tick]) else 0.0
+                                gp = float(gap_pct[tick]) if tick in gap_pct and pd.notna(gap_pct[tick]) else 0.0
+                                intd = float(intraday_pct[tick]) if tick in intraday_pct and pd.notna(intraday_pct[tick]) else 0.0
+                                
+                                if dv >= 1_000_000:
+                                    dv_str = f"${dv/1_000_000:.1f}M"
+                                elif dv >= 1_000:
+                                    dv_str = f"${dv/1_000:.1f}K"
                                 else:
-                                    vol_val = 0
+                                    dv_str = f"${dv:.0f}"
                                     
                                 hot_results.append({
                                     "Ticker": str(tick),
                                     "Price": round(float(last_close[tick]), 2),
                                     "Daily Return %": round(float(daily_ret[tick]) * 100, 2),
+                                    "Gap %": round(gp * 100, 2),
+                                    "Intraday %": round(intd * 100, 2),
                                     "VIX Multiple": round(float(score), 2),
-                                    "Volume": vol_val
+                                    "RVOL": round(rv, 2),
+                                    "Dollar Vol": dv_str,
+                                    "Volume": v
                                 })
                             except:
                                 pass
@@ -4828,19 +4860,25 @@ with tab15:
                         all_tick = get_total_us_stocks()
                         
                     dl_tickers = all_tick + ["^VIX"] if "^VIX" not in all_tick else all_tick
-                    chunk_size = 2000
+                    import concurrent.futures
+                    chunk_size = 500
                     dfs = []
+                    chunks = [dl_tickers[i:i+chunk_size] for i in range(0, len(dl_tickers), chunk_size)]
                     
-                    for i in range(0, len(dl_tickers), chunk_size):
-                        chunk = dl_tickers[i:i+chunk_size]
-                        chunk_df = yf.download(chunk, period="2d", threads=False, progress=False)
-                        dfs.append(chunk_df)
-                        gc.collect()
+                    def fetch_chunk(c):
+                        return yf.download(c, period="20d", threads=False, progress=False)
+                        
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                        for res in executor.map(fetch_chunk, chunks):
+                            if not res.empty:
+                                dfs.append(res)
+                            gc.collect()
                         
                     if not dfs: return pd.DataFrame()
                     
                     df_bulk = pd.concat(dfs, axis=1) if len(dfs) > 1 else dfs[0]
                     closes = df_bulk['Close'].ffill()
+                    opens = df_bulk['Open'].ffill() if 'Open' in df_bulk else None
                     vols = df_bulk['Volume'].ffill() if 'Volume' in df_bulk else None
                     if len(closes) < 2: return pd.DataFrame()
                     
@@ -4850,7 +4888,24 @@ with tab15:
                     
                     last_close = closes.iloc[-1]
                     prev_close = closes.iloc[-2]
+                    last_open = opens.iloc[-1] if opens is not None else prev_close
+                    
                     daily_ret = (last_close - prev_close) / prev_close
+                    gap_pct = (last_open - prev_close) / prev_close
+                    intraday_pct = (last_close - last_open) / last_open
+                    
+                    if vols is not None:
+                        last_vol = vols.iloc[-1]
+                        if len(vols) >= 20:
+                            avg_vol = vols.rolling(window=20).mean().iloc[-1]
+                        else:
+                            avg_vol = vols.mean()
+                        rvol = last_vol / (avg_vol + 1)
+                    else:
+                        last_vol = pd.Series(0, index=closes.columns)
+                        rvol = pd.Series(0, index=closes.columns)
+                        
+                    dollar_vol = last_close * last_vol
                     
                     valid_mask = ((last_close >= min_price) & (daily_ret > adaptive_thresh)).fillna(False)
                     valid_tickers = valid_mask[valid_mask].index.tolist()
@@ -4860,12 +4915,28 @@ with tab15:
                     for tick in valid_tickers:
                         try:
                             score = float(daily_ret[tick]) / float(adaptive_thresh)
-                            v = int(vols.iloc[-1][tick]) if vols is not None and pd.notna(vols.iloc[-1][tick]) else 0
+                            v = int(last_vol[tick]) if tick in last_vol and pd.notna(last_vol[tick]) else 0
+                            rv = float(rvol[tick]) if tick in rvol and pd.notna(rvol[tick]) else 0.0
+                            dv = float(dollar_vol[tick]) if tick in dollar_vol and pd.notna(dollar_vol[tick]) else 0.0
+                            gp = float(gap_pct[tick]) if tick in gap_pct and pd.notna(gap_pct[tick]) else 0.0
+                            intd = float(intraday_pct[tick]) if tick in intraday_pct and pd.notna(intraday_pct[tick]) else 0.0
+                            
+                            if dv >= 1_000_000:
+                                dv_str = f"${dv/1_000_000:.1f}M"
+                            elif dv >= 1_000:
+                                dv_str = f"${dv/1_000:.1f}K"
+                            else:
+                                dv_str = f"${dv:.0f}"
+                                
                             hot_results.append({
                                 "Ticker": str(tick),
                                 "Price": round(float(last_close[tick]), 2),
                                 "Daily Return %": round(float(daily_ret[tick]) * 100, 2),
+                                "Gap %": round(gp * 100, 2),
+                                "Intraday %": round(intd * 100, 2),
                                 "VIX Multiple": round(float(score), 2),
+                                "RVOL": round(rv, 2),
+                                "Dollar Vol": dv_str,
                                 "Volume": v
                             })
                         except: pass
