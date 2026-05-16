@@ -3811,165 +3811,177 @@ with tab7:
                 st.error(f"Error loading benchmark data: {str(e)}")
                 signals = None
 
-    elif strategy_type == "Implied Volatility Proxy (^VIX)":
-        st.markdown("### 🎲 Adaptive Implied Volatility Bands (^VIX)")
-        st.markdown("Instantly exit to cash when the VIX spikes relative to its dynamic baseline, dodging sudden crashes.")
+    elif strategy_type == "Asset-Specific GARCH Volatility Regime":
+        st.markdown("### 🎲 Asset-Specific GARCH Volatility Regime")
+        st.markdown("Instead of relying on macro indexes like the VIX, this dynamically calculates the specific asset's conditional volatility via GARCH and regime via GMM to size capital appropriately.")
         
-        col_vx1, col_vx2, col_vx3, col_vx4 = st.columns(4)
-        with col_vx1:
-            vix_ma_len = st.number_input("VIX Baseline (MA Length)", min_value=5, max_value=200, value=20, step=1)
-        with col_vx2:
-            vix_z = st.number_input("Risk-Off Spike (Z-Score)", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
-        with col_vx3:
-            vix_cap_z = st.number_input("Capitulation Buy (Z-Score)", min_value=1.0, max_value=6.0, value=3.5, step=0.1)
-        with col_vx4:
-            st.write("Asset Trend Filter")
-            use_trend_filter = st.checkbox("Only Sell if Asset < 50-SMA", value=True)
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            target_ann_vol = st.number_input("Target Annual Volatility (%)", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
+        with col_g2:
+            st.write("Vol-Targeting Machinery")
+            st.caption("Continuous capital sizing based on Target Vol / GARCH Vol.")
             
-        with st.spinner("Fetching ^VIX data..."):
+        with st.spinner("Fitting GARCH and Gaussian Mixture Models..."):
             try:
-                if live_mode:
-                    vix_df = load_data('^VIX', start_date, end_date, interval=data_interval)
-                else:
-                    vix_df = load_data('^VIX', bt_start_date, bt_end_date, interval='1d')
-                    
-                if vix_df is None or vix_df.empty:
-                    st.error("Could not fetch ^VIX data. Strategy cannot proceed.")
+                returns_bt = prices_bt.pct_change().dropna()
+                if len(returns_bt) < 100:
+                    st.error("Not enough data to fit GARCH and GMM.")
                     signals = None
                 else:
-                    vix_prices = vix_df['Close']
-                    common_idx = prices_bt.index.intersection(vix_prices.index)
+                    # 1. Fit GMM for BULL / BEAR Regime
+                    from sklearn.mixture import GaussianMixture
+                    gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42)
+                    ret_arr = returns_bt.values.reshape(-1, 1)
+                    gmm.fit(ret_arr)
                     
-                    if len(common_idx) < vix_ma_len:
-                        st.error("Not enough overlapping data between asset and ^VIX to calculate bands.")
-                        signals = None
-                    else:
-                        aligned_vix = vix_prices.loc[common_idx]
+                    # Identify the BULL regime as the one with the higher mean return
+                    bull_class = np.argmax(gmm.means_.flatten())
+                    gmm_preds = gmm.predict(ret_arr)
+                    
+                    is_bull = pd.Series(gmm_preds == bull_class, index=returns_bt.index)
+                    
+                    # 2. Fit GARCH for Conditional Volatility
+                    from arch import arch_model
+                    # arch_model expects percentage returns
+                    am = arch_model(returns_bt * 100, vol='Garch', p=1, q=1, dist='normal')
+                    res = am.fit(disp='off')
+                    
+                    # conditional_volatility is in percentage points (e.g. 1.5 meaning 1.5%)
+                    # Convert to decimal daily volatility
+                    garch_vol_daily = res.conditional_volatility / 100
+                    
+                    # 3. Determine vol_state
+                    avg_vol = garch_vol_daily.mean()
+                    is_high_vol = garch_vol_daily > (avg_vol * 1.2)
+                    
+                    # 4. Generate Signal: Long only if BULL and not HIGH Vol
+                    raw_signal = (is_bull & ~is_high_vol).astype(float)
+                    
+                    # 5. Volatility Targeting Capital Sizing
+                    # Target daily vol = Target Annual Vol / sqrt(252)
+                    daily_target_vol = (target_ann_vol / 100) / np.sqrt(252)
+                    
+                    # signal = min(1.0, target_vol / curr_garch_vol)
+                    # We clip the leverage to 1.0 (no margin)
+                    position_size = np.clip(daily_target_vol / garch_vol_daily, 0.0, 1.0)
+                    
+                    # Final Continuous Signal
+                    final_signals = raw_signal * position_size
+                    
+                    # Align indices (returns_bt is missing the first day)
+                    signals = pd.Series(0.0, index=prices_bt.index)
+                    signals.loc[returns_bt.index] = final_signals
+                    
+                    with st.expander("See Strategy Context", expanded=True):
+                        fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.05)
                         
-                        # Calculate Adaptive Bands
-                        vix_ma = aligned_vix.rolling(window=int(vix_ma_len)).mean()
-                        vix_std = aligned_vix.rolling(window=int(vix_ma_len)).std()
-                        vix_upper = vix_ma + (vix_z * vix_std)
-                        vix_cap = vix_ma + (vix_cap_z * vix_std)
+                        fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Asset Price'), row=1, col=1)
                         
-                        asset_prices = prices_bt.loc[common_idx]
-                        asset_sma = asset_prices.rolling(window=50).mean()
+                        # Plot GARCH Volatility
+                        fig_ctx.add_trace(go.Scatter(x=garch_vol_daily.index, y=garch_vol_daily * 100, mode='lines', line=dict(color='purple'), name='GARCH Vol (%)'), row=2, col=1)
+                        fig_ctx.add_trace(go.Scatter(x=garch_vol_daily.index, y=np.ones(len(garch_vol_daily)) * (avg_vol * 1.2) * 100, mode='lines', line=dict(color='red', dash='dash'), name='High Vol Threshold'), row=2, col=1)
                         
-                        raw_signals = np.ones(len(aligned_vix)) # Default LONG
-                        current_state = 1 # 1 = LONG, 0 = CASH
+                        # Plot Capital Allocation
+                        fig_ctx.add_trace(go.Scatter(x=signals.index, y=signals * 100, mode='lines', line=dict(color='green'), fill='tozeroy', name='Capital Exposure (%)'), row=3, col=1)
                         
-                        for i in range(len(aligned_vix)):
-                            if pd.isna(vix_upper.iloc[i]):
-                                raw_signals[i] = 1
-                                continue
-                                
-                            v_val = aligned_vix.iloc[i]
-                            v_ma = vix_ma.iloc[i]
-                            v_up = vix_upper.iloc[i]
-                            v_cp = vix_cap.iloc[i]
-                            
-                            asset_val = asset_prices.iloc[i]
-                            a_sma = asset_sma.iloc[i]
-                            
-                            # 1. Capitulation Panic Buy (Extreme Z-Score Mean Reversion)
-                            if v_val >= v_cp:
-                                current_state = 1
-                            # 2. Risk-Off Spike Exit
-                            elif v_val >= v_up:
-                                # Check Trend Filter
-                                if use_trend_filter and not pd.isna(a_sma):
-                                    if asset_val < a_sma:
-                                        current_state = 0 # Asset breaking down -> CASH
-                                    else:
-                                        pass # Asset strong -> Ignore VIX noise
-                                else:
-                                    current_state = 0 # No filter -> CASH
-                            # 3. Hysteresis Re-entry (Wait for VIX to drop fully below MA)
-                            elif v_val < v_ma:
-                                current_state = 1
-                            # 4. The "Chop Zone" between MA and Upper Band -> Maintain State
-                            else:
-                                pass 
-                                
-                            raw_signals[i] = current_state
-                            
-                        signals = pd.Series(np.nan, index=prices_bt.index)
-                        signals.loc[common_idx] = raw_signals
-                        signals = signals.ffill().fillna(1)
+                        # Highlight BULL regime
+                        highlight_plotly_zones(fig_ctx, is_bull, 'green', opacity=0.1, row=1, col=1)
                         
-                        with st.expander("See Strategy Context", expanded=True):
-                            fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
-                            
-                            fig_ctx.add_trace(go.Scatter(x=asset_prices.index, y=asset_prices, mode='lines', line=dict(color='gray'), opacity=0.8, name='Asset Price'), row=1, col=1)
-                            if use_trend_filter:
-                                fig_ctx.add_trace(go.Scatter(x=asset_sma.index, y=asset_sma, mode='lines', line=dict(color='yellow', dash='dot'), opacity=0.5, name='Asset 50-SMA'), row=1, col=1)
-                                
-                            fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'Baseline MA ({vix_ma_len})'), row=2, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Threshold (+{vix_z}σ)'), row=2, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Buy (+{vix_cap_z}σ)'), row=2, col=1)
-                            
-                            highlight_plotly_zones(fig_ctx, pd.Series(raw_signals, index=common_idx) == 1, 'green', opacity=0.1, row=1, col=1)
-                            highlight_plotly_zones(fig_ctx, pd.Series(raw_signals, index=common_idx) == 1, 'green', opacity=0.1, row=2, col=1)
-                            
-                            fig_ctx.update_layout(title="Institutional VIX Regime Model (Hysteresis + Capitulation)", hovermode="x unified", template="plotly_dark", height=600)
-                            st.plotly_chart(fig_ctx, use_container_width=True)
-                            
+                        fig_ctx.update_layout(title="Asset-Specific Volatility Targeting (GMM Regime + GARCH)", hovermode="x unified", template="plotly_dark", height=700)
+                        fig_ctx.update_yaxes(title_text="Capital (%)", row=3, col=1, range=[0, 105])
+                        st.plotly_chart(fig_ctx, use_container_width=True)
+                        
             except Exception as e:
-                st.error(f"Error loading ^VIX data: {str(e)}")
+                st.error(f"Error executing Volatility Regime backtest: {str(e)}")
                 signals = None
 
     elif strategy_type == "Institutional Hurst Exponent":
         st.markdown("### 🎲 Institutional Hurst Exponent (Trend vs Mean-Reversion)")
-        st.markdown("Trade the asset based on its mathematical persistence. \n* **Trending Regime (H > Threshold):** Buy via Momentum (EMA Cross).\n* **Mean-Reverting Regime (H < Threshold):** Buy via Mean Reversion (Bollinger Bands).")
+        st.markdown("Trade the asset based on its mathematical persistence. \n* **Trending Regime (H > 0.55):** Buy via Momentum (EMA Cross).\n* **Mean-Reverting Regime (H < 0.45):** Buy via Mean Reversion (Bollinger Bands).\n* **Dead Zone:** Stay in CASH between 0.45 and 0.55. Uses 5-bar confirmation to kill whipsaws.")
         
         col_h1, col_h2 = st.columns(2)
         with col_h1:
             hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=100, step=10)
+            target_ann_vol = st.number_input("Target Annual Volatility (%) ", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
         with col_h2:
-            hurst_threshold = st.number_input("Trend Threshold (Long >)", min_value=0.4, max_value=0.7, value=0.50, step=0.01)
+            st.write("Regime Parameters")
+            st.caption("Dead Zone: 0.45 to 0.55\nConfirmation: 5 Consecutive Bars\nSizing: Continuous Vol-Targeting")
             
-        with st.spinner("Calculating Rolling Hurst Exponent..."):
+        with st.spinner("Calculating Institutional Hurst & Volatility Targeting..."):
             try:
                 hurst_series = rolling_hurst(prices_bt, window=int(hurst_window))
                 
                 # 1. Trend Signal (EMA Cross)
                 ema_fast = prices_bt.ewm(span=20, adjust=False).mean()
                 ema_slow = prices_bt.ewm(span=50, adjust=False).mean()
-                trend_signal = (ema_fast > ema_slow).astype(int)
+                trend_signal = (ema_fast > ema_slow).astype(float)
                 
                 # 2. Mean Reversion Signal (Bollinger Bands)
                 bb_ma = prices_bt.rolling(window=20).mean()
                 bb_std = prices_bt.rolling(window=20).std()
                 bb_lower = bb_ma - (2 * bb_std)
-                # Stateful MR inline
                 mr_sig = pd.Series(np.nan, index=prices_bt.index)
-                mr_sig.loc[prices_bt < bb_lower] = 1
-                mr_sig.loc[prices_bt > bb_ma] = 0
-                mr_signal = mr_sig.ffill().fillna(0)
+                mr_sig.loc[prices_bt < bb_lower] = 1.0
+                mr_sig.loc[prices_bt > bb_ma] = 0.0
+                mr_signal = mr_sig.ffill().fillna(0.0)
                 
-                # 3. Regime Allocator
-                is_trending = (hurst_series > hurst_threshold)
+                # 3. Regime Allocator (5-Bar Confirmation + Dead Zone)
+                cond_trend = (hurst_series > 0.55)
+                cond_mr = (hurst_series < 0.45)
+                cond_cash = (hurst_series >= 0.45) & (hurst_series <= 0.55)
                 
-                raw_signals = pd.Series(0, index=prices_bt.index)
-                raw_signals[is_trending] = trend_signal[is_trending]
-                raw_signals[~is_trending] = mr_signal[~is_trending]
+                conf_trend = cond_trend.rolling(5).sum() == 5
+                conf_mr = cond_mr.rolling(5).sum() == 5
+                conf_cash = cond_cash.rolling(5).sum() == 5
                 
-                signals = raw_signals.fillna(0)
+                state = pd.Series(np.nan, index=prices_bt.index)
+                state.loc[conf_trend] = 1 # 1 = TREND
+                state.loc[conf_mr] = -1   # -1 = MR
+                state.loc[conf_cash] = 0  # 0 = CASH
+                state = state.ffill().fillna(0)
+                
+                raw_signals = pd.Series(0.0, index=prices_bt.index)
+                raw_signals.loc[state == 1] = trend_signal.loc[state == 1]
+                raw_signals.loc[state == -1] = mr_signal.loc[state == -1]
+                
+                # 4. Volatility Targeting Capital Sizing
+                returns_bt = prices_bt.pct_change().dropna()
+                from arch import arch_model
+                am = arch_model(returns_bt * 100, vol='Garch', p=1, q=1, dist='normal')
+                res = am.fit(disp='off')
+                garch_vol_daily = res.conditional_volatility / 100
+                
+                # Align garch_vol_daily with prices_bt
+                garch_vol_aligned = pd.Series(np.nan, index=prices_bt.index)
+                garch_vol_aligned.loc[returns_bt.index] = garch_vol_daily
+                garch_vol_aligned = garch_vol_aligned.bfill() # fill the first day
+                
+                daily_target_vol = (target_ann_vol / 100) / np.sqrt(252)
+                position_size = np.clip(daily_target_vol / garch_vol_aligned, 0.0, 1.0)
+                
+                signals = raw_signals * position_size
                 
                 with st.expander("See Strategy Context", expanded=True):
-                    fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+                    fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.4, 0.3, 0.3], vertical_spacing=0.05)
                     
                     fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
                     
                     fig_ctx.add_trace(go.Scatter(x=hurst_series.index, y=hurst_series, mode='lines', line=dict(color='cyan'), name='Hurst (H)'), row=2, col=1)
-                    fig_ctx.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="Random Walk (0.5)")
-                    fig_ctx.add_hline(y=hurst_threshold, line_dash="dash", line_color="green", row=2, col=1, annotation_text=f"Trend Entry ({hurst_threshold})")
+                    fig_ctx.add_hline(y=0.55, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Trend (>0.55)")
+                    fig_ctx.add_hline(y=0.45, line_dash="dash", line_color="red", row=2, col=1, annotation_text="Mean Reversion (<0.45)")
                     
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
+                    # Plot Capital Allocation
+                    fig_ctx.add_trace(go.Scatter(x=signals.index, y=signals * 100, mode='lines', line=dict(color='green'), fill='tozeroy', name='Capital Exposure (%)'), row=3, col=1)
                     
-                    fig_ctx.update_layout(title="Hurst Exponent Strategy", hovermode="x unified", template="plotly_dark", height=500)
+                    # Highlight regimes
+                    highlight_plotly_zones(fig_ctx, state == 1, 'green', opacity=0.1, row=1, col=1)
+                    highlight_plotly_zones(fig_ctx, state == -1, 'orange', opacity=0.1, row=1, col=1)
+                    highlight_plotly_zones(fig_ctx, state == 1, 'green', opacity=0.1, row=2, col=1)
+                    highlight_plotly_zones(fig_ctx, state == -1, 'orange', opacity=0.1, row=2, col=1)
+                    
+                    fig_ctx.update_layout(title="Institutional Hurst Regime (Dead Zone + Vol Targeting)", hovermode="x unified", template="plotly_dark", height=700)
+                    fig_ctx.update_yaxes(title_text="Capital (%)", row=3, col=1, range=[0, 105])
                     st.plotly_chart(fig_ctx, use_container_width=True)
                     
             except Exception as e:
