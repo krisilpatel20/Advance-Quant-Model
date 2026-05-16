@@ -1085,7 +1085,7 @@ class BacktestEngine:
                 if stop_out:
                     position = 0
                     exit_price = price
-                    cash = holdings * exit_price
+                    cash = cash + (holdings * exit_price)
                     holdings = 0
                     
                     pnl = (exit_price - entry_price) / entry_price
@@ -1105,20 +1105,22 @@ class BacktestEngine:
                 current_val = cash
             
             # Signal Processing
-            if position == 0 and signal == 1 and cooldown_bars == 0:
+            if position == 0 and signal > 0 and cooldown_bars == 0:
                 # Buy
                 position = 1
                 entry_price = price
                 entry_date = date
                 max_price_since_entry = price
                 
-                holdings = cash / price
-                cash = 0
+                # Fractional position sizing based on signal (1.0 = 100%, 0.35 = 35%)
+                invest_amt = cash * signal
+                holdings = invest_amt / price
+                cash = cash - invest_amt
             elif position == 1 and signal == 0:
                 # Sell
                 position = 0
                 exit_price = price
-                cash = holdings * exit_price
+                cash = cash + (holdings * exit_price)
                 holdings = 0
                 
                 pnl = (exit_price - entry_price) / entry_price
