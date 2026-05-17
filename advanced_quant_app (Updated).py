@@ -14,7 +14,7 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from datetime import datetime, timedelta
 import io
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -1017,6 +1017,179 @@ class EhlersFilters:
         decycler = prices_vals - hp
         return pd.Series(decycler, index=prices.index)
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_iv_metrics(ticker: str) -> dict | None:
+    try:
+        tk = yf.Ticker(ticker)
+        info = tk.info
+        hist = tk.history(period="252d", interval="1d", auto_adjust=True)
+        if hist.empty or len(hist) < 30:
+            return None
+        current_price = float(hist['Close'].iloc[-1])
+        if current_price <= 0:
+            return None
+        log_rets = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
+        hv_30 = float(log_rets.tail(21).std() * np.sqrt(252) * 100)
+        hv_60 = float(log_rets.tail(42).std() * np.sqrt(252) * 100) if len(log_rets) >= 42 else hv_30
+        hv_252 = float(log_rets.std() * np.sqrt(252) * 100)
+        expirations = tk.options
+        if not expirations:
+            return None
+        now = datetime.now()
+        valid_exps = []
+        for exp in expirations:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d")
+            dte = (exp_date - now).days
+            if 7 <= dte <= 90:
+                valid_exps.append((exp, dte))
+        if not valid_exps:
+            return None
+        all_call_iv, all_put_iv, atm_call_iv_list, atm_put_iv_list = [], [], [], []
+        total_call_vol, total_put_vol, total_call_oi, total_put_oi = 0, 0, 0, 0
+        skew_readings = []
+        for exp, dte in valid_exps[:4]:
+            try:
+                chain = tk.option_chain(exp)
+                calls = chain.calls[(chain.calls['impliedVolatility'] > 0.01) & (chain.calls['impliedVolatility'] < 5.0)].copy()
+                puts = chain.puts[(chain.puts['impliedVolatility'] > 0.01) & (chain.puts['impliedVolatility'] < 5.0)].copy()
+                if calls.empty or puts.empty:
+                    continue
+                atm_range = (current_price * 0.95, current_price * 1.05)
+                atm_calls = calls[(calls['strike'] >= atm_range[0]) & (calls['strike'] <= atm_range[1])]
+                atm_puts = puts[(puts['strike'] >= atm_range[0]) & (puts['strike'] <= atm_range[1])]
+                if not atm_calls.empty:
+                    atm_call_iv_list.append(float(atm_calls['impliedVolatility'].median()))
+                if not atm_puts.empty:
+                    atm_put_iv_list.append(float(atm_puts['impliedVolatility'].median()))
+                otm_puts = puts[(puts['strike'] >= current_price * 0.85) & (puts['strike'] < current_price * 0.95)]
+                otm_calls = calls[(calls['strike'] > current_price * 1.05) & (calls['strike'] <= current_price * 1.15)]
+                if not otm_puts.empty and not atm_calls.empty:
+                    put_iv = float(otm_puts['impliedVolatility'].median())
+                    call_iv_atm = float(atm_calls['impliedVolatility'].median())
+                    skew_readings.append(put_iv - call_iv_atm)
+                total_call_vol += int(calls['volume'].fillna(0).sum())
+                total_put_vol += int(puts['volume'].fillna(0).sum())
+                total_call_oi += int(calls['openInterest'].fillna(0).sum())
+                total_put_oi += int(puts['openInterest'].fillna(0).sum())
+            except Exception:
+                continue
+        if not atm_call_iv_list:
+            return None
+        current_atm_iv = float(np.mean(atm_call_iv_list) * 100)
+        if len(log_rets) >= 252:
+            rolling_vols = log_rets.rolling(21).std().dropna() * np.sqrt(252) * 100
+            iv_52w_low = float(rolling_vols.min())
+            iv_52w_high = float(rolling_vols.max())
+            iv_percentile = float((rolling_vols < current_atm_iv).mean() * 100)
+        else:
+            iv_52w_low = min(hv_30, hv_252) * 0.8
+            iv_52w_high = max(hv_30, hv_252) * 1.3
+            iv_percentile = float(np.clip(((current_atm_iv - iv_52w_low) / (iv_52w_high - iv_52w_low + 1e-6)) * 100, 0, 100))
+        iv_rank = float(np.clip(((current_atm_iv - iv_52w_low) / (iv_52w_high - iv_52w_low + 1e-6)) * 100, 0, 100))
+        pc_ratio = total_put_vol / (total_call_vol + 1e-6)
+        pc_oi_ratio = total_put_oi / (total_call_oi + 1e-6)
+        skew = float(np.mean(skew_readings)) * 100 if skew_readings else 0.0
+        iv_hv_ratio = current_atm_iv / (hv_30 + 1e-6)
+        term_structure_slope = (atm_call_iv_list[-1] - atm_call_iv_list[0]) * 100 if len(atm_call_iv_list) >= 2 else 0.0
+        
+        score = 0.0
+        signals = []
+        if iv_rank < 30 and iv_hv_ratio > 1.05:
+            score += 2.5
+            signals.append(("IV Expansion from Low Base", "green", f"IVR={iv_rank:.0f} (low), IV/HV={iv_hv_ratio:.2f} (rising)"))
+        if skew < -2.0:
+            score += 2.0
+            signals.append(("Bullish Call Skew", "green", f"Skew={skew:.1f}% (calls premium over puts)"))
+        elif skew > 5.0:
+            score -= 1.0
+            signals.append(("Bearish Put Skew", "red", f"Skew={skew:.1f}% (puts heavily bid — hedging)"))
+        if pc_ratio < 0.6 and current_atm_iv > hv_30:
+            score += 2.0
+            signals.append(("Call Buying Dominance", "green", f"P/C={pc_ratio:.2f} (call-heavy), IV > HV"))
+        if iv_rank > 70 and iv_hv_ratio > 1.3:
+            score += 1.5
+            signals.append(("IV Crush Setup", "orange", f"IVR={iv_rank:.0f} (elevated), IV/HV={iv_hv_ratio:.2f}"))
+        if term_structure_slope > 1.0:
+            score += 1.0
+            signals.append(("Contango IV Structure", "green", f"Near→Far slope: +{term_structure_slope:.1f}%"))
+        elif term_structure_slope < -3.0:
+            score -= 1.0
+            signals.append(("Backwardation IV Structure", "orange", f"Near→Far slope: {term_structure_slope:.1f}% (event risk near)"))
+        if pc_oi_ratio < 0.5:
+            score += 1.0
+            signals.append(("Heavy Call OI", "green", f"P/C OI={pc_oi_ratio:.2f} (call-heavy positioning)"))
+        if iv_hv_ratio < 0.7:
+            score -= 1.5
+            signals.append(("IV Suppressed vs HV", "red", f"IV/HV={iv_hv_ratio:.2f} (options underpricing risk)"))
+            
+        if score >= 4.0:
+            verdict, verdict_color = "STRONG BUY", "#00ff88"
+        elif score >= 2.5:
+            verdict, verdict_color = "BUY", "#44cc66"
+        elif score >= 1.0:
+            verdict, verdict_color = "WATCH", "#ffcc00"
+        elif score <= -1.0:
+            verdict, verdict_color = "AVOID", "#ff4444"
+        else:
+            verdict, verdict_color = "NEUTRAL", "#aaaaaa"
+            
+        return {
+            'ticker': ticker, 'price': current_price, 'atm_iv': current_atm_iv, 'iv_rank': iv_rank,
+            'iv_percentile': iv_percentile, 'hv_30': hv_30, 'hv_60': hv_60, 'hv_252': hv_252,
+            'iv_hv_ratio': iv_hv_ratio, 'skew': skew, 'pc_ratio': pc_ratio, 'pc_oi_ratio': pc_oi_ratio,
+            'term_structure_slope': term_structure_slope, 'call_vol': total_call_vol, 'put_vol': total_put_vol,
+            'call_oi': total_call_oi, 'put_oi': total_put_oi, 'score': score, 'verdict': verdict,
+            'verdict_color': verdict_color, 'signals': signals, 'mkt_cap': info.get('marketCap', 0),
+            'sector': info.get('sector', 'Unknown'), 'name': info.get('shortName', ticker)
+        }
+    except Exception:
+        return None
+
+def build_iv_surface(ticker: str, current_price: float):
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options
+        if not expirations:
+            return None
+        now = datetime.now()
+        surface_rows = []
+        for exp in expirations[:6]:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d")
+            dte = (exp_date - now).days
+            if dte < 5:
+                continue
+            try:
+                chain = tk.option_chain(exp)
+                calls = chain.calls[(chain.calls['impliedVolatility'] > 0.01) & (chain.calls['volume'].fillna(0) > 0)].copy()
+                for _, row in calls.iterrows():
+                    moneyness = (row['strike'] / current_price - 1) * 100
+                    if -25 <= moneyness <= 25:
+                        surface_rows.append({'DTE': dte, 'Moneyness': round(moneyness, 1), 'IV': round(row['impliedVolatility'] * 100, 2)})
+            except Exception:
+                continue
+        return pd.DataFrame(surface_rows) if surface_rows else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=86400)
+def get_sp500():
+    try:
+        return pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].tolist()
+    except:
+        return ["AAPL","MSFT","AMZN","GOOG","NVDA","META","TSLA","BRK-B","UNH","JNJ", "JPM","V","PG","MA","HD","CVX","MRK","ABBV","PEP","COST"]
+
+@st.cache_data(ttl=86400)
+def get_nasdaq100():
+    try:
+        tables = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')
+        for t in tables:
+            if 'Ticker' in t.columns:
+                return t['Ticker'].tolist()
+        return tables[4].iloc[:, 1].tolist()
+    except:
+        return ["AAPL","MSFT","AMZN","GOOG","NVDA","META","TSLA","AVGO","PEP","COST"]
+
+
 class BacktestEngine:
     """
     Handles simple vectorised backtesting for regime-based strategies.
@@ -1085,7 +1258,7 @@ class BacktestEngine:
                 if stop_out:
                     position = 0
                     exit_price = price
-                    cash = holdings * exit_price
+                    cash = cash + (holdings * exit_price)
                     holdings = 0
                     
                     pnl = (exit_price - entry_price) / entry_price
@@ -1105,20 +1278,22 @@ class BacktestEngine:
                 current_val = cash
             
             # Signal Processing
-            if position == 0 and signal == 1 and cooldown_bars == 0:
+            if position == 0 and signal > 0 and cooldown_bars == 0:
                 # Buy
                 position = 1
                 entry_price = price
                 entry_date = date
                 max_price_since_entry = price
                 
-                holdings = cash / price
-                cash = 0
+                # Fractional position sizing based on signal (1.0 = 100%, 0.35 = 35%)
+                invest_amt = cash * signal
+                holdings = invest_amt / price
+                cash = cash - invest_amt
             elif position == 1 and signal == 0:
                 # Sell
                 position = 0
                 exit_price = price
-                cash = holdings * exit_price
+                cash = cash + (holdings * exit_price)
                 holdings = 0
                 
                 pnl = (exit_price - entry_price) / entry_price
@@ -1977,10 +2152,11 @@ tabs = st.tabs([
     "🏦 FED Balance Sheet",
     "🎲 Options IV Surface",
     "🎲 Hurst Exponent",
-    "🔥 Hot 10 (Daily)"
+    "🔥 Hot 10 (Daily)",
+    "🎯 Institutional IV Scanner"
 ])
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15 = tabs
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16 = tabs
 
 if df_main is not None:
     # Initialize Report Generator
@@ -3921,55 +4097,90 @@ with tab7:
 
     elif strategy_type == "Institutional Hurst Exponent":
         st.markdown("### 🎲 Institutional Hurst Exponent (Trend vs Mean-Reversion)")
-        st.markdown("Trade the asset based on its mathematical persistence. \n* **Trending Regime (H > Threshold):** Buy via Momentum (EMA Cross).\n* **Mean-Reverting Regime (H < Threshold):** Buy via Mean Reversion (Bollinger Bands).")
+        st.markdown("Trade the asset based on its mathematical persistence. \n* **Trending Regime (H > 0.55):** Buy via Momentum (EMA Cross).\n* **Mean-Reverting Regime (H < 0.45):** Buy via Mean Reversion (Bollinger Bands).\n* **Dead Zone:** Stay in CASH between 0.45 and 0.55. Uses 5-bar confirmation to kill whipsaws.")
         
         col_h1, col_h2 = st.columns(2)
         with col_h1:
             hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=100, step=10)
+            target_ann_vol = st.number_input("Target Annual Volatility (%) ", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
         with col_h2:
-            hurst_threshold = st.number_input("Trend Threshold (Long >)", min_value=0.4, max_value=0.7, value=0.50, step=0.01)
+            st.write("Regime Parameters")
+            st.caption("Dead Zone: 0.45 to 0.55\nConfirmation: 5 Consecutive Bars\nSizing: Continuous Vol-Targeting")
             
-        with st.spinner("Calculating Rolling Hurst Exponent..."):
+        with st.spinner("Calculating Institutional Hurst & Volatility Targeting..."):
             try:
                 hurst_series = rolling_hurst(prices_bt, window=int(hurst_window))
                 
                 # 1. Trend Signal (EMA Cross)
                 ema_fast = prices_bt.ewm(span=20, adjust=False).mean()
                 ema_slow = prices_bt.ewm(span=50, adjust=False).mean()
-                trend_signal = (ema_fast > ema_slow).astype(int)
+                trend_signal = (ema_fast > ema_slow).astype(float)
                 
                 # 2. Mean Reversion Signal (Bollinger Bands)
                 bb_ma = prices_bt.rolling(window=20).mean()
                 bb_std = prices_bt.rolling(window=20).std()
                 bb_lower = bb_ma - (2 * bb_std)
-                # Stateful MR inline
                 mr_sig = pd.Series(np.nan, index=prices_bt.index)
-                mr_sig.loc[prices_bt < bb_lower] = 1
-                mr_sig.loc[prices_bt > bb_ma] = 0
-                mr_signal = mr_sig.ffill().fillna(0)
+                mr_sig.loc[prices_bt < bb_lower] = 1.0
+                mr_sig.loc[prices_bt > bb_ma] = 0.0
+                mr_signal = mr_sig.ffill().fillna(0.0)
                 
-                # 3. Regime Allocator
-                is_trending = (hurst_series > hurst_threshold)
+                # 3. Regime Allocator (5-Bar Confirmation + Dead Zone)
+                cond_trend = (hurst_series > 0.55)
+                cond_mr = (hurst_series < 0.45)
+                cond_cash = (hurst_series >= 0.45) & (hurst_series <= 0.55)
                 
-                raw_signals = pd.Series(0, index=prices_bt.index)
-                raw_signals[is_trending] = trend_signal[is_trending]
-                raw_signals[~is_trending] = mr_signal[~is_trending]
+                conf_trend = cond_trend.rolling(5).sum() == 5
+                conf_mr = cond_mr.rolling(5).sum() == 5
+                conf_cash = cond_cash.rolling(5).sum() == 5
                 
-                signals = raw_signals.fillna(0)
+                state = pd.Series(np.nan, index=prices_bt.index)
+                state.loc[conf_trend] = 1 # 1 = TREND
+                state.loc[conf_mr] = -1   # -1 = MR
+                state.loc[conf_cash] = 0  # 0 = CASH
+                state = state.ffill().fillna(0)
+                
+                raw_signals = pd.Series(0.0, index=prices_bt.index)
+                raw_signals.loc[state == 1] = trend_signal.loc[state == 1]
+                raw_signals.loc[state == -1] = mr_signal.loc[state == -1]
+                
+                # 4. Volatility Targeting Capital Sizing
+                returns_bt = prices_bt.pct_change().dropna()
+                from arch import arch_model
+                am = arch_model(returns_bt * 100, vol='Garch', p=1, q=1, dist='normal')
+                res = am.fit(disp='off')
+                garch_vol_daily = res.conditional_volatility / 100
+                
+                # Align garch_vol_daily with prices_bt
+                garch_vol_aligned = pd.Series(np.nan, index=prices_bt.index)
+                garch_vol_aligned.loc[returns_bt.index] = garch_vol_daily
+                garch_vol_aligned = garch_vol_aligned.bfill() # fill the first day
+                
+                daily_target_vol = (target_ann_vol / 100) / np.sqrt(252)
+                position_size = np.clip(daily_target_vol / garch_vol_aligned, 0.0, 1.0)
+                
+                signals = raw_signals * position_size
                 
                 with st.expander("See Strategy Context", expanded=True):
-                    fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+                    fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.4, 0.3, 0.3], vertical_spacing=0.05)
                     
                     fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
                     
                     fig_ctx.add_trace(go.Scatter(x=hurst_series.index, y=hurst_series, mode='lines', line=dict(color='cyan'), name='Hurst (H)'), row=2, col=1)
-                    fig_ctx.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="Random Walk (0.5)")
-                    fig_ctx.add_hline(y=hurst_threshold, line_dash="dash", line_color="green", row=2, col=1, annotation_text=f"Trend Entry ({hurst_threshold})")
+                    fig_ctx.add_hline(y=0.55, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Trend (>0.55)")
+                    fig_ctx.add_hline(y=0.45, line_dash="dash", line_color="red", row=2, col=1, annotation_text="Mean Reversion (<0.45)")
                     
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
-                    highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
+                    # Plot Capital Allocation
+                    fig_ctx.add_trace(go.Scatter(x=signals.index, y=signals * 100, mode='lines', line=dict(color='green'), fill='tozeroy', name='Capital Exposure (%)'), row=3, col=1)
                     
-                    fig_ctx.update_layout(title="Hurst Exponent Strategy", hovermode="x unified", template="plotly_dark", height=500)
+                    # Highlight regimes
+                    highlight_plotly_zones(fig_ctx, state == 1, 'green', opacity=0.1, row=1, col=1)
+                    highlight_plotly_zones(fig_ctx, state == -1, 'orange', opacity=0.1, row=1, col=1)
+                    highlight_plotly_zones(fig_ctx, state == 1, 'green', opacity=0.1, row=2, col=1)
+                    highlight_plotly_zones(fig_ctx, state == -1, 'orange', opacity=0.1, row=2, col=1)
+                    
+                    fig_ctx.update_layout(title="Institutional Hurst Regime (Dead Zone + Vol Targeting)", hovermode="x unified", template="plotly_dark", height=700)
+                    fig_ctx.update_yaxes(title_text="Capital (%)", row=3, col=1, range=[0, 105])
                     st.plotly_chart(fig_ctx, use_container_width=True)
                     
             except Exception as e:
@@ -5054,6 +5265,206 @@ with tab15:
                     st.success(f"✅ Full report successfully emailed to {receiver_email}!")
                 except Exception as e:
                     st.error(f"Failed to send email. Check credentials. Error: {str(e)}")
+
+with tab16:
+    st.markdown("## 🎯 Institutional IV-Based Stock Scanner")
+    st.markdown("**Precision targeting using Implied Volatility dynamics — the way hedge funds screen for high-conviction setups.**\n\nThe model identifies stocks where IV structure signals institutional accumulation or directional conviction.")
+    
+    with st.expander("⚙️ Scanner Configuration", expanded=True):
+        col_c1, col_c2, col_c3 = st.columns(3)
+        with col_c1:
+            universe_choice = st.selectbox("Universe", ["S&P 500 (503 stocks)", "NASDAQ 100 (101 stocks)", "Custom Watchlist"])
+            scan_depth = st.number_input("Scan Depth (# tickers)", min_value=5, max_value=503, value=50, step=5)
+            workers = st.slider("Parallel Workers", 1, 20, 10)
+        with col_c2:
+            min_ivr = st.slider("Min IV Rank", 0, 100, 0)
+            max_ivr = st.slider("Max IV Rank", 0, 100, 100)
+            max_pc = st.slider("Max P/C Ratio", 0.1, 3.0, 1.5, step=0.1)
+        with col_c3:
+            min_score = st.slider("Min Signal Score", 0.0, 6.0, 2.5, step=0.5)
+            min_mktcap = st.select_slider("Min Market Cap", options=["Any", "$500M", "$2B", "$10B", "$50B"], value="$2B")
+            mktcap_map = {"Any": 0, "$500M": 5e8, "$2B": 2e9, "$10B": 1e10, "$50B": 5e10}
+            min_mktcap_val = mktcap_map[min_mktcap]
+            
+        custom_list = ""
+        if universe_choice == "Custom Watchlist":
+            custom_list = st.text_area("Tickers (comma separated)", "AAPL, TSLA, NVDA, META, AMZN")
+            
+        setup_filter = st.multiselect("Include Setups", ["IV Expansion from Low Base", "Bullish Call Skew", "Call Buying Dominance", "IV Crush Setup", "Contango IV Structure", "Heavy Call OI"], default=["IV Expansion from Low Base", "Bullish Call Skew", "Call Buying Dominance"])
+
+    st.subheader("🔍 Single Ticker Deep Dive")
+    col_td1, col_td2 = st.columns([1, 3])
+    with col_td1:
+        single_ticker = st.text_input("Deep Dive Ticker", "AAPL").upper()
+        run_single = st.button("Analyze Ticker", type="primary", use_container_width=True)
+
+    if run_single:
+        with st.spinner(f"Fetching options data for {single_ticker}..."):
+            result = get_iv_metrics(single_ticker)
+
+        if result is None:
+            st.error(f"No options data available for {single_ticker}, or insufficient history.")
+        else:
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Price", f"${result['price']:.2f}")
+            c2.metric("ATM IV", f"{result['atm_iv']:.1f}%")
+            c3.metric("IV Rank", f"{result['iv_rank']:.0f}/100", delta="High" if result['iv_rank'] > 50 else "Low", delta_color="inverse" if result['iv_rank'] > 70 else "normal")
+            c4.metric("IV/HV Ratio", f"{result['iv_hv_ratio']:.2f}", delta="Rich" if result['iv_hv_ratio'] > 1.2 else "Cheap")
+            c5.metric("P/C Ratio", f"{result['pc_ratio']:.2f}", delta="Calls dominant" if result['pc_ratio'] < 0.8 else "Puts dominant", delta_color="normal" if result['pc_ratio'] < 0.8 else "inverse")
+            c6.metric("Skew", f"{result['skew']:.1f}%", delta="Call skew ↑" if result['skew'] < -2 else "Put skew ↑", delta_color="normal" if result['skew'] < -2 else "inverse")
+            st.divider()
+            
+            score = result['score']
+            verdict = result['verdict']
+            col_v1, col_v2 = st.columns([1, 2])
+            with col_v1:
+                st.markdown(f'<div style="background:{result["verdict_color"]}22; border:2px solid {result["verdict_color"]}; border-radius:12px; padding:20px; text-align:center;"><h2 style="color:{result["verdict_color"]}; margin:0;">{verdict}</h2><p style="margin:4px 0; font-size:1.2em;">Score: {score:.1f} / 6.0</p><p style="margin:0; color:#aaa;">{result["name"]} | {result["sector"]}</p></div>', unsafe_allow_html=True)
+            with col_v2:
+                st.write("#### Active Signals")
+                if result['signals']:
+                    for sig_name, sig_color, sig_detail in result['signals']:
+                        icon = {"green": "✅", "orange": "⚠️", "red": "🔴"}.get(sig_color, "•")
+                        st.markdown(f"{icon} **{sig_name}**: {sig_detail}")
+                else:
+                    st.info("No strong directional signals detected.")
+            st.divider()
+
+            col_surf1, col_surf2 = st.columns(2)
+            with col_surf1:
+                st.write("#### IV Smile (Near-Term)")
+                surface_df = build_iv_surface(single_ticker, result['price'])
+                if surface_df is not None and not surface_df.empty:
+                    dte_options = sorted(surface_df['DTE'].unique())
+                    fig_smile = go.Figure()
+                    colors = ['#00f2ff', '#ff6b35', '#a855f7', '#22c55e']
+                    for i, dte in enumerate(dte_options[:4]):
+                        smile_data = surface_df[surface_df['DTE'] == dte].sort_values('Moneyness')
+                        if len(smile_data) >= 3:
+                            fig_smile.add_trace(go.Scatter(x=smile_data['Moneyness'], y=smile_data['IV'], mode='lines+markers', name=f"{dte}d", line=dict(color=colors[i % len(colors)], width=2), marker=dict(size=5)))
+                    fig_smile.add_vline(x=0, line_dash="dash", line_color="white", opacity=0.5, annotation_text="ATM")
+                    fig_smile.update_layout(title="IV Smile by Expiration", xaxis_title="Moneyness (% from ATM)", yaxis_title="Implied Volatility (%)", template="plotly_dark", height=350, legend=dict(orientation="h", y=-0.2))
+                    st.plotly_chart(fig_smile, use_container_width=True)
+                else:
+                    st.info("Insufficient options data for smile chart.")
+            with col_surf2:
+                st.write("#### Historical Vol Comparison")
+                fig_hv = go.Figure()
+                categories = ['HV 30d', 'HV 60d', 'HV 252d', 'ATM IV']
+                values = [result['hv_30'], result['hv_60'], result['hv_252'], result['atm_iv']]
+                fig_hv.add_trace(go.Bar(x=categories, y=values, marker_color=['#4488ff', '#3377ee', '#2266dd', '#ff6b35'], text=[f"{v:.1f}%" for v in values], textposition='outside'))
+                fig_hv.update_layout(title="IV vs Historical Volatility", yaxis_title="Volatility (%)", template="plotly_dark", height=350, showlegend=False)
+                st.plotly_chart(fig_hv, use_container_width=True)
+
+            st.write("#### IV Rank Gauge")
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number+delta", value=result['iv_rank'], domain={'x': [0, 1], 'y': [0, 1]},
+                title={'text': "IV Rank (0=Historically Low, 100=Historically High)", 'font': {'color': 'white'}},
+                delta={'reference': 50, 'increasing': {'color': "orange"}, 'decreasing': {'color': "green"}},
+                gauge={'axis': {'range': [0, 100], 'tickcolor': "white"}, 'bar': {'color': result['verdict_color']}, 'bgcolor': "gray", 'bordercolor': "white", 'steps': [{'range': [0, 30], 'color': '#00441b'}, {'range': [30, 70], 'color': '#525252'}, {'range': [70, 100], 'color': '#67000d'}], 'threshold': {'line': {'color': "white", 'width': 3}, 'thickness': 0.75, 'value': result['iv_rank']}}
+            ))
+            fig_gauge.update_layout(template="plotly_dark", height=300, paper_bgcolor='rgba(0,0,0,0)', font={'color': 'white'})
+            st.plotly_chart(fig_gauge, use_container_width=True)
+
+    st.divider()
+    st.subheader("📡 Bulk IV Scanner")
+    st.markdown("Scans the selected universe and ranks stocks by institutional IV conviction.")
+    
+    if st.button("🚀 Run IV Scan", type="primary", use_container_width=True):
+        if universe_choice == "S&P 500 (503 stocks)":
+            full_universe = get_sp500()
+        elif universe_choice == "NASDAQ 100 (101 stocks)":
+            full_universe = get_nasdaq100()
+        else:
+            full_universe = [t.strip().upper() for t in custom_list.split(",") if t.strip()]
+            
+        universe = full_universe[:scan_depth]
+        st.info(f"Scanning {len(universe)} tickers from {universe_choice}...")
+        
+        results = []
+        prog = st.progress(0)
+        status = st.empty()
+        errors = []
+        
+        def worker(ticker):
+            return get_iv_metrics(ticker)
+            
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(worker, t): t for t in universe}
+            for i, future in enumerate(as_completed(futures)):
+                t = futures[future]
+                try:
+                    r = future.result()
+                    if r is not None:
+                        results.append(r)
+                except Exception as e:
+                    errors.append(t)
+                prog.progress((i + 1) / len(universe))
+                status.text(f"Processed {i+1}/{len(universe)} | Found {len(results)} valid | Skipped {len(errors)}")
+                
+        prog.empty()
+        status.empty()
+        
+        if not results:
+            st.error("No results returned. Check ticker symbols or try a different universe.")
+        else:
+            df_results = pd.DataFrame(results)
+            filtered = df_results.copy()
+            if min_mktcap_val > 0:
+                filtered = filtered[filtered['mkt_cap'] >= min_mktcap_val]
+            filtered = filtered[(filtered['iv_rank'] >= min_ivr) & (filtered['iv_rank'] <= max_ivr) & (filtered['pc_ratio'] <= max_pc) & (filtered['score'] >= min_score)]
+            
+            if setup_filter:
+                def has_setup(signals):
+                    return any(sf in [s[0] for s in signals] for sf in setup_filter)
+                filtered = filtered[filtered['signals'].apply(has_setup)]
+                
+            filtered = filtered.sort_values('score', ascending=False)
+            st.write(f"### Results: {len(filtered)} stocks match criteria (from {len(df_results)} analyzed)")
+            
+            if filtered.empty:
+                st.warning("No stocks matched all filters. Try relaxing the criteria in the sidebar.")
+            else:
+                display_cols = ['ticker', 'name', 'price', 'atm_iv', 'iv_rank', 'iv_hv_ratio', 'skew', 'pc_ratio', 'score', 'verdict', 'sector']
+                display_df = filtered[display_cols].copy()
+                display_df.columns = ['Ticker', 'Name', 'Price', 'ATM IV%', 'IVR', 'IV/HV', 'Skew%', 'P/C', 'Score', 'Verdict', 'Sector']
+                
+                def style_verdict(val):
+                    return {'STRONG BUY': 'background-color: #00441b; color: #00ff88', 'BUY': 'background-color: #1a472a; color: #44cc66', 'WATCH': 'background-color: #3d3000; color: #ffcc00', 'NEUTRAL': 'background-color: #2a2a2a; color: #aaaaaa', 'AVOID': 'background-color: #3d0000; color: #ff4444'}.get(val, '')
+                    
+                styled = display_df.style.format({'Price': '${:.2f}', 'ATM IV%': '{:.1f}%', 'IVR': '{:.0f}', 'IV/HV': '{:.2f}', 'Skew%': '{:.1f}', 'P/C': '{:.2f}', 'Score': '{:.1f}'}).map(style_verdict, subset=['Verdict']).background_gradient(subset=['Score'], cmap='RdYlGn')
+                st.dataframe(styled, use_container_width=True, height=500)
+                
+                csv = display_df.to_csv(index=False)
+                st.download_button("📥 Download Results CSV", csv, file_name=f"iv_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
+                
+                st.divider()
+                st.write("#### Top 10 Institutional IV Setups")
+                top10 = filtered.head(10)
+                for _, row in top10.iterrows():
+                    with st.expander(f"{'🟢' if 'BUY' in row['verdict'] else '🟡'} {row['ticker']} — {row['name']} | Score: {row['score']:.1f} | {row['verdict']}"):
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1.metric("Price", f"${row['price']:.2f}")
+                        m2.metric("ATM IV", f"{row['atm_iv']:.1f}%")
+                        m3.metric("IV Rank", f"{row['iv_rank']:.0f}")
+                        m4.metric("IV/HV", f"{row['iv_hv_ratio']:.2f}")
+                        m5.metric("P/C", f"{row['pc_ratio']:.2f}")
+                        st.write("**Active signals:**")
+                        for sig_name, sig_color, sig_detail in row['signals']:
+                            icon = "✅" if sig_color == "green" else "⚠️" if sig_color == "orange" else "🔴"
+                            st.markdown(f"{icon} **{sig_name}**: {sig_detail}")
+                            
+                        fig_mini = go.Figure(go.Bar(x=['HV 30d', 'HV 252d', 'ATM IV'], y=[row['hv_30'], row['hv_252'], row['atm_iv']], marker_color=['#4488ff', '#2266dd', '#ff6b35'], text=[f"{v:.1f}%" for v in [row['hv_30'], row['hv_252'], row['atm_iv']]], textposition='outside'))
+                        fig_mini.update_layout(height=200, template="plotly_dark", margin=dict(t=10, b=10, l=10, r=10), showlegend=False, yaxis_title="Vol %")
+                        st.plotly_chart(fig_mini, use_container_width=True)
+
+                st.divider()
+                st.write("#### Sector Distribution of Signals")
+                sector_counts = filtered.groupby('sector')['score'].agg(['count', 'mean']).reset_index()
+                sector_counts.columns = ['Sector', 'Count', 'Avg Score']
+                sector_counts = sector_counts.sort_values('Count', ascending=True)
+                fig_sector = go.Figure(go.Bar(x=sector_counts['Count'], y=sector_counts['Sector'], orientation='h', marker=dict(color=sector_counts['Avg Score'], colorscale='RdYlGn', showscale=True, colorbar=dict(title="Avg Score")), text=[f"{c} stocks (avg {s:.1f})" for c, s in zip(sector_counts['Count'], sector_counts['Avg Score'])], textposition='outside'))
+                fig_sector.update_layout(title="Sectors with IV Conviction Signals", template="plotly_dark", height=max(300, len(sector_counts) * 35), xaxis_title="Number of Stocks")
+                st.plotly_chart(fig_sector, use_container_width=True)
 
 # Footer
 st.markdown("---")
