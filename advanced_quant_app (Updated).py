@@ -2153,10 +2153,13 @@ tabs = st.tabs([
     "🎲 Options IV Surface",
     "🎲 Hurst Exponent",
     "🔥 Hot 10 (Daily)",
-    "🎯 Institutional IV Scanner"
+    "🎯 Institutional IV Scanner",
+    "📊 CVD & Volume Delta",
+    "📈 Institutional VWAP",
+    "🔬 Time Series Analysis"
 ])
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16 = tabs
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19 = tabs
 
 if df_main is not None:
     # Initialize Report Generator
