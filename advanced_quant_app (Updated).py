@@ -1382,6 +1382,91 @@ class BacktestEngine:
 
 
 
+
+
+def make_stateful_position(entry_cond, exit_cond, index):
+    """
+    Converts entry/exit booleans into a 0/1 long-only position series.
+    Entry = 1, Exit = 0, then forward-filled.
+    """
+    pos = pd.Series(np.nan, index=index, dtype=float)
+    entry_cond = pd.Series(entry_cond, index=index).fillna(False)
+    exit_cond = pd.Series(exit_cond, index=index).fillna(False)
+    pos.loc[entry_cond] = 1.0
+    pos.loc[exit_cond] = 0.0
+    return pos.ffill().fillna(0.0).clip(lower=0, upper=1)
+
+
+def evaluate_strategy_candidate(prices, signals, initial_capital=10000.0):
+    """Fast score helper for strategy candidate ranking."""
+    prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    signals = pd.Series(signals).reindex(prices.index).ffill().fillna(0).clip(lower=0, upper=1)
+    if len(prices) < 5:
+        return None
+    res = BacktestEngine.run_strategy(prices, signals, initial_capital=initial_capital)
+    strat_ret = (res['equity_curve'].iloc[-1] / initial_capital - 1) * 100
+    bh_ret = (res['benchmark_curve'].iloc[-1] / initial_capital - 1) * 100
+    rets = res['returns']
+    dd = ((1 + rets).cumprod() / (1 + rets).cumprod().cummax() - 1).min() * 100 if len(rets) else 0
+    return {
+        'Strategy Return %': strat_ret,
+        'Buy & Hold Return %': bh_ret,
+        'Difference %': strat_ret - bh_ret,
+        'Max DD %': dd,
+        'Trades': len(res['trades']),
+        'signals': signals,
+        'raw': res
+    }
+
+
+def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=10000.0, file_prefix="Adaptive_Strategy"):
+    """
+    Tests multiple long/cash rules and displays the best performer vs buy & hold.
+    This is an optimizer/research lab, not a future guarantee.
+    """
+    rows = []
+    scored = []
+    for name, logic_text, sig in candidates:
+        score = evaluate_strategy_candidate(prices, sig, initial_capital=initial_capital)
+        if score is None:
+            continue
+        scored.append((name, logic_text, score))
+        rows.append({
+            'Rule': name,
+            'Strategy Return %': round(score['Strategy Return %'], 2),
+            'Buy & Hold Return %': round(score['Buy & Hold Return %'], 2),
+            'Difference %': round(score['Difference %'], 2),
+            'Max DD %': round(score['Max DD %'], 2),
+            'Trades': score['Trades']
+        })
+
+    if not scored:
+        st.info(f"Not enough data to run {title} adaptive strategy lab.")
+        return None
+
+    rank_df = pd.DataFrame(rows).sort_values(['Difference %', 'Strategy Return %'], ascending=False)
+    best_rule = rank_df.iloc[0]['Rule']
+    best = next(item for item in scored if item[0] == best_rule)
+    best_name, best_logic, best_score = best
+
+    st.write(f"#### 🚀 {title}: Adaptive Rule Optimizer")
+    st.caption("This tests multiple simple long/cash rules on the selected history and picks the best one. It can overfit, so use it as a research tool — not a magic guarantee.")
+    st.dataframe(rank_df, use_container_width=True)
+
+    if best_score['Difference %'] > 0:
+        st.success(f"Best rule beat buy & hold by **{best_score['Difference %']:.2f}%** on this selected history: **{best_name}**")
+    else:
+        st.warning(f"Best rule still did not beat buy & hold on this selected history. Best rule: **{best_name}**. That means this ticker/timeframe was better as buy-and-hold.")
+    st.info(f"Best rule logic: {best_logic}")
+
+    return display_strategy_vs_buyhold_backtest(
+        best_name,
+        prices,
+        best_score['signals'],
+        initial_capital=initial_capital,
+        file_prefix=file_prefix
+    )
+
 def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital=10000.0, file_prefix="Strategy"):
     """
     Shared Streamlit display for small strategy checks inside analytical tabs.
@@ -5795,15 +5880,62 @@ with tab17:
             else:
                 st.info("No CVD crossover signals in the selected date range.")
 
-            # ── CVD Strategy Backtest ──────────────────────────────────────
+            # ── CVD Adaptive Strategy Backtest ──────────────────────────────
             st.divider()
             st.write("#### 🧪 CVD Strategy Backtest")
-            st.caption("Long after CVD crosses above its rolling mean. Cash after CVD crosses below. Compared against simple buy & hold.")
-            cvd_position = pd.Series(np.nan, index=df_cvd.index)
-            cvd_position.loc[cvd_cross_up] = 1
-            cvd_position.loc[cvd_cross_down] = 0
-            cvd_position = cvd_position.ffill().fillna(0)
-            display_strategy_vs_buyhold_backtest("CVD Cross Strategy", cl, cvd_position, file_prefix="CVD_Strategy")
+            st.caption("Goal: beat buy & hold by using CVD confirmation, price trend, and risk-off exits instead of one weak CVD mean-cross rule.")
+
+            cvd_ma = cvd.rolling(window=cvd_lookback).mean()
+            cvd_fast = cvd.ewm(span=max(3, cvd_lookback // 3), adjust=False).mean()
+            cvd_slow = cvd.ewm(span=max(8, cvd_lookback), adjust=False).mean()
+            ema20 = cl.ewm(span=20, adjust=False).mean()
+            ema50 = cl.ewm(span=50, adjust=False).mean()
+            ema200 = cl.ewm(span=200, adjust=False).mean()
+            price_mom_5 = cl.pct_change(5)
+            price_mom_20 = cl.pct_change(20)
+            cvd_mom_5 = cvd.diff(5)
+            cvd_mom_20 = cvd.diff(20)
+            flow_z = (rolling_delta - rolling_delta.rolling(50).mean()) / (rolling_delta.rolling(50).std() + 1e-9)
+            cvd_high = cvd.rolling(cvd_lookback).max().shift(1)
+            cvd_low = cvd.rolling(cvd_lookback).min().shift(1)
+
+            cvd_position_basic = make_stateful_position(cvd_cross_up, cvd_cross_down, df_cvd.index)
+            cvd_position_confirmed = make_stateful_position(
+                (cvd > cvd_ma) & (rolling_delta > 0) & (cl > ema20),
+                (cvd < cvd_ma) | (rolling_delta < 0) | (cl < ema20),
+                df_cvd.index
+            )
+            cvd_position_breakout = make_stateful_position(
+                (cvd > cvd_high) & (cl > ema50) & (price_mom_20 > 0),
+                (cvd < cvd_ma) | (cl < ema20) | (cvd < cvd_low),
+                df_cvd.index
+            )
+            cvd_position_smart_money = make_stateful_position(
+                (cvd_fast > cvd_slow) & (cvd_mom_5 > 0) & (rolling_delta > 0) & (cl > ema50),
+                (cvd_fast < cvd_slow) | (rolling_delta < 0) | (cl < ema50),
+                df_cvd.index
+            )
+            cvd_position_accumulation = make_stateful_position(
+                (cvd_mom_20 > 0) & (price_mom_5 > -0.03) & (cl > ema200) & (flow_z > -0.5),
+                (cvd_mom_20 < 0) | (cl < ema50) | (flow_z < -1.25),
+                df_cvd.index
+            )
+            cvd_position_risk_on = make_stateful_position(
+                (cl > ema20) & (ema20 > ema50) & (cvd > cvd_slow) & (rolling_delta > 0),
+                (cl < ema20) | (cvd < cvd_slow) | (rolling_delta < 0),
+                df_cvd.index
+            )
+
+            cvd_candidates = [
+                ("CVD Mean Cross", "Long after CVD crosses above its rolling mean; cash after CVD crosses below.", cvd_position_basic),
+                ("CVD Confirmed Trend", "Long only when CVD is above mean, rolling flow is positive, and price is above EMA20.", cvd_position_confirmed),
+                ("CVD Breakout + Price Momentum", "Long when CVD breaks its rolling high while price is above EMA50 and 20-bar momentum is positive.", cvd_position_breakout),
+                ("Smart-Money CVD Flow", "Long when fast CVD is above slow CVD, CVD momentum is positive, rolling delta is positive, and price is above EMA50.", cvd_position_smart_money),
+                ("Accumulation Filter", "Long when 20-bar CVD momentum is positive, price is above EMA200, and flow is not strongly negative.", cvd_position_accumulation),
+                ("Risk-On CVD Trend", "Long only when EMA20 > EMA50, price is above EMA20, CVD is above slow CVD, and rolling delta is positive.", cvd_position_risk_on),
+            ]
+
+            display_adaptive_strategy_lab("CVD", cl, cvd_candidates, file_prefix="CVD_Adaptive_Strategy")
 
             # ── Delta Profile (Volume at Price bucket) ─────────────────────
             st.divider()
@@ -6139,12 +6271,55 @@ with tab18:
             else:
                 st.info("No VWAP crossovers in the selected date range.")
 
-            # ── VWAP Strategy Backtest ─────────────────────────────────────
+            # ── VWAP Adaptive Strategy Backtest ────────────────────────────
             st.divider()
             st.write("#### 🧪 VWAP Strategy Backtest")
-            st.caption("Long when price is above VWAP. Cash when price is below VWAP. Compared against simple buy & hold.")
-            vwap_position = (cl > vwap_s).astype(int).reindex(df_vwap.index).fillna(0)
-            display_strategy_vs_buyhold_backtest("VWAP Above/Below Strategy", cl, vwap_position, file_prefix="VWAP_Strategy")
+            st.caption("Adaptive VWAP rules: trend, reclaim, band breakout, and mean-reversion candidates ranked against buy & hold.")
+
+            ema20_v = cl.ewm(span=20, adjust=False).mean()
+            ema50_v = cl.ewm(span=50, adjust=False).mean()
+            vwap_dist = (cl - vwap_s) / (vwap_s + 1e-9)
+            vwap_dist_z = (vwap_dist - vwap_dist.rolling(50).mean()) / (vwap_dist.rolling(50).std() + 1e-9)
+            vol_ma = vol.rolling(20).mean()
+            high20 = cl.rolling(20).max().shift(1)
+
+            vwap_above = (cl > vwap_s).astype(int).reindex(df_vwap.index).fillna(0)
+            vwap_reclaim = make_stateful_position(
+                (cl > vwap_s) & (cl.shift(1) <= vwap_s.shift(1)) & (vol > vol_ma),
+                (cl < vwap_s) | (cl < ema20_v),
+                df_vwap.index
+            )
+            vwap_trend = make_stateful_position(
+                (cl > vwap_s) & (cl > ema20_v) & (ema20_v > ema50_v),
+                (cl < vwap_s) | (ema20_v < ema50_v),
+                df_vwap.index
+            )
+            vwap_breakout = make_stateful_position(
+                (cl > upper_band) & (cl > high20) & (vol > vol_ma),
+                (cl < vwap_s) | (cl < ema20_v),
+                df_vwap.index
+            )
+            vwap_mean_revert = make_stateful_position(
+                (vwap_dist_z < -1.25) & (cl > ema50_v),
+                (vwap_dist_z > 0.0) | (cl < ema50_v),
+                df_vwap.index
+            )
+            vwap_pullback = make_stateful_position(
+                (cl > ema50_v) & (vwap_dist < 0.01) & (vwap_dist > -0.015) & (cl > cl.shift(1)),
+                (cl < ema50_v) | (vwap_dist < -0.025),
+                df_vwap.index
+            )
+
+            vwap_candidates = [
+                ("VWAP Above/Below", "Long when price is above VWAP; cash below VWAP.", vwap_above),
+                ("VWAP Reclaim + Volume", "Long only after price reclaims VWAP with above-average volume; exit below VWAP or EMA20.", vwap_reclaim),
+                ("VWAP Trend Stack", "Long when price is above VWAP and EMA20 > EMA50; exit when VWAP/trend stack breaks.", vwap_trend),
+                ("VWAP Band Breakout", "Long when price breaks above the upper VWAP band and 20-bar high with volume confirmation.", vwap_breakout),
+                ("VWAP Mean Reversion", "Long when price is stretched below VWAP but still above EMA50; exit when it normalizes.", vwap_mean_revert),
+                ("VWAP Pullback Buy", "Long on shallow pullbacks near VWAP while price remains above EMA50.", vwap_pullback),
+            ]
+
+            display_adaptive_strategy_lab("VWAP", cl, vwap_candidates, file_prefix="VWAP_Adaptive_Strategy")
 
             if st.session_state.report_gen:
                 st.session_state.report_gen.add_plot("VWAP Suite", fig_vwap)
@@ -6714,59 +6889,65 @@ with tab19:
 
         # ── Sub-tab 7: Time Series Signal Backtest ─────────────────────────
         with ts_subtab[6]:
-            st.write("#### 🧪 Time Series Signal Backtest")
-            st.caption("Simple research-style signals from time-series behavior. This is for comparison only, not a guaranteed trading model.")
+            st.write("#### 🧪 Time Series Adaptive Backtest")
+            st.caption("Instead of one fixed signal, this tests several time-series rules and ranks them versus buy & hold.")
 
             try:
-                ts_bt_col1, ts_bt_col2, ts_bt_col3 = st.columns(3)
+                ts_bt_col1, ts_bt_col2 = st.columns(2)
                 with ts_bt_col1:
-                    ts_signal_mode = st.selectbox(
-                        "Signal Logic",
-                        ["AR(1) Momentum", "Mean Reversion Z-Score", "Hurst Regime"],
-                        key="ts_signal_mode"
-                    )
-                with ts_bt_col2:
                     ts_win = st.slider("Rolling Window", 20, 150, 60, key="ts_bt_win")
-                with ts_bt_col3:
+                with ts_bt_col2:
                     ts_initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000, key="ts_bt_cap")
 
                 ts_prices = df_main['Close'].dropna()
                 ts_rets = np.log(ts_prices / ts_prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
-                ts_signals = pd.Series(0, index=ts_prices.index, dtype=float)
+                ts_ema20 = ts_prices.ewm(span=20, adjust=False).mean()
+                ts_ema50 = ts_prices.ewm(span=50, adjust=False).mean()
+                ts_ema200 = ts_prices.ewm(span=200, adjust=False).mean()
+                ts_mom5 = ts_prices.pct_change(5)
+                ts_mom20 = ts_prices.pct_change(20)
+                rolling_ac = ts_rets.rolling(ts_win).corr(ts_rets.shift(1)).reindex(ts_prices.index)
+                ma = ts_prices.rolling(ts_win).mean()
+                sd = ts_prices.rolling(ts_win).std()
+                z = (ts_prices - ma) / (sd + 1e-9)
+                h = rolling_hurst(ts_prices, window=ts_win, max_lag=min(20, max(5, ts_win // 3))).reindex(ts_prices.index)
+                vol20 = ts_rets.rolling(20).std().reindex(ts_prices.index)
+                vol100 = ts_rets.rolling(100).std().reindex(ts_prices.index)
 
-                if ts_signal_mode == "AR(1) Momentum":
-                    # Long only when short-term momentum is positive AND rolling serial correlation supports momentum.
-                    rolling_ac = ts_rets.rolling(ts_win).corr(ts_rets.shift(1))
-                    short_mom = ts_prices.pct_change(5)
-                    ts_signals = ((rolling_ac > 0) & (short_mom > 0)).astype(int).reindex(ts_prices.index).fillna(0)
-                    st.info("Logic: long when returns show positive serial correlation and 5-bar momentum is positive.")
+                ts_ar_mom = ((rolling_ac > 0) & (ts_mom5 > 0)).astype(int).reindex(ts_prices.index).fillna(0)
+                ts_mean_rev = make_stateful_position(z < -1.0, z > 0.0, ts_prices.index)
+                ts_hurst_trend = ((h > 0.55) & (ts_prices > ts_ema50)).astype(int).reindex(ts_prices.index).fillna(0)
+                ts_trend_stack = make_stateful_position(
+                    (ts_prices > ts_ema20) & (ts_ema20 > ts_ema50) & (ts_mom20 > 0),
+                    (ts_prices < ts_ema20) | (ts_ema20 < ts_ema50),
+                    ts_prices.index
+                )
+                ts_low_vol_momentum = make_stateful_position(
+                    (ts_mom20 > 0) & (ts_prices > ts_ema50) & (vol20 < vol100),
+                    (ts_mom20 < 0) | (ts_prices < ts_ema50) | (vol20 > vol100 * 1.5),
+                    ts_prices.index
+                )
+                ts_regime_combo = make_stateful_position(
+                    (h > 0.50) & (ts_prices > ts_ema200) & (ts_mom20 > 0),
+                    (h < 0.45) | (ts_prices < ts_ema50) | (ts_mom20 < -0.05),
+                    ts_prices.index
+                )
 
-                elif ts_signal_mode == "Mean Reversion Z-Score":
-                    # Long when price is stretched below its rolling mean; exit after it normalizes.
-                    ma = ts_prices.rolling(ts_win).mean()
-                    sd = ts_prices.rolling(ts_win).std()
-                    z = (ts_prices - ma) / (sd + 1e-9)
-                    entry = z < -1.0
-                    exit_ = z > 0.0
-                    pos = pd.Series(np.nan, index=ts_prices.index)
-                    pos.loc[entry] = 1
-                    pos.loc[exit_] = 0
-                    ts_signals = pos.ffill().fillna(0)
-                    st.info("Logic: buy when price is more than 1σ below its rolling mean; exit when it returns near the mean.")
+                ts_candidates = [
+                    ("AR(1) Momentum", "Long when serial correlation is positive and 5-bar momentum is positive.", ts_ar_mom),
+                    ("Mean Reversion Z-Score", "Buy when price is more than 1σ below rolling mean; exit near mean.", ts_mean_rev),
+                    ("Hurst Trend Regime", "Long only when Hurst suggests trend behavior and price is above EMA50.", ts_hurst_trend),
+                    ("EMA Trend Stack", "Long when price > EMA20 > EMA50 with positive 20-bar momentum.", ts_trend_stack),
+                    ("Low-Vol Momentum", "Long when momentum is positive, price is above EMA50, and realized volatility is calm.", ts_low_vol_momentum),
+                    ("Regime Combo", "Long when Hurst is above random, price is above EMA200, and 20-bar momentum is positive.", ts_regime_combo),
+                ]
 
-                else:  # Hurst Regime
-                    # Long during trending regime when trend is up; avoid random/mean-reverting regimes.
-                    h = rolling_hurst(ts_prices, window=ts_win, max_lag=min(20, max(5, ts_win // 3)))
-                    trend_up = ts_prices > ts_prices.ewm(span=max(10, ts_win // 2), adjust=False).mean()
-                    ts_signals = ((h > 0.55) & trend_up).astype(int).reindex(ts_prices.index).fillna(0)
-                    st.info("Logic: long only when Hurst suggests trending behavior (H > 0.55) and price is above its EMA trend.")
-
-                display_strategy_vs_buyhold_backtest(
-                    f"Time Series {ts_signal_mode}",
+                display_adaptive_strategy_lab(
+                    "Time Series",
                     ts_prices,
-                    ts_signals,
+                    ts_candidates,
                     initial_capital=float(ts_initial_cap),
-                    file_prefix=f"TimeSeries_{ts_signal_mode.replace(' ', '_').replace('(', '').replace(')', '')}"
+                    file_prefix="TimeSeries_Adaptive_Strategy"
                 )
 
             except Exception as e:
