@@ -4153,21 +4153,22 @@ with tab7:
                 signals = None
 
     elif strategy_type == "Implied Volatility Proxy (^VIX)":
-        st.markdown("### 🎲 Adaptive Implied Volatility Bands (^VIX)")
-        st.markdown("Instantly exit to cash when the VIX spikes relative to its dynamic baseline, dodging sudden crashes.")
+        st.markdown("### 🎲 Robust Implied Volatility Proxy Lab (^VIX)")
+        st.markdown("Instead of one fixed VIX rule, this tests several VIX + price confirmation rules and selects the strongest one for the selected history.")
+        st.caption("Goal: avoid weak noisy VIX exits, reduce whipsaws, and only go risk-off when VIX stress is confirmed by price weakness.")
         
         col_vx1, col_vx2, col_vx3, col_vx4 = st.columns(4)
         with col_vx1:
-            vix_ma_len = st.number_input("VIX Baseline (MA Length)", min_value=5, max_value=200, value=20, step=1)
+            vix_ma_len = st.number_input("VIX Baseline Length", min_value=5, max_value=200, value=20, step=1)
         with col_vx2:
-            vix_z = st.number_input("Risk-Off Spike (Z-Score)", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
+            vix_z = st.number_input("Risk-Off Z-Score", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
         with col_vx3:
-            vix_cap_z = st.number_input("Capitulation Buy (Z-Score)", min_value=1.0, max_value=6.0, value=3.5, step=0.1)
+            vix_cap_z = st.number_input("Capitulation Z-Score", min_value=1.0, max_value=6.0, value=3.5, step=0.1)
         with col_vx4:
-            st.write("Asset Trend Filter")
-            use_trend_filter = st.checkbox("Only Sell if Asset < 50-SMA", value=True)
+            confirm_bars = st.number_input("Confirmation Bars", min_value=1, max_value=10, value=2, step=1)
+            use_adaptive_iv_lab = st.checkbox("Use adaptive IV strategy chooser", value=True)
             
-        with st.spinner("Fetching ^VIX data..."):
+        with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
                 if live_mode:
                     vix_df = load_data('^VIX', start_date, end_date, interval=data_interval)
@@ -4180,84 +4181,245 @@ with tab7:
                 else:
                     vix_prices = vix_df['Close']
                     common_idx = prices_bt.index.intersection(vix_prices.index)
+                    min_needed = max(int(vix_ma_len), 50)
                     
-                    if len(common_idx) < vix_ma_len:
-                        st.error("Not enough overlapping data between asset and ^VIX to calculate bands.")
+                    if len(common_idx) < min_needed:
+                        st.error("Not enough overlapping data between asset and ^VIX to calculate robust IV proxy rules.")
                         signals = None
                     else:
-                        aligned_vix = vix_prices.loc[common_idx]
+                        asset_prices = prices_bt.loc[common_idx].astype(float)
+                        aligned_vix = vix_prices.loc[common_idx].astype(float)
                         
-                        # Calculate Adaptive Bands
+                        # Core VIX/IV proxy features
                         vix_ma = aligned_vix.rolling(window=int(vix_ma_len)).mean()
                         vix_std = aligned_vix.rolling(window=int(vix_ma_len)).std()
-                        vix_upper = vix_ma + (vix_z * vix_std)
-                        vix_cap = vix_ma + (vix_cap_z * vix_std)
+                        vix_zscore = (aligned_vix - vix_ma) / (vix_std + 1e-9)
+                        vix_upper = vix_ma + (float(vix_z) * vix_std)
+                        vix_cap = vix_ma + (float(vix_cap_z) * vix_std)
+                        vix_ema_fast = aligned_vix.ewm(span=5, adjust=False).mean()
+                        vix_ema_slow = aligned_vix.ewm(span=20, adjust=False).mean()
+                        vix_slope_down = vix_ema_fast < vix_ema_slow
                         
-                        asset_prices = prices_bt.loc[common_idx]
-                        asset_sma = asset_prices.rolling(window=50).mean()
+                        # Asset confirmation features
+                        asset_sma20 = asset_prices.rolling(window=20).mean()
+                        asset_sma50 = asset_prices.rolling(window=50).mean()
+                        asset_sma200 = asset_prices.rolling(window=200, min_periods=50).mean()
+                        asset_ret_5 = asset_prices.pct_change(5)
+                        asset_vol_20 = asset_prices.pct_change().rolling(20).std()
+                        asset_vol_med = asset_vol_20.rolling(100, min_periods=20).median()
                         
-                        raw_signals = np.ones(len(aligned_vix)) # Default LONG
-                        current_state = 1 # 1 = LONG, 0 = CASH
+                        def confirmed(cond, bars=None):
+                            bars = int(confirm_bars if bars is None else bars)
+                            cond = pd.Series(cond, index=common_idx).fillna(False)
+                            if bars <= 1:
+                                return cond
+                            return cond.rolling(bars).sum().fillna(0) >= bars
                         
-                        for i in range(len(aligned_vix)):
-                            if pd.isna(vix_upper.iloc[i]):
-                                raw_signals[i] = 1
-                                continue
-                                
+                        def stateful(entry, exit_, start_long=True):
+                            pos = pd.Series(np.nan, index=common_idx, dtype=float)
+                            pos.loc[pd.Series(entry, index=common_idx).fillna(False)] = 1.0
+                            pos.loc[pd.Series(exit_, index=common_idx).fillna(False)] = 0.0
+                            pos = pos.ffill()
+                            return pos.fillna(1.0 if start_long else 0.0).clip(0, 1)
+                        
+                        # -------------------------------
+                        # Strategy candidates
+                        # -------------------------------
+                        candidates = []
+                        
+                        # 1. Original but cleaner: VIX spike exits only when asset also weak; capitulation can reset long.
+                        orig_pos = []
+                        current_state = 1.0
+                        for i in range(len(common_idx)):
                             v_val = aligned_vix.iloc[i]
-                            v_ma = vix_ma.iloc[i]
-                            v_up = vix_upper.iloc[i]
-                            v_cp = vix_cap.iloc[i]
-                            
-                            asset_val = asset_prices.iloc[i]
-                            a_sma = asset_sma.iloc[i]
-                            
-                            # 1. Capitulation Panic Buy (Extreme Z-Score Mean Reversion)
-                            if v_val >= v_cp:
-                                current_state = 1
-                            # 2. Risk-Off Spike Exit
-                            elif v_val >= v_up:
-                                # Check Trend Filter
-                                if use_trend_filter and not pd.isna(a_sma):
-                                    if asset_val < a_sma:
-                                        current_state = 0 # Asset breaking down -> CASH
-                                    else:
-                                        pass # Asset strong -> Ignore VIX noise
-                                else:
-                                    current_state = 0 # No filter -> CASH
-                            # 3. Hysteresis Re-entry (Wait for VIX to drop fully below MA)
-                            elif v_val < v_ma:
-                                current_state = 1
-                            # 4. The "Chop Zone" between MA and Upper Band -> Maintain State
-                            else:
-                                pass 
-                                
-                            raw_signals[i] = current_state
-                            
-                        signals = pd.Series(np.nan, index=prices_bt.index)
-                        signals.loc[common_idx] = raw_signals
-                        signals = signals.ffill().fillna(1)
+                            v_ma_i = vix_ma.iloc[i]
+                            v_up_i = vix_upper.iloc[i]
+                            v_cp_i = vix_cap.iloc[i]
+                            a_val = asset_prices.iloc[i]
+                            a_sma = asset_sma50.iloc[i]
+                            if pd.isna(v_up_i) or pd.isna(v_ma_i):
+                                orig_pos.append(current_state)
+                                continue
+                            if v_val >= v_cp_i:
+                                current_state = 1.0
+                            elif v_val >= v_up_i and not pd.isna(a_sma) and a_val < a_sma:
+                                current_state = 0.0
+                            elif v_val < v_ma_i:
+                                current_state = 1.0
+                            orig_pos.append(current_state)
+                        candidates.append((
+                            "Original VIX Hysteresis + Trend Filter",
+                            "Long by default. Exit when VIX spikes above the upper band and price is below the 50-SMA. Re-enter when VIX cools below baseline or capitulation appears.",
+                            pd.Series(orig_pos, index=common_idx)
+                        ))
                         
-                        with st.expander("See Strategy Context", expanded=True):
-                            fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+                        # 2. Crash shield: designed to avoid big drawdowns, not overtrade.
+                        crash_exit = confirmed((vix_zscore > vix_z) & (asset_prices < asset_sma50) & (asset_ret_5 < 0))
+                        crash_entry = (vix_zscore < 0.25) | ((asset_prices > asset_sma20) & vix_slope_down)
+                        candidates.append((
+                            "Crash Shield Confirmed",
+                            "Exit only when VIX stress is high AND price trend is weak. Re-enter after VIX cools or price recovers above short trend.",
+                            stateful(crash_entry, crash_exit, start_long=True)
+                        ))
+                        
+                        # 3. Risk-on only: lower whipsaw by requiring calm VIX and price trend.
+                        risk_on_entry = (vix_zscore < 0.75) & (asset_prices > asset_sma50)
+                        risk_on_exit = confirmed((vix_zscore > vix_z) | (asset_prices < asset_sma50))
+                        candidates.append((
+                            "VIX Risk-On Trend Gate",
+                            "Long only when VIX is not stressed and price is above the 50-SMA. Cash when either VIX stress or price weakness is confirmed.",
+                            stateful(risk_on_entry, risk_on_exit, start_long=False)
+                        ))
+                        
+                        # 4. Vol compression breakout: good when lower implied vol supports trend continuation.
+                        compression_entry = (aligned_vix < vix_ma) & (vix_ema_fast < vix_ema_slow) & (asset_prices > asset_sma20) & (asset_prices > asset_sma50)
+                        compression_exit = confirmed((aligned_vix > vix_upper) | (asset_prices < asset_sma20))
+                        candidates.append((
+                            "Vol Compression Breakout",
+                            "Long when VIX is falling below baseline and price is stacked above 20/50-SMA. Exit on VIX spike or loss of 20-SMA.",
+                            stateful(compression_entry, compression_exit, start_long=False)
+                        ))
+                        
+                        # 5. Panic reset: handles extreme VIX spikes as potential washout, but demands price recovery.
+                        panic_exit = confirmed((vix_zscore > vix_z) & (asset_prices < asset_sma50))
+                        panic_entry = ((vix_zscore > vix_cap_z) & (asset_ret_5 > -0.03)) | ((vix_zscore < 0) & (asset_prices > asset_sma20))
+                        candidates.append((
+                            "Panic Reset + Recovery",
+                            "Exit confirmed stress. Re-enter after extreme panic if price stabilizes, or after VIX falls below baseline and price reclaims 20-SMA.",
+                            stateful(panic_entry, panic_exit, start_long=True)
+                        ))
+                        
+                        # 6. Multi-factor IV score: avoids binary/noisy signal by requiring a score threshold.
+                        score = pd.Series(0.0, index=common_idx)
+                        score += (vix_zscore < 0.5).astype(float)
+                        score += (vix_slope_down).astype(float)
+                        score += (asset_prices > asset_sma20).astype(float)
+                        score += (asset_prices > asset_sma50).astype(float)
+                        score += (asset_vol_20 <= asset_vol_med).fillna(False).astype(float)
+                        score_exit = confirmed((score <= 2) & (vix_zscore > 1.0))
+                        score_entry = score >= 3
+                        candidates.append((
+                            "Robust IV Composite Score",
+                            "Combines VIX calmness, falling VIX trend, price trend, and realized-vol filter. Long only when the total score is healthy.",
+                            stateful(score_entry, score_exit, start_long=False)
+                        ))
+                        
+                        # 7. Long-term trend override: do not fight strong uptrends unless VIX stress is serious.
+                        trend_override_entry = (asset_prices > asset_sma200) & ((vix_zscore < vix_z) | vix_slope_down)
+                        trend_override_exit = confirmed((asset_prices < asset_sma200) & (vix_zscore > 1.0)) | confirmed(vix_zscore > vix_cap_z + 0.5, bars=1)
+                        candidates.append((
+                            "Long-Term Trend Override",
+                            "Stay long in larger uptrends unless VIX stress is confirmed and price loses the long-term trend. Built to avoid unnecessary exits.",
+                            stateful(trend_override_entry, trend_override_exit, start_long=True)
+                        ))
+                        
+                        # Rank all candidates on the same selected history.
+                        ranking_rows = []
+                        scored_candidates = []
+                        for name, logic, sig in candidates:
+                            score_res = evaluate_strategy_candidate(asset_prices, sig, initial_capital=initial_cap)
+                            if score_res is None:
+                                continue
+                            scored_candidates.append((name, logic, sig, score_res))
+                            ranking_rows.append({
+                                "Rule": name,
+                                "Strategy Return %": round(score_res['Strategy Return %'], 2),
+                                "Buy & Hold Return %": round(score_res['Buy & Hold Return %'], 2),
+                                "Difference %": round(score_res['Difference %'], 2),
+                                "Max DD %": round(score_res['Max DD %'], 2),
+                                "Trades": score_res['Trades']
+                            })
+                        
+                        if not scored_candidates:
+                            st.warning("No IV proxy candidates could be scored.")
+                            signals = None
+                        else:
+                            rank_df = pd.DataFrame(ranking_rows).sort_values(['Difference %', 'Strategy Return %'], ascending=False).reset_index(drop=True)
+                            best_name = rank_df.iloc[0]['Rule']
+                            best_name, best_logic, best_sig, best_score = next(x for x in scored_candidates if x[0] == best_name)
                             
-                            fig_ctx.add_trace(go.Scatter(x=asset_prices.index, y=asset_prices, mode='lines', line=dict(color='gray'), opacity=0.8, name='Asset Price'), row=1, col=1)
-                            if use_trend_filter:
-                                fig_ctx.add_trace(go.Scatter(x=asset_sma.index, y=asset_sma, mode='lines', line=dict(color='yellow', dash='dot'), opacity=0.5, name='Asset 50-SMA'), row=1, col=1)
+                            st.write("#### 🧠 Robust IV Proxy Strategy Ranking")
+                            st.caption("This chooses the best VIX/IV proxy rule for the selected history. Use the Stability Score to judge whether the winner is reliable or just curve-fit.")
+                            st.dataframe(rank_df, use_container_width=True)
+                            
+                            # Stability score across sub-windows. This reduces blind trust in one lucky full-period backtest.
+                            windows = [63, 126, 252, len(asset_prices)]
+                            windows = sorted(set([w for w in windows if len(asset_prices) >= max(30, w)]))
+                            stable_checks = []
+                            positive_windows = 0
+                            top2_windows = 0
+                            for w in windows:
+                                sub_prices = asset_prices.tail(w)
+                                sub_rows = []
+                                for name, logic, sig in candidates:
+                                    sub_sig = pd.Series(sig).reindex(sub_prices.index).ffill().fillna(0)
+                                    sub_score = evaluate_strategy_candidate(sub_prices, sub_sig, initial_capital=initial_cap)
+                                    if sub_score is None:
+                                        continue
+                                    sub_rows.append((name, sub_score['Difference %']))
+                                if sub_rows:
+                                    sub_rank = sorted(sub_rows, key=lambda x: x[1], reverse=True)
+                                    best_diff_sub = dict(sub_rows).get(best_name, np.nan)
+                                    rank_pos = [x[0] for x in sub_rank].index(best_name) + 1 if best_name in [x[0] for x in sub_rank] else np.nan
+                                    if pd.notna(best_diff_sub) and best_diff_sub > 0:
+                                        positive_windows += 1
+                                    if pd.notna(rank_pos) and rank_pos <= 2:
+                                        top2_windows += 1
+                                    stable_checks.append({
+                                        "Window": f"Last {w} bars" if w != len(asset_prices) else "Full selected period",
+                                        "Best Rule Rank": rank_pos,
+                                        "Difference %": round(best_diff_sub, 2) if pd.notna(best_diff_sub) else np.nan
+                                    })
+                            
+                            stability_score = 0
+                            if stable_checks:
+                                stability_score = round(100 * ((positive_windows / len(stable_checks)) * 0.55 + (top2_windows / len(stable_checks)) * 0.45), 0)
+                                st.write("#### 🧱 Stability Check")
+                                s1, s2, s3 = st.columns(3)
+                                s1.metric("Selected Best Rule", best_name)
+                                s2.metric("Stability Score", f"{stability_score:.0f}/100")
+                                s3.metric("Windows Tested", len(stable_checks))
+                                st.dataframe(pd.DataFrame(stable_checks), use_container_width=True)
+                                if stability_score >= 70:
+                                    st.success("This IV proxy winner looks relatively stable across multiple windows.")
+                                elif stability_score >= 45:
+                                    st.warning("This IV proxy winner is decent, but not fully stable. Confirm with CVD/VWAP before trusting it.")
+                                else:
+                                    st.error("This IV proxy winner is unstable. Treat it as research only, not a strong trading edge.")
+                            
+                            st.info(f"Chosen IV proxy rule: **{best_name}** — {best_logic}")
+                            
+                            # Re-index selected best signal back to full backtest price index for the shared backtest engine below.
+                            signals = pd.Series(np.nan, index=prices_bt.index)
+                            signals.loc[common_idx] = best_sig
+                            signals = signals.ffill().fillna(1).clip(0, 1)
+                            
+                            with st.expander("See Robust IV Proxy Context", expanded=True):
+                                fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.45, 0.35, 0.20], vertical_spacing=0.05)
                                 
-                            fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'Baseline MA ({vix_ma_len})'), row=2, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Threshold (+{vix_z}σ)'), row=2, col=1)
-                            fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Buy (+{vix_cap_z}σ)'), row=2, col=1)
-                            
-                            highlight_plotly_zones(fig_ctx, pd.Series(raw_signals, index=common_idx) == 1, 'green', opacity=0.1, row=1, col=1)
-                            highlight_plotly_zones(fig_ctx, pd.Series(raw_signals, index=common_idx) == 1, 'green', opacity=0.1, row=2, col=1)
-                            
-                            fig_ctx.update_layout(title="Institutional VIX Regime Model (Hysteresis + Capitulation)", hovermode="x unified", template="plotly_dark", height=600)
-                            st.plotly_chart(fig_ctx, use_container_width=True)
+                                fig_ctx.add_trace(go.Scatter(x=asset_prices.index, y=asset_prices, mode='lines', line=dict(color='gray'), opacity=0.85, name='Asset Price'), row=1, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=asset_sma20.index, y=asset_sma20, mode='lines', line=dict(color='cyan', dash='dot'), opacity=0.55, name='20-SMA'), row=1, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=asset_sma50.index, y=asset_sma50, mode='lines', line=dict(color='yellow', dash='dot'), opacity=0.55, name='50-SMA'), row=1, col=1)
+                                
+                                fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'VIX Baseline ({vix_ma_len})'), row=2, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Band (+{vix_z}σ)'), row=2, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Band (+{vix_cap_z}σ)'), row=2, col=1)
+                                
+                                chosen_aligned = pd.Series(best_sig, index=common_idx).reindex(common_idx).ffill().fillna(0)
+                                fig_ctx.add_trace(go.Scatter(x=chosen_aligned.index, y=chosen_aligned * 100, mode='lines', line=dict(color='#00f2ff'), fill='tozeroy', name='Chosen Exposure (%)'), row=3, col=1)
+                                
+                                highlight_plotly_zones(fig_ctx, chosen_aligned == 1, 'green', opacity=0.10, row=1, col=1)
+                                highlight_plotly_zones(fig_ctx, chosen_aligned == 0, 'red', opacity=0.08, row=1, col=1)
+                                highlight_plotly_zones(fig_ctx, chosen_aligned == 1, 'green', opacity=0.08, row=2, col=1)
+                                highlight_plotly_zones(fig_ctx, chosen_aligned == 0, 'red', opacity=0.08, row=2, col=1)
+                                
+                                fig_ctx.update_layout(title=f"Robust IV Proxy Context — Selected Rule: {best_name}", hovermode="x unified", template="plotly_dark", height=760)
+                                fig_ctx.update_yaxes(title_text="Exposure", row=3, col=1, range=[0, 105])
+                                st.plotly_chart(fig_ctx, use_container_width=True)
                             
             except Exception as e:
-                st.error(f"Error loading ^VIX data: {str(e)}")
+                st.error(f"Error loading or testing ^VIX data: {str(e)}")
                 signals = None
 
     elif strategy_type == "Institutional Hurst Exponent":
