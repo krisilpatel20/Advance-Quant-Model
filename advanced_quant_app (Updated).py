@@ -5959,12 +5959,12 @@ with tab18:
                 if band not in band_traces_added:
                     fig_vwap.add_trace(go.Scatter(
                         x=df_vwap.index, y=upper, mode='lines',
-                        line=dict(color=c_fill.replace('0.', '0.8,').replace(',', ''), width=1, dash='dot'),
+                        line=dict(color=c_fill.replace('0.3', '0.8').replace('0.25', '0.8').replace('0.2', '0.8'), width=1, dash='dot'),
                         name=f"+{band}", showlegend=True
                     ), row=1, col=1)
                     fig_vwap.add_trace(go.Scatter(
                         x=df_vwap.index, y=lower, mode='lines',
-                        line=dict(color=c_fill.replace('0.', '0.8,').replace(',', ''), width=1, dash='dot'),
+                        line=dict(color=c_fill.replace('0.3', '0.8').replace('0.25', '0.8').replace('0.2', '0.8'), width=1, dash='dot'),
                         fill='tonexty', fillcolor=c_fill,
                         name=f"-{band}", showlegend=True
                     ), row=1, col=1)
@@ -6099,11 +6099,11 @@ with tab19:
             st.caption("""
             **ADF**: Null = unit root (non-stationary). Reject → stationary.
             **KPSS**: Null = stationary. Reject → non-stationary.
-            **PP**: Phillips-Perron, robust to serial correlation.
+            **PP**: Phillips-Perron skipped here because your statsmodels build does not include it.
             """)
 
             try:
-                from statsmodels.tsa.stattools import adfuller, kpss, PhillipsPerron
+                from statsmodels.tsa.stattools import adfuller, kpss
 
                 # ADF Test
                 adf_result = adfuller(ts_data, autolag='AIC')
