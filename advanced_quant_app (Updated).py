@@ -1488,6 +1488,9 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         buyhold_ret_pct = (bt_results['benchmark_curve'].iloc[-1] / initial_capital - 1) * 100
         alpha_pct = strat_ret_pct - buyhold_ret_pct
         trades_df = bt_results['trades'].copy()
+        # Show newest trades first by default
+        if not trades_df.empty and 'Entry Date' in trades_df.columns:
+            trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
 
         st.write(f"#### 📊 {title}: Strategy vs Buy & Hold")
         c1, c2, c3, c4 = st.columns(4)
@@ -4391,8 +4394,11 @@ with tab7:
         
         # Trade Log
         st.write("#### 📝 Trade Log")
-        trades_df = bt_results['trades']
+        trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
+            # Show newest trades first by default
+            if 'Entry Date' in trades_df.columns:
+                trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
             # Format dates
             trades_df['Entry Date'] = pd.to_datetime(trades_df['Entry Date']).dt.date
             trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).apply(lambda x: x.date() if pd.notnull(x) else "Open")
@@ -5899,7 +5905,18 @@ with tab17:
             cvd_high = cvd.rolling(cvd_lookback).max().shift(1)
             cvd_low = cvd.rolling(cvd_lookback).min().shift(1)
 
+            # Uses the exact CVD line shown in chart row 2.
+            # Long when CVD flips above zero / green zone.
+            # Exit immediately when CVD flips below zero / red zone.
+            cvd_zero_cross_up = (cvd_plot > 0) & (cvd_plot.shift(1) <= 0)
+            cvd_zero_cross_down = (cvd_plot < 0) & (cvd_plot.shift(1) >= 0)
+
             cvd_position_basic = make_stateful_position(cvd_cross_up, cvd_cross_down, df_cvd.index)
+            cvd_position_zero_flip = make_stateful_position(
+                cvd_zero_cross_up,
+                (cvd_plot < 0) | cvd_zero_cross_down,
+                df_cvd.index
+            )
             cvd_position_confirmed = make_stateful_position(
                 (cvd > cvd_ma) & (rolling_delta > 0) & (cl > ema20),
                 (cvd < cvd_ma) | (rolling_delta < 0) | (cl < ema20),
@@ -5927,6 +5944,7 @@ with tab17:
             )
 
             cvd_candidates = [
+                ("CVD Zero-Line Flip", "Uses the CVD graph row 2 directly: long when CVD crosses above zero/green, cash immediately when CVD goes below zero/red.", cvd_position_zero_flip),
                 ("CVD Mean Cross", "Long after CVD crosses above its rolling mean; cash after CVD crosses below.", cvd_position_basic),
                 ("CVD Confirmed Trend", "Long only when CVD is above mean, rolling flow is positive, and price is above EMA20.", cvd_position_confirmed),
                 ("CVD Breakout + Price Momentum", "Long when CVD breaks its rolling high while price is above EMA50 and 20-bar momentum is positive.", cvd_position_breakout),
@@ -6282,6 +6300,8 @@ with tab18:
             vwap_dist_z = (vwap_dist - vwap_dist.rolling(50).mean()) / (vwap_dist.rolling(50).std() + 1e-9)
             vol_ma = vol.rolling(20).mean()
             high20 = cl.rolling(20).max().shift(1)
+            upper_band = (vwap_s + std_s).reindex(df_vwap.index)
+            lower_band = (vwap_s - std_s).reindex(df_vwap.index)
 
             vwap_above = (cl > vwap_s).astype(int).reindex(df_vwap.index).fillna(0)
             vwap_reclaim = make_stateful_position(
