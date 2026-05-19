@@ -1401,6 +1401,215 @@ def make_stateful_position(entry_cond, exit_cond, index):
     return pos.ffill().fillna(0.0).clip(lower=0, upper=1)
 
 
+def enforce_min_hold_period(raw_signal, min_hold=1):
+    """
+    Applies a minimum hold period to a 0/1 signal so the strategy does not flip too quickly.
+    This makes the Regime Switching Period method materially different from a simple probability rule.
+    """
+    raw_signal = pd.Series(raw_signal).fillna(0).astype(float).clip(0, 1)
+    min_hold = max(1, int(min_hold))
+    out = []
+    position = 0.0
+    bars_held = min_hold
+    for desired in raw_signal.values:
+        desired = 1.0 if desired > 0 else 0.0
+        if desired != position and bars_held >= min_hold:
+            position = desired
+            bars_held = 1
+        else:
+            bars_held += 1
+        out.append(position)
+    return pd.Series(out, index=raw_signal.index, dtype=float)
+
+
+def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes, signal_method, conviction=0.65, min_hold=1):
+    """
+    Converts Markov filtered probabilities into a tradable long/cash signal.
+    Uses filtered probabilities only, so it is causal for closed bars.
+    """
+    probs_df = res_model.filtered_marginal_probabilities.copy()
+    probs_df.index = model_index
+
+    regime_means = []
+    for i in range(n_regimes):
+        if f'const[{i}]' in res_model.params:
+            mean_val = res_model.params[f'const[{i}]']
+        else:
+            mean_val = res_model.params.get('const', 0.0)
+        regime_means.append((i, float(mean_val)))
+    bull_regime_idx = sorted(regime_means, key=lambda x: x[1], reverse=True)[0][0]
+
+    bull_probs = probs_df.iloc[:, bull_regime_idx]
+    dominant_regime = probs_df.idxmax(axis=1)
+
+    if signal_method == "Regime Weighted Expected Return":
+        expected_ret = pd.Series(0.0, index=model_index)
+        for i in range(n_regimes):
+            if f'const[{i}]' in res_model.params:
+                mean_val = float(res_model.params[f'const[{i}]'])
+            else:
+                mean_val = float(res_model.params.get('const', 0.0))
+            expected_ret += probs_df.iloc[:, i] * mean_val
+        raw_signal = ((expected_ret > 0) & (bull_probs > float(conviction))).astype(float)
+        context = {"expected_ret": expected_ret, "bull_probs": bull_probs, "dominant_regime": dominant_regime, "bull_regime_idx": bull_regime_idx}
+
+    elif signal_method == "Regime Probability":
+        # User-requested conviction threshold: bull probability must clear the threshold.
+        raw_signal = (bull_probs > float(conviction)).astype(float)
+        context = {"bull_probs": bull_probs, "dominant_regime": dominant_regime, "bull_regime_idx": bull_regime_idx}
+
+    else:  # Regime Switching Period
+        # Different from Regime Probability: require bull dominance + conviction, then enforce a minimum hold period.
+        raw_signal = ((dominant_regime == bull_regime_idx) & (bull_probs > float(conviction))).astype(float)
+        raw_signal = enforce_min_hold_period(raw_signal, min_hold=min_hold)
+        context = {"bull_probs": bull_probs, "dominant_regime": dominant_regime, "bull_regime_idx": bull_regime_idx}
+
+    signal = raw_signal.reindex(prices_index).ffill().fillna(0).clip(0, 1)
+    return signal, context
+
+
+def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True):
+    """
+    Walk-forward validation for the Regime Switching backtest.
+    Each forward block fits only on the trailing training window, selects the best regime signal method
+    on that training window, then applies the latest confirmed exposure to the next unseen block.
+    """
+    prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    returns = pd.Series(returns).reindex(prices.index).replace([np.inf, -np.inf], np.nan).dropna()
+    common_idx = prices.index.intersection(returns.index)
+    prices = prices.loc[common_idx]
+    returns = returns.loc[common_idx]
+
+    train_window = int(train_window)
+    forward_window = int(forward_window)
+    if len(prices) < train_window + max(5, forward_window):
+        return None
+
+    methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
+    idx = prices.index
+    wf_signal = pd.Series(np.nan, index=idx, dtype=float)
+    rows = []
+    sequence = []
+
+    start = train_window
+    period_no = 1
+    while start < len(idx):
+        train_idx = idx[start-train_window:start]
+        test_idx = idx[start:min(start+forward_window, len(idx))]
+        if len(test_idx) < 2:
+            break
+
+        train_returns = (returns.loc[train_idx].dropna() * 100)
+        if len(train_returns) < max(20, n_regimes * 8):
+            start += forward_window
+            period_no += 1
+            continue
+        train_returns = pd.Series(train_returns.values.flatten().astype(float), index=train_returns.index)
+
+        res = fit_regime_model(train_returns, int(n_regimes), switch_vol, switch_trend, search_reps=8)
+        if res is None:
+            start += forward_window
+            period_no += 1
+            continue
+
+        train_scores = []
+        for method in methods:
+            try:
+                sig_train, _ = build_regime_backtest_signal(
+                    res, train_returns.index, prices.loc[train_idx].index,
+                    int(n_regimes), method, conviction=float(conviction), min_hold=int(min_hold)
+                )
+                if confirmed_bar:
+                    sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
+                score = evaluate_strategy_candidate(
+                    prices.loc[train_idx], sig_train,
+                    initial_capital=initial_capital,
+                    trailing_stop_pct=trailing_stop_pct,
+                    stop_loss_pct=stop_loss_pct
+                )
+                if score is None:
+                    continue
+                train_scores.append({"method": method, "score": score, "signal": sig_train})
+            except Exception:
+                continue
+
+        if not train_scores:
+            start += forward_window
+            period_no += 1
+            continue
+
+        train_scores = sorted(
+            train_scores,
+            key=lambda x: (x["score"]["Difference %"], x["score"]["Strategy Return %"], -abs(x["score"]["Max DD %"])),
+            reverse=True
+        )
+        chosen = train_scores[0]
+        chosen_method = chosen["method"]
+        sequence.append(chosen_method)
+
+        # No-lookahead forward execution: carry the latest training exposure into the next unseen block.
+        latest_exposure = float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0
+        test_signal = pd.Series(latest_exposure, index=test_idx, dtype=float)
+        wf_signal.loc[test_idx] = test_signal
+
+        test_score = evaluate_strategy_candidate(
+            prices.loc[test_idx], test_signal,
+            initial_capital=initial_capital,
+            trailing_stop_pct=trailing_stop_pct,
+            stop_loss_pct=stop_loss_pct
+        )
+        rows.append({
+            "Period": period_no,
+            "Train Start": train_idx[0],
+            "Train End": train_idx[-1],
+            "Forward Start": test_idx[0],
+            "Forward End": test_idx[-1],
+            "Selected Method": chosen_method,
+            "Train Diff %": round(chosen["score"]["Difference %"], 2),
+            "Forward Strategy %": round(test_score.get("Strategy Return %", np.nan), 2) if test_score else np.nan,
+            "Forward Buy & Hold %": round(test_score.get("Buy & Hold Return %", np.nan), 2) if test_score else np.nan,
+            "Forward Diff %": round(test_score.get("Difference %", np.nan), 2) if test_score else np.nan,
+            "Forward Max DD %": round(test_score.get("Max DD %", np.nan), 2) if test_score else np.nan,
+            "Forward Trades": int(test_score.get("Trades", 0)) if test_score else 0
+        })
+
+        start += forward_window
+        period_no += 1
+
+    if not rows:
+        return None
+
+    wf_signal = wf_signal.ffill().fillna(0).clip(0, 1)
+    first_forward_start = rows[0]["Forward Start"]
+    eval_prices = prices.loc[first_forward_start:]
+    eval_signal = wf_signal.reindex(eval_prices.index).ffill().fillna(0).clip(0, 1)
+    overall = evaluate_strategy_candidate(
+        eval_prices, eval_signal,
+        initial_capital=initial_capital,
+        trailing_stop_pct=trailing_stop_pct,
+        stop_loss_pct=stop_loss_pct
+    )
+    rows_df = pd.DataFrame(rows)
+    valid = rows_df["Forward Diff %"].dropna()
+    win_rate = float((valid > 0).mean()) if len(valid) else 0.0
+    changes = sum(1 for a, b in zip(sequence, sequence[1:]) if a != b)
+    change_rate = changes / max(1, len(sequence)-1)
+    avg_diff = float(valid.mean()) if len(valid) else 0.0
+    stability_score = round(100 * (0.65 * win_rate + 0.20 * max(0, min(1, avg_diff / 10)) + 0.15 * (1 - change_rate)), 0)
+    return {
+        "signal": wf_signal,
+        "rows": rows_df,
+        "overall": overall,
+        "first_forward_start": first_forward_start,
+        "win_rate": win_rate,
+        "changes": changes,
+        "change_rate": change_rate,
+        "avg_forward_diff": avg_diff,
+        "stability_score": stability_score,
+        "strategy_sequence": sequence
+    }
+
+
 def evaluate_strategy_candidate(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0):
     """Fast score helper for strategy candidate ranking. Uses the same stop settings as the main backtest when supplied."""
     prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
@@ -4268,12 +4477,27 @@ with tab7:
         # Signal Method Selection
         signal_method = st.radio("Signal Method", ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"], horizontal=True)
 
+        col_sig1, col_sig2, col_sig3 = st.columns(3)
+        with col_sig1:
+            conviction = st.slider("Min Bull Probability", 0.5, 0.9, 0.65, step=0.05, key="bt_regime_conviction")
+        with col_sig2:
+            min_hold_period = st.number_input("Minimum Hold Period", min_value=1, max_value=60, value=3, step=1, key="bt_regime_min_hold")
+        with col_sig3:
+            confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
+
+        with st.expander("🧭 Regime WFO Settings", expanded=True):
+            wf_c1, wf_c2, wf_c3, wf_c4 = st.columns(4)
+            enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=True, key="bt_regime_enable_wfo")
+            use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=True, key="bt_regime_use_wfo")
+            regime_wf_train = wf_c3.number_input("Regime WFO train bars", min_value=30, max_value=1000, value=126, step=21, key="bt_regime_wf_train")
+            regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=21, step=5, key="bt_regime_wf_forward")
+
         if signal_method == "Regime Weighted Expected Return":
-            st.markdown("**Strategy:** Long when **Expected Return > 0**. Sell when **Expected Return < 0**.")
+            st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
         elif signal_method == "Regime Probability":
-            st.markdown("**Strategy:** Long when **Bull Probability** crosses above others (Dominant Regime). Sell otherwise.")
+            st.markdown("**Strategy:** Long when **Bull Probability > Min Bull Probability**. This uses the exact conviction threshold.")
         else:
-            st.markdown("**Strategy:** Long immediately when entering **Bull Regime**. Sell immediately when exiting.")
+            st.markdown("**Strategy:** Long when Bull Regime is dominant and above conviction, then hold for at least the minimum hold period before switching.")
 
         # --- MODEL FITNESS INFO ---
         st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'Compare Fitness' button below to find the best fit.")
@@ -4299,21 +4523,19 @@ with tab7:
                             r_means.append((i, m_val))
                         bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
                         
-                        # 2. Generate Signals
-                        p_df = r.filtered_marginal_probabilities
-                        if signal_method == "Regime Weighted Expected Return":
-                            e_ret = pd.Series(0.0, index=loc_model_data.index)
-                            for i in range(n):
-                                m = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
-                                e_ret += p_df.iloc[:, i] * m
-                            sigs = (e_ret > 0).astype(int)
-                        elif signal_method == "Regime Probability":
-                            dom = p_df.idxmax(axis=1)
-                            sigs = (dom == bull_idx).astype(int)
-                        else: # Period
-                            dom = p_df.idxmax(axis=1)
-                            sigs = (dom == bull_idx).astype(int)
-                        
+                        # 2. Generate Signals with conviction/min-hold logic
+                        sigs, _ = build_regime_backtest_signal(
+                            r,
+                            loc_model_data.index,
+                            loc_prices.index,
+                            n,
+                            signal_method,
+                            conviction=float(conviction),
+                            min_hold=int(min_hold_period)
+                        )
+                        if confirmed_regime_bar:
+                            sigs = sigs.shift(1).ffill().fillna(0).clip(0, 1)
+
                         # 3. Run Backtest
                         common_idx = loc_prices.index.intersection(sigs.index)
                         bt_res = BacktestEngine.run_strategy(loc_prices.loc[common_idx], sigs.loc[common_idx], initial_cap, trailing_stop, stop_loss)
@@ -4349,18 +4571,20 @@ with tab7:
         if bt_freq == "Weekly":
             # Resample Prices to Weekly (Last Close)
             prices_bt_resampled = prices_bt.resample('W').last().dropna()
-            # Recalculate Returns from resampled prices
-            returns_bt_resampled = prices_bt_resampled.pct_change().dropna()
-            strat_prices = prices_bt_resampled
         else:
-            prices_bt_resampled = prices_bt
-            returns_bt_resampled = returns_bt
+            prices_bt_resampled = prices_bt.dropna()
 
-        # Apply Smoothing if requested
+        # Apply smoothing consistently to prices first, then calculate returns from those same prices.
+        # This fixes the old mismatch where model data was smoothed but execution prices were raw.
         if bt_stability > 0:
-            model_data_bt = returns_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
+            prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
+            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
         else:
-            model_data_bt = returns_bt_resampled.dropna() * 100
+            prices_bt_model = prices_bt_resampled.copy()
+
+        strat_prices = prices_bt_model
+        returns_bt_resampled = prices_bt_model.pct_change().dropna()
+        model_data_bt = returns_bt_resampled.dropna() * 100
 
         # FIX: Robust 1D Series reconstruction
         if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
@@ -4390,111 +4614,89 @@ with tab7:
                         st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
                     st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
                     
-                    # Identify Regimes (Sort by Mean)
-                    regime_means = []
-                    for i in range(bt_n_regimes):
-                        if f'const[{i}]' in res_bt.params:
-                            mean_val = res_bt.params[f'const[{i}]']
+                    # Build selected-method full-history signal using conviction + min-hold logic
+                    signals, regime_context = build_regime_backtest_signal(
+                        res_bt,
+                        model_data_bt.index,
+                        strat_prices.index,
+                        int(bt_n_regimes),
+                        signal_method,
+                        conviction=float(conviction),
+                        min_hold=int(min_hold_period)
+                    )
+                    if confirmed_regime_bar:
+                        signals = signals.shift(1).ffill().fillna(0).clip(0, 1)
+
+                    # --- Walk-forward validation / primary signal ---
+                    if enable_regime_wfo:
+                        with st.spinner("Running Regime Walk-Forward Optimization..."):
+                            wf_regime = walk_forward_regime_selection(
+                                strat_prices,
+                                returns_bt_resampled,
+                                n_regimes=int(bt_n_regimes),
+                                switch_vol=bool(bt_switch_vol),
+                                switch_trend=bool(bt_switch_trend),
+                                train_window=int(regime_wf_train),
+                                forward_window=int(regime_wf_forward),
+                                conviction=float(conviction),
+                                min_hold=int(min_hold_period),
+                                initial_capital=initial_cap,
+                                trailing_stop_pct=trailing_stop,
+                                stop_loss_pct=stop_loss,
+                                confirmed_bar=bool(confirmed_regime_bar)
+                            )
+
+                        st.write("#### 🧭 Regime Walk-Forward Result")
+                        if wf_regime is None or wf_regime.get("overall") is None:
+                            st.warning("Not enough data or model convergence to run Regime WFO. Falling back to full-history selected signal.")
                         else:
-                            mean_val = res_bt.params.get('const', 0.0)
-                        regime_means.append((i, mean_val))
-                    
-                    # Sort regimes by mean return (High to Low) -> Index 0 is Bull
-                    sorted_regimes = sorted(regime_means, key=lambda x: x[1], reverse=True)
-                    bull_regime_idx = sorted_regimes[0][0]
-                    
-                    # Get Filtered Probabilities
-                    probs_df = res_bt.filtered_marginal_probabilities
-                    
-                    if signal_method == "Regime Weighted Expected Return":
-                        # Calculate Expected Return
-                        expected_ret = pd.Series(0.0, index=model_data_bt.index)
-                        for i in range(bt_n_regimes):
-                            # Get Regime Mean
-                            if f'const[{i}]' in res_bt.params:
-                                mean_val = res_bt.params[f'const[{i}]']
+                            wf_overall = wf_regime["overall"]
+                            full_bh = buy_hold_return_pct(strat_prices)
+                            wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
+                            wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
+                            wfc2.metric("WF Test Benchmark", f"{wf_overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample WFO test window.")
+                            wfc3.metric("Full Benchmark", f"{full_bh:.2f}%" if pd.notna(full_bh) else "N/A", help="Buy & hold over the full selected period. Reference only.")
+                            wfc4.metric("WF Difference", f"{wf_overall['Difference %']:+.2f}%")
+                            wfc5.metric("WF Stability", f"{wf_regime['stability_score']:.0f}/100")
+
+                            if wf_overall['Difference %'] > 0 and wf_regime['stability_score'] >= 60:
+                                st.success("Regime WFO is positive and reasonably stable.")
+                            elif wf_overall['Difference %'] > 0:
+                                st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
                             else:
-                                mean_val = res_bt.params.get('const', 0.0)
-                                
-                            # Get Filtered Probability
-                            prob = probs_df.iloc[:, i]
-                            expected_ret += prob * mean_val
-                        
-                        # Align indices
-                        common_idx = strat_prices.index.intersection(expected_ret.index)
-                        expected_ret = expected_ret.loc[common_idx]
-                        
-                        # Generate Signals (1 = Long if Exp Ret > 0, else 0)
-                        signals = (expected_ret > 0).astype(int)
-                        
-                        # Plot Context
-                        with st.expander("See Strategy Context"):
-                            fig_ctx = go.Figure()
+                                st.warning("Regime WFO did not beat buy & hold on the unseen forward windows. Treat full-history results as research only.")
+
+                            wf_rows = wf_regime["rows"].copy()
+                            if not wf_rows.empty:
+                                for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
+                                    wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
+                                st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
+
+                            if use_regime_wfo:
+                                first_forward_start = wf_regime["first_forward_start"]
+                                strat_prices = strat_prices.loc[first_forward_start:]
+                                signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                benchmark_label_for_metrics = "WFO Test Benchmark"
+                                full_period_benchmark_pct_for_metrics = full_bh
+                                using_wfo_primary_for_metrics = True
+
+                    # Plot Context
+                    with st.expander("See Strategy Context"):
+                        fig_ctx = go.Figure()
+                        if signal_method == "Regime Weighted Expected Return" and "expected_ret" in regime_context:
+                            expected_ret = regime_context["expected_ret"].reindex(strat_prices.index).ffill()
                             fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
                             fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
-                            
-                            highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.3)
-                            highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.3)
-                            
-                            fig_ctx.update_layout(title="Regime-Weighted Expected Return", hovermode="x unified", template="plotly_dark", height=400)
-                            st.plotly_chart(fig_ctx, use_container_width=True)
-
-                    elif signal_method == "Regime Probability":
-                        # Logic: Long if Bull Probability is the highest (Dominant)
-                        # Or specifically: Bull > Bear (and Bull > Normal)
-                        
-                        bull_probs = probs_df.iloc[:, bull_regime_idx]
-                        
-                        # Determine if Bull is dominant
-                        # We can just check if argmax is the bull index
-                        dominant_regime = probs_df.idxmax(axis=1) # Returns column name (0, 1, etc)
-                        
-                        # Align indices
-                        common_idx = strat_prices.index.intersection(dominant_regime.index)
-                        dominant_regime = dominant_regime.loc[common_idx]
-                        bull_probs = bull_probs.loc[common_idx]
-                        
-                        # Signal: 1 if Dominant Regime is Bull, else 0
-                        signals = (dominant_regime == bull_regime_idx).astype(int)
-                        
-                        # Plot Context
-                        with st.expander("See Strategy Context"):
-                            fig_ctx = go.Figure()
+                            highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.2)
+                            highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.2)
+                            fig_ctx.update_layout(title="Regime-Weighted Expected Return + Conviction Filter", hovermode="x unified", template="plotly_dark", height=400)
+                        else:
+                            bull_probs = regime_context.get("bull_probs", pd.Series(dtype=float)).reindex(strat_prices.index).ffill()
                             fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=bull_probs, mode='lines', line=dict(color='green', width=1.5), name='Bull Probability'))
-                            for r_idx, r_mean in sorted_regimes:
-                                if r_idx != bull_regime_idx:
-                                    other_probs = probs_df.iloc[:, r_idx].loc[common_idx]
-                                    fig_ctx.add_trace(go.Scatter(x=other_probs.index, y=other_probs, mode='lines', line=dict(dash='dash'), opacity=0.6, name=f'Regime {r_idx} Prob'))
-                            
-                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-                            
-                            fig_ctx.update_layout(title=f"Regime Probability Crossover (Bull Regime: {bull_regime_idx})", hovermode="x unified", template="plotly_dark", height=400)
-                            st.plotly_chart(fig_ctx, use_container_width=True)
-
-                    else: # Regime Switching Period
-                        # Logic: Long if Bull Probability is the highest (Dominant)
-                        # This is similar to 'Regime Probability' but framed as "Period"
-                        # We ensure it's strictly 1 or 0 based on dominance.
-                        
-                        dominant_regime = probs_df.idxmax(axis=1)
-                        
-                        # Align indices
-                        common_idx = strat_prices.index.intersection(dominant_regime.index)
-                        dominant_regime = dominant_regime.loc[common_idx]
-                        
-                        # Signal: 1 if Dominant Regime is Bull
-                        signals = (dominant_regime == bull_regime_idx).astype(int)
-                        
-                        # Plot Context
-                        with st.expander("See Strategy Context"):
-                            fig_ctx = go.Figure()
-                            strat_prices_aligned = strat_prices.loc[common_idx]
-                            fig_ctx.add_trace(go.Scatter(x=strat_prices_aligned.index, y=strat_prices_aligned, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-                            
-                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.2)
-                            
-                            fig_ctx.update_layout(title=f"Regime Switching Periods (Bull Regime: {bull_regime_idx})", hovermode="x unified", template="plotly_dark", height=400)
-                            st.plotly_chart(fig_ctx, use_container_width=True)
+                            fig_ctx.add_hline(y=float(conviction), line_dash="dash", line_color="white", annotation_text="Min Bull Probability")
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.15)
+                            fig_ctx.update_layout(title=f"{signal_method} (Conviction={conviction:.0%}, Min Hold={int(min_hold_period)})", hovermode="x unified", template="plotly_dark", height=400)
+                        st.plotly_chart(fig_ctx, use_container_width=True)
 
                     # Debug Dataframe
                     with st.expander("🔍 Debug: Signal Details"):
