@@ -1558,9 +1558,39 @@ def walk_forward_strategy_selection(prices, candidates, train_window=126, forwar
 
 def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=10000.0, file_prefix="Adaptive_Strategy"):
     """
-    Tests multiple long/cash rules and displays the best performer vs buy & hold.
-    This is an optimizer/research lab, not a future guarantee.
+    Tests multiple long/cash rules and displays both:
+    1) Walk-forward selected result (primary, more realistic)
+    2) Full-history adaptive ranking (research/reference only)
     """
+    prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+
+    st.write(f"#### 🚀 {title}: Adaptive Rule Optimizer")
+    st.caption(
+        "Walk-forward mode trains on past data, chooses the best rule, then tests it on the next unseen window. "
+        "This is more realistic than picking the best rule from the full chart."
+    )
+
+    with st.expander(f"⚙️ {title} Walk-Forward Settings", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        enable_wfo = c1.checkbox(f"Enable {title} WFO", value=True, key=f"{file_prefix}_enable_wfo")
+        use_wfo_primary = c2.checkbox(f"Use WFO as main result", value=True, key=f"{file_prefix}_use_wfo_primary")
+        confirmed_bar = c3.checkbox(f"Confirmed-bar execution", value=True, key=f"{file_prefix}_confirmed_bar")
+        show_insample = c4.checkbox(f"Show full-history ranking", value=True, key=f"{file_prefix}_show_insample")
+
+        c5, c6 = st.columns(2)
+        wf_train_bars = c5.number_input(
+            f"{title} WFO train bars",
+            min_value=30, max_value=1000, value=126, step=21,
+            key=f"{file_prefix}_wf_train_bars",
+            help="How many past bars the model uses to choose the best rule."
+        )
+        wf_forward_bars = c6.number_input(
+            f"{title} WFO forward bars",
+            min_value=5, max_value=252, value=21, step=5,
+            key=f"{file_prefix}_wf_forward_bars",
+            help="How many unseen future bars the chosen rule is tested on before re-optimizing."
+        )
+
     rows = []
     scored = []
     for name, logic_text, sig in candidates:
@@ -1586,15 +1616,71 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
     best = next(item for item in scored if item[0] == best_rule)
     best_name, best_logic, best_score = best
 
-    st.write(f"#### 🚀 {title}: Adaptive Rule Optimizer")
-    st.caption("This tests multiple simple long/cash rules on the selected history and picks the best one. It can overfit, so use it as a research tool — not a magic guarantee.")
-    st.dataframe(rank_df, use_container_width=True)
+    wf_result = None
+    if enable_wfo:
+        wf_result = walk_forward_strategy_selection(
+            prices,
+            candidates,
+            train_window=int(wf_train_bars),
+            forward_window=int(wf_forward_bars),
+            initial_capital=initial_capital,
+            confirmed_bar=confirmed_bar
+        )
 
-    if best_score['Difference %'] > 0:
-        st.success(f"Best rule beat buy & hold by **{best_score['Difference %']:.2f}%** on this selected history: **{best_name}**")
-    else:
-        st.warning(f"Best rule still did not beat buy & hold on this selected history. Best rule: **{best_name}**. That means this ticker/timeframe was better as buy-and-hold.")
-    st.info(f"Best rule logic: {best_logic}")
+        st.write(f"#### 🧭 {title} Walk-Forward Result")
+        if wf_result is None or wf_result.get('overall') is None:
+            st.warning(f"Not enough data to run {title} walk-forward validation. Falling back to full-history adaptive winner.")
+        else:
+            overall = wf_result['overall']
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("WFO Strategy Return", f"{overall['Strategy Return %']:.2f}%")
+            c2.metric("WFO Buy & Hold", f"{overall['Buy & Hold Return %']:.2f}%")
+            c3.metric("WFO Difference", f"{overall['Difference %']:+.2f}%")
+            c4.metric("WFO Win Rate", f"{wf_result['win_rate']*100:.0f}%")
+            c5.metric("Stability", f"{wf_result['stability_score']:.0f}/100")
+
+            if overall['Difference %'] > 0 and wf_result['stability_score'] >= 60:
+                st.success(f"{title} WFO is positive and reasonably stable. This is stronger than only using the in-sample winner.")
+            elif overall['Difference %'] > 0:
+                st.warning(f"{title} WFO beat buy & hold, but stability is not very strong. Use confirmation.")
+            else:
+                st.warning(f"{title} WFO did not beat buy & hold on the unseen forward windows. Treat the adaptive winner as research, not a strong edge.")
+
+            wf_rows = wf_result['rows'].copy()
+            if not wf_rows.empty:
+                for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
+                    wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
+                st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
+                st.download_button(
+                    f"📥 Download {title} WFO Periods",
+                    wf_rows.to_csv(index=False),
+                    file_name=f"{file_prefix}_WalkForward_Periods_{TICKER}.csv",
+                    mime="text/csv",
+                    key=f"{file_prefix}_download_wfo_periods"
+                )
+
+    if show_insample:
+        st.write(f"#### 📌 {title} Full-History Ranking / Research Reference")
+        st.caption("This ranking uses the whole selected chart. It is useful for research, but it can overfit more than WFO.")
+        st.dataframe(rank_df, use_container_width=True)
+
+        if best_score['Difference %'] > 0:
+            st.success(f"Full-history best rule beat buy & hold by **{best_score['Difference %']:.2f}%**: **{best_name}**")
+        else:
+            st.warning(f"Full-history best rule still did not beat buy & hold. Best rule: **{best_name}**.")
+        st.info(f"Full-history best rule logic: {best_logic}")
+
+    if enable_wfo and use_wfo_primary and wf_result is not None and wf_result.get('overall') is not None:
+        first_forward_start = wf_result['rows']['Forward Start'].iloc[0]
+        exec_prices = prices.loc[first_forward_start:]
+        exec_signal = wf_result['signal'].reindex(exec_prices.index).ffill().fillna(0).clip(0, 1)
+        return display_strategy_vs_buyhold_backtest(
+            f"{title} WFO-Selected Strategy",
+            exec_prices,
+            exec_signal,
+            initial_capital=initial_capital,
+            file_prefix=file_prefix
+        )
 
     return display_strategy_vs_buyhold_backtest(
         best_name,
