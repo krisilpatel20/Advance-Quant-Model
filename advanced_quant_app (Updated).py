@@ -15,6 +15,10 @@ from datetime import datetime, timedelta
 import io
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import json
+import smtplib
+from email.message import EmailMessage
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -1909,6 +1913,156 @@ def load_fred_data(series_id):
         print(f"Error loading FRED {series_id}: {e}")
         return None
 
+
+# ==========================================
+# LIVE SIGNAL ALERT HELPERS
+# ==========================================
+def _safe_secret(section, key, default=""):
+    """Safely read Streamlit secrets without breaking local runs."""
+    try:
+        if section in st.secrets and key in st.secrets[section]:
+            return st.secrets[section][key]
+    except Exception:
+        pass
+    return default
+
+
+def _alert_state_path():
+    """Persistent local state so refresh/rerun does not resend the same alert."""
+    try:
+        return Path.cwd() / ".quant_live_alert_state.json"
+    except Exception:
+        return Path(".quant_live_alert_state.json")
+
+
+def _load_alert_state():
+    try:
+        fp = _alert_state_path()
+        if fp.exists():
+            return json.loads(fp.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_alert_state(state):
+    try:
+        _alert_state_path().write_text(json.dumps(state, indent=2, default=str))
+    except Exception:
+        # If the app host is read-only, session_state still prevents most duplicate alerts.
+        pass
+
+
+def _send_email_alert(subject, body, recipients, smtp_server, smtp_port, sender_email, sender_password, use_tls=True):
+    """Send an email alert. SMS works by using carrier email-to-text addresses as recipients."""
+    recipients = [r.strip() for r in str(recipients).replace(";", ",").split(",") if r.strip()]
+    if not recipients:
+        return False, "No alert recipients entered."
+    if not smtp_server or not smtp_port or not sender_email or not sender_password:
+        return False, "Missing SMTP settings. Add sender email/app password or Streamlit secrets."
+
+    msg = EmailMessage()
+    msg["From"] = sender_email
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if int(smtp_port) == 465 and not use_tls:
+            with smtplib.SMTP_SSL(smtp_server, int(smtp_port), timeout=20) as server:
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_server, int(smtp_port), timeout=20) as server:
+                if use_tls:
+                    server.starttls()
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        return True, f"Alert sent to {', '.join(recipients)}"
+    except Exception as e:
+        return False, f"Alert send failed: {e}"
+
+
+def maybe_send_live_signal_alert(
+    enabled,
+    live_mode,
+    ticker,
+    strategy_name,
+    signals,
+    prices,
+    alert_config,
+    extra_note=""
+):
+    """Send BUY/SELL alert only when the latest signal changes in live mode."""
+    if not enabled or not live_mode or signals is None or prices is None:
+        return
+
+    try:
+        sig = pd.Series(signals).replace([np.inf, -np.inf], np.nan).dropna()
+        px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(sig) < 2 or px.empty:
+            return
+
+        sig = sig.clip(lower=0, upper=1)
+        prev_sig = float(sig.iloc[-2])
+        last_sig = float(sig.iloc[-1])
+        last_dt = sig.index[-1]
+        aligned_px = px.reindex(sig.index).ffill().bfill()
+        last_price = float(aligned_px.iloc[-1])
+
+        action = None
+        if prev_sig <= 0 and last_sig > 0:
+            action = "BUY"
+        elif prev_sig > 0 and last_sig <= 0:
+            action = "SELL"
+        else:
+            return
+
+        # Prevent duplicate alerts for the same ticker/strategy/bar/action.
+        dedupe_key = f"{ticker}|{strategy_name}|{action}|{pd.Timestamp(last_dt).isoformat()}"
+        state = _load_alert_state()
+        session_key = f"last_alert_{ticker}_{strategy_name}"
+        if state.get("last_alert_key") == dedupe_key or st.session_state.get(session_key) == dedupe_key:
+            return
+
+        subject = f"{action} Alert: {ticker} @ {last_price:.2f}"
+        body = f"""Live model signal alert
+
+Ticker: {ticker}
+Action: {action}
+Strategy: {strategy_name}
+Signal time: {last_dt}
+Approx price: {last_price:.2f}
+Previous exposure: {prev_sig:.2f}
+New exposure: {last_sig:.2f}
+
+{extra_note}
+
+This is a model alert, not financial advice. Confirm price/liquidity before trading.
+"""
+        ok, msg = _send_email_alert(
+            subject=subject,
+            body=body,
+            recipients=alert_config.get("recipients", ""),
+            smtp_server=alert_config.get("smtp_server", ""),
+            smtp_port=alert_config.get("smtp_port", 587),
+            sender_email=alert_config.get("sender_email", ""),
+            sender_password=alert_config.get("sender_password", ""),
+            use_tls=alert_config.get("use_tls", True),
+        )
+
+        if ok:
+            st.session_state[session_key] = dedupe_key
+            state["last_alert_key"] = dedupe_key
+            state["last_alert_message"] = subject
+            state["last_alert_time"] = datetime.now().isoformat()
+            _save_alert_state(state)
+            st.toast(f"🔔 {msg}")
+        else:
+            st.warning(msg)
+    except Exception as e:
+        st.warning(f"Live alert check failed: {e}")
+
 # FED Balance Sheet Series Definitions
 FED_ASSETS = {
     "WGCAL": "Gold Certificate Account",
@@ -2312,6 +2466,49 @@ with st.sidebar:
             st.rerun()
     else:
         data_interval = '1d'
+
+    st.divider()
+    st.header("🔔 Live Buy/Sell Alerts")
+    alert_enabled = st.toggle(
+        "Enable live signal alerts",
+        value=False,
+        help="Sends an email/SMS-gateway alert only when the selected live strategy flips BUY or SELL."
+    )
+
+    default_recipients = _safe_secret("alert_email", "recipients", _safe_secret("alert_email", "recipient", ""))
+    default_smtp_server = _safe_secret("alert_email", "smtp_server", "smtp.gmail.com")
+    default_smtp_port = int(_safe_secret("alert_email", "smtp_port", 587))
+    default_sender_email = _safe_secret("alert_email", "sender_email", "")
+    default_sender_password = _safe_secret("alert_email", "sender_password", "")
+    default_use_tls = bool(_safe_secret("alert_email", "use_tls", True))
+
+    if alert_enabled:
+        st.caption("For text messages, enter your carrier SMS gateway email, or use your normal email. Example: yournumber@vtext.com.")
+        alert_recipients = st.text_input("Alert recipient(s)", value=default_recipients, help="Comma-separated emails or SMS-gateway addresses.")
+        with st.expander("SMTP sender settings", expanded=False):
+            alert_smtp_server = st.text_input("SMTP server", value=default_smtp_server)
+            alert_smtp_port = st.number_input("SMTP port", min_value=1, max_value=9999, value=default_smtp_port, step=1)
+            alert_use_tls = st.checkbox("Use TLS", value=default_use_tls)
+            alert_sender_email = st.text_input("Sender email", value=default_sender_email)
+            alert_sender_password = st.text_input("Sender app password", value=default_sender_password, type="password")
+        if not live_mode:
+            st.info("Alerts only fire when Live Data mode is enabled.")
+    else:
+        alert_recipients = default_recipients
+        alert_smtp_server = default_smtp_server
+        alert_smtp_port = default_smtp_port
+        alert_use_tls = default_use_tls
+        alert_sender_email = default_sender_email
+        alert_sender_password = default_sender_password
+
+    alert_config = {
+        "recipients": alert_recipients,
+        "smtp_server": alert_smtp_server,
+        "smtp_port": int(alert_smtp_port),
+        "use_tls": bool(alert_use_tls),
+        "sender_email": alert_sender_email,
+        "sender_password": alert_sender_password,
+    }
 
     st.subheader("Report Export")
     if not EXPORT_AVAILABLE:
@@ -4615,6 +4812,18 @@ with tab7:
             st.success(f"🚀 **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Action: **HOLD LONG**")
         else:
             st.error(f"🛑 **STRATEGY SIGNAL (CASH)** | Last Update: {last_dt} | Action: **STAY IN CASH / HEDGE**")
+
+        # Live alert: only fires on actual BUY/SELL flips, not on every refresh/hold.
+        maybe_send_live_signal_alert(
+            enabled=alert_enabled,
+            live_mode=live_mode,
+            ticker=TICKER,
+            strategy_name=strategy_type,
+            signals=signals,
+            prices=strat_prices,
+            alert_config=alert_config,
+            extra_note=f"Backtest tab strategy: {strategy_type}"
+        )
         
         # Metrics
         strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
