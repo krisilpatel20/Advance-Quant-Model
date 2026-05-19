@@ -5029,11 +5029,11 @@ with tab7:
         
         col_h1, col_h2 = st.columns(2)
         with col_h1:
-            hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=100, step=10)
-            target_ann_vol = st.number_input("Target Annual Volatility (%) ", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
+            hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=50, step=10)
+            target_ann_vol = st.number_input("Target Annual Volatility (%)", min_value=1.0, max_value=100.0, value=25.0, step=1.0)
         with col_h2:
             st.write("Regime Parameters")
-            st.caption("Dead Zone: 0.45 to 0.55\nConfirmation: 5 Consecutive Bars\nSizing: Continuous Vol-Targeting")
+            st.caption("Dead Zone: 0.45 to 0.55\nConfirmation: 3 Consecutive Bars\nSizing: Continuous Vol-Targeting")
             
         with st.spinner("Calculating Institutional Hurst & Volatility Targeting..."):
             try:
@@ -5053,14 +5053,14 @@ with tab7:
                 mr_sig.loc[prices_bt > bb_ma] = 0.0
                 mr_signal = mr_sig.ffill().fillna(0.0)
                 
-                # 3. Regime Allocator (5-Bar Confirmation + Dead Zone)
+                # 3. Regime Allocator (3-Bar Confirmation + Dead Zone)
                 cond_trend = (hurst_series > 0.55)
                 cond_mr = (hurst_series < 0.45)
                 cond_cash = (hurst_series >= 0.45) & (hurst_series <= 0.55)
                 
-                conf_trend = cond_trend.rolling(5).sum() == 5
-                conf_mr = cond_mr.rolling(5).sum() == 5
-                conf_cash = cond_cash.rolling(5).sum() == 5
+                conf_trend = cond_trend.astype(int).rolling(3, min_periods=3).sum().eq(3).fillna(False)
+                conf_mr = cond_mr.astype(int).rolling(3, min_periods=3).sum().eq(3).fillna(False)
+                conf_cash = cond_cash.astype(int).rolling(3, min_periods=3).sum().eq(3).fillna(False)
                 
                 state = pd.Series(np.nan, index=prices_bt.index)
                 state.loc[conf_trend] = 1 # 1 = TREND
