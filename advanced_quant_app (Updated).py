@@ -1472,7 +1472,8 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
     """
     Walk-forward validation for the Regime Switching backtest.
     Each forward block fits only on the trailing training window, selects the best regime signal method
-    on that training window, then applies the latest confirmed exposure to the next unseen block.
+    and, when n_regimes='Auto', the best number of regimes from 2/3/4 on that training window.
+    It then applies the latest confirmed exposure to the next unseen block.
     """
     prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
     returns = pd.Series(returns).reindex(prices.index).replace([np.inf, -np.inf], np.nan).dropna()
@@ -1485,9 +1486,12 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
     if len(prices) < train_window + max(5, forward_window):
         return None
 
-    methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
-    if use_strong_runner_override:
-        methods.append("Strong Runner Trend Hold")
+    base_methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
+    # Auto means WFO chooses the best regime count per forward block using only the training window.
+    if isinstance(n_regimes, str) and n_regimes.lower() == "auto":
+        regime_candidates = [2, 3, 4]
+    else:
+        regime_candidates = [int(n_regimes)]
     idx = prices.index
     wf_signal = pd.Series(np.nan, index=idx, dtype=float)
     rows = []
@@ -1508,22 +1512,50 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             continue
         train_returns = pd.Series(train_returns.values.flatten().astype(float), index=train_returns.index)
 
-        res = fit_regime_model(train_returns, int(n_regimes), switch_vol, switch_trend, search_reps=8)
-        if res is None:
-            start += forward_window
-            period_no += 1
-            continue
-
         train_scores = []
-        for method in methods:
+
+        # 1) Markov regime candidates: WFO can choose 2, 3, or 4 regimes per stock/period.
+        for n_candidate in regime_candidates:
             try:
-                if method == "Strong Runner Trend Hold":
-                    sig_train = strong_runner_trend_hold_signal(prices.loc[train_idx])
-                else:
-                    sig_train, _ = build_regime_backtest_signal(
-                        res, train_returns.index, prices.loc[train_idx].index,
-                        int(n_regimes), method, conviction=float(conviction), min_hold=int(min_hold)
-                    )
+                n_candidate = int(n_candidate)
+                if len(train_returns) < max(20, n_candidate * 8):
+                    continue
+                res = fit_regime_model(train_returns, n_candidate, switch_vol, switch_trend, search_reps=8)
+                if res is None:
+                    continue
+
+                for method in base_methods:
+                    try:
+                        sig_train, _ = build_regime_backtest_signal(
+                            res, train_returns.index, prices.loc[train_idx].index,
+                            n_candidate, method, conviction=float(conviction), min_hold=int(min_hold)
+                        )
+                        if confirmed_bar:
+                            sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
+                        score = evaluate_strategy_candidate(
+                            prices.loc[train_idx], sig_train,
+                            initial_capital=initial_capital,
+                            trailing_stop_pct=trailing_stop_pct,
+                            stop_loss_pct=stop_loss_pct
+                        )
+                        if score is None:
+                            continue
+                        score["Institutional Score"] = risk_adjusted_candidate_score(score)
+                        train_scores.append({
+                            "method": method,
+                            "n_regimes": n_candidate,
+                            "score": score,
+                            "signal": sig_train
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # 2) Strong runner candidate is not a Markov model, so add it only once.
+        if use_strong_runner_override:
+            try:
+                sig_train = strong_runner_trend_hold_signal(prices.loc[train_idx])
                 if confirmed_bar:
                     sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
                 score = evaluate_strategy_candidate(
@@ -1532,12 +1564,16 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                     trailing_stop_pct=trailing_stop_pct,
                     stop_loss_pct=stop_loss_pct
                 )
-                if score is None:
-                    continue
-                score["Institutional Score"] = risk_adjusted_candidate_score(score)
-                train_scores.append({"method": method, "score": score, "signal": sig_train})
+                if score is not None:
+                    score["Institutional Score"] = risk_adjusted_candidate_score(score)
+                    train_scores.append({
+                        "method": "Strong Runner Trend Hold",
+                        "n_regimes": "Trend",
+                        "score": score,
+                        "signal": sig_train
+                    })
             except Exception:
-                continue
+                pass
 
         if not train_scores:
             start += forward_window
@@ -1551,7 +1587,8 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         )
         chosen = train_scores[0]
         chosen_method = chosen["method"]
-        sequence.append(chosen_method)
+        chosen_n_regimes = chosen.get("n_regimes", n_regimes)
+        sequence.append(f"{chosen_method} | {chosen_n_regimes}R")
 
         # No-lookahead forward execution.
         # For Markov signals, carry the latest training exposure into the next unseen block.
@@ -1579,6 +1616,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             "Forward Start": test_idx[0],
             "Forward End": test_idx[-1],
             "Selected Method": chosen_method,
+            "Selected Regimes": chosen_n_regimes,
             "Train Diff %": round(chosen["score"]["Difference %"], 2),
             "Forward Strategy %": round(test_score.get("Strategy Return %", np.nan), 2) if test_score else np.nan,
             "Forward Buy & Hold %": round(test_score.get("Buy & Hold Return %", np.nan), 2) if test_score else np.nan,
@@ -4554,6 +4592,7 @@ with tab7:
             use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=True, key="bt_regime_use_wfo")
             regime_wf_train = wf_c3.number_input("Regime WFO train bars", min_value=30, max_value=1000, value=252, step=21, key="bt_regime_wf_train")
             regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=21, step=5, key="bt_regime_wf_forward")
+            auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
 
         if signal_method == "Regime Weighted Expected Return":
@@ -4697,7 +4736,7 @@ with tab7:
                             wf_regime = walk_forward_regime_selection(
                                 strat_prices,
                                 returns_bt_resampled,
-                                n_regimes=int(bt_n_regimes),
+                                n_regimes="Auto" if bool(auto_wfo_regimes) else int(bt_n_regimes),
                                 switch_vol=bool(bt_switch_vol),
                                 switch_trend=bool(bt_switch_trend),
                                 train_window=int(regime_wf_train),
