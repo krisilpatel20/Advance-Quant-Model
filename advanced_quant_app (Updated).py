@@ -1483,7 +1483,13 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
 
     train_window = int(train_window)
     forward_window = int(forward_window)
-    if len(prices) < train_window + max(5, forward_window):
+
+    # Strict WFO sizing: do not silently shrink the walk-forward windows.
+    # If there is not enough data to train and test honestly, return None and
+    # let the UI show no WFO trades instead of forcing fallback results.
+    if len(prices) < max(35, train_window + forward_window):
+        return None
+    if train_window < 25 or forward_window < 5:
         return None
 
     base_methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
@@ -1506,22 +1512,21 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             break
 
         train_returns = (returns.loc[train_idx].dropna() * 100)
-        # n_regimes can be "Auto". Use the smallest allowed regime candidate for the basic data check,
-        # then each candidate gets its own stricter check inside the loop below.
-        min_required_regimes = min(int(x) for x in regime_candidates if isinstance(x, (int, np.integer)) or str(x).isdigit())
-        if len(train_returns) < max(20, min_required_regimes * 8):
-            start += forward_window
-            period_no += 1
-            continue
+        # n_regimes can be "Auto". Markov candidates need enough returns to converge,
+        # but non-Markov fallback candidates like Strong Runner can still be tested on
+        # short/noisy windows. Do NOT skip the whole WFO period just because Markov
+        # lacks enough observations.
+        has_markov_training_data = len(train_returns) >= 20
         train_returns = pd.Series(train_returns.values.flatten().astype(float), index=train_returns.index)
 
         train_scores = []
+        markov_candidate_count = 0
 
         # 1) Markov regime candidates: WFO can choose 2, 3, or 4 regimes per stock/period.
         for n_candidate in regime_candidates:
             try:
                 n_candidate = int(n_candidate)
-                if len(train_returns) < max(20, n_candidate * 8):
+                if (not has_markov_training_data) or len(train_returns) < max(20, n_candidate * 8):
                     continue
                 res = fit_regime_model(train_returns, n_candidate, switch_vol, switch_trend, search_reps=8)
                 if res is None:
@@ -1544,6 +1549,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                         if score is None:
                             continue
                         score["Institutional Score"] = risk_adjusted_candidate_score(score)
+                        markov_candidate_count += 1
                         train_scores.append({
                             "method": method,
                             "n_regimes": n_candidate,
@@ -1555,7 +1561,9 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             except Exception:
                 continue
 
-        # 2) Strong runner candidate is not a Markov model, so add it only once.
+        # 2) Strong runner candidate is not a Markov model, so add it once per training window.
+        # This is still a true WFO candidate because it is scored only on the training window
+        # and then tested only on the next unseen forward window. It is NOT a full-history fallback.
         if use_strong_runner_override:
             try:
                 sig_train = strong_runner_trend_hold_signal(prices.loc[train_idx])
@@ -1661,7 +1669,9 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         "change_rate": change_rate,
         "avg_forward_diff": avg_diff,
         "stability_score": stability_score,
-        "strategy_sequence": sequence
+        "strategy_sequence": sequence,
+        "effective_train_window": train_window,
+        "effective_forward_window": forward_window
     }
 
 
@@ -4755,9 +4765,14 @@ with tab7:
 
                         st.write("#### 🧭 Regime Walk-Forward Result")
                         if wf_regime is None or wf_regime.get("overall") is None:
-                            st.warning("Not enough data or model convergence to run Regime WFO. Falling back to full-history selected signal.")
+                            st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
+                            using_wfo_primary_for_metrics = False
                         else:
                             wf_overall = wf_regime["overall"]
+                            eff_train = wf_regime.get("effective_train_window", regime_wf_train)
+                            eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
+                            if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
+                                st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
                             full_bh = buy_hold_return_pct(strat_prices)
                             wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
                             wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
