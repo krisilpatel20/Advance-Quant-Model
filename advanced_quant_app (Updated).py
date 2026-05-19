@@ -5031,6 +5031,7 @@ with tab7:
         with col_h1:
             hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=50, step=10)
             target_ann_vol = st.number_input("Target Annual Volatility (%)", min_value=1.0, max_value=100.0, value=25.0, step=1.0)
+            use_vol_target = st.checkbox("Enable Vol Targeting", value=False)
         with col_h2:
             st.write("Regime Parameters")
             st.caption("Dead Zone: 0.45 to 0.55\nConfirmation: 3 Consecutive Bars\nSizing: Continuous Vol-Targeting")
@@ -5039,10 +5040,12 @@ with tab7:
             try:
                 hurst_series = rolling_hurst(prices_bt, window=int(hurst_window))
                 
-                # 1. Trend Signal (EMA Cross)
+                # 1. Trend Signal (Slow EMA trend filter)
+                # Cleaner than EMA-fast/EMA-slow cross for this Hurst allocator:
+                # long only when price is above the slow trend filter.
                 ema_fast = prices_bt.ewm(span=20, adjust=False).mean()
                 ema_slow = prices_bt.ewm(span=50, adjust=False).mean()
-                trend_signal = (ema_fast > ema_slow).astype(float)
+                trend_signal = (prices_bt > ema_slow).astype(float)
                 
                 # 2. Mean Reversion Signal (Bollinger Bands)
                 bb_ma = prices_bt.rolling(window=20).mean()
@@ -5072,22 +5075,33 @@ with tab7:
                 raw_signals.loc[state == 1] = trend_signal.loc[state == 1]
                 raw_signals.loc[state == -1] = mr_signal.loc[state == -1]
                 
-                # 4. Volatility Targeting Capital Sizing
-                returns_bt = prices_bt.pct_change().dropna()
-                from arch import arch_model
-                am = arch_model(returns_bt * 100, vol='Garch', p=1, q=1, dist='normal')
-                res = am.fit(disp='off')
-                garch_vol_daily = res.conditional_volatility / 100
-                
-                # Align garch_vol_daily with prices_bt
-                garch_vol_aligned = pd.Series(np.nan, index=prices_bt.index)
-                garch_vol_aligned.loc[returns_bt.index] = garch_vol_daily
-                garch_vol_aligned = garch_vol_aligned.bfill() # fill the first day
-                
-                daily_target_vol = (target_ann_vol / 100) / np.sqrt(252)
-                position_size = np.clip(daily_target_vol / garch_vol_aligned, 0.0, 1.0)
-                
-                signals = raw_signals * position_size
+                # 4. Optional Volatility Targeting Capital Sizing
+                # OFF = clean 0/1 strategy signal.
+                # ON  = scale exposure by GARCH volatility, capped between 0% and 100%.
+                if use_vol_target:
+                    returns_bt = prices_bt.pct_change().dropna()
+                    if ARCH_AVAILABLE and len(returns_bt) >= 30:
+                        try:
+                            am = arch_model(returns_bt * 100, vol='Garch', p=1, q=1, dist='normal')
+                            res = am.fit(disp='off')
+                            garch_vol_daily = res.conditional_volatility / 100
+
+                            # Align garch_vol_daily with prices_bt
+                            garch_vol_aligned = pd.Series(np.nan, index=prices_bt.index)
+                            garch_vol_aligned.loc[returns_bt.index] = garch_vol_daily
+                            garch_vol_aligned = garch_vol_aligned.replace([np.inf, -np.inf], np.nan).bfill().ffill()
+
+                            daily_target_vol = (target_ann_vol / 100) / np.sqrt(252)
+                            position_size = (daily_target_vol / (garch_vol_aligned + 1e-9)).clip(0.0, 1.0)
+                            signals = (raw_signals * position_size).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                        except Exception as vol_e:
+                            st.warning(f"Vol targeting failed, using raw Hurst signals instead: {vol_e}")
+                            signals = raw_signals.fillna(0.0)
+                    else:
+                        st.warning("Vol targeting needs the 'arch' package and enough return history. Using raw Hurst signals instead.")
+                        signals = raw_signals.fillna(0.0)
+                else:
+                    signals = raw_signals.fillna(0.0)
                 
                 with st.expander("See Strategy Context", expanded=True):
                     fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.4, 0.3, 0.3], vertical_spacing=0.05)
@@ -5107,7 +5121,7 @@ with tab7:
                     highlight_plotly_zones(fig_ctx, state == 1, 'green', opacity=0.1, row=2, col=1)
                     highlight_plotly_zones(fig_ctx, state == -1, 'orange', opacity=0.1, row=2, col=1)
                     
-                    fig_ctx.update_layout(title="Institutional Hurst Regime (Dead Zone + Vol Targeting)", hovermode="x unified", template="plotly_dark", height=700)
+                    fig_ctx.update_layout(title=f"Institutional Hurst Regime (Dead Zone + {'Vol Targeting' if use_vol_target else 'Raw 0/1 Exposure'})", hovermode="x unified", template="plotly_dark", height=700)
                     fig_ctx.update_yaxes(title_text="Capital (%)", row=3, col=1, range=[0, 105])
                     st.plotly_chart(fig_ctx, use_container_width=True)
                     
@@ -5123,8 +5137,8 @@ with tab7:
         last_sig = signals.iloc[-1]
         last_dt = signals.index[-1]
         st.divider()
-        if last_sig == 1:
-            st.success(f"🚀 **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Action: **HOLD LONG**")
+        if last_sig > 0:
+            st.success(f"🚀 **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Exposure: **{last_sig*100:.0f}%** | Action: **HOLD LONG**")
         else:
             st.error(f"🛑 **STRATEGY SIGNAL (CASH)** | Last Update: {last_dt} | Action: **STAY IN CASH / HEDGE**")
 
