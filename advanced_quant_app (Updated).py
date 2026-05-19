@@ -1506,7 +1506,10 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             break
 
         train_returns = (returns.loc[train_idx].dropna() * 100)
-        if len(train_returns) < max(20, n_regimes * 8):
+        # n_regimes can be "Auto". Use the smallest allowed regime candidate for the basic data check,
+        # then each candidate gets its own stricter check inside the loop below.
+        min_required_regimes = min(int(x) for x in regime_candidates if isinstance(x, (int, np.integer)) or str(x).isdigit())
+        if len(train_returns) < max(20, min_required_regimes * 8):
             start += forward_window
             period_no += 1
             continue
