@@ -2606,6 +2606,208 @@ class ReportGenerator:
         return pdf_raw
 
 # ==========================================
+
+def walk_forward_strategy_selection_institutional(prices, candidates, train_window=252, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0, top_n=3, ensemble_threshold=0.45, switch_penalty=8.0, min_trades=3, trend_override=True):
+    """
+    Institutional-style walk-forward selector.
+    Differences from single-winner WFO:
+    - Scores candidates by risk-adjusted quality, not raw return only.
+    - Uses a top-N ensemble vote instead of trusting one rule.
+    - Penalizes frequent rule switching.
+    - Adds a price-trend override so strong runners are not missed by a defensive IV filter.
+    """
+    prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(prices) < int(train_window) + max(5, int(forward_window)):
+        return None
+
+    train_window = int(train_window)
+    forward_window = int(forward_window)
+    top_n = max(1, int(top_n))
+    idx = prices.index
+
+    sma50 = prices.rolling(50, min_periods=20).mean()
+    sma200 = prices.rolling(200, min_periods=50).mean()
+    mom63 = prices.pct_change(63)
+    strong_trend = ((prices > sma50) & (prices > sma200) & (mom63 > 0)).fillna(False)
+    weak_trend = ((prices < sma50) & (mom63 < 0)).fillna(False)
+
+    wf_signal = pd.Series(np.nan, index=idx, dtype=float)
+    wf_rows = []
+    strategy_sequence = []
+    prev_primary = None
+
+    start = train_window
+    period_no = 1
+    while start < len(prices):
+        train_idx = idx[start - train_window:start]
+        test_idx = idx[start:min(start + forward_window, len(prices))]
+        if len(test_idx) < 2:
+            break
+
+        train_prices = prices.loc[train_idx]
+        test_prices = prices.loc[test_idx]
+        train_scores = []
+
+        for name, logic, sig in candidates:
+            sig_series = pd.Series(sig).reindex(idx).ffill().fillna(0).clip(0, 1)
+            train_sig = sig_series.reindex(train_idx).ffill().fillna(0).clip(0, 1)
+            score_res = evaluate_strategy_candidate(
+                train_prices, train_sig,
+                initial_capital=initial_capital,
+                trailing_stop_pct=trailing_stop_pct,
+                stop_loss_pct=stop_loss_pct
+            )
+            if score_res is None:
+                continue
+
+            raw_returns = score_res.get('raw', {}).get('returns', pd.Series(dtype=float))
+            risk_metrics = BacktestEngine.calculate_metrics(raw_returns) if len(raw_returns) else {}
+            sharpe = float(risk_metrics.get('Sharpe Ratio', 0.0))
+            max_dd = float(score_res.get('Max DD %', 0.0))
+            trades = int(score_res.get('Trades', 0))
+            strat_ret = float(score_res.get('Strategy Return %', 0.0))
+            diff = float(score_res.get('Difference %', 0.0))
+
+            # Institutional score: return matters, but drawdown, low sample size, and instability matter too.
+            low_trade_penalty = 8.0 if 0 < trades < int(min_trades) else 0.0
+            no_trade_penalty = 15.0 if trades == 0 else 0.0
+            dd_penalty = 0.35 * abs(min(max_dd, 0.0))
+            sharpe_bonus = 8.0 * np.tanh(sharpe / 2.0)
+            score = (0.55 * strat_ret) + (0.45 * diff) + sharpe_bonus - dd_penalty - low_trade_penalty - no_trade_penalty
+
+            # Do not let tiny differences cause strategy flipping.
+            if prev_primary is not None and name != prev_primary:
+                score -= float(switch_penalty)
+
+            train_scores.append({
+                'name': name,
+                'logic': logic,
+                'signal': sig_series,
+                'score': score,
+                'train_return': strat_ret,
+                'train_diff': diff,
+                'train_dd': max_dd,
+                'train_sharpe': sharpe,
+                'train_trades': trades
+            })
+
+        if not train_scores:
+            start += forward_window
+            period_no += 1
+            continue
+
+        train_scores = sorted(train_scores, key=lambda x: (x['score'], x['train_diff'], x['train_return']), reverse=True)
+        selected = train_scores[:min(top_n, len(train_scores))]
+        primary = selected[0]
+        prev_primary = primary['name']
+
+        # Weighted top-N ensemble. Rank weights avoid overtrusting one lucky winner.
+        base_weights = np.array([0.50, 0.30, 0.20] + [0.0] * 10, dtype=float)[:len(selected)]
+        if len(selected) == 1:
+            base_weights = np.array([1.0])
+        else:
+            base_weights = base_weights / base_weights.sum()
+
+        ensemble_full = pd.Series(0.0, index=idx, dtype=float)
+        for w, item in zip(base_weights, selected):
+            ensemble_full = ensemble_full.add(item['signal'].reindex(idx).ffill().fillna(0).clip(0, 1) * float(w), fill_value=0.0)
+
+        if confirmed_bar:
+            ensemble_exec = ensemble_full.shift(1).ffill().fillna(0).clip(0, 1)
+        else:
+            ensemble_exec = ensemble_full.ffill().fillna(0).clip(0, 1)
+
+        # Convert ensemble vote into executable exposure.
+        # Strong trend override keeps exposure on for big momentum names unless the ensemble is almost fully defensive.
+        test_ensemble = ensemble_exec.reindex(test_idx).ffill().fillna(0).clip(0, 1)
+        test_signal = (test_ensemble >= float(ensemble_threshold)).astype(float)
+        if trend_override:
+            st_test = strong_trend.reindex(test_idx).fillna(False)
+            wk_test = weak_trend.reindex(test_idx).fillna(False)
+            test_signal = test_signal.where(~(st_test & (test_ensemble >= 0.20)), 1.0)
+            test_signal = test_signal.where(~(wk_test & (test_ensemble <= 0.20)), 0.0)
+
+        wf_signal.loc[test_idx] = test_signal
+
+        test_score = evaluate_strategy_candidate(
+            test_prices, test_signal,
+            initial_capital=initial_capital,
+            trailing_stop_pct=trailing_stop_pct,
+            stop_loss_pct=stop_loss_pct
+        )
+        strat_return = np.nan
+        bh_return = np.nan
+        diff_return = np.nan
+        trades = 0
+        max_dd = np.nan
+        if test_score is not None:
+            strat_return = test_score.get('Strategy Return %', np.nan)
+            bh_return = test_score.get('Buy & Hold Return %', np.nan)
+            diff_return = test_score.get('Difference %', np.nan)
+            trades = test_score.get('Trades', 0)
+            max_dd = test_score.get('Max DD %', np.nan)
+
+        selected_names = ' + '.join([x['name'] for x in selected])
+        wf_rows.append({
+            'Period': period_no,
+            'Train Start': train_idx[0],
+            'Train End': train_idx[-1],
+            'Forward Start': test_idx[0],
+            'Forward End': test_idx[-1],
+            'Selected Rule': primary['name'],
+            'Ensemble Rules': selected_names,
+            'Train Score': round(primary['score'], 2),
+            'Train Diff %': round(primary['train_diff'], 2) if pd.notna(primary['train_diff']) else np.nan,
+            'Train Sharpe': round(primary['train_sharpe'], 2) if pd.notna(primary['train_sharpe']) else np.nan,
+            'Forward Strategy %': round(strat_return, 2) if pd.notna(strat_return) else np.nan,
+            'Forward Buy & Hold %': round(bh_return, 2) if pd.notna(bh_return) else np.nan,
+            'Forward Diff %': round(diff_return, 2) if pd.notna(diff_return) else np.nan,
+            'Forward Max DD %': round(max_dd, 2) if pd.notna(max_dd) else np.nan,
+            'Forward Trades': trades
+        })
+        strategy_sequence.append(primary['name'])
+
+        start += forward_window
+        period_no += 1
+
+    wf_signal = wf_signal.ffill().fillna(0).clip(0, 1)
+    if len(wf_rows) == 0:
+        return None
+
+    first_forward_start = wf_rows[0]['Forward Start']
+    wf_eval_index = prices.loc[first_forward_start:].index
+    wf_prices = prices.loc[wf_eval_index]
+    wf_sig_active = wf_signal.reindex(wf_eval_index).ffill().fillna(0).clip(0, 1)
+    overall = evaluate_strategy_candidate(
+        wf_prices, wf_sig_active,
+        initial_capital=initial_capital,
+        trailing_stop_pct=trailing_stop_pct,
+        stop_loss_pct=stop_loss_pct
+    )
+
+    rows_df = pd.DataFrame(wf_rows)
+    wins = int((rows_df['Forward Diff %'] > 0).sum()) if 'Forward Diff %' in rows_df else 0
+    valid_periods = int(rows_df['Forward Diff %'].notna().sum()) if 'Forward Diff %' in rows_df else len(rows_df)
+    changes = sum(1 for a, b in zip(strategy_sequence, strategy_sequence[1:]) if a != b)
+    change_rate = changes / max(1, len(strategy_sequence) - 1)
+    win_rate = wins / max(1, valid_periods)
+    avg_forward_diff = float(rows_df['Forward Diff %'].dropna().mean()) if 'Forward Diff %' in rows_df and rows_df['Forward Diff %'].notna().any() else 0.0
+    stability_score = round(100 * (0.60 * win_rate + 0.25 * max(0, min(1, avg_forward_diff / 10)) + 0.15 * (1 - change_rate)), 0)
+
+    return {
+        'signal': wf_signal,
+        'rows': rows_df,
+        'overall': overall,
+        'win_rate': win_rate,
+        'changes': changes,
+        'change_rate': change_rate,
+        'avg_forward_diff': avg_forward_diff,
+        'stability_score': stability_score,
+        'strategy_sequence': strategy_sequence,
+        'confirmed_bar': confirmed_bar,
+        'mode': 'Institutional Ensemble'
+    }
+
 # 3. SIDEBAR CONTROLS
 # ==========================================
 with st.sidebar:
@@ -4700,6 +4902,20 @@ with tab7:
         with wf_col4:
             use_wf_signal = st.checkbox("Use WF signal for backtest", value=True)
         wf_confirmed_bar = st.checkbox("WF confirmed-bar execution: use previous closed signal", value=True, help="More realistic. It prevents same-candle lookahead by trading from the prior completed signal.")
+
+        with st.expander("Institutional WFO Controls", expanded=True):
+            st.caption("These settings make WFO less overfit: top-3 ensemble, risk-adjusted scoring, strategy-switch penalty, and momentum override for strong runners.")
+            iw1, iw2, iw3, iw4 = st.columns(4)
+            with iw1:
+                iv_wfo_mode = st.selectbox("WFO Selection Mode", ["Institutional Ensemble", "Single Best Rule"], index=0)
+            with iw2:
+                iv_top_n = st.number_input("Top-N Ensemble", min_value=1, max_value=5, value=3, step=1)
+            with iw3:
+                iv_switch_penalty = st.number_input("Strategy Switch Penalty", min_value=0.0, max_value=30.0, value=8.0, step=1.0)
+            with iw4:
+                iv_ensemble_threshold = st.number_input("Ensemble Long Threshold", min_value=0.10, max_value=0.90, value=0.45, step=0.05)
+            iv_trend_override = st.checkbox("Momentum / trend override for strong runners", value=True, help="Keeps the strategy from going fully defensive when the stock is above major trend filters and showing momentum.")
+            iv_min_trades = st.number_input("Minimum Trades Penalty Level", min_value=1, max_value=20, value=3, step=1)
             
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
@@ -4852,6 +5068,31 @@ with tab7:
                             "Stay long in larger uptrends unless VIX stress is confirmed and price loses the long-term trend. Built to avoid unnecessary exits.",
                             stateful(trend_override_entry, trend_override_exit, start_long=True)
                         ))
+
+                        # 8. Momentum protected IV gate: institutional guardrail for big stock-specific runners.
+                        # It uses SPY relative strength when available, but safely falls back to price momentum only.
+                        try:
+                            if live_mode:
+                                spy_df = load_data("SPY", start_date, end_date, interval=data_interval)
+                            else:
+                                spy_df = load_data("SPY", bt_start_date, bt_end_date, interval='1d')
+                            spy_close = spy_df['Close'].reindex(common_idx).ffill() if spy_df is not None and not spy_df.empty else pd.Series(np.nan, index=common_idx)
+                            rs_ratio = (asset_prices / spy_close).replace([np.inf, -np.inf], np.nan)
+                            rs_ma = rs_ratio.rolling(50, min_periods=20).mean()
+                            rs_strong = (rs_ratio > rs_ma).fillna(False)
+                        except Exception:
+                            rs_strong = pd.Series(True, index=common_idx)
+
+                        asset_ret_20 = asset_prices.pct_change(20)
+                        strong_runner = (asset_prices > asset_sma50) & (asset_prices > asset_sma200) & (asset_ret_20 > 0) & rs_strong
+                        severe_iv_stress = confirmed((vix_zscore > vix_cap_z) & (asset_prices < asset_sma50), bars=1)
+                        protected_entry = strong_runner | ((vix_zscore < 1.0) & (asset_prices > asset_sma20))
+                        protected_exit = severe_iv_stress | confirmed((asset_prices < asset_sma50) & (vix_zscore > vix_z), bars=int(confirm_bars))
+                        candidates.append((
+                            "Momentum Protected IV Gate",
+                            "Allows strong relative-strength uptrends to stay long unless IV stress becomes severe. Designed to avoid missing huge runners.",
+                            stateful(protected_entry, protected_exit, start_long=True)
+                        ))
                         
                         # Rank all candidates on the same selected history.
                         ranking_rows = []
@@ -4886,16 +5127,33 @@ with tab7:
                             if enable_iv_walk_forward:
                                 st.write("#### 🚶 Walk-Forward IV Proxy Validation")
                                 st.caption("This is stricter than the normal ranking: it chooses the best rule using only the past training window, then tests that rule on the next unseen forward window.")
-                                wf_result = walk_forward_strategy_selection(
-                                    asset_prices,
-                                    candidates,
-                                    train_window=int(wf_train_window),
-                                    forward_window=int(wf_forward_window),
-                                    initial_capital=initial_cap,
-                                    confirmed_bar=bool(wf_confirmed_bar),
-                                    trailing_stop_pct=trailing_stop,
-                                    stop_loss_pct=stop_loss
-                                )
+                                if iv_wfo_mode == "Institutional Ensemble":
+                                    wf_result = walk_forward_strategy_selection_institutional(
+                                        asset_prices,
+                                        candidates,
+                                        train_window=int(wf_train_window),
+                                        forward_window=int(wf_forward_window),
+                                        initial_capital=initial_cap,
+                                        confirmed_bar=bool(wf_confirmed_bar),
+                                        trailing_stop_pct=trailing_stop,
+                                        stop_loss_pct=stop_loss,
+                                        top_n=int(iv_top_n),
+                                        ensemble_threshold=float(iv_ensemble_threshold),
+                                        switch_penalty=float(iv_switch_penalty),
+                                        min_trades=int(iv_min_trades),
+                                        trend_override=bool(iv_trend_override)
+                                    )
+                                else:
+                                    wf_result = walk_forward_strategy_selection(
+                                        asset_prices,
+                                        candidates,
+                                        train_window=int(wf_train_window),
+                                        forward_window=int(wf_forward_window),
+                                        initial_capital=initial_cap,
+                                        confirmed_bar=bool(wf_confirmed_bar),
+                                        trailing_stop_pct=trailing_stop,
+                                        stop_loss_pct=stop_loss
+                                    )
 
                                 if wf_result is None:
                                     st.warning("Not enough history for walk-forward validation with the selected train/forward windows. Try smaller WF windows or a longer backtest range.")
