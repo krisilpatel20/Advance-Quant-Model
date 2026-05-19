@@ -1809,6 +1809,88 @@ def load_data(ticker, start, end, interval='1d'):
         st.error(f"Error loading data for {ticker}: {e}")
         return None
 
+def load_iv_proxy_data_for_backtest(asset_index, live_mode=False, data_interval='1d', start_date=None, end_date=None):
+    """
+    Robust loader for ^VIX used by the Implied Vol Proxy strategy.
+    In live mode, ^VIX can fail or have timestamps that do not exactly match the stock.
+    This tries several intervals and returns the first usable proxy series.
+    """
+    if asset_index is None or len(asset_index) == 0:
+        return None, None
+
+    idx = pd.DatetimeIndex(asset_index)
+    idx_min = idx.min()
+    idx_max = idx.max()
+
+    # Add a little buffer so rolling VIX features have enough prior data.
+    start_buffer = idx_min - timedelta(days=10 if live_mode else 5)
+    end_buffer = idx_max + timedelta(days=1)
+
+    attempts = []
+    if live_mode:
+        # ^VIX intraday availability can be spotty. Try the requested interval first,
+        # then progressively safer fallbacks. VX=F is included as a futures proxy.
+        attempts.extend([
+            ('^VIX', data_interval),
+            ('^VIX', '15m'),
+            ('^VIX', '60m'),
+            ('VX=F', data_interval),
+            ('VX=F', '15m'),
+            ('VX=F', '60m'),
+            ('^VIX', '1d')
+        ])
+    else:
+        attempts.append(('^VIX', '1d'))
+
+    seen = set()
+    for proxy_ticker, interval in attempts:
+        key = (proxy_ticker, interval)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            df_proxy = load_data(proxy_ticker, start_buffer, end_buffer, interval=interval)
+            if df_proxy is not None and not df_proxy.empty and 'Close' in df_proxy.columns:
+                series = df_proxy['Close'].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+                if len(series) >= 5:
+                    return series, f"{proxy_ticker} {interval}"
+        except Exception:
+            continue
+
+    return None, None
+
+def align_proxy_to_asset(asset_prices, proxy_prices):
+    """
+    Aligns VIX/proxy data to the asset index without requiring exact timestamp matches.
+    This is critical for live mode because stock and ^VIX candles often have slightly
+    different timestamps.
+    """
+    asset_prices = pd.Series(asset_prices).replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+    proxy_prices = pd.Series(proxy_prices).replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+
+    if asset_prices.empty or proxy_prices.empty:
+        return pd.DataFrame(columns=['asset', 'proxy'])
+
+    if not isinstance(asset_prices.index, pd.DatetimeIndex) or not isinstance(proxy_prices.index, pd.DatetimeIndex):
+        common_idx = asset_prices.index.intersection(proxy_prices.index)
+        return pd.DataFrame({'asset': asset_prices.loc[common_idx], 'proxy': proxy_prices.loc[common_idx]}).dropna()
+
+    # Timezone safety
+    if asset_prices.index.tz is not None:
+        asset_prices.index = asset_prices.index.tz_localize(None)
+    if proxy_prices.index.tz is not None:
+        proxy_prices.index = proxy_prices.index.tz_localize(None)
+
+    # Forward-fill proxy values onto asset candle timestamps.
+    union_idx = proxy_prices.index.union(asset_prices.index).sort_values()
+    aligned_proxy = proxy_prices.reindex(union_idx).ffill().reindex(asset_prices.index)
+
+    # If daily VIX is used on intraday stock data, early bars may need backfill.
+    aligned_proxy = aligned_proxy.bfill()
+
+    aligned = pd.DataFrame({'asset': asset_prices, 'proxy': aligned_proxy}, index=asset_prices.index).dropna()
+    return aligned
+
 @st.cache_data(ttl=3600) # Macro data changes weekly, cache for 1 hour
 def load_fred_data(series_id):
     """
@@ -4159,7 +4241,7 @@ with tab7:
         
         col_vx1, col_vx2, col_vx3, col_vx4 = st.columns(4)
         with col_vx1:
-            vix_ma_len = st.number_input("VIX Baseline Length", min_value=5, max_value=200, value=20, step=1)
+            vix_ma_len = st.number_input("IV Proxy Baseline Length", min_value=5, max_value=200, value=20, step=1)
         with col_vx2:
             vix_z = st.number_input("Risk-Off Z-Score", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
         with col_vx3:
@@ -4170,25 +4252,32 @@ with tab7:
             
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
-                if live_mode:
-                    vix_df = load_data('^VIX', start_date, end_date, interval=data_interval)
-                else:
-                    vix_df = load_data('^VIX', bt_start_date, bt_end_date, interval='1d')
-                    
-                if vix_df is None or vix_df.empty:
-                    st.error("Could not fetch ^VIX data. Strategy cannot proceed.")
+                proxy_prices, proxy_label = load_iv_proxy_data_for_backtest(
+                    prices_bt.index,
+                    live_mode=live_mode,
+                    data_interval=data_interval,
+                    start_date=bt_start_date,
+                    end_date=bt_end_date
+                )
+
+                if proxy_prices is None or len(proxy_prices) < 5:
+                    st.error("Could not fetch ^VIX/VX proxy data. Strategy cannot proceed.")
                     signals = None
                 else:
-                    vix_prices = vix_df['Close']
-                    common_idx = prices_bt.index.intersection(vix_prices.index)
+                    aligned_pair = align_proxy_to_asset(prices_bt, proxy_prices)
                     min_needed = max(int(vix_ma_len), 50)
-                    
-                    if len(common_idx) < min_needed:
-                        st.error("Not enough overlapping data between asset and ^VIX to calculate robust IV proxy rules.")
+
+                    if len(aligned_pair) < min_needed:
+                        st.error("Not enough aligned asset/VIX proxy candles to calculate robust IV proxy rules. In live mode, try 15m or 60m interval.")
                         signals = None
                     else:
-                        asset_prices = prices_bt.loc[common_idx].astype(float)
-                        aligned_vix = vix_prices.loc[common_idx].astype(float)
+                        common_idx = aligned_pair.index
+                        asset_prices = aligned_pair['asset'].astype(float)
+                        aligned_vix = aligned_pair['proxy'].astype(float)
+                        if live_mode:
+                            st.caption(f"Live IV proxy source: {proxy_label}. Proxy values are forward-filled to match stock candle timestamps when exact timestamps differ.")
+                        else:
+                            st.caption(f"IV proxy source: {proxy_label}.")
                         
                         # Core VIX/IV proxy features
                         vix_ma = aligned_vix.rolling(window=int(vix_ma_len)).mean()
@@ -4401,8 +4490,8 @@ with tab7:
                                 fig_ctx.add_trace(go.Scatter(x=asset_sma20.index, y=asset_sma20, mode='lines', line=dict(color='cyan', dash='dot'), opacity=0.55, name='20-SMA'), row=1, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=asset_sma50.index, y=asset_sma50, mode='lines', line=dict(color='yellow', dash='dot'), opacity=0.55, name='50-SMA'), row=1, col=1)
                                 
-                                fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='^VIX'), row=2, col=1)
-                                fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'VIX Baseline ({vix_ma_len})'), row=2, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='IV Proxy'), row=2, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'IV Proxy Baseline ({vix_ma_len})'), row=2, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Band (+{vix_z}σ)'), row=2, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Band (+{vix_cap_z}σ)'), row=2, col=1)
                                 
