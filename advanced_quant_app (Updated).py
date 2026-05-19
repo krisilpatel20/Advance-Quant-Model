@@ -1423,6 +1423,13 @@ def evaluate_strategy_candidate(prices, signals, initial_capital=10000.0, traili
     }
 
 
+def buy_hold_return_pct(prices):
+    """Buy-and-hold return over exactly the supplied price window."""
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 2 or px.iloc[0] == 0:
+        return np.nan
+    return (px.iloc[-1] / px.iloc[0] - 1) * 100
+
 def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0):
     """
     Walk-forward validation for adaptive strategy choosers.
@@ -1632,12 +1639,14 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
             st.warning(f"Not enough data to run {title} walk-forward validation. Falling back to full-history adaptive winner.")
         else:
             overall = wf_result['overall']
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            full_bh_pct = buy_hold_return_pct(prices)
             c1.metric("WFO Strategy Return", f"{overall['Strategy Return %']:.2f}%")
-            c2.metric("WFO Buy & Hold", f"{overall['Buy & Hold Return %']:.2f}%")
-            c3.metric("WFO Difference", f"{overall['Difference %']:+.2f}%")
-            c4.metric("WFO Win Rate", f"{wf_result['win_rate']*100:.0f}%")
-            c5.metric("Stability", f"{wf_result['stability_score']:.0f}/100")
+            c2.metric("WFO Test Benchmark", f"{overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample walk-forward test window.")
+            c3.metric("Full Benchmark", f"{full_bh_pct:.2f}%" if pd.notna(full_bh_pct) else "N/A", help="Buy & hold over the full selected chart period. This is reference only when WFO is enabled.")
+            c4.metric("WFO Difference", f"{overall['Difference %']:+.2f}%")
+            c5.metric("WFO Win Rate", f"{wf_result['win_rate']*100:.0f}%")
+            c6.metric("Stability", f"{wf_result['stability_score']:.0f}/100")
 
             if overall['Difference %'] > 0 and wf_result['stability_score'] >= 60:
                 st.success(f"{title} WFO is positive and reasonably stable. This is stronger than only using the in-sample winner.")
@@ -1679,7 +1688,9 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
             exec_prices,
             exec_signal,
             initial_capital=initial_capital,
-            file_prefix=file_prefix
+            file_prefix=file_prefix,
+            full_period_prices=prices,
+            benchmark_label="WFO Test Benchmark"
         )
 
     return display_strategy_vs_buyhold_backtest(
@@ -1690,10 +1701,10 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
         file_prefix=file_prefix
     )
 
-def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital=10000.0, file_prefix="Strategy"):
+def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital=10000.0, file_prefix="Strategy", full_period_prices=None, benchmark_label="Buy & Hold Return"):
     """
     Shared Streamlit display for small strategy checks inside analytical tabs.
-    Shows Strategy %, Buy & Hold %, Alpha, equity curve, and detailed trade log.
+    Shows Strategy %, matching-window benchmark %, optional full-period benchmark %, equity curve, and detailed trade log.
     """
     try:
         prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
@@ -1709,6 +1720,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         bt_results = BacktestEngine.run_strategy(prices, signals, initial_capital=initial_capital)
         strat_ret_pct = (bt_results['equity_curve'].iloc[-1] / initial_capital - 1) * 100
         buyhold_ret_pct = (bt_results['benchmark_curve'].iloc[-1] / initial_capital - 1) * 100
+        full_benchmark_pct = buy_hold_return_pct(full_period_prices) if full_period_prices is not None else np.nan
         alpha_pct = strat_ret_pct - buyhold_ret_pct
         trades_df = bt_results['trades'].copy()
         # Show newest trades first by default
@@ -1716,11 +1728,19 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
             trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
 
         st.write(f"#### 📊 {title}: Strategy vs Buy & Hold")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
-        c2.metric("Buy & Hold Return", f"{buyhold_ret_pct:.2f}%")
-        c3.metric("Difference", f"{alpha_pct:+.2f}%")
-        c4.metric("Trades", len(trades_df))
+        if full_period_prices is not None and pd.notna(full_benchmark_pct):
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
+            c2.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%", help="Benchmark over the same window used for this strategy result.")
+            c3.metric("Full Benchmark", f"{full_benchmark_pct:.2f}%", help="Buy & hold over the full selected chart period. Reference only if WFO starts after a training window.")
+            c4.metric("Difference vs Test Benchmark", f"{alpha_pct:+.2f}%")
+            c5.metric("Trades", len(trades_df))
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
+            c2.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%")
+            c3.metric("Difference", f"{alpha_pct:+.2f}%")
+            c4.metric("Trades", len(trades_df))
 
         fig_perf = go.Figure()
         fig_perf.add_trace(go.Scatter(
@@ -1758,6 +1778,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         return {
             'strategy_return_pct': strat_ret_pct,
             'buy_hold_return_pct': buyhold_ret_pct,
+            'full_benchmark_pct': full_benchmark_pct,
             'alpha_pct': alpha_pct,
             'trades': trades_df
         }
@@ -4021,6 +4042,9 @@ with tab7:
     
     signals = None
     strat_prices = prices_bt
+    benchmark_label_for_metrics = "Benchmark Return"
+    full_period_benchmark_pct_for_metrics = np.nan
+    using_wfo_primary_for_metrics = False
     
     if strategy_type == "Regime Switching (Trend Following)":
         
@@ -4952,7 +4976,10 @@ with tab7:
                             # the out-of-sample walk-forward segment, not the training/history segment.
                             signals = pd.Series(np.nan, index=prices_bt.index)
                             using_wfo_primary = bool(enable_iv_walk_forward and use_wf_signal and wf_result is not None)
+                            using_wfo_primary_for_metrics = using_wfo_primary
                             if using_wfo_primary:
+                                benchmark_label_for_metrics = "WFO Test Benchmark"
+                                full_period_benchmark_pct_for_metrics = buy_hold_return_pct(asset_prices)
                                 wf_sig = wf_result['signal'].reindex(common_idx).ffill().fillna(0).clip(0, 1)
                                 signals.loc[common_idx] = wf_sig
                                 first_forward_start = wf_result.get('rows', pd.DataFrame()).iloc[0]['Forward Start'] if not wf_result.get('rows', pd.DataFrame()).empty else common_idx[0]
@@ -5119,22 +5146,35 @@ with tab7:
         
         # Display Metrics
         st.write("#### 📊 Performance Metrics")
-        met_col1, met_col2, met_col3, met_col4 = st.columns(4)
-        
-        with met_col1:
-            st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
-        with met_col2:
-            st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
-        with met_col3:
-            st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
-        with met_col4:
-            st.metric("Benchmark Return", f"{(bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+        current_benchmark_pct = (bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100
+        if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
+            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
+            with met_col1:
+                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+            with met_col2:
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+            with met_col3:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col4:
+                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help="Buy & hold over the same out-of-sample WFO test window used by the strategy.")
+            with met_col5:
+                st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
+        else:
+            met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+            with met_col1:
+                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+            with met_col2:
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+            with met_col3:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col4:
+                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
             
         # Equity Curve Plot
         st.write("#### 📈 Equity Curve")
         fig_bt = go.Figure()
         fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
-        fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name='Buy & Hold (Benchmark)'))
+        fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
         fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
         st.plotly_chart(fig_bt, use_container_width=True)
         st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
