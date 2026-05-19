@@ -1423,6 +1423,139 @@ def evaluate_strategy_candidate(prices, signals, initial_capital=10000.0):
     }
 
 
+def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True):
+    """
+    Walk-forward validation for adaptive strategy choosers.
+    Chooses the best candidate using ONLY the trailing training window, then applies that candidate
+    to the next unseen forward window. This helps reduce full-period curve fitting.
+    """
+    prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(prices) < int(train_window) + max(5, int(forward_window)):
+        return None
+
+    train_window = int(train_window)
+    forward_window = int(forward_window)
+    idx = prices.index
+
+    wf_signal = pd.Series(np.nan, index=idx, dtype=float)
+    wf_rows = []
+    strategy_sequence = []
+
+    start = train_window
+    period_no = 1
+    while start < len(prices):
+        train_idx = idx[start - train_window:start]
+        test_idx = idx[start:min(start + forward_window, len(prices))]
+        if len(test_idx) < 2:
+            break
+
+        train_prices = prices.loc[train_idx]
+        test_prices = prices.loc[test_idx]
+
+        train_scores = []
+        for name, logic, sig in candidates:
+            sig_series = pd.Series(sig).reindex(idx).ffill().fillna(0).clip(0, 1)
+            train_sig = sig_series.reindex(train_idx).ffill().fillna(0)
+            score_res = evaluate_strategy_candidate(train_prices, train_sig, initial_capital=initial_capital)
+            if score_res is None:
+                continue
+            train_scores.append({
+                "name": name,
+                "logic": logic,
+                "signal": sig_series,
+                "train_diff": score_res.get("Difference %", np.nan),
+                "train_return": score_res.get("Strategy Return %", np.nan),
+                "train_dd": score_res.get("Max DD %", np.nan),
+                "train_trades": score_res.get("Trades", 0)
+            })
+
+        if not train_scores:
+            start += forward_window
+            period_no += 1
+            continue
+
+        # Pick best using training-only result. Difference vs buy/hold is primary; return is tie-breaker.
+        train_scores = sorted(train_scores, key=lambda x: (x["train_diff"], x["train_return"], -abs(x["train_dd"])), reverse=True)
+        chosen = train_scores[0]
+
+        chosen_sig_full = chosen["signal"].copy()
+        # Confirmed-bar mode: today's position uses the prior closed bar's signal.
+        if confirmed_bar:
+            exec_sig_full = chosen_sig_full.shift(1).ffill().fillna(0).clip(0, 1)
+        else:
+            exec_sig_full = chosen_sig_full.ffill().fillna(0).clip(0, 1)
+
+        test_sig = exec_sig_full.reindex(test_idx).ffill().fillna(0).clip(0, 1)
+        wf_signal.loc[test_idx] = test_sig
+
+        test_score = evaluate_strategy_candidate(test_prices, test_sig, initial_capital=initial_capital)
+        bh_return = np.nan
+        strat_return = np.nan
+        diff_return = np.nan
+        trades = 0
+        max_dd = np.nan
+        if test_score is not None:
+            strat_return = test_score.get("Strategy Return %", np.nan)
+            bh_return = test_score.get("Buy & Hold Return %", np.nan)
+            diff_return = test_score.get("Difference %", np.nan)
+            trades = test_score.get("Trades", 0)
+            max_dd = test_score.get("Max DD %", np.nan)
+
+        wf_rows.append({
+            "Period": period_no,
+            "Train Start": train_idx[0],
+            "Train End": train_idx[-1],
+            "Forward Start": test_idx[0],
+            "Forward End": test_idx[-1],
+            "Selected Rule": chosen["name"],
+            "Train Diff %": round(chosen["train_diff"], 2) if pd.notna(chosen["train_diff"]) else np.nan,
+            "Forward Strategy %": round(strat_return, 2) if pd.notna(strat_return) else np.nan,
+            "Forward Buy & Hold %": round(bh_return, 2) if pd.notna(bh_return) else np.nan,
+            "Forward Diff %": round(diff_return, 2) if pd.notna(diff_return) else np.nan,
+            "Forward Max DD %": round(max_dd, 2) if pd.notna(max_dd) else np.nan,
+            "Forward Trades": trades
+        })
+        strategy_sequence.append(chosen["name"])
+
+        start += forward_window
+        period_no += 1
+
+    wf_signal = wf_signal.ffill().fillna(0).clip(0, 1)
+    if len(wf_rows) == 0:
+        return None
+
+    # Score the stitched walk-forward signal only from the first unseen forward segment onward.
+    first_forward_start = wf_rows[0]["Forward Start"] if wf_rows else idx[0]
+    wf_eval_index = prices.loc[first_forward_start:].index
+    wf_prices = prices.loc[wf_eval_index]
+    wf_sig_active = wf_signal.reindex(wf_eval_index).ffill().fillna(0).clip(0, 1)
+    overall = evaluate_strategy_candidate(wf_prices, wf_sig_active, initial_capital=initial_capital)
+
+    rows_df = pd.DataFrame(wf_rows)
+    wins = int((rows_df["Forward Diff %"] > 0).sum()) if "Forward Diff %" in rows_df else 0
+    valid_periods = int(rows_df["Forward Diff %"].notna().sum()) if "Forward Diff %" in rows_df else len(rows_df)
+    changes = sum(1 for a, b in zip(strategy_sequence, strategy_sequence[1:]) if a != b)
+    change_rate = changes / max(1, len(strategy_sequence) - 1)
+    win_rate = wins / max(1, valid_periods)
+    avg_forward_diff = float(rows_df["Forward Diff %"].dropna().mean()) if "Forward Diff %" in rows_df and rows_df["Forward Diff %"].notna().any() else 0.0
+
+    # Stability score rewards out-of-sample wins and penalizes excessive rule switching.
+    stability_score = round(100 * (0.65 * win_rate + 0.20 * max(0, min(1, avg_forward_diff / 10)) + 0.15 * (1 - change_rate)), 0)
+
+    return {
+        "signal": wf_signal,
+        "rows": rows_df,
+        "overall": overall,
+        "win_rate": win_rate,
+        "changes": changes,
+        "change_rate": change_rate,
+        "avg_forward_diff": avg_forward_diff,
+        "stability_score": stability_score,
+        "strategy_sequence": strategy_sequence,
+        "confirmed_bar": confirmed_bar
+    }
+
+
 def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=10000.0, file_prefix="Adaptive_Strategy"):
     """
     Tests multiple long/cash rules and displays the best performer vs buy & hold.
@@ -4446,6 +4579,17 @@ with tab7:
         with col_vx4:
             confirm_bars = st.number_input("Confirmation Bars", min_value=1, max_value=10, value=2, step=1)
             use_adaptive_iv_lab = st.checkbox("Use adaptive IV strategy chooser", value=True)
+
+        wf_col1, wf_col2, wf_col3, wf_col4 = st.columns(4)
+        with wf_col1:
+            enable_iv_walk_forward = st.checkbox("Walk-forward validation", value=True)
+        with wf_col2:
+            wf_train_window = st.number_input("WF Train Bars", min_value=60, max_value=756, value=126, step=21)
+        with wf_col3:
+            wf_forward_window = st.number_input("WF Forward Bars", min_value=5, max_value=126, value=21, step=5)
+        with wf_col4:
+            use_wf_signal = st.checkbox("Use WF signal for backtest", value=False)
+        wf_confirmed_bar = st.checkbox("WF confirmed-bar execution: use previous closed signal", value=True, help="More realistic. It prevents same-candle lookahead by trading from the prior completed signal.")
             
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
@@ -4672,12 +4816,52 @@ with tab7:
                                     st.warning("This IV proxy winner is decent, but not fully stable. Confirm with CVD/VWAP before trusting it.")
                                 else:
                                     st.error("This IV proxy winner is unstable. Treat it as research only, not a strong trading edge.")
-                            
+
+                            wf_result = None
+                            if enable_iv_walk_forward:
+                                st.write("#### 🚶 Walk-Forward IV Proxy Validation")
+                                st.caption("This is stricter than the normal ranking: it chooses the best rule using only the past training window, then tests that rule on the next unseen forward window.")
+                                wf_result = walk_forward_strategy_selection(
+                                    asset_prices,
+                                    candidates,
+                                    train_window=int(wf_train_window),
+                                    forward_window=int(wf_forward_window),
+                                    initial_capital=initial_cap,
+                                    confirmed_bar=bool(wf_confirmed_bar)
+                                )
+
+                                if wf_result is None:
+                                    st.warning("Not enough history for walk-forward validation with the selected train/forward windows. Try smaller WF windows or a longer backtest range.")
+                                else:
+                                    wf_overall = wf_result.get('overall') or {}
+                                    w1, w2, w3, w4, w5 = st.columns(5)
+                                    w1.metric("WF Strategy Return", f"{wf_overall.get('Strategy Return %', 0):.2f}%")
+                                    w2.metric("WF Buy & Hold", f"{wf_overall.get('Buy & Hold Return %', 0):.2f}%")
+                                    w3.metric("WF Difference", f"{wf_overall.get('Difference %', 0):+.2f}%")
+                                    w4.metric("WF Win Rate", f"{wf_result['win_rate'] * 100:.0f}%")
+                                    w5.metric("WF Stability", f"{wf_result['stability_score']:.0f}/100")
+
+                                    st.dataframe(wf_result['rows'].sort_values('Forward End', ascending=False), use_container_width=True)
+
+                                    if wf_result['stability_score'] >= 70 and wf_overall.get('Difference %', 0) > 0:
+                                        st.success("Walk-forward result is strong: the chooser worked out-of-sample better than buy & hold over the tested periods.")
+                                    elif wf_result['stability_score'] >= 45:
+                                        st.warning("Walk-forward result is mixed. Useful as a filter, but confirm with CVD/VWAP and avoid oversized trades.")
+                                    else:
+                                        st.error("Walk-forward result is weak/unstable. Do not treat this IV Proxy winner as a strong standalone edge.")
+
+                                    if use_wf_signal:
+                                        st.info("Using the walk-forward-selected signal for the main backtest below. This is more realistic than using the full-history best rule.")
+
                             st.info(f"Chosen IV proxy rule: **{best_name}** — {best_logic}")
                             
                             # Re-index selected best signal back to full backtest price index for the shared backtest engine below.
                             signals = pd.Series(np.nan, index=prices_bt.index)
-                            signals.loc[common_idx] = best_sig
+                            if enable_iv_walk_forward and use_wf_signal and wf_result is not None:
+                                wf_sig = wf_result['signal'].reindex(common_idx).ffill().fillna(0).clip(0, 1)
+                                signals.loc[common_idx] = wf_sig
+                            else:
+                                signals.loc[common_idx] = best_sig
                             signals = signals.ffill().fillna(1).clip(0, 1)
                             
                             with st.expander("See Robust IV Proxy Context", expanded=True):
