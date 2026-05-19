@@ -1484,22 +1484,13 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
     train_window = int(train_window)
     forward_window = int(forward_window)
 
-    # Practical WFO sizing: keep WFO honest, but do not let the tab go blank
-    # just because the requested train/forward windows are too large for the
-    # selected data window. We shrink the windows only when necessary and report
-    # the effective values back to the UI.
-    if len(prices) < 45:
+    # Strict WFO sizing: do not silently shrink the walk-forward windows.
+    # If there is not enough data to train and test honestly, return None and
+    # let the UI show no WFO trades instead of forcing fallback results.
+    if len(prices) < max(35, train_window + forward_window):
         return None
-    if train_window < 25:
-        train_window = 25
-    if forward_window < 5:
-        forward_window = 5
-    if len(prices) < train_window + forward_window:
-        # Use roughly 70% training / 30% forward chunks, with safe lower bounds.
-        train_window = max(25, int(len(prices) * 0.60))
-        forward_window = max(5, min(int(len(prices) * 0.15), len(prices) - train_window))
-        if len(prices) < train_window + forward_window or forward_window < 2:
-            return None
+    if train_window < 25 or forward_window < 5:
+        return None
 
     base_methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
     # Auto means WFO chooses the best regime count per forward block using only the training window.
@@ -1595,30 +1586,6 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             except Exception:
                 pass
 
-        # 3) Simple Trend Hold is the final true-WFO candidate.
-        # It prevents blank WFO output on difficult/noisy symbols without using future data
-        # and without falling back to full-history optimization.
-        try:
-            sig_train = simple_trend_hold_signal(prices.loc[train_idx])
-            if confirmed_bar:
-                sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
-            score = evaluate_strategy_candidate(
-                prices.loc[train_idx], sig_train,
-                initial_capital=initial_capital,
-                trailing_stop_pct=trailing_stop_pct,
-                stop_loss_pct=stop_loss_pct
-            )
-            if score is not None:
-                score["Institutional Score"] = risk_adjusted_candidate_score(score, benchmark_bias=0.25)
-                train_scores.append({
-                    "method": "Simple Trend Hold",
-                    "n_regimes": "Trend",
-                    "score": score,
-                    "signal": sig_train
-                })
-        except Exception:
-            pass
-
         if not train_scores:
             start += forward_window
             period_no += 1
@@ -1640,11 +1607,6 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         if chosen_method == "Strong Runner Trend Hold":
             combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
             test_signal = strong_runner_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
-            if confirmed_bar:
-                test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
-        elif chosen_method == "Simple Trend Hold":
-            combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
-            test_signal = simple_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
             if confirmed_bar:
                 test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
         else:
@@ -1774,29 +1736,6 @@ def strong_runner_trend_hold_signal(prices, fast=20, slow=50, long=100):
     # Exit only on a real trend break, not a tiny wiggle.
     trend_break = (px < ema_slow * 0.97) | ((ema_fast < ema_slow) & (slow_slope < 0))
     sig = make_stateful_position(strong_uptrend, trend_break, px.index)
-    return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
-
-
-
-
-def simple_trend_hold_signal(prices, fast=10, slow=30):
-    """
-    Always-available WFO candidate.
-    Purpose: prevent Regime WFO from going blank when Markov models fail to converge.
-    It is still honest WFO because it is selected on the training window and tested only
-    on the next unseen forward window. Uses causal EMA trend logic only.
-    """
-    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 10:
-        return pd.Series(0.0, index=px.index)
-    fast = int(max(3, min(fast, max(3, len(px)//3))))
-    slow = int(max(fast + 2, min(slow, max(fast + 2, len(px)//2))))
-    ema_fast = px.ewm(span=fast, adjust=False).mean()
-    ema_slow = px.ewm(span=slow, adjust=False).mean()
-    mom = px.pct_change(max(3, min(21, len(px)//4))).fillna(0)
-    long_cond = (px > ema_slow) & (ema_fast >= ema_slow) & (mom >= 0)
-    exit_cond = (px < ema_slow * 0.985) | (ema_fast < ema_slow)
-    sig = make_stateful_position(long_cond, exit_cond, px.index)
     return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
 
 
@@ -4826,7 +4765,7 @@ with tab7:
 
                         st.write("#### 🧭 Regime Walk-Forward Result")
                         if wf_regime is None or wf_regime.get("overall") is None:
-                            st.warning("Regime WFO still could not generate a valid out-of-sample result for this data window. The full-history regime signal below is shown only as research, not WFO-validated.")
+                            st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
                             using_wfo_primary_for_metrics = False
                         else:
                             wf_overall = wf_regime["overall"]
