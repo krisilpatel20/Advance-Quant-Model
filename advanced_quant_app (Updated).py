@@ -1401,13 +1401,13 @@ def make_stateful_position(entry_cond, exit_cond, index):
     return pos.ffill().fillna(0.0).clip(lower=0, upper=1)
 
 
-def evaluate_strategy_candidate(prices, signals, initial_capital=10000.0):
-    """Fast score helper for strategy candidate ranking."""
+def evaluate_strategy_candidate(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0):
+    """Fast score helper for strategy candidate ranking. Uses the same stop settings as the main backtest when supplied."""
     prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
     signals = pd.Series(signals).reindex(prices.index).ffill().fillna(0).clip(lower=0, upper=1)
     if len(prices) < 5:
         return None
-    res = BacktestEngine.run_strategy(prices, signals, initial_capital=initial_capital)
+    res = BacktestEngine.run_strategy(prices, signals, initial_capital=initial_capital, trailing_stop_pct=trailing_stop_pct, stop_loss_pct=stop_loss_pct)
     strat_ret = (res['equity_curve'].iloc[-1] / initial_capital - 1) * 100
     bh_ret = (res['benchmark_curve'].iloc[-1] / initial_capital - 1) * 100
     rets = res['returns']
@@ -1423,7 +1423,7 @@ def evaluate_strategy_candidate(prices, signals, initial_capital=10000.0):
     }
 
 
-def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True):
+def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0):
     """
     Walk-forward validation for adaptive strategy choosers.
     Chooses the best candidate using ONLY the trailing training window, then applies that candidate
@@ -1456,7 +1456,7 @@ def walk_forward_strategy_selection(prices, candidates, train_window=126, forwar
         for name, logic, sig in candidates:
             sig_series = pd.Series(sig).reindex(idx).ffill().fillna(0).clip(0, 1)
             train_sig = sig_series.reindex(train_idx).ffill().fillna(0)
-            score_res = evaluate_strategy_candidate(train_prices, train_sig, initial_capital=initial_capital)
+            score_res = evaluate_strategy_candidate(train_prices, train_sig, initial_capital=initial_capital, trailing_stop_pct=trailing_stop_pct, stop_loss_pct=stop_loss_pct)
             if score_res is None:
                 continue
             train_scores.append({
@@ -1488,7 +1488,7 @@ def walk_forward_strategy_selection(prices, candidates, train_window=126, forwar
         test_sig = exec_sig_full.reindex(test_idx).ffill().fillna(0).clip(0, 1)
         wf_signal.loc[test_idx] = test_sig
 
-        test_score = evaluate_strategy_candidate(test_prices, test_sig, initial_capital=initial_capital)
+        test_score = evaluate_strategy_candidate(test_prices, test_sig, initial_capital=initial_capital, trailing_stop_pct=trailing_stop_pct, stop_loss_pct=stop_loss_pct)
         bh_return = np.nan
         strat_return = np.nan
         diff_return = np.nan
@@ -1529,7 +1529,7 @@ def walk_forward_strategy_selection(prices, candidates, train_window=126, forwar
     wf_eval_index = prices.loc[first_forward_start:].index
     wf_prices = prices.loc[wf_eval_index]
     wf_sig_active = wf_signal.reindex(wf_eval_index).ffill().fillna(0).clip(0, 1)
-    overall = evaluate_strategy_candidate(wf_prices, wf_sig_active, initial_capital=initial_capital)
+    overall = evaluate_strategy_candidate(wf_prices, wf_sig_active, initial_capital=initial_capital, trailing_stop_pct=trailing_stop_pct, stop_loss_pct=stop_loss_pct)
 
     rows_df = pd.DataFrame(wf_rows)
     wins = int((rows_df["Forward Diff %"] > 0).sum()) if "Forward Diff %" in rows_df else 0
@@ -4747,7 +4747,7 @@ with tab7:
                         ranking_rows = []
                         scored_candidates = []
                         for name, logic, sig in candidates:
-                            score_res = evaluate_strategy_candidate(asset_prices, sig, initial_capital=initial_cap)
+                            score_res = evaluate_strategy_candidate(asset_prices, sig, initial_capital=initial_cap, trailing_stop_pct=trailing_stop, stop_loss_pct=stop_loss)
                             if score_res is None:
                                 continue
                             scored_candidates.append((name, logic, sig, score_res))
@@ -4782,7 +4782,9 @@ with tab7:
                                     train_window=int(wf_train_window),
                                     forward_window=int(wf_forward_window),
                                     initial_capital=initial_cap,
-                                    confirmed_bar=bool(wf_confirmed_bar)
+                                    confirmed_bar=bool(wf_confirmed_bar),
+                                    trailing_stop_pct=trailing_stop,
+                                    stop_loss_pct=stop_loss
                                 )
 
                                 if wf_result is None:
@@ -4819,7 +4821,7 @@ with tab7:
                                 sub_rows = []
                                 for name, logic, sig in candidates:
                                     sub_sig = pd.Series(sig).reindex(sub_prices.index).ffill().fillna(0)
-                                    sub_score = evaluate_strategy_candidate(sub_prices, sub_sig, initial_capital=initial_cap)
+                                    sub_score = evaluate_strategy_candidate(sub_prices, sub_sig, initial_capital=initial_cap, trailing_stop_pct=trailing_stop, stop_loss_pct=stop_loss)
                                     if sub_score is None:
                                         continue
                                     sub_rows.append((name, sub_score['Difference %']))
@@ -4859,14 +4861,21 @@ with tab7:
                             else:
                                 st.info(f"Chosen IV proxy rule: **{best_name}** — {best_logic}")
                             
-                            # Re-index selected best signal back to full backtest price index for the shared backtest engine below.
+                            # Re-index selected signal back to the shared backtest engine.
+                            # IMPORTANT: when WFO is enabled, make the main performance metrics use ONLY
+                            # the out-of-sample walk-forward segment, not the training/history segment.
                             signals = pd.Series(np.nan, index=prices_bt.index)
-                            if enable_iv_walk_forward and use_wf_signal and wf_result is not None:
+                            using_wfo_primary = bool(enable_iv_walk_forward and use_wf_signal and wf_result is not None)
+                            if using_wfo_primary:
                                 wf_sig = wf_result['signal'].reindex(common_idx).ffill().fillna(0).clip(0, 1)
                                 signals.loc[common_idx] = wf_sig
+                                first_forward_start = wf_result.get('rows', pd.DataFrame()).iloc[0]['Forward Start'] if not wf_result.get('rows', pd.DataFrame()).empty else common_idx[0]
+                                signals = signals.loc[signals.index >= first_forward_start]
+                                strat_prices = strat_prices.loc[strat_prices.index >= first_forward_start]
                             else:
                                 signals.loc[common_idx] = best_sig
-                            signals = signals.ffill().fillna(1).clip(0, 1)
+                                signals = signals.ffill().fillna(1).clip(0, 1)
+                            signals = signals.ffill().fillna(0 if using_wfo_primary else 1).clip(0, 1)
                             
                             with st.expander("See Robust IV Proxy Context", expanded=True):
                                 fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.45, 0.35, 0.20], vertical_spacing=0.05)
@@ -4880,8 +4889,13 @@ with tab7:
                                 fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Band (+{vix_z}σ)'), row=2, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Band (+{vix_cap_z}σ)'), row=2, col=1)
                                 
-                                chosen_aligned = pd.Series(best_sig, index=common_idx).reindex(common_idx).ffill().fillna(0)
-                                fig_ctx.add_trace(go.Scatter(x=chosen_aligned.index, y=chosen_aligned * 100, mode='lines', line=dict(color='#00f2ff'), fill='tozeroy', name='Chosen Exposure (%)'), row=3, col=1)
+                                if enable_iv_walk_forward and use_wf_signal and wf_result is not None:
+                                    chosen_aligned = wf_result['signal'].reindex(common_idx).ffill().fillna(0).clip(0, 1)
+                                    exposure_label = 'WFO Selected Exposure (%)'
+                                else:
+                                    chosen_aligned = pd.Series(best_sig, index=common_idx).reindex(common_idx).ffill().fillna(0).clip(0, 1)
+                                    exposure_label = 'Chosen Exposure (%)'
+                                fig_ctx.add_trace(go.Scatter(x=chosen_aligned.index, y=chosen_aligned * 100, mode='lines', line=dict(color='#00f2ff'), fill='tozeroy', name=exposure_label), row=3, col=1)
                                 
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 1, 'green', opacity=0.10, row=1, col=1)
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 0, 'red', opacity=0.08, row=1, col=1)
