@@ -1468,7 +1468,7 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
     return signal, context
 
 
-def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True):
+def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True):
     """
     Walk-forward validation for the Regime Switching backtest.
     Each forward block fits only on the trailing training window, selects the best regime signal method
@@ -1486,6 +1486,8 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         return None
 
     methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
+    if use_strong_runner_override:
+        methods.append("Strong Runner Trend Hold")
     idx = prices.index
     wf_signal = pd.Series(np.nan, index=idx, dtype=float)
     rows = []
@@ -1515,10 +1517,13 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         train_scores = []
         for method in methods:
             try:
-                sig_train, _ = build_regime_backtest_signal(
-                    res, train_returns.index, prices.loc[train_idx].index,
-                    int(n_regimes), method, conviction=float(conviction), min_hold=int(min_hold)
-                )
+                if method == "Strong Runner Trend Hold":
+                    sig_train = strong_runner_trend_hold_signal(prices.loc[train_idx])
+                else:
+                    sig_train, _ = build_regime_backtest_signal(
+                        res, train_returns.index, prices.loc[train_idx].index,
+                        int(n_regimes), method, conviction=float(conviction), min_hold=int(min_hold)
+                    )
                 if confirmed_bar:
                     sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
                 score = evaluate_strategy_candidate(
@@ -1529,6 +1534,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                 )
                 if score is None:
                     continue
+                score["Institutional Score"] = risk_adjusted_candidate_score(score)
                 train_scores.append({"method": method, "score": score, "signal": sig_train})
             except Exception:
                 continue
@@ -1540,16 +1546,24 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
 
         train_scores = sorted(
             train_scores,
-            key=lambda x: (x["score"]["Difference %"], x["score"]["Strategy Return %"], -abs(x["score"]["Max DD %"])),
+            key=lambda x: x["score"].get("Institutional Score", -1e9),
             reverse=True
         )
         chosen = train_scores[0]
         chosen_method = chosen["method"]
         sequence.append(chosen_method)
 
-        # No-lookahead forward execution: carry the latest training exposure into the next unseen block.
-        latest_exposure = float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0
-        test_signal = pd.Series(latest_exposure, index=test_idx, dtype=float)
+        # No-lookahead forward execution.
+        # For Markov signals, carry the latest training exposure into the next unseen block.
+        # For Strong Runner Trend Hold, calculate a causal trend-hold signal on train+test and use only the test portion.
+        if chosen_method == "Strong Runner Trend Hold":
+            combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
+            test_signal = strong_runner_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
+            if confirmed_bar:
+                test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
+        else:
+            latest_exposure = float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0
+            test_signal = pd.Series(latest_exposure, index=test_idx, dtype=float)
         wf_signal.loc[test_idx] = test_signal
 
         test_score = evaluate_strategy_candidate(
@@ -1638,6 +1652,55 @@ def buy_hold_return_pct(prices):
     if len(px) < 2 or px.iloc[0] == 0:
         return np.nan
     return (px.iloc[-1] / px.iloc[0] - 1) * 100
+
+
+def strong_runner_trend_hold_signal(prices, fast=20, slow=50, long=100):
+    """
+    Benchmark-aware trend-hold candidate.
+    Purpose: when a stock is a true strong runner, avoid defensive regime models sitting in cash.
+    Uses only price data available up to each bar.
+    Long when price is above rising trend structure; cash only when trend breaks.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < max(slow, 30):
+        return pd.Series(0.0, index=px.index)
+
+    ema_fast = px.ewm(span=int(fast), adjust=False).mean()
+    ema_slow = px.ewm(span=int(slow), adjust=False).mean()
+    ema_long = px.ewm(span=int(long), adjust=False).mean() if len(px) >= int(long) else ema_slow
+
+    # Momentum / relative trend strength from price itself. No future data.
+    mom_21 = px.pct_change(21).fillna(0)
+    mom_63 = px.pct_change(63).fillna(0)
+    slow_slope = ema_slow.pct_change(10).fillna(0)
+
+    strong_uptrend = (
+        (px > ema_slow) &
+        (ema_fast > ema_slow) &
+        (ema_slow >= ema_long * 0.98) &
+        (slow_slope > 0) &
+        ((mom_21 > 0) | (mom_63 > 0))
+    )
+
+    # Exit only on a real trend break, not a tiny wiggle.
+    trend_break = (px < ema_slow * 0.97) | ((ema_fast < ema_slow) & (slow_slope < 0))
+    sig = make_stateful_position(strong_uptrend, trend_break, px.index)
+    return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
+
+
+def risk_adjusted_candidate_score(score, benchmark_bias=0.15):
+    """
+    Institutional-style scoring: return matters, but drawdown and benchmark underperformance are penalized.
+    benchmark_bias rewards candidates that stay closer to buy-and-hold during strong runners.
+    """
+    if score is None:
+        return -1e9
+    ret = float(score.get('Strategy Return %', 0.0))
+    diff = float(score.get('Difference %', 0.0))
+    dd = abs(float(score.get('Max DD %', 0.0)))
+    trades = int(score.get('Trades', 0))
+    trade_penalty = 5.0 if trades < 2 else 0.0
+    return (0.55 * ret) + (0.35 * diff) - (0.25 * dd) - trade_penalty + (benchmark_bias * max(ret, 0))
 
 def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0):
     """
@@ -4489,8 +4552,9 @@ with tab7:
             wf_c1, wf_c2, wf_c3, wf_c4 = st.columns(4)
             enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=True, key="bt_regime_enable_wfo")
             use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=True, key="bt_regime_use_wfo")
-            regime_wf_train = wf_c3.number_input("Regime WFO train bars", min_value=30, max_value=1000, value=126, step=21, key="bt_regime_wf_train")
+            regime_wf_train = wf_c3.number_input("Regime WFO train bars", min_value=30, max_value=1000, value=252, step=21, key="bt_regime_wf_train")
             regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=21, step=5, key="bt_regime_wf_forward")
+            use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -4643,7 +4707,8 @@ with tab7:
                                 initial_capital=initial_cap,
                                 trailing_stop_pct=trailing_stop,
                                 stop_loss_pct=stop_loss,
-                                confirmed_bar=bool(confirmed_regime_bar)
+                                confirmed_bar=bool(confirmed_regime_bar),
+                                use_strong_runner_override=bool(use_regime_runner_override)
                             )
 
                         st.write("#### 🧭 Regime Walk-Forward Result")
@@ -4664,7 +4729,7 @@ with tab7:
                             elif wf_overall['Difference %'] > 0:
                                 st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
                             else:
-                                st.warning("Regime WFO did not beat buy & hold on the unseen forward windows. Treat full-history results as research only.")
+                                st.warning("Regime WFO did not beat buy & hold on unseen windows. If the benchmark is extremely high, the stock is a strong runner and defensive regime exits may still lag buy-and-hold.")
 
                             wf_rows = wf_regime["rows"].copy()
                             if not wf_rows.empty:
