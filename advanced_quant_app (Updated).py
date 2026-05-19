@@ -4588,7 +4588,7 @@ with tab7:
         with wf_col3:
             wf_forward_window = st.number_input("WF Forward Bars", min_value=5, max_value=126, value=21, step=5)
         with wf_col4:
-            use_wf_signal = st.checkbox("Use WF signal for backtest", value=False)
+            use_wf_signal = st.checkbox("Use WF signal for backtest", value=True)
         wf_confirmed_bar = st.checkbox("WF confirmed-bar execution: use previous closed signal", value=True, help="More realistic. It prevents same-candle lookahead by trading from the prior completed signal.")
             
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
@@ -4769,9 +4769,45 @@ with tab7:
                             best_name, best_logic, best_sig, best_score = next(x for x in scored_candidates if x[0] == best_name)
                             
                             st.write("#### 🧠 Robust IV Proxy Strategy Ranking")
-                            st.caption("This chooses the best VIX/IV proxy rule for the selected history. Use the Stability Score to judge whether the winner is reliable or just curve-fit.")
+                            st.caption("In-sample ranking is now a reference table. When walk-forward is enabled, the main backtest below uses the walk-forward-selected signal by default.")
                             st.dataframe(rank_df, use_container_width=True)
                             
+                            wf_result = None
+                            if enable_iv_walk_forward:
+                                st.write("#### 🚶 Walk-Forward IV Proxy Validation")
+                                st.caption("This is stricter than the normal ranking: it chooses the best rule using only the past training window, then tests that rule on the next unseen forward window.")
+                                wf_result = walk_forward_strategy_selection(
+                                    asset_prices,
+                                    candidates,
+                                    train_window=int(wf_train_window),
+                                    forward_window=int(wf_forward_window),
+                                    initial_capital=initial_cap,
+                                    confirmed_bar=bool(wf_confirmed_bar)
+                                )
+
+                                if wf_result is None:
+                                    st.warning("Not enough history for walk-forward validation with the selected train/forward windows. Try smaller WF windows or a longer backtest range.")
+                                else:
+                                    wf_overall = wf_result.get('overall') or {}
+                                    w1, w2, w3, w4, w5 = st.columns(5)
+                                    w1.metric("WF Strategy Return", f"{wf_overall.get('Strategy Return %', 0):.2f}%")
+                                    w2.metric("WF Buy & Hold", f"{wf_overall.get('Buy & Hold Return %', 0):.2f}%")
+                                    w3.metric("WF Difference", f"{wf_overall.get('Difference %', 0):+.2f}%")
+                                    w4.metric("WF Win Rate", f"{wf_result['win_rate'] * 100:.0f}%")
+                                    w5.metric("WF Stability", f"{wf_result['stability_score']:.0f}/100")
+
+                                    st.dataframe(wf_result['rows'].sort_values('Forward End', ascending=False), use_container_width=True)
+
+                                    if wf_result['stability_score'] >= 70 and wf_overall.get('Difference %', 0) > 0:
+                                        st.success("Walk-forward result is strong: the chooser worked out-of-sample better than buy & hold over the tested periods.")
+                                    elif wf_result['stability_score'] >= 45:
+                                        st.warning("Walk-forward result is mixed. Useful as a filter, but confirm with CVD/VWAP and avoid oversized trades.")
+                                    else:
+                                        st.error("Walk-forward result is weak/unstable. Do not treat this IV Proxy winner as a strong standalone edge.")
+
+                                    if use_wf_signal:
+                                        st.info("Using the walk-forward-selected signal for the main backtest below. This is more realistic than using the full-history best rule.")
+
                             # Stability score across sub-windows. This reduces blind trust in one lucky full-period backtest.
                             windows = [63, 126, 252, len(asset_prices)]
                             windows = sorted(set([w for w in windows if len(asset_prices) >= max(30, w)]))
@@ -4817,43 +4853,11 @@ with tab7:
                                 else:
                                     st.error("This IV proxy winner is unstable. Treat it as research only, not a strong trading edge.")
 
-                            wf_result = None
-                            if enable_iv_walk_forward:
-                                st.write("#### 🚶 Walk-Forward IV Proxy Validation")
-                                st.caption("This is stricter than the normal ranking: it chooses the best rule using only the past training window, then tests that rule on the next unseen forward window.")
-                                wf_result = walk_forward_strategy_selection(
-                                    asset_prices,
-                                    candidates,
-                                    train_window=int(wf_train_window),
-                                    forward_window=int(wf_forward_window),
-                                    initial_capital=initial_cap,
-                                    confirmed_bar=bool(wf_confirmed_bar)
-                                )
-
-                                if wf_result is None:
-                                    st.warning("Not enough history for walk-forward validation with the selected train/forward windows. Try smaller WF windows or a longer backtest range.")
-                                else:
-                                    wf_overall = wf_result.get('overall') or {}
-                                    w1, w2, w3, w4, w5 = st.columns(5)
-                                    w1.metric("WF Strategy Return", f"{wf_overall.get('Strategy Return %', 0):.2f}%")
-                                    w2.metric("WF Buy & Hold", f"{wf_overall.get('Buy & Hold Return %', 0):.2f}%")
-                                    w3.metric("WF Difference", f"{wf_overall.get('Difference %', 0):+.2f}%")
-                                    w4.metric("WF Win Rate", f"{wf_result['win_rate'] * 100:.0f}%")
-                                    w5.metric("WF Stability", f"{wf_result['stability_score']:.0f}/100")
-
-                                    st.dataframe(wf_result['rows'].sort_values('Forward End', ascending=False), use_container_width=True)
-
-                                    if wf_result['stability_score'] >= 70 and wf_overall.get('Difference %', 0) > 0:
-                                        st.success("Walk-forward result is strong: the chooser worked out-of-sample better than buy & hold over the tested periods.")
-                                    elif wf_result['stability_score'] >= 45:
-                                        st.warning("Walk-forward result is mixed. Useful as a filter, but confirm with CVD/VWAP and avoid oversized trades.")
-                                    else:
-                                        st.error("Walk-forward result is weak/unstable. Do not treat this IV Proxy winner as a strong standalone edge.")
-
-                                    if use_wf_signal:
-                                        st.info("Using the walk-forward-selected signal for the main backtest below. This is more realistic than using the full-history best rule.")
-
-                            st.info(f"Chosen IV proxy rule: **{best_name}** — {best_logic}")
+                            if enable_iv_walk_forward and use_wf_signal and wf_result is not None:
+                                st.info("Primary result below uses **walk-forward-selected IV rules**. The in-sample chosen rule is shown only as reference.")
+                                st.caption(f"In-sample reference winner: {best_name} — {best_logic}")
+                            else:
+                                st.info(f"Chosen IV proxy rule: **{best_name}** — {best_logic}")
                             
                             # Re-index selected best signal back to full backtest price index for the shared backtest engine below.
                             signals = pd.Series(np.nan, index=prices_bt.index)
