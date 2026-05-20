@@ -1258,8 +1258,13 @@ class BacktestEngine:
                 'Exit Date': exit_date,
                 'Buy Price': float(entry_price),
                 'Sell Price': float(exit_price),
-                'PnL (%)': float(trade_return_pct),              # single trade price return
-                'Cumulative Return (%)': float(cumulative_return_pct),  # total account return after this trade
+                'PnL (%)': float(trade_return_pct),              # kept for compatibility
+                'Trade Return (%)': float(trade_return_pct),     # price move on the trade
+                'Entry Equity': float(entry_equity),
+                'Exit Equity': float(exit_equity),
+                'Account Return (%)': float(account_return_pct), # actual account impact
+                'Cumulative Return (%)': float(cumulative_return_pct),
+                'Exposure Used': float(entry_signal),
                 'Status': status_msg
             })
 
