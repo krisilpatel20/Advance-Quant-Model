@@ -1468,7 +1468,7 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
     return signal, context
 
 
-def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True):
+def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True, trade_activity_mode='Balanced'):
     """
     Walk-forward validation for the Regime Switching backtest.
     Each forward block fits only on the trailing training window, selects the best regime signal method
@@ -1502,6 +1502,23 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             return None
 
     base_methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
+
+    # Trade activity control:
+    # Conservative = closer to original behavior.
+    # Balanced/Active = tests slightly lower conviction + shorter min-hold variants using TRAINING data only.
+    # This makes WFO more responsive without using future data.
+    mode = str(trade_activity_mode or "Balanced").lower()
+    base_conviction = float(conviction)
+    base_min_hold = int(min_hold)
+    if mode == "active":
+        conviction_candidates = sorted(set([base_conviction, max(0.50, base_conviction - 0.05), max(0.50, base_conviction - 0.10)]), reverse=True)
+        min_hold_candidates = sorted(set([base_min_hold, max(1, base_min_hold // 2), 1]))
+    elif mode == "conservative":
+        conviction_candidates = [base_conviction]
+        min_hold_candidates = [base_min_hold]
+    else:  # Balanced
+        conviction_candidates = sorted(set([base_conviction, max(0.50, base_conviction - 0.05)]), reverse=True)
+        min_hold_candidates = sorted(set([base_min_hold, max(1, base_min_hold // 2)]))
     # Auto means WFO chooses the best regime count per forward block using only the training window.
     if isinstance(n_regimes, str) and n_regimes.lower() == "auto":
         regime_candidates = [2, 3, 4]
@@ -1542,31 +1559,38 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                     continue
 
                 for method in base_methods:
-                    try:
-                        sig_train, _ = build_regime_backtest_signal(
-                            res, train_returns.index, prices.loc[train_idx].index,
-                            n_candidate, method, conviction=float(conviction), min_hold=int(min_hold)
-                        )
-                        if confirmed_bar:
-                            sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
-                        score = evaluate_strategy_candidate(
-                            prices.loc[train_idx], sig_train,
-                            initial_capital=initial_capital,
-                            trailing_stop_pct=trailing_stop_pct,
-                            stop_loss_pct=stop_loss_pct
-                        )
-                        if score is None:
-                            continue
-                        score["Institutional Score"] = risk_adjusted_candidate_score(score)
-                        markov_candidate_count += 1
-                        train_scores.append({
-                            "method": method,
-                            "n_regimes": n_candidate,
-                            "score": score,
-                            "signal": sig_train
-                        })
-                    except Exception:
-                        continue
+                    for conv_try in conviction_candidates:
+                        for hold_try in min_hold_candidates:
+                            try:
+                                sig_train, _ = build_regime_backtest_signal(
+                                    res, train_returns.index, prices.loc[train_idx].index,
+                                    n_candidate, method, conviction=float(conv_try), min_hold=int(hold_try)
+                                )
+                                if confirmed_bar:
+                                    sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
+                                score = evaluate_strategy_candidate(
+                                    prices.loc[train_idx], sig_train,
+                                    initial_capital=initial_capital,
+                                    trailing_stop_pct=trailing_stop_pct,
+                                    stop_loss_pct=stop_loss_pct
+                                )
+                                if score is None:
+                                    continue
+                                # Add a small trade-activity bonus so WFO does not always choose ultra-static signals.
+                                score["Institutional Score"] = risk_adjusted_candidate_score(score, activity_mode=trade_activity_mode)
+                                markov_candidate_count += 1
+                                label = method if (conv_try == base_conviction and hold_try == base_min_hold) else f"{method} | Conv {conv_try:.2f} | Hold {int(hold_try)}"
+                                train_scores.append({
+                                    "method": label,
+                                    "base_method": method,
+                                    "n_regimes": n_candidate,
+                                    "conviction": float(conv_try),
+                                    "min_hold": int(hold_try),
+                                    "score": score,
+                                    "signal": sig_train
+                                })
+                            except Exception:
+                                continue
             except Exception:
                 continue
 
@@ -1585,7 +1609,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                     stop_loss_pct=stop_loss_pct
                 )
                 if score is not None:
-                    score["Institutional Score"] = risk_adjusted_candidate_score(score)
+                    score["Institutional Score"] = risk_adjusted_candidate_score(score, activity_mode=trade_activity_mode)
                     train_scores.append({
                         "method": "Strong Runner Trend Hold",
                         "n_regimes": "Trend",
@@ -1609,7 +1633,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                 stop_loss_pct=stop_loss_pct
             )
             if score is not None:
-                score["Institutional Score"] = risk_adjusted_candidate_score(score, benchmark_bias=0.25)
+                score["Institutional Score"] = risk_adjusted_candidate_score(score, benchmark_bias=0.25, activity_mode=trade_activity_mode)
                 train_scores.append({
                     "method": "Simple Trend Hold",
                     "n_regimes": "Trend",
@@ -1800,7 +1824,7 @@ def simple_trend_hold_signal(prices, fast=10, slow=30):
     return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
 
 
-def risk_adjusted_candidate_score(score, benchmark_bias=0.15):
+def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode='Balanced'):
     """
     Institutional-style scoring: return matters, but drawdown and benchmark underperformance are penalized.
     benchmark_bias rewards candidates that stay closer to buy-and-hold during strong runners.
@@ -1811,8 +1835,17 @@ def risk_adjusted_candidate_score(score, benchmark_bias=0.15):
     diff = float(score.get('Difference %', 0.0))
     dd = abs(float(score.get('Max DD %', 0.0)))
     trades = int(score.get('Trades', 0))
+    mode = str(activity_mode or "Balanced").lower()
     trade_penalty = 5.0 if trades < 2 else 0.0
-    return (0.55 * ret) + (0.35 * diff) - (0.25 * dd) - trade_penalty + (benchmark_bias * max(ret, 0))
+    # Small bonus for reasonable activity, not overtrading. This helps Regime WFO take trades
+    # instead of always choosing a dead/static signal.
+    if mode == "active":
+        activity_bonus = min(trades, 8) * 0.80
+    elif mode == "conservative":
+        activity_bonus = 0.0
+    else:
+        activity_bonus = min(trades, 6) * 0.45
+    return (0.55 * ret) + (0.35 * diff) - (0.25 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
 
 def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0):
     """
@@ -4654,9 +4687,9 @@ with tab7:
 
         col_sig1, col_sig2, col_sig3 = st.columns(3)
         with col_sig1:
-            conviction = st.slider("Min Bull Probability", 0.5, 0.9, 0.65, step=0.05, key="bt_regime_conviction")
+            conviction = st.slider("Min Bull Probability", 0.5, 0.9, 0.60, step=0.05, key="bt_regime_conviction")
         with col_sig2:
-            min_hold_period = st.number_input("Minimum Hold Period", min_value=1, max_value=60, value=3, step=1, key="bt_regime_min_hold")
+            min_hold_period = st.number_input("Minimum Hold Period", min_value=1, max_value=60, value=2, step=1, key="bt_regime_min_hold")
         with col_sig3:
             confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
 
@@ -4665,9 +4698,10 @@ with tab7:
             enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=True, key="bt_regime_enable_wfo")
             use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=True, key="bt_regime_use_wfo")
             regime_wf_train = wf_c3.number_input("Regime WFO train bars", min_value=30, max_value=1000, value=252, step=21, key="bt_regime_wf_train")
-            regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=21, step=5, key="bt_regime_wf_forward")
+            regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=10, step=5, key="bt_regime_wf_forward")
             auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
+            regime_trade_activity = st.selectbox("Regime WFO trade activity", ["Conservative", "Balanced", "Active"], index=1, key="bt_regime_trade_activity", help="Balanced/Active tests lower-conviction and shorter-hold variants inside WFO, using training data only. Active takes more trades; Conservative stays closest to the original.")
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -4821,7 +4855,8 @@ with tab7:
                                 trailing_stop_pct=trailing_stop,
                                 stop_loss_pct=stop_loss,
                                 confirmed_bar=bool(confirmed_regime_bar),
-                                use_strong_runner_override=bool(use_regime_runner_override)
+                                use_strong_runner_override=bool(use_regime_runner_override),
+                                trade_activity_mode=regime_trade_activity
                             )
 
                         st.write("#### 🧭 Regime Walk-Forward Result")
