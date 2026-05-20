@@ -1205,166 +1205,138 @@ class BacktestEngine:
         signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
         trailing_stop_pct: Float (e.g., 0.05 for 5%). If > 0, applies trailing stop.
         stop_loss_pct: Float (e.g., 0.08 for 8%). If > 0, applies a hard stop loss.
+
+        Important:
+        The equity curve, performance metrics, and trade log all come from the same
+        account-level accounting below. Individual trade PnL can differ from total
+        strategy return because the account compounds and may use fractional exposure.
         """
-        # Align
+        # Align and clean
         common_idx = prices.index.intersection(signals.index)
-        prices = prices.loc[common_idx]
-        signals = signals.loc[common_idx]
-        
-        # Calculate Returns
-        returns = prices.pct_change().fillna(0)
-        
-        # Note: Vectorized approach is hard with path-dependent trailing stop.
-        # We will use the loop for everything to be consistent and accurate with stops.
-        
-        equity_curve = [initial_capital]
+        prices = pd.Series(prices.loc[common_idx]).replace([np.inf, -np.inf], np.nan).dropna()
+        signals = pd.Series(signals).reindex(prices.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
+
+        if len(prices) == 0:
+            empty = pd.Series(dtype=float)
+            return {
+                'equity_curve': empty,
+                'benchmark_curve': empty,
+                'trades': pd.DataFrame(),
+                'returns': empty
+            }
+
+        returns = prices.pct_change().fillna(0.0)
+
+        equity_vals = []
         trades = []
-        position = 0 # 0: Cash, 1: Long
-        entry_price = 0
+
+        position = 0  # 0: Cash, 1: Long
+        entry_price = 0.0
         entry_date = None
-        max_price_since_entry = 0
-        entry_equity = 0.0
-        entry_cash = 0.0
-        entry_invested = 0.0
-        
-        cash = initial_capital
-        holdings = 0
-        
+        entry_equity = initial_capital
+        entry_signal = 0.0
+        max_price_since_entry = 0.0
+
+        cash = float(initial_capital)
+        holdings = 0.0
         cooldown_bars = 0
-        
-        for date, price, signal in zip(prices.index, prices, signals):
-            # Cooldown logic to prevent stop-loss bleed
+
+        def current_equity(price):
+            return float(cash + holdings * price)
+
+        def record_trade(exit_date, exit_price, status_msg):
+            nonlocal cash, holdings, position, entry_price, entry_date, entry_equity, entry_signal
+
+            trade_return_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price else 0.0
+            exit_equity = current_equity(exit_price)
+            account_return_pct = ((exit_equity / entry_equity) - 1.0) * 100.0 if entry_equity else 0.0
+            cumulative_return_pct = ((exit_equity / initial_capital) - 1.0) * 100.0 if initial_capital else 0.0
+
+            trades.append({
+                'Side': 'Long',
+                'Entry Date': entry_date,
+                'Exit Date': exit_date,
+                'Buy Price': float(entry_price),
+                'Sell Price': float(exit_price),
+                'PnL (%)': float(trade_return_pct),              # kept for compatibility
+                'Trade Return (%)': float(trade_return_pct),     # price move on the trade
+                'Entry Equity': float(entry_equity),
+                'Exit Equity': float(exit_equity),
+                'Account Return (%)': float(account_return_pct), # actual account impact
+                'Cumulative Return (%)': float(cumulative_return_pct),
+                'Exposure Used': float(entry_signal),
+                'Status': status_msg
+            })
+
+        for date, price in prices.items():
+            price = float(price)
+            desired_signal = float(signals.loc[date])
+
+            # Cooldown logic to prevent immediate re-entry after stop loss/trailing stop
             if cooldown_bars > 0:
                 cooldown_bars -= 1
-                if signal == 0:
-                    cooldown_bars = 0 # Early reset if indicator drops to cash naturally
-            
-            # Mark to Market
+                if desired_signal == 0:
+                    cooldown_bars = 0
+
+            # Stop checks are based on the same account state used by the equity curve
             if position == 1:
-                current_val = cash + holdings * price
-                
                 stop_out = False
                 status_msg = ""
-                
-                # 1. Check Hard Stop Loss
+
                 if stop_loss_pct > 0:
                     hard_stop_price = entry_price * (1 - stop_loss_pct)
                     if price <= hard_stop_price:
                         stop_out = True
                         status_msg = 'Stop Loss'
-                
-                # 2. Check Trailing Stop
+
                 if not stop_out and trailing_stop_pct > 0:
                     max_price_since_entry = max(max_price_since_entry, price)
                     stop_price = max_price_since_entry * (1 - trailing_stop_pct)
-                    
                     if price <= stop_price:
                         stop_out = True
                         status_msg = 'Trailing Stop'
-                        
+
                 if stop_out:
+                    cash += holdings * price
+                    holdings = 0.0
+                    record_trade(date, price, status_msg)
                     position = 0
-                    exit_price = price
-                    cash = cash + (holdings * exit_price)
-                    holdings = 0
-                    
-                    pnl = (exit_price - entry_price) / entry_price
-                    exit_equity = cash
-                    account_return = (exit_equity / entry_equity - 1) if entry_equity > 0 else pnl
-                    cumulative_return = (exit_equity / initial_capital - 1) if initial_capital > 0 else np.nan
-                    trades.append({
-                        'Side': 'Long',
-                        'Entry Date': entry_date,
-                        'Exit Date': date,
-                        'Buy Price': entry_price,
-                        'Sell Price': exit_price,
-                        'Trade PnL (%)': pnl * 100,
-                        'Account Return (%)': account_return * 100,
-                        'Entry Equity': entry_equity,
-                        'Exit Equity': exit_equity,
-                        'Cumulative Return (%)': cumulative_return * 100,
-                        'Status': status_msg
-                    })
-                    equity_curve.append(cash)
-                    cooldown_bars = 5 # Lock out new positions for 5 bars to prevent immediate re-entry bleed
-                    continue # Skip normal signal processing for this bar
-            else:
-                current_val = cash
-            
-            # Signal Processing
-            if position == 0 and signal > 0 and cooldown_bars == 0:
-                # Buy
+                    cooldown_bars = 5
+                    equity_vals.append(cash)
+                    continue
+
+            # Signal processing
+            if position == 0 and desired_signal > 0 and cooldown_bars == 0:
                 position = 1
                 entry_price = price
                 entry_date = date
+                entry_equity = current_equity(price)
+                entry_signal = desired_signal
                 max_price_since_entry = price
-                
-                # Fractional position sizing based on signal (1.0 = 100%, 0.35 = 35%)
-                entry_equity = cash
-                entry_cash = cash
-                invest_amt = cash * signal
-                entry_invested = invest_amt
+
+                invest_amt = cash * desired_signal
                 holdings = invest_amt / price
-                cash = cash - invest_amt
-            elif position == 1 and signal == 0:
-                # Sell
+                cash -= invest_amt
+
+            elif position == 1 and desired_signal == 0:
+                cash += holdings * price
+                holdings = 0.0
+                record_trade(date, price, 'Closed')
                 position = 0
-                exit_price = price
-                cash = cash + (holdings * exit_price)
-                holdings = 0
-                
-                pnl = (exit_price - entry_price) / entry_price
-                exit_equity = cash
-                account_return = (exit_equity / entry_equity - 1) if entry_equity > 0 else pnl
-                cumulative_return = (exit_equity / initial_capital - 1) if initial_capital > 0 else np.nan
-                trades.append({
-                    'Side': 'Long',
-                    'Entry Date': entry_date,
-                    'Exit Date': date,
-                    'Buy Price': entry_price,
-                    'Sell Price': exit_price,
-                    'Trade PnL (%)': pnl * 100,
-                    'Account Return (%)': account_return * 100,
-                    'Entry Equity': entry_equity,
-                    'Exit Equity': exit_equity,
-                    'Cumulative Return (%)': cumulative_return * 100,
-                    'Status': 'Closed'
-                })
-            
-            if position == 1:
-                equity_curve.append(cash + holdings * price)
-            else:
-                equity_curve.append(cash)
-            
-        # Capture Open Position
+
+            equity_vals.append(current_equity(price))
+
+        # Capture open position as mark-to-market, using TOTAL account equity
+        # (cash + holdings), not holdings-only.
         if position == 1:
-            current_price = prices.iloc[-1]
-            current_val = cash + holdings * current_price
-            pnl = (current_price - entry_price) / entry_price
-            account_return = (current_val / entry_equity - 1) if entry_equity > 0 else pnl
-            cumulative_return = (current_val / initial_capital - 1) if initial_capital > 0 else np.nan
-            trades.append({
-                'Side': 'Long',
-                'Entry Date': entry_date,
-                'Exit Date': None, # Open
-                'Buy Price': entry_price,
-                'Sell Price': current_price, # Mark-to-Market
-                'Trade PnL (%)': pnl * 100,
-                'Account Return (%)': account_return * 100,
-                'Entry Equity': entry_equity,
-                'Exit Equity': current_val,
-                'Cumulative Return (%)': cumulative_return * 100,
-                'Status': 'Open'
-            })
-            equity_curve[-1] = current_val # Update last point
-            
-        # Convert to Series
-        equity_curve_series = pd.Series(equity_curve[1:], index=prices.index)
+            current_price = float(prices.iloc[-1])
+            record_trade(None, current_price, 'Open')
+            equity_vals[-1] = current_equity(current_price)
+
+        equity_curve_series = pd.Series(equity_vals, index=prices.index, dtype=float)
         benchmark_curve = initial_capital * (1 + returns).cumprod()
-        
-        # Derived Strategy Returns
-        strat_returns = equity_curve_series.pct_change().fillna(0)
-                
+        strat_returns = equity_curve_series.pct_change().fillna(0.0)
+
         return {
             'equity_curve': equity_curve_series,
             'benchmark_curve': benchmark_curve,
@@ -1510,22 +1482,13 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
     train_window = int(train_window)
     forward_window = int(forward_window)
 
-    # Practical WFO sizing: keep WFO honest, but do not let the tab go blank
-    # just because the requested train/forward windows are too large for the
-    # selected data window. We shrink the windows only when necessary and report
-    # the effective values back to the UI.
-    if len(prices) < 45:
+    # Strict WFO sizing: do not silently shrink the walk-forward windows.
+    # If there is not enough data to train and test honestly, return None and
+    # let the UI show no WFO trades instead of forcing fallback results.
+    if len(prices) < max(35, train_window + forward_window):
         return None
-    if train_window < 25:
-        train_window = 25
-    if forward_window < 5:
-        forward_window = 5
-    if len(prices) < train_window + forward_window:
-        # Use roughly 70% training / 30% forward chunks, with safe lower bounds.
-        train_window = max(25, int(len(prices) * 0.60))
-        forward_window = max(5, min(int(len(prices) * 0.15), len(prices) - train_window))
-        if len(prices) < train_window + forward_window or forward_window < 2:
-            return None
+    if train_window < 25 or forward_window < 5:
+        return None
 
     base_methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
     # Auto means WFO chooses the best regime count per forward block using only the training window.
@@ -1621,30 +1584,6 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             except Exception:
                 pass
 
-        # 3) Simple Trend Hold is the final true-WFO candidate.
-        # It prevents blank WFO output on difficult/noisy symbols without using future data
-        # and without falling back to full-history optimization.
-        try:
-            sig_train = simple_trend_hold_signal(prices.loc[train_idx])
-            if confirmed_bar:
-                sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
-            score = evaluate_strategy_candidate(
-                prices.loc[train_idx], sig_train,
-                initial_capital=initial_capital,
-                trailing_stop_pct=trailing_stop_pct,
-                stop_loss_pct=stop_loss_pct
-            )
-            if score is not None:
-                score["Institutional Score"] = risk_adjusted_candidate_score(score, benchmark_bias=0.25)
-                train_scores.append({
-                    "method": "Simple Trend Hold",
-                    "n_regimes": "Trend",
-                    "score": score,
-                    "signal": sig_train
-                })
-        except Exception:
-            pass
-
         if not train_scores:
             start += forward_window
             period_no += 1
@@ -1666,11 +1605,6 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         if chosen_method == "Strong Runner Trend Hold":
             combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
             test_signal = strong_runner_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
-            if confirmed_bar:
-                test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
-        elif chosen_method == "Simple Trend Hold":
-            combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
-            test_signal = simple_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
             if confirmed_bar:
                 test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
         else:
@@ -1800,29 +1734,6 @@ def strong_runner_trend_hold_signal(prices, fast=20, slow=50, long=100):
     # Exit only on a real trend break, not a tiny wiggle.
     trend_break = (px < ema_slow * 0.97) | ((ema_fast < ema_slow) & (slow_slope < 0))
     sig = make_stateful_position(strong_uptrend, trend_break, px.index)
-    return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
-
-
-
-
-def simple_trend_hold_signal(prices, fast=10, slow=30):
-    """
-    Always-available WFO candidate.
-    Purpose: prevent Regime WFO from going blank when Markov models fail to converge.
-    It is still honest WFO because it is selected on the training window and tested only
-    on the next unseen forward window. Uses causal EMA trend logic only.
-    """
-    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 10:
-        return pd.Series(0.0, index=px.index)
-    fast = int(max(3, min(fast, max(3, len(px)//3))))
-    slow = int(max(fast + 2, min(slow, max(fast + 2, len(px)//2))))
-    ema_fast = px.ewm(span=fast, adjust=False).mean()
-    ema_slow = px.ewm(span=slow, adjust=False).mean()
-    mom = px.pct_change(max(3, min(21, len(px)//4))).fillna(0)
-    long_cond = (px > ema_slow) & (ema_fast >= ema_slow) & (mom >= 0)
-    exit_cond = (px < ema_slow * 0.985) | (ema_fast < ema_slow)
-    sig = make_stateful_position(long_cond, exit_cond, px.index)
     return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
 
 
@@ -2174,12 +2085,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
-                "PnL (%)": "{:.2f}%",
-                "Trade PnL (%)": "{:.2f}%",
-                "Account Return (%)": "{:.2f}%",
-                "Entry Equity": "${:,.2f}",
-                "Exit Equity": "${:,.2f}",
-                "Cumulative Return (%)": "{:.2f}%"
+                "PnL (%)": "{:.2f}%"
             }), use_container_width=True)
             st.download_button(
                 f"📥 Download {title} Trade Log",
@@ -4857,7 +4763,7 @@ with tab7:
 
                         st.write("#### 🧭 Regime Walk-Forward Result")
                         if wf_regime is None or wf_regime.get("overall") is None:
-                            st.warning("Regime WFO still could not generate a valid out-of-sample result for this data window. The full-history regime signal below is shown only as research, not WFO-validated.")
+                            st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
                             using_wfo_primary_for_metrics = False
                         else:
                             wf_overall = wf_regime["overall"]
@@ -5882,12 +5788,7 @@ with tab7:
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
-                "PnL (%)": "{:.2f}%",
-                "Trade PnL (%)": "{:.2f}%",
-                "Account Return (%)": "{:.2f}%",
-                "Entry Equity": "${:,.2f}",
-                "Exit Equity": "${:,.2f}",
-                "Cumulative Return (%)": "{:.2f}%"
+                "PnL (%)": "{:.2f}%"
             }), use_container_width=True)
         else:
             st.info("No closed trades generated by the strategy.")
