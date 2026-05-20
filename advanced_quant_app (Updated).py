@@ -1643,6 +1643,36 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         except Exception:
             pass
 
+        # 4) Mode-specific responsive trend pulse candidates.
+        # These make Conservative/Balanced/Active genuinely different instead of only changing labels.
+        # They are scored on the training window and tested on the next unseen window only.
+        if mode in ["balanced", "active"]:
+            pulse_specs = [("Balanced Trend Pulse", 8, 21, 0.992, 10)]
+            if mode == "active":
+                pulse_specs.append(("Active Trend Pulse", 5, 13, 0.997, 5))
+            for pulse_name, pf, ps, pbuf, pmom in pulse_specs:
+                try:
+                    sig_train = responsive_trend_pulse_signal(prices.loc[train_idx], fast=pf, slow=ps, exit_buffer=pbuf, momentum_window=pmom)
+                    if confirmed_bar:
+                        sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
+                    score = evaluate_strategy_candidate(
+                        prices.loc[train_idx], sig_train,
+                        initial_capital=initial_capital,
+                        trailing_stop_pct=trailing_stop_pct,
+                        stop_loss_pct=stop_loss_pct
+                    )
+                    if score is not None:
+                        score["Institutional Score"] = risk_adjusted_candidate_score(score, benchmark_bias=0.10, activity_mode=trade_activity_mode)
+                        train_scores.append({
+                            "method": pulse_name,
+                            "n_regimes": "Pulse",
+                            "score": score,
+                            "signal": sig_train,
+                            "pulse_params": (pf, ps, pbuf, pmom)
+                        })
+                except Exception:
+                    pass
+
         if not train_scores:
             start += forward_window
             period_no += 1
@@ -1661,19 +1691,38 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         # No-lookahead forward execution.
         # For Markov signals, carry the latest training exposure into the next unseen block.
         # For Strong Runner Trend Hold, calculate a causal trend-hold signal on train+test and use only the test portion.
+        combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
         if chosen_method == "Strong Runner Trend Hold":
-            combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
             test_signal = strong_runner_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
             if confirmed_bar:
                 test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
         elif chosen_method == "Simple Trend Hold":
-            combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
             test_signal = simple_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
+            if confirmed_bar:
+                test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
+        elif "Trend Pulse" in str(chosen_method):
+            pf, ps, pbuf, pmom = chosen.get("pulse_params", (8, 21, 0.992, 10))
+            test_signal = responsive_trend_pulse_signal(combo_px, fast=pf, slow=ps, exit_buffer=pbuf, momentum_window=pmom).reindex(test_idx).ffill().fillna(0).clip(0, 1)
             if confirmed_bar:
                 test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
         else:
             latest_exposure = float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0
             test_signal = pd.Series(latest_exposure, index=test_idx, dtype=float)
+
+        # Activity layer overlay: this is the part that makes the layer visibly different.
+        # Conservative = no overlay. Balanced = allow trend pulse to turn on when Markov is static.
+        # Active = use a faster pulse overlay, so it can take more trades. All are causal + confirmed-bar safe.
+        if mode in ["balanced", "active"]:
+            if mode == "active":
+                overlay = responsive_trend_pulse_signal(combo_px, fast=5, slow=13, exit_buffer=0.997, momentum_window=5)
+            else:
+                overlay = responsive_trend_pulse_signal(combo_px, fast=8, slow=21, exit_buffer=0.992, momentum_window=10)
+            overlay = overlay.reindex(test_idx).ffill().fillna(0).clip(0, 1)
+            if confirmed_bar:
+                overlay = overlay.shift(1).ffill().fillna(float(test_signal.iloc[0]) if len(test_signal) else 0.0).clip(0, 1)
+            # Use max() so a strong causal trend pulse can add entries, but never shorts.
+            test_signal = pd.concat([test_signal, overlay], axis=1).max(axis=1).ffill().fillna(0).clip(0, 1)
+
         wf_signal.loc[test_idx] = test_signal
 
         test_score = evaluate_strategy_candidate(
@@ -1733,7 +1782,8 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         "stability_score": stability_score,
         "strategy_sequence": sequence,
         "effective_train_window": train_window,
-        "effective_forward_window": forward_window
+        "effective_forward_window": forward_window,
+        "trade_activity_mode": trade_activity_mode
     }
 
 
@@ -1824,10 +1874,37 @@ def simple_trend_hold_signal(prices, fast=10, slow=30):
     return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
 
 
+
+def responsive_trend_pulse_signal(prices, fast=6, slow=18, exit_buffer=0.995, momentum_window=8):
+    """
+    More active trend candidate for Regime WFO activity layers.
+    Uses only causal price information. It is intentionally more responsive than Simple Trend Hold.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 8:
+        return pd.Series(0.0, index=px.index)
+    fast = int(max(2, min(fast, max(2, len(px)//3))))
+    slow = int(max(fast + 1, min(slow, max(fast + 1, len(px)//2))))
+    mom_win = int(max(2, min(momentum_window, max(2, len(px)//3))))
+    ema_fast = px.ewm(span=fast, adjust=False).mean()
+    ema_slow = px.ewm(span=slow, adjust=False).mean()
+    mom = px.pct_change(mom_win).fillna(0)
+    slope = ema_fast.pct_change(3).fillna(0)
+
+    long_cond = ((ema_fast > ema_slow) & (px >= ema_fast * 0.995) & ((mom > 0) | (slope > 0)))
+    exit_cond = (px < ema_slow * float(exit_buffer)) | ((ema_fast < ema_slow) & (mom < 0))
+    sig = make_stateful_position(long_cond, exit_cond, px.index)
+    return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
+
+
 def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode='Balanced'):
     """
     Institutional-style scoring: return matters, but drawdown and benchmark underperformance are penalized.
-    benchmark_bias rewards candidates that stay closer to buy-and-hold during strong runners.
+
+    Important fix: activity_mode now has a REAL effect.
+    Conservative does not reward extra trades.
+    Balanced mildly rewards useful activity.
+    Active strongly penalizes dead/static signals and rewards candidates that actually create trades.
     """
     if score is None:
         return -1e9
@@ -1836,16 +1913,23 @@ def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode='Bal
     dd = abs(float(score.get('Max DD %', 0.0)))
     trades = int(score.get('Trades', 0))
     mode = str(activity_mode or "Balanced").lower()
-    trade_penalty = 5.0 if trades < 2 else 0.0
-    # Small bonus for reasonable activity, not overtrading. This helps Regime WFO take trades
-    # instead of always choosing a dead/static signal.
+
     if mode == "active":
-        activity_bonus = min(trades, 8) * 0.80
-    elif mode == "conservative":
+        # Active should NOT keep choosing a static/no-trade candidate.
+        trade_penalty = 25.0 if trades < 1 else (10.0 if trades < 2 else 0.0)
+        activity_bonus = min(trades, 12) * 2.50
+        return (0.48 * ret) + (0.27 * diff) - (0.20 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
+
+    if mode == "conservative":
+        # Conservative prioritizes robustness and avoids chasing activity.
+        trade_penalty = 3.0 if trades < 1 else 0.0
         activity_bonus = 0.0
-    else:
-        activity_bonus = min(trades, 6) * 0.45
-    return (0.55 * ret) + (0.35 * diff) - (0.25 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
+        return (0.60 * ret) + (0.35 * diff) - (0.30 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
+
+    # Balanced: modest activity preference, but still risk-adjusted.
+    trade_penalty = 10.0 if trades < 1 else (4.0 if trades < 2 else 0.0)
+    activity_bonus = min(trades, 8) * 1.15
+    return (0.54 * ret) + (0.32 * diff) - (0.24 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
 
 def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0):
     """
@@ -4701,7 +4785,7 @@ with tab7:
             regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=10, step=5, key="bt_regime_wf_forward")
             auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
-            regime_trade_activity = st.selectbox("Regime WFO trade activity", ["Conservative", "Balanced", "Active"], index=1, key="bt_regime_trade_activity", help="Balanced/Active tests lower-conviction and shorter-hold variants inside WFO, using training data only. Active takes more trades; Conservative stays closest to the original.")
+            regime_trade_activity = st.selectbox("Regime WFO trade activity", ["Conservative", "Balanced", "Active"], index=1, key="bt_regime_trade_activity", help="Now changes real forward behavior. Conservative = no activity overlay. Balanced = moderate trend-pulse overlay. Active = faster trend-pulse overlay for more entries/exits.")
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
