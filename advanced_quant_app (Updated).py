@@ -1205,140 +1205,133 @@ class BacktestEngine:
         signals: Series of 1 (Long) or 0 (Cash/Neutral). Index must match prices.
         trailing_stop_pct: Float (e.g., 0.05 for 5%). If > 0, applies trailing stop.
         stop_loss_pct: Float (e.g., 0.08 for 8%). If > 0, applies a hard stop loss.
+
+        Important:
+        The equity curve, performance metrics, and trade log all come from the same
+        account-level accounting below. Individual trade PnL can differ from total
+        strategy return because the account compounds and may use fractional exposure.
         """
-        # Align
+        # Align and clean
         common_idx = prices.index.intersection(signals.index)
-        prices = prices.loc[common_idx]
-        signals = signals.loc[common_idx]
-        
-        # Calculate Returns
-        returns = prices.pct_change().fillna(0)
-        
-        # Note: Vectorized approach is hard with path-dependent trailing stop.
-        # We will use the loop for everything to be consistent and accurate with stops.
-        
-        equity_curve = [initial_capital]
+        prices = pd.Series(prices.loc[common_idx]).replace([np.inf, -np.inf], np.nan).dropna()
+        signals = pd.Series(signals).reindex(prices.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
+
+        if len(prices) == 0:
+            empty = pd.Series(dtype=float)
+            return {
+                'equity_curve': empty,
+                'benchmark_curve': empty,
+                'trades': pd.DataFrame(),
+                'returns': empty
+            }
+
+        returns = prices.pct_change().fillna(0.0)
+
+        equity_vals = []
         trades = []
-        position = 0 # 0: Cash, 1: Long
-        entry_price = 0
+
+        position = 0  # 0: Cash, 1: Long
+        entry_price = 0.0
         entry_date = None
-        max_price_since_entry = 0
-        
-        cash = initial_capital
-        holdings = 0
-        
+        entry_equity = initial_capital
+        entry_signal = 0.0
+        max_price_since_entry = 0.0
+
+        cash = float(initial_capital)
+        holdings = 0.0
         cooldown_bars = 0
-        
-        for date, price, signal in zip(prices.index, prices, signals):
-            # Cooldown logic to prevent stop-loss bleed
+
+        def current_equity(price):
+            return float(cash + holdings * price)
+
+        def record_trade(exit_date, exit_price, status_msg):
+            nonlocal cash, holdings, position, entry_price, entry_date, entry_equity, entry_signal
+
+            trade_return_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price else 0.0
+            exit_equity = current_equity(exit_price)
+            account_return_pct = ((exit_equity / entry_equity) - 1.0) * 100.0 if entry_equity else 0.0
+            cumulative_return_pct = ((exit_equity / initial_capital) - 1.0) * 100.0 if initial_capital else 0.0
+
+            trades.append({
+                'Side': 'Long',
+                'Entry Date': entry_date,
+                'Exit Date': exit_date,
+                'Buy Price': float(entry_price),
+                'Sell Price': float(exit_price),
+                'PnL (%)': float(trade_return_pct),              # single trade price return
+                'Cumulative Return (%)': float(cumulative_return_pct),  # total account return after this trade
+                'Status': status_msg
+            })
+
+        for date, price in prices.items():
+            price = float(price)
+            desired_signal = float(signals.loc[date])
+
+            # Cooldown logic to prevent immediate re-entry after stop loss/trailing stop
             if cooldown_bars > 0:
                 cooldown_bars -= 1
-                if signal == 0:
-                    cooldown_bars = 0 # Early reset if indicator drops to cash naturally
-            
-            # Mark to Market
+                if desired_signal == 0:
+                    cooldown_bars = 0
+
+            # Stop checks are based on the same account state used by the equity curve
             if position == 1:
-                current_val = cash + holdings * price
-                
                 stop_out = False
                 status_msg = ""
-                
-                # 1. Check Hard Stop Loss
+
                 if stop_loss_pct > 0:
                     hard_stop_price = entry_price * (1 - stop_loss_pct)
                     if price <= hard_stop_price:
                         stop_out = True
                         status_msg = 'Stop Loss'
-                
-                # 2. Check Trailing Stop
+
                 if not stop_out and trailing_stop_pct > 0:
                     max_price_since_entry = max(max_price_since_entry, price)
                     stop_price = max_price_since_entry * (1 - trailing_stop_pct)
-                    
                     if price <= stop_price:
                         stop_out = True
                         status_msg = 'Trailing Stop'
-                        
+
                 if stop_out:
+                    cash += holdings * price
+                    holdings = 0.0
+                    record_trade(date, price, status_msg)
                     position = 0
-                    exit_price = price
-                    cash = cash + (holdings * exit_price)
-                    holdings = 0
-                    
-                    pnl = (exit_price - entry_price) / entry_price
-                    trades.append({
-                        'Side': 'Long',
-                        'Entry Date': entry_date,
-                        'Exit Date': date,
-                        'Buy Price': entry_price,
-                        'Sell Price': exit_price,
-                        'PnL (%)': pnl * 100,
-                        'Status': status_msg
-                    })
-                    equity_curve.append(cash)
-                    cooldown_bars = 5 # Lock out new positions for 5 bars to prevent immediate re-entry bleed
-                    continue # Skip normal signal processing for this bar
-            else:
-                current_val = cash
-            
-            # Signal Processing
-            if position == 0 and signal > 0 and cooldown_bars == 0:
-                # Buy
+                    cooldown_bars = 5
+                    equity_vals.append(cash)
+                    continue
+
+            # Signal processing
+            if position == 0 and desired_signal > 0 and cooldown_bars == 0:
                 position = 1
                 entry_price = price
                 entry_date = date
+                entry_equity = current_equity(price)
+                entry_signal = desired_signal
                 max_price_since_entry = price
-                
-                # Fractional position sizing based on signal (1.0 = 100%, 0.35 = 35%)
-                invest_amt = cash * signal
+
+                invest_amt = cash * desired_signal
                 holdings = invest_amt / price
-                cash = cash - invest_amt
-            elif position == 1 and signal == 0:
-                # Sell
+                cash -= invest_amt
+
+            elif position == 1 and desired_signal == 0:
+                cash += holdings * price
+                holdings = 0.0
+                record_trade(date, price, 'Closed')
                 position = 0
-                exit_price = price
-                cash = cash + (holdings * exit_price)
-                holdings = 0
-                
-                pnl = (exit_price - entry_price) / entry_price
-                trades.append({
-                    'Side': 'Long',
-                    'Entry Date': entry_date,
-                    'Exit Date': date,
-                    'Buy Price': entry_price,
-                    'Sell Price': exit_price,
-                    'PnL (%)': pnl * 100,
-                    'Status': 'Closed'
-                })
-            
-            if position == 1:
-                equity_curve.append(cash + holdings * price)
-            else:
-                equity_curve.append(cash)
-            
-        # Capture Open Position
+
+            equity_vals.append(current_equity(price))
+
+        # Capture open position as mark-to-market, using TOTAL account equity
+        # (cash + holdings), not holdings-only.
         if position == 1:
-            current_price = prices.iloc[-1]
-            current_val = holdings * current_price
-            pnl = (current_price - entry_price) / entry_price
-            trades.append({
-                'Side': 'Long',
-                'Entry Date': entry_date,
-                'Exit Date': None, # Open
-                'Buy Price': entry_price,
-                'Sell Price': current_price, # Mark-to-Market
-                'PnL (%)': pnl * 100,
-                'Status': 'Open'
-            })
-            equity_curve[-1] = current_val # Update last point
-            
-        # Convert to Series
-        equity_curve_series = pd.Series(equity_curve[1:], index=prices.index)
+            current_price = float(prices.iloc[-1])
+            record_trade(None, current_price, 'Open')
+            equity_vals[-1] = current_equity(current_price)
+
+        equity_curve_series = pd.Series(equity_vals, index=prices.index, dtype=float)
         benchmark_curve = initial_capital * (1 + returns).cumprod()
-        
-        # Derived Strategy Returns
-        strat_returns = equity_curve_series.pct_change().fillna(0)
-                
+        strat_returns = equity_curve_series.pct_change().fillna(0.0)
+
         return {
             'equity_curve': equity_curve_series,
             'benchmark_curve': benchmark_curve,
@@ -1468,7 +1461,7 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
     return signal, context
 
 
-def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True, trade_activity_mode='Balanced'):
+def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True, activity_mode="Conservative"):
     """
     Walk-forward validation for the Regime Switching backtest.
     Each forward block fits only on the trailing training window, selects the best regime signal method
@@ -1484,41 +1477,15 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
     train_window = int(train_window)
     forward_window = int(forward_window)
 
-    # Practical WFO sizing: keep WFO honest, but do not let the tab go blank
-    # just because the requested train/forward windows are too large for the
-    # selected data window. We shrink the windows only when necessary and report
-    # the effective values back to the UI.
-    if len(prices) < 45:
+    # Strict WFO sizing: do not silently shrink the walk-forward windows.
+    # If there is not enough data to train and test honestly, return None and
+    # let the UI show no WFO trades instead of forcing fallback results.
+    if len(prices) < max(35, train_window + forward_window):
         return None
-    if train_window < 25:
-        train_window = 25
-    if forward_window < 5:
-        forward_window = 5
-    if len(prices) < train_window + forward_window:
-        # Use roughly 70% training / 30% forward chunks, with safe lower bounds.
-        train_window = max(25, int(len(prices) * 0.60))
-        forward_window = max(5, min(int(len(prices) * 0.15), len(prices) - train_window))
-        if len(prices) < train_window + forward_window or forward_window < 2:
-            return None
+    if train_window < 25 or forward_window < 5:
+        return None
 
     base_methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
-
-    # Trade activity control:
-    # Conservative = closer to original behavior.
-    # Balanced/Active = tests slightly lower conviction + shorter min-hold variants using TRAINING data only.
-    # This makes WFO more responsive without using future data.
-    mode = str(trade_activity_mode or "Balanced").lower()
-    base_conviction = float(conviction)
-    base_min_hold = int(min_hold)
-    if mode == "active":
-        conviction_candidates = sorted(set([base_conviction, max(0.50, base_conviction - 0.05), max(0.50, base_conviction - 0.10)]), reverse=True)
-        min_hold_candidates = sorted(set([base_min_hold, max(1, base_min_hold // 2), 1]))
-    elif mode == "conservative":
-        conviction_candidates = [base_conviction]
-        min_hold_candidates = [base_min_hold]
-    else:  # Balanced
-        conviction_candidates = sorted(set([base_conviction, max(0.50, base_conviction - 0.05)]), reverse=True)
-        min_hold_candidates = sorted(set([base_min_hold, max(1, base_min_hold // 2)]))
     # Auto means WFO chooses the best regime count per forward block using only the training window.
     if isinstance(n_regimes, str) and n_regimes.lower() == "auto":
         regime_candidates = [2, 3, 4]
@@ -1559,38 +1526,57 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                     continue
 
                 for method in base_methods:
-                    for conv_try in conviction_candidates:
-                        for hold_try in min_hold_candidates:
-                            try:
-                                sig_train, _ = build_regime_backtest_signal(
-                                    res, train_returns.index, prices.loc[train_idx].index,
-                                    n_candidate, method, conviction=float(conv_try), min_hold=int(hold_try)
-                                )
-                                if confirmed_bar:
-                                    sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
-                                score = evaluate_strategy_candidate(
-                                    prices.loc[train_idx], sig_train,
-                                    initial_capital=initial_capital,
-                                    trailing_stop_pct=trailing_stop_pct,
-                                    stop_loss_pct=stop_loss_pct
-                                )
-                                if score is None:
-                                    continue
-                                # Add a small trade-activity bonus so WFO does not always choose ultra-static signals.
-                                score["Institutional Score"] = risk_adjusted_candidate_score(score, activity_mode=trade_activity_mode)
-                                markov_candidate_count += 1
-                                label = method if (conv_try == base_conviction and hold_try == base_min_hold) else f"{method} | Conv {conv_try:.2f} | Hold {int(hold_try)}"
+                    try:
+                        sig_train, _ = build_regime_backtest_signal(
+                            res, train_returns.index, prices.loc[train_idx].index,
+                            n_candidate, method, conviction=float(conviction), min_hold=int(min_hold)
+                        )
+                        if confirmed_bar:
+                            sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
+                        score = evaluate_strategy_candidate(
+                            prices.loc[train_idx], sig_train,
+                            initial_capital=initial_capital,
+                            trailing_stop_pct=trailing_stop_pct,
+                            stop_loss_pct=stop_loss_pct
+                        )
+                        if score is None:
+                            continue
+                        score["Institutional Score"] = risk_adjusted_candidate_score(score, activity_mode=str(activity_mode))
+                        markov_candidate_count += 1
+                        train_scores.append({
+                            "method": method,
+                            "n_regimes": n_candidate,
+                            "score": score,
+                            "signal": sig_train,
+                            "activity_variant": "Base"
+                        })
+
+                        # Activity-aware variant: this is what makes Conservative/Balanced/Active truly different.
+                        # It is scored on the training window only, then re-created causally for the forward window.
+                        if str(activity_mode).lower() != "conservative":
+                            act_sig_train = combine_regime_activity_signal(
+                                sig_train, prices.loc[train_idx], mode=str(activity_mode)
+                            )
+                            if confirmed_bar:
+                                act_sig_train = act_sig_train.shift(1).ffill().fillna(0).clip(0, 1)
+                            act_score = evaluate_strategy_candidate(
+                                prices.loc[train_idx], act_sig_train,
+                                initial_capital=initial_capital,
+                                trailing_stop_pct=trailing_stop_pct,
+                                stop_loss_pct=stop_loss_pct
+                            )
+                            if act_score is not None:
+                                act_score["Institutional Score"] = risk_adjusted_candidate_score(act_score, activity_mode=str(activity_mode))
                                 train_scores.append({
-                                    "method": label,
+                                    "method": f"{method} + {str(activity_mode)} Activity",
                                     "base_method": method,
                                     "n_regimes": n_candidate,
-                                    "conviction": float(conv_try),
-                                    "min_hold": int(hold_try),
-                                    "score": score,
-                                    "signal": sig_train
+                                    "score": act_score,
+                                    "signal": act_sig_train,
+                                    "activity_variant": str(activity_mode)
                                 })
-                            except Exception:
-                                continue
+                    except Exception:
+                        continue
             except Exception:
                 continue
 
@@ -1609,69 +1595,41 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                     stop_loss_pct=stop_loss_pct
                 )
                 if score is not None:
-                    score["Institutional Score"] = risk_adjusted_candidate_score(score, activity_mode=trade_activity_mode)
+                    score["Institutional Score"] = risk_adjusted_candidate_score(score, activity_mode=str(activity_mode))
                     train_scores.append({
                         "method": "Strong Runner Trend Hold",
                         "n_regimes": "Trend",
                         "score": score,
-                        "signal": sig_train
+                        "signal": sig_train,
+                        "activity_variant": "Base"
                     })
             except Exception:
                 pass
 
-        # 3) Simple Trend Hold is the final true-WFO candidate.
-        # It prevents blank WFO output on difficult/noisy symbols without using future data
-        # and without falling back to full-history optimization.
-        try:
-            sig_train = simple_trend_hold_signal(prices.loc[train_idx])
-            if confirmed_bar:
-                sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
-            score = evaluate_strategy_candidate(
-                prices.loc[train_idx], sig_train,
-                initial_capital=initial_capital,
-                trailing_stop_pct=trailing_stop_pct,
-                stop_loss_pct=stop_loss_pct
-            )
-            if score is not None:
-                score["Institutional Score"] = risk_adjusted_candidate_score(score, benchmark_bias=0.25, activity_mode=trade_activity_mode)
-                train_scores.append({
-                    "method": "Simple Trend Hold",
-                    "n_regimes": "Trend",
-                    "score": score,
-                    "signal": sig_train
-                })
-        except Exception:
-            pass
-
-        # 4) Mode-specific responsive trend pulse candidates.
-        # These make Conservative/Balanced/Active genuinely different instead of only changing labels.
-        # They are scored on the training window and tested on the next unseen window only.
-        if mode in ["balanced", "active"]:
-            pulse_specs = [("Balanced Trend Pulse", 8, 21, 0.992, 10)]
-            if mode == "active":
-                pulse_specs.append(("Active Trend Pulse", 5, 13, 0.997, 5))
-            for pulse_name, pf, ps, pbuf, pmom in pulse_specs:
-                try:
-                    sig_train = responsive_trend_pulse_signal(prices.loc[train_idx], fast=pf, slow=ps, exit_buffer=pbuf, momentum_window=pmom)
-                    if confirmed_bar:
-                        sig_train = sig_train.shift(1).ffill().fillna(0).clip(0, 1)
-                    score = evaluate_strategy_candidate(
-                        prices.loc[train_idx], sig_train,
-                        initial_capital=initial_capital,
-                        trailing_stop_pct=trailing_stop_pct,
-                        stop_loss_pct=stop_loss_pct
-                    )
-                    if score is not None:
-                        score["Institutional Score"] = risk_adjusted_candidate_score(score, benchmark_bias=0.10, activity_mode=trade_activity_mode)
-                        train_scores.append({
-                            "method": pulse_name,
-                            "n_regimes": "Pulse",
-                            "score": score,
-                            "signal": sig_train,
-                            "pulse_params": (pf, ps, pbuf, pmom)
-                        })
-                except Exception:
-                    pass
+        # Pure activity candidate: useful when Markov is too defensive and does not trade enough.
+        # This is still true WFO: it is chosen using training data only, then tested on unseen forward data.
+        if str(activity_mode).lower() != "conservative":
+            try:
+                pulse_train = regime_activity_pulse_signal(prices.loc[train_idx], mode=str(activity_mode))
+                if confirmed_bar:
+                    pulse_train = pulse_train.shift(1).ffill().fillna(0).clip(0, 1)
+                pulse_score = evaluate_strategy_candidate(
+                    prices.loc[train_idx], pulse_train,
+                    initial_capital=initial_capital,
+                    trailing_stop_pct=trailing_stop_pct,
+                    stop_loss_pct=stop_loss_pct
+                )
+                if pulse_score is not None:
+                    pulse_score["Institutional Score"] = risk_adjusted_candidate_score(pulse_score, activity_mode=str(activity_mode))
+                    train_scores.append({
+                        "method": f"{str(activity_mode)} Trend Pulse",
+                        "n_regimes": "Pulse",
+                        "score": pulse_score,
+                        "signal": pulse_train,
+                        "activity_variant": str(activity_mode)
+                    })
+            except Exception:
+                pass
 
         if not train_scores:
             start += forward_window
@@ -1692,37 +1650,24 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         # For Markov signals, carry the latest training exposure into the next unseen block.
         # For Strong Runner Trend Hold, calculate a causal trend-hold signal on train+test and use only the test portion.
         combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
+        chosen_variant = str(chosen.get("activity_variant", "Base"))
+        latest_exposure = float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0
+        base_forward = pd.Series(latest_exposure, index=test_idx, dtype=float)
+
         if chosen_method == "Strong Runner Trend Hold":
             test_signal = strong_runner_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
             if confirmed_bar:
-                test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
-        elif chosen_method == "Simple Trend Hold":
-            test_signal = simple_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
+                test_signal = test_signal.shift(1).ffill().fillna(latest_exposure).clip(0, 1)
+        elif "Trend Pulse" in chosen_method:
+            test_signal = regime_activity_pulse_signal(combo_px, mode=chosen_variant).reindex(test_idx).ffill().fillna(latest_exposure).clip(0, 1)
             if confirmed_bar:
-                test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
-        elif "Trend Pulse" in str(chosen_method):
-            pf, ps, pbuf, pmom = chosen.get("pulse_params", (8, 21, 0.992, 10))
-            test_signal = responsive_trend_pulse_signal(combo_px, fast=pf, slow=ps, exit_buffer=pbuf, momentum_window=pmom).reindex(test_idx).ffill().fillna(0).clip(0, 1)
+                test_signal = test_signal.shift(1).ffill().fillna(latest_exposure).clip(0, 1)
+        elif chosen_variant.lower() != "base":
+            test_signal = combine_regime_activity_signal(base_forward, combo_px, mode=chosen_variant).reindex(test_idx).ffill().fillna(latest_exposure).clip(0, 1)
             if confirmed_bar:
-                test_signal = test_signal.shift(1).ffill().fillna(float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0).clip(0, 1)
+                test_signal = test_signal.shift(1).ffill().fillna(latest_exposure).clip(0, 1)
         else:
-            latest_exposure = float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0
-            test_signal = pd.Series(latest_exposure, index=test_idx, dtype=float)
-
-        # Activity layer overlay: this is the part that makes the layer visibly different.
-        # Conservative = no overlay. Balanced = allow trend pulse to turn on when Markov is static.
-        # Active = use a faster pulse overlay, so it can take more trades. All are causal + confirmed-bar safe.
-        if mode in ["balanced", "active"]:
-            if mode == "active":
-                overlay = responsive_trend_pulse_signal(combo_px, fast=5, slow=13, exit_buffer=0.997, momentum_window=5)
-            else:
-                overlay = responsive_trend_pulse_signal(combo_px, fast=8, slow=21, exit_buffer=0.992, momentum_window=10)
-            overlay = overlay.reindex(test_idx).ffill().fillna(0).clip(0, 1)
-            if confirmed_bar:
-                overlay = overlay.shift(1).ffill().fillna(float(test_signal.iloc[0]) if len(test_signal) else 0.0).clip(0, 1)
-            # Use max() so a strong causal trend pulse can add entries, but never shorts.
-            test_signal = pd.concat([test_signal, overlay], axis=1).max(axis=1).ffill().fillna(0).clip(0, 1)
-
+            test_signal = base_forward
         wf_signal.loc[test_idx] = test_signal
 
         test_score = evaluate_strategy_candidate(
@@ -1739,6 +1684,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             "Forward End": test_idx[-1],
             "Selected Method": chosen_method,
             "Selected Regimes": chosen_n_regimes,
+            "Activity Mode": str(activity_mode),
             "Train Diff %": round(chosen["score"]["Difference %"], 2),
             "Forward Strategy %": round(test_score.get("Strategy Return %", np.nan), 2) if test_score else np.nan,
             "Forward Buy & Hold %": round(test_score.get("Buy & Hold Return %", np.nan), 2) if test_score else np.nan,
@@ -1782,8 +1728,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         "stability_score": stability_score,
         "strategy_sequence": sequence,
         "effective_train_window": train_window,
-        "effective_forward_window": forward_window,
-        "trade_activity_mode": trade_activity_mode
+        "effective_forward_window": forward_window
     }
 
 
@@ -1853,58 +1798,59 @@ def strong_runner_trend_hold_signal(prices, fast=20, slow=50, long=100):
 
 
 
-def simple_trend_hold_signal(prices, fast=10, slow=30):
+def regime_activity_pulse_signal(prices, mode="Balanced"):
     """
-    Always-available WFO candidate.
-    Purpose: prevent Regime WFO from going blank when Markov models fail to converge.
-    It is still honest WFO because it is selected on the training window and tested only
-    on the next unseen forward window. Uses causal EMA trend logic only.
+    Causal trend-pulse signal used by Regime WFO activity modes.
+    Balanced is moderate. Active is faster. No future data is used.
     """
     px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 10:
+    if len(px) < 15:
         return pd.Series(0.0, index=px.index)
-    fast = int(max(3, min(fast, max(3, len(px)//3))))
-    slow = int(max(fast + 2, min(slow, max(fast + 2, len(px)//2))))
+
+    mode_l = str(mode or "Balanced").lower()
+    if mode_l == "active":
+        fast, slow, exit_span, mom_len, confirm = 4, 10, 16, 2, 1
+    else:
+        fast, slow, exit_span, mom_len, confirm = 8, 21, 34, 5, 2
+
     ema_fast = px.ewm(span=fast, adjust=False).mean()
     ema_slow = px.ewm(span=slow, adjust=False).mean()
-    mom = px.pct_change(max(3, min(21, len(px)//4))).fillna(0)
-    long_cond = (px > ema_slow) & (ema_fast >= ema_slow) & (mom >= 0)
-    exit_cond = (px < ema_slow * 0.985) | (ema_fast < ema_slow)
-    sig = make_stateful_position(long_cond, exit_cond, px.index)
-    return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
+    ema_exit = px.ewm(span=exit_span, adjust=False).mean()
+    mom = px.pct_change(mom_len).fillna(0.0)
+    slope = ema_slow.pct_change(max(2, mom_len)).fillna(0.0)
+
+    entry = (ema_fast > ema_slow) & (px > ema_fast) & ((mom > 0) | (slope > 0))
+    exit_ = (px < ema_exit) | ((ema_fast < ema_slow) & (mom < 0))
+
+    if confirm > 1:
+        entry = entry.astype(int).rolling(confirm, min_periods=confirm).sum().eq(confirm)
+
+    return make_stateful_position(entry, exit_, px.index).reindex(px.index).ffill().fillna(0.0).clip(0, 1)
 
 
-
-def responsive_trend_pulse_signal(prices, fast=6, slow=18, exit_buffer=0.995, momentum_window=8):
+def combine_regime_activity_signal(base_signal, prices_window, mode="Balanced"):
     """
-    More active trend candidate for Regime WFO activity layers.
-    Uses only causal price information. It is intentionally more responsive than Simple Trend Hold.
+    Combines a regime WFO signal with a causal trend-pulse.
+    Balanced: regime OR moderate trend pulse, but trend break can exit.
+    Active: fast trend pulse controls exposure.
     """
-    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 8:
-        return pd.Series(0.0, index=px.index)
-    fast = int(max(2, min(fast, max(2, len(px)//3))))
-    slow = int(max(fast + 1, min(slow, max(fast + 1, len(px)//2))))
-    mom_win = int(max(2, min(momentum_window, max(2, len(px)//3))))
-    ema_fast = px.ewm(span=fast, adjust=False).mean()
-    ema_slow = px.ewm(span=slow, adjust=False).mean()
-    mom = px.pct_change(mom_win).fillna(0)
-    slope = ema_fast.pct_change(3).fillna(0)
+    px = pd.Series(prices_window).replace([np.inf, -np.inf], np.nan).dropna()
+    base = pd.Series(base_signal).reindex(px.index).ffill().fillna(0.0).clip(0, 1)
+    mode_l = str(mode or "Balanced").lower()
+    pulse = regime_activity_pulse_signal(px, mode=mode)
 
-    long_cond = ((ema_fast > ema_slow) & (px >= ema_fast * 0.995) & ((mom > 0) | (slope > 0)))
-    exit_cond = (px < ema_slow * float(exit_buffer)) | ((ema_fast < ema_slow) & (mom < 0))
-    sig = make_stateful_position(long_cond, exit_cond, px.index)
-    return sig.reindex(px.index).ffill().fillna(0).clip(0, 1)
+    if mode_l == "active":
+        return pulse.reindex(px.index).ffill().fillna(0.0).clip(0, 1)
 
+    # Balanced: be more willing to enter than pure regime, but still exit on clear pulse weakness.
+    # This makes the output materially different while staying safer than Active.
+    combined = ((base >= 0.5) | (pulse >= 0.5)).astype(float)
+    return pd.Series(combined, index=px.index).ffill().fillna(0.0).clip(0, 1)
 
-def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode='Balanced'):
+def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode="Conservative"):
     """
     Institutional-style scoring: return matters, but drawdown and benchmark underperformance are penalized.
-
-    Important fix: activity_mode now has a REAL effect.
-    Conservative does not reward extra trades.
-    Balanced mildly rewards useful activity.
-    Active strongly penalizes dead/static signals and rewards candidates that actually create trades.
+    benchmark_bias rewards candidates that stay closer to buy-and-hold during strong runners.
     """
     if score is None:
         return -1e9
@@ -1912,24 +1858,22 @@ def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode='Bal
     diff = float(score.get('Difference %', 0.0))
     dd = abs(float(score.get('Max DD %', 0.0)))
     trades = int(score.get('Trades', 0))
-    mode = str(activity_mode or "Balanced").lower()
+    mode_l = str(activity_mode or "Conservative").lower()
 
-    if mode == "active":
-        # Active should NOT keep choosing a static/no-trade candidate.
-        trade_penalty = 25.0 if trades < 1 else (10.0 if trades < 2 else 0.0)
-        activity_bonus = min(trades, 12) * 2.50
-        return (0.48 * ret) + (0.27 * diff) - (0.20 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
-
-    if mode == "conservative":
-        # Conservative prioritizes robustness and avoids chasing activity.
-        trade_penalty = 3.0 if trades < 1 else 0.0
-        activity_bonus = 0.0
-        return (0.60 * ret) + (0.35 * diff) - (0.30 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
-
-    # Balanced: modest activity preference, but still risk-adjusted.
-    trade_penalty = 10.0 if trades < 1 else (4.0 if trades < 2 else 0.0)
-    activity_bonus = min(trades, 8) * 1.15
-    return (0.54 * ret) + (0.32 * diff) - (0.24 * dd) - trade_penalty + activity_bonus + (benchmark_bias * max(ret, 0))
+    # Conservative prefers clean, fewer-trade behavior.
+    # Balanced wants enough participation to challenge buy/hold.
+    # Active penalizes dead/no-trade signals much harder.
+    if mode_l == "active":
+        trade_penalty = 18.0 if trades < 2 else (8.0 if trades < 4 else 0.0)
+        activity_bonus = min(trades, 8) * 1.25
+        return (0.45 * ret) + (0.45 * diff) - (0.28 * dd) - trade_penalty + activity_bonus
+    elif mode_l == "balanced":
+        trade_penalty = 10.0 if trades < 2 else 0.0
+        activity_bonus = min(trades, 5) * 0.65
+        return (0.50 * ret) + (0.42 * diff) - (0.28 * dd) - trade_penalty + activity_bonus
+    else:
+        trade_penalty = 5.0 if trades < 2 else 0.0
+        return (0.55 * ret) + (0.35 * diff) - (0.25 * dd) - trade_penalty + (benchmark_bias * max(ret, 0))
 
 def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0):
     """
@@ -4771,21 +4715,21 @@ with tab7:
 
         col_sig1, col_sig2, col_sig3 = st.columns(3)
         with col_sig1:
-            conviction = st.slider("Min Bull Probability", 0.5, 0.9, 0.60, step=0.05, key="bt_regime_conviction")
+            conviction = st.slider("Min Bull Probability", 0.5, 0.9, 0.65, step=0.05, key="bt_regime_conviction")
         with col_sig2:
-            min_hold_period = st.number_input("Minimum Hold Period", min_value=1, max_value=60, value=2, step=1, key="bt_regime_min_hold")
+            min_hold_period = st.number_input("Minimum Hold Period", min_value=1, max_value=60, value=3, step=1, key="bt_regime_min_hold")
         with col_sig3:
             confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
 
         with st.expander("🧭 Regime WFO Settings", expanded=True):
-            wf_c1, wf_c2, wf_c3, wf_c4 = st.columns(4)
+            wf_c1, wf_c2, wf_c3, wf_c4, wf_c5 = st.columns(5)
             enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=True, key="bt_regime_enable_wfo")
             use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=True, key="bt_regime_use_wfo")
             regime_wf_train = wf_c3.number_input("Regime WFO train bars", min_value=30, max_value=1000, value=252, step=21, key="bt_regime_wf_train")
-            regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=10, step=5, key="bt_regime_wf_forward")
+            regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=21, step=5, key="bt_regime_wf_forward")
+            regime_activity_mode = wf_c5.selectbox("Regime WFO activity", ["Conservative", "Balanced", "Active"], index=1, key="bt_regime_activity_mode", help="Conservative = original Markov behavior. Balanced = Markov plus moderate trend-pulse. Active = faster trend-pulse candidates for more trades.")
             auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
-            regime_trade_activity = st.selectbox("Regime WFO trade activity", ["Conservative", "Balanced", "Active"], index=1, key="bt_regime_trade_activity", help="Now changes real forward behavior. Conservative = no activity overlay. Balanced = moderate trend-pulse overlay. Active = faster trend-pulse overlay for more entries/exits.")
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -4940,12 +4884,12 @@ with tab7:
                                 stop_loss_pct=stop_loss,
                                 confirmed_bar=bool(confirmed_regime_bar),
                                 use_strong_runner_override=bool(use_regime_runner_override),
-                                trade_activity_mode=regime_trade_activity
+                                activity_mode=str(regime_activity_mode)
                             )
 
                         st.write("#### 🧭 Regime Walk-Forward Result")
                         if wf_regime is None or wf_regime.get("overall") is None:
-                            st.warning("Regime WFO still could not generate a valid out-of-sample result for this data window. The full-history regime signal below is shown only as research, not WFO-validated.")
+                            st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
                             using_wfo_primary_for_metrics = False
                         else:
                             wf_overall = wf_regime["overall"]
