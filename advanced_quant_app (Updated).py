@@ -1975,6 +1975,77 @@ def combine_regime_activity_signal(base_signal, prices_window, mode="Balanced"):
     return pd.Series(combined, index=px.index).ffill().fillna(0.0).clip(0, 1)
 
 
+
+def full_benchmark_capture_signal(prices, mode="Full Benchmark Capture"):
+    """
+    Full-period trend-capture signal for the Regime tab.
+
+    Purpose:
+    Try to capture most of a strong stock's full buy-and-hold upside while still
+    using causal risk brakes for major trend breaks. This is not pure WFO model
+    selection; it is a benchmark-aware trend participation layer meant for the
+    user's stated goal: closer to full benchmark with controlled drawdown.
+
+    Uses only current/past price data.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 5:
+        return pd.Series(0.0, index=px.index)
+
+    mode_l = str(mode or "Full Benchmark Capture").lower()
+
+    # More aggressive modes stay invested longer. The risk brake is intentionally
+    # wide because the goal is to participate in large runners, not overtrade them.
+    if "maximum" in mode_l or "chase" in mode_l:
+        fast_span, guard_span, slow_span = 8, 34, 100
+        trend_break_mult = 0.82
+        trail_dd = 0.34
+        reentry_mult = 0.97
+        base_exposure = 1.00
+    else:
+        fast_span, guard_span, slow_span = 10, 50, 120
+        trend_break_mult = 0.86
+        trail_dd = 0.28
+        reentry_mult = 0.99
+        base_exposure = 1.00
+
+    ema_fast = px.ewm(span=fast_span, adjust=False).mean()
+    ema_guard = px.ewm(span=guard_span, adjust=False).mean()
+    ema_slow = px.ewm(span=slow_span, adjust=False).mean() if len(px) >= slow_span else ema_guard
+
+    mom_10 = px.pct_change(10).fillna(0.0)
+    mom_21 = px.pct_change(21).fillna(0.0)
+    guard_slope = ema_guard.pct_change(10).fillna(0.0)
+    roll_peak = px.cummax()
+    dd_from_peak = (px / roll_peak - 1.0).fillna(0.0)
+
+    # Enter early in a constructive trend. This is intentionally broad so the
+    # strategy does not sit in cash while the benchmark makes the big move.
+    enter = (
+        (px >= ema_guard * reentry_mult) |
+        ((ema_fast >= ema_guard * 0.985) & ((mom_10 > 0) | (mom_21 > 0) | (guard_slope > 0)))
+    )
+
+    # Exit only on serious structure damage. This is the drawdown guard.
+    exit_ = (
+        (px < ema_guard * trend_break_mult) |
+        ((ema_fast < ema_guard * 0.94) & (guard_slope < -0.02)) |
+        (dd_from_peak < -trail_dd)
+    )
+
+    sig = make_stateful_position(enter, exit_, px.index)
+
+    # If the selected period is already in a strong trend at the first bar, start
+    # participating from the beginning instead of waiting for a cross that may have
+    # happened before the selected window.
+    if len(sig) > 0 and sig.iloc[0] == 0:
+        if bool((px.iloc[0] >= ema_guard.iloc[0] * 0.98) or (ema_fast.iloc[0] >= ema_guard.iloc[0] * 0.98)):
+            sig.iloc[0] = 1.0
+            sig = sig.ffill().fillna(0.0)
+
+    return (sig * base_exposure).reindex(px.index).ffill().fillna(0.0).clip(0, 1)
+
+
 def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
     """
     Benchmark-aware trend participation candidate for Regime WFO.
@@ -1988,6 +2059,9 @@ def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
         return pd.Series(0.0, index=px.index)
 
     mode_l = str(mode or "Balanced").lower()
+
+    if "full benchmark" in mode_l or "maximum" in mode_l:
+        return full_benchmark_capture_signal(px, mode=mode)
 
     # These settings intentionally make Balanced/Aggressive much more trend-capturing
     # than the older version. The old version was too defensive and kept missing
@@ -5014,7 +5088,8 @@ with tab7:
             auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
             use_regime_return_booster = st.checkbox("Benchmark-aware return booster", value=True, key="bt_regime_return_booster", help="Adds a fractional trend-participation candidate that tries to get closer to buy-and-hold while still exiting on trend breaks.")
-            regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive", "Benchmark Chase"], index=1, key="bt_regime_return_booster_mode", help="Balanced is the recommended default. Benchmark Chase gets closest to buy-and-hold but can increase drawdown.")
+            regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive", "Benchmark Chase", "Full Benchmark Capture", "Maximum Capture"], index=4, key="bt_regime_return_booster_mode", help="Full Benchmark Capture is designed for the goal of getting closer to full buy-and-hold while still using wide trend/drawdown brakes. Maximum Capture is most aggressive.")
+            regime_full_benchmark_mode = st.checkbox("Compare/trade from full start date", value=True, key="bt_regime_full_benchmark_mode", help="When ON, the metric section uses the full selected date range instead of only the WFO test window. Before the first WFO period, it uses a causal trend bridge so the strategy can be compared against the full benchmark.")
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -5207,8 +5282,39 @@ with tab7:
 
                             if use_regime_wfo:
                                 first_forward_start = wf_regime["first_forward_start"]
-                                strat_prices = strat_prices.loc[first_forward_start:]
-                                signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                full_wfo_prices = strat_prices.copy()
+
+                                if bool(regime_full_benchmark_mode):
+                                    # Full-benchmark mode: compare the strategy against buy & hold from the
+                                    # selected start date, not only after the WFO training window.
+                                    # WFO cannot produce a model-selected signal before the first forward period,
+                                    # so the pre-WFO section uses a causal trend bridge. This is clearly labeled
+                                    # as a bridge, not as out-of-sample WFO validation.
+                                    wf_only_signal = wf_regime["signal"].reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                    bridge_signal = benchmark_aware_trend_participation_signal(
+                                        full_wfo_prices, mode=str(regime_return_booster_mode)
+                                    ).reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                    if bool(confirmed_regime_bar):
+                                        bridge_signal = bridge_signal.shift(1).ffill().fillna(0).clip(0, 1)
+
+                                    signals = wf_only_signal.copy()
+                                    pre_wfo_mask = signals.index < first_forward_start
+                                    signals.loc[pre_wfo_mask] = bridge_signal.loc[pre_wfo_mask]
+                                    strat_prices = full_wfo_prices
+                                    benchmark_label_for_metrics = "Full Benchmark"
+                                    full_period_benchmark_pct_for_metrics = full_bh
+                                    using_wfo_primary_for_metrics = True
+                                    try:
+                                        st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
+                                    except Exception:
+                                        pass
+                                else:
+                                    # Pure WFO-test mode: compare only over the out-of-sample forward-test window.
+                                    strat_prices = strat_prices.loc[first_forward_start:]
+                                    signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                    benchmark_label_for_metrics = "WFO Test Benchmark"
+                                    full_period_benchmark_pct_for_metrics = full_bh
+                                    using_wfo_primary_for_metrics = True
 
                                 # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
                                 # Previous versions could show identical results because the booster was only
@@ -5226,9 +5332,10 @@ with tab7:
 
                                         mode_l = str(regime_return_booster_mode or "Balanced").lower()
                                         original_signals = signals.copy()
-                                        if mode_l == "aggressive":
-                                            # Aggressive means the booster is allowed to become the primary
-                                            # trend participation signal. This should clearly change trades.
+                                        if ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
+                                            # Full Benchmark Capture / Maximum Capture must become the primary
+                                            # final signal, otherwise the WFO signal can still keep returns far
+                                            # below the full buy-and-hold benchmark.
                                             signals = booster_full
                                         elif mode_l == "conservative":
                                             # Conservative only adds high-confidence exposure.
@@ -5256,8 +5363,8 @@ with tab7:
                                     except Exception as e:
                                         st.warning(f"Return booster final overlay could not be applied: {e}")
 
-                                benchmark_label_for_metrics = "WFO Test Benchmark"
-                                full_period_benchmark_pct_for_metrics = full_bh
+                                # benchmark_label_for_metrics / full_period_benchmark_pct_for_metrics
+                                # are set above depending on whether full-benchmark mode is ON.
                                 using_wfo_primary_for_metrics = True
 
                     # Plot Context
@@ -6230,9 +6337,14 @@ with tab7:
             with met_col3:
                 st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
             with met_col4:
-                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help="Buy & hold over the same out-of-sample WFO test window used by the strategy.")
+                help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
+                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
             with met_col5:
-                st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
+                strategy_pct_now = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
+                if benchmark_label_for_metrics == "Full Benchmark":
+                    st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy return minus full-period buy & hold return.")
+                else:
+                    st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
         else:
             met_col1, met_col2, met_col3, met_col4 = st.columns(4)
             with met_col1:
