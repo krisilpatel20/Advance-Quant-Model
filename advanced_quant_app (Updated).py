@@ -1464,7 +1464,7 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
     return signal, context
 
 
-def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True, activity_mode="Conservative"):
+def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True, activity_mode="Conservative", use_return_booster=True, return_booster_mode="Balanced"):
     """
     Walk-forward validation for the Regime Switching backtest.
     Each forward block fits only on the trailing training window, selects the best regime signal method
@@ -1634,6 +1634,37 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
             except Exception:
                 pass
 
+        # 4) Benchmark-aware return booster candidate.
+        # Goal: get closer to buy-and-hold during strong trends while still using a trend-break exit
+        # to protect drawdown. It is scored on training only and tested forward unseen.
+        if use_return_booster:
+            try:
+                booster_train = benchmark_aware_trend_participation_signal(
+                    prices.loc[train_idx], mode=str(return_booster_mode)
+                )
+                if confirmed_bar:
+                    booster_train = booster_train.shift(1).ffill().fillna(0).clip(0, 1)
+                booster_score = evaluate_strategy_candidate(
+                    prices.loc[train_idx], booster_train,
+                    initial_capital=initial_capital,
+                    trailing_stop_pct=trailing_stop_pct,
+                    stop_loss_pct=stop_loss_pct
+                )
+                if booster_score is not None:
+                    # Score wants benchmark participation, but still punishes drawdown.
+                    booster_score["Institutional Score"] = risk_adjusted_candidate_score(
+                        booster_score, activity_mode="ReturnBooster"
+                    )
+                    train_scores.append({
+                        "method": f"Benchmark-Aware Return Booster ({str(return_booster_mode)})",
+                        "n_regimes": "Booster",
+                        "score": booster_score,
+                        "signal": booster_train,
+                        "activity_variant": "ReturnBooster"
+                    })
+            except Exception:
+                pass
+
         if not train_scores:
             start += forward_window
             period_no += 1
@@ -1657,7 +1688,13 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         latest_exposure = float(chosen["signal"].iloc[-1]) if len(chosen["signal"]) else 0.0
         base_forward = pd.Series(latest_exposure, index=test_idx, dtype=float)
 
-        if chosen_method == "Strong Runner Trend Hold":
+        if "Benchmark-Aware Return Booster" in chosen_method:
+            test_signal = benchmark_aware_trend_participation_signal(
+                combo_px, mode=str(return_booster_mode)
+            ).reindex(test_idx).ffill().fillna(latest_exposure).clip(0, 1)
+            if confirmed_bar:
+                test_signal = test_signal.shift(1).ffill().fillna(latest_exposure).clip(0, 1)
+        elif chosen_method == "Strong Runner Trend Hold":
             test_signal = strong_runner_trend_hold_signal(combo_px).reindex(test_idx).ffill().fillna(0).clip(0, 1)
             if confirmed_bar:
                 test_signal = test_signal.shift(1).ffill().fillna(latest_exposure).clip(0, 1)
@@ -1850,6 +1887,71 @@ def combine_regime_activity_signal(base_signal, prices_window, mode="Balanced"):
     combined = ((base >= 0.5) | (pulse >= 0.5)).astype(float)
     return pd.Series(combined, index=px.index).ffill().fillna(0.0).clip(0, 1)
 
+
+def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
+    """
+    Benchmark-aware trend participation candidate for Regime WFO.
+    Purpose: when buy-and-hold is very strong, this candidate stays invested longer,
+    but it still exits on a meaningful trend break to preserve drawdown/Sharpe.
+    Uses only current/past price data. No future data.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 30:
+        return pd.Series(0.0, index=px.index)
+
+    mode_l = str(mode or "Balanced").lower()
+    if mode_l == "aggressive":
+        floor_exposure = 0.85
+        strong_exposure = 1.00
+        break_mult = 0.93
+        dd_exit = 0.25
+        fast, mid, slow = 10, 30, 75
+    elif mode_l == "conservative":
+        floor_exposure = 0.45
+        strong_exposure = 0.75
+        break_mult = 0.97
+        dd_exit = 0.16
+        fast, mid, slow = 20, 50, 100
+    else:  # Balanced
+        floor_exposure = 0.65
+        strong_exposure = 0.95
+        break_mult = 0.95
+        dd_exit = 0.20
+        fast, mid, slow = 14, 40, 90
+
+    ema_fast = px.ewm(span=fast, adjust=False).mean()
+    ema_mid = px.ewm(span=mid, adjust=False).mean()
+    ema_slow = px.ewm(span=slow, adjust=False).mean() if len(px) >= slow else ema_mid
+
+    mom_10 = px.pct_change(10).fillna(0.0)
+    mom_21 = px.pct_change(21).fillna(0.0)
+    mid_slope = ema_mid.pct_change(10).fillna(0.0)
+    rolling_peak = px.cummax()
+    drawdown_from_peak = (px / rolling_peak - 1.0).fillna(0.0)
+
+    strong_trend = (px > ema_mid) & (ema_fast > ema_mid) & (mid_slope > 0) & ((mom_10 > 0) | (mom_21 > 0))
+    very_strong_trend = strong_trend & (px > ema_fast) & (ema_mid >= ema_slow * 0.98) & (mom_21 > 0.03)
+    trend_break = (px < ema_mid * break_mult) | ((ema_fast < ema_mid) & (mid_slope < 0)) | (drawdown_from_peak < -dd_exit)
+
+    out = []
+    exposure = 0.0
+    for i, dt in enumerate(px.index):
+        if bool(trend_break.loc[dt]):
+            exposure = 0.0
+        elif bool(very_strong_trend.loc[dt]):
+            exposure = max(exposure, strong_exposure)
+        elif bool(strong_trend.loc[dt]):
+            exposure = max(exposure, floor_exposure)
+        else:
+            # Do not instantly go cash during pauses; decay exposure gently.
+            exposure = exposure * 0.75 if exposure > 0 else 0.0
+            if exposure < 0.25:
+                exposure = 0.0
+        out.append(float(np.clip(exposure, 0.0, 1.0)))
+
+    return pd.Series(out, index=px.index, dtype=float).ffill().fillna(0.0).clip(0, 1)
+
+
 def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode="Conservative"):
     """
     Institutional-style scoring: return matters, but drawdown and benchmark underperformance are penalized.
@@ -1866,7 +1968,12 @@ def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode="Con
     # Conservative prefers clean, fewer-trade behavior.
     # Balanced wants enough participation to challenge buy/hold.
     # Active penalizes dead/no-trade signals much harder.
-    if mode_l == "active":
+    if mode_l == "returnbooster":
+        # Designed for your goal: challenge benchmark return, but keep drawdown controlled.
+        trade_penalty = 6.0 if trades < 1 else 0.0
+        drawdown_penalty = 0.55 * dd if dd > 18 else 0.35 * dd
+        return (0.55 * ret) + (0.55 * diff) - drawdown_penalty - trade_penalty
+    elif mode_l == "active":
         trade_penalty = 18.0 if trades < 2 else (8.0 if trades < 4 else 0.0)
         activity_bonus = min(trades, 8) * 1.25
         return (0.45 * ret) + (0.45 * diff) - (0.28 * dd) - trade_penalty + activity_bonus
@@ -1923,6 +2030,37 @@ def walk_forward_strategy_selection(prices, candidates, train_window=126, forwar
                 "train_dd": score_res.get("Max DD %", np.nan),
                 "train_trades": score_res.get("Trades", 0)
             })
+
+        # 4) Benchmark-aware return booster candidate.
+        # Goal: get closer to buy-and-hold during strong trends while still using a trend-break exit
+        # to protect drawdown. It is scored on training only and tested forward unseen.
+        if use_return_booster:
+            try:
+                booster_train = benchmark_aware_trend_participation_signal(
+                    prices.loc[train_idx], mode=str(return_booster_mode)
+                )
+                if confirmed_bar:
+                    booster_train = booster_train.shift(1).ffill().fillna(0).clip(0, 1)
+                booster_score = evaluate_strategy_candidate(
+                    prices.loc[train_idx], booster_train,
+                    initial_capital=initial_capital,
+                    trailing_stop_pct=trailing_stop_pct,
+                    stop_loss_pct=stop_loss_pct
+                )
+                if booster_score is not None:
+                    # Score wants benchmark participation, but still punishes drawdown.
+                    booster_score["Institutional Score"] = risk_adjusted_candidate_score(
+                        booster_score, activity_mode="ReturnBooster"
+                    )
+                    train_scores.append({
+                        "method": f"Benchmark-Aware Return Booster ({str(return_booster_mode)})",
+                        "n_regimes": "Booster",
+                        "score": booster_score,
+                        "signal": booster_train,
+                        "activity_variant": "ReturnBooster"
+                    })
+            except Exception:
+                pass
 
         if not train_scores:
             start += forward_window
@@ -3139,6 +3277,37 @@ def walk_forward_strategy_selection_institutional(prices, candidates, train_wind
                 'train_sharpe': sharpe,
                 'train_trades': trades
             })
+
+        # 4) Benchmark-aware return booster candidate.
+        # Goal: get closer to buy-and-hold during strong trends while still using a trend-break exit
+        # to protect drawdown. It is scored on training only and tested forward unseen.
+        if use_return_booster:
+            try:
+                booster_train = benchmark_aware_trend_participation_signal(
+                    prices.loc[train_idx], mode=str(return_booster_mode)
+                )
+                if confirmed_bar:
+                    booster_train = booster_train.shift(1).ffill().fillna(0).clip(0, 1)
+                booster_score = evaluate_strategy_candidate(
+                    prices.loc[train_idx], booster_train,
+                    initial_capital=initial_capital,
+                    trailing_stop_pct=trailing_stop_pct,
+                    stop_loss_pct=stop_loss_pct
+                )
+                if booster_score is not None:
+                    # Score wants benchmark participation, but still punishes drawdown.
+                    booster_score["Institutional Score"] = risk_adjusted_candidate_score(
+                        booster_score, activity_mode="ReturnBooster"
+                    )
+                    train_scores.append({
+                        "method": f"Benchmark-Aware Return Booster ({str(return_booster_mode)})",
+                        "n_regimes": "Booster",
+                        "score": booster_score,
+                        "signal": booster_train,
+                        "activity_variant": "ReturnBooster"
+                    })
+            except Exception:
+                pass
 
         if not train_scores:
             start += forward_window
@@ -4734,6 +4903,8 @@ with tab7:
             regime_activity_mode = wf_c5.selectbox("Regime WFO activity", ["Conservative", "Balanced", "Active"], index=1, key="bt_regime_activity_mode", help="Conservative = original Markov behavior. Balanced = Markov plus moderate trend-pulse. Active = faster trend-pulse candidates for more trades.")
             auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
+            use_regime_return_booster = st.checkbox("Benchmark-aware return booster", value=True, key="bt_regime_return_booster", help="Adds a fractional trend-participation candidate that tries to get closer to buy-and-hold while still exiting on trend breaks.")
+            regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive"], index=1, key="bt_regime_return_booster_mode", help="Balanced is the recommended default. Aggressive gets closer to benchmark but can increase drawdown.")
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -4888,7 +5059,9 @@ with tab7:
                                 stop_loss_pct=stop_loss,
                                 confirmed_bar=bool(confirmed_regime_bar),
                                 use_strong_runner_override=bool(use_regime_runner_override),
-                                activity_mode=str(regime_activity_mode)
+                                activity_mode=str(regime_activity_mode),
+                                use_return_booster=bool(use_regime_return_booster),
+                                return_booster_mode=str(regime_return_booster_mode)
                             )
 
                         st.write("#### 🧭 Regime Walk-Forward Result")
