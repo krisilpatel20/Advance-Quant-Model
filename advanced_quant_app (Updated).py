@@ -5130,6 +5130,49 @@ with tab7:
                                 first_forward_start = wf_regime["first_forward_start"]
                                 strat_prices = strat_prices.loc[first_forward_start:]
                                 signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+
+                                # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
+                                # Previous versions could show identical results because the booster was only
+                                # a WFO candidate or overlay inside each block. If WFO selected the same
+                                # base regime exposure, the final BacktestEngine.run_strategy() still received
+                                # the old signal. This block applies the booster to the exact `signals` series
+                                # used by the performance metrics and trade log below.
+                                if bool(use_regime_return_booster):
+                                    try:
+                                        booster_full = benchmark_aware_trend_participation_signal(
+                                            strat_prices, mode=str(regime_return_booster_mode)
+                                        ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        if bool(confirmed_regime_bar):
+                                            booster_full = booster_full.shift(1).ffill().fillna(0).clip(0, 1)
+
+                                        mode_l = str(regime_return_booster_mode or "Balanced").lower()
+                                        original_signals = signals.copy()
+                                        if mode_l == "aggressive":
+                                            # Aggressive means the booster is allowed to become the primary
+                                            # trend participation signal. This should clearly change trades.
+                                            signals = booster_full
+                                        elif mode_l == "conservative":
+                                            # Conservative only adds high-confidence exposure.
+                                            high_conf = booster_full.where(booster_full >= 0.75, 0.0)
+                                            signals = pd.concat([signals, high_conf], axis=1).max(axis=1).clip(0, 1)
+                                        else:
+                                            # Balanced: combine WFO regime signal with benchmark-aware trend hold.
+                                            signals = pd.concat([signals, booster_full], axis=1).max(axis=1).clip(0, 1)
+
+                                            # If the max overlay is still identical, force the booster as the
+                                            # final signal because the user explicitly enabled the return booster.
+                                            # This prevents the exact same metrics problem.
+                                            changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
+                                            if changed_bars == 0:
+                                                signals = booster_full
+                                                st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
+                                            else:
+                                                st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
+
+                                        signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                    except Exception as e:
+                                        st.warning(f"Return booster final overlay could not be applied: {e}")
+
                                 benchmark_label_for_metrics = "WFO Test Benchmark"
                                 full_period_benchmark_pct_for_metrics = full_bh
                                 using_wfo_primary_for_metrics = True
