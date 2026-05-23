@@ -19,6 +19,9 @@ from pathlib import Path
 import json
 import smtplib
 from email.message import EmailMessage
+
+# Default historical/non-live anchor date
+DEFAULT_NONLIVE_START = datetime(2024, 1, 1)
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -3302,7 +3305,7 @@ with st.sidebar:
         st.code(f"Raw Ticker = '{raw_ticker}'")
         st.code(f"Final TICKER = '{TICKER}'")
     
-    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
+    start_date = st.date_input("Start Date", DEFAULT_NONLIVE_START)
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
@@ -4664,7 +4667,7 @@ with tab7:
     # Date Selection
     col_b3 = st.container()
     with col_b3:
-        default_start = datetime.now() - timedelta(days=365)
+        default_start = DEFAULT_NONLIVE_START
         bt_start_date = st.date_input("Backtest Start", default_start)
         bt_end_date = st.date_input("Backtest End", datetime.now())
 
@@ -6374,7 +6377,7 @@ with tab12:
     
     fed_date_col1, fed_date_col2 = st.columns(2)
     with fed_date_col1:
-        fed_start_date = st.date_input("FED History Start", datetime(2010, 1, 1))
+        fed_start_date = st.date_input("FED History Start", DEFAULT_NONLIVE_START)
     
     @st.fragment
     def render_fed_dashboard():
@@ -7669,9 +7672,14 @@ with tab18:
             elif vwap_type == "Anchored VWAP (from date)":
                 min_d = df_vwap.index[0].date()
                 max_d = df_vwap.index[-1].date()
+                default_anchor_d = DEFAULT_NONLIVE_START.date()
+                if default_anchor_d < min_d:
+                    default_anchor_d = min_d
+                if default_anchor_d > max_d:
+                    default_anchor_d = min_d
                 anchor_date = st.date_input("Anchor Date", min_value=min_d,
                                              max_value=max_d,
-                                             value=min_d,
+                                             value=default_anchor_d,
                                              key="avwap_anchor")
                 # Find nearest index
                 anchor_ts = pd.Timestamp(anchor_date)
