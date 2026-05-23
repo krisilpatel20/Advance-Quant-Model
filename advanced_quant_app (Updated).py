@@ -1708,6 +1708,37 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                 test_signal = test_signal.shift(1).ffill().fillna(latest_exposure).clip(0, 1)
         else:
             test_signal = base_forward
+
+        # IMPORTANT FIX:
+        # Earlier the return booster was only a candidate. If the WFO selector chose a Markov
+        # candidate, the final forward signal stayed unchanged, so enabling the booster could
+        # produce the exact same return. When enabled, apply the booster as a controlled
+        # participation overlay to the actual forward signal. This makes it genuinely affect
+        # the trade log/metrics while still using only train+current forward data.
+        if use_return_booster and "Benchmark-Aware Return Booster" not in chosen_method:
+            try:
+                booster_overlay = benchmark_aware_trend_participation_signal(
+                    combo_px, mode=str(return_booster_mode)
+                ).reindex(test_idx).ffill().fillna(0).clip(0, 1)
+                if confirmed_bar:
+                    booster_overlay = booster_overlay.shift(1).ffill().fillna(0).clip(0, 1)
+
+                mode_l = str(return_booster_mode or "Balanced").lower()
+                if mode_l == "aggressive":
+                    # Get closer to buy-and-hold in strong trends.
+                    test_signal = pd.concat([test_signal, booster_overlay], axis=1).max(axis=1)
+                elif mode_l == "conservative":
+                    # Only add exposure when the booster is very confident.
+                    added = booster_overlay.where(booster_overlay >= 0.75, 0.0)
+                    test_signal = pd.concat([test_signal, added], axis=1).max(axis=1)
+                else:
+                    # Balanced: participate more, but keep exposure slightly below pure hold.
+                    added = (booster_overlay * 0.90).clip(0, 1)
+                    test_signal = pd.concat([test_signal, added], axis=1).max(axis=1)
+                test_signal = test_signal.reindex(test_idx).ffill().fillna(latest_exposure).clip(0, 1)
+            except Exception:
+                pass
+
         wf_signal.loc[test_idx] = test_signal
 
         test_score = evaluate_strategy_candidate(
