@@ -19,6 +19,9 @@ from pathlib import Path
 import json
 import smtplib
 from email.message import EmailMessage
+
+DEFAULT_ANCHOR_START = datetime(2024, 1, 1)
+DEFAULT_LIVE_ANCHOR_START = datetime(2026, 4, 15)
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -45,8 +48,6 @@ except ImportError:
 # Statsmodels Diagnostic Imports
 
 from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
-
-APP_DEFAULT_START_DATE = datetime(2024, 1, 1)
 
 # ==========================================
 # 1. CONFIGURATION & STYLING
@@ -1261,7 +1262,7 @@ class BacktestEngine:
                 'Buy Price': float(entry_price),
                 'Sell Price': float(exit_price),
                 'PnL (%)': float(trade_return_pct),              # single trade price return
-                'Cumulative Return (%)': round(float(cumulative_return_pct), 1),  # total account return after this trade
+                'Cumulative Return (%)': float(cumulative_return_pct),  # total account return after this trade
                 'Status': status_msg
             })
 
@@ -2211,8 +2212,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
-                "PnL (%)": "{:.2f}%",
-                "Cumulative Return (%)": "{:.1f}%"
+                "PnL (%)": "{:.2f}%"
             }), use_container_width=True)
             st.download_button(
                 f"📥 Download {title} Trade Log",
@@ -2500,6 +2500,77 @@ def load_data(ticker, start, end, interval='1d'):
     except Exception as e:
         st.error(f"Error loading data for {ticker}: {e}")
         return None
+
+
+def _live_interval_lookback_days(interval):
+    """Yahoo intraday limits are short, so keep rolling mode inside safe limits."""
+    interval = str(interval).lower()
+    if interval == '1m':
+        return 7
+    if interval in ['5m', '15m', '30m']:
+        return 30
+    if interval in ['60m', '1h']:
+        return 365
+    return 30
+
+
+def _recompute_price_columns(df):
+    """Recalculate Returns/Log_Returns after combining daily + live data."""
+    if df is None or df.empty:
+        return df
+    df = df.copy().sort_index()
+    df = df[~df.index.duplicated(keep='last')]
+    if 'Close' in df.columns:
+        df['Returns'] = df['Close'].pct_change()
+        df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+    return df.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def load_live_data_with_optional_anchor(ticker, anchor_start, live_end, interval='5m', use_anchor=False):
+    """
+    Live data range helper.
+    - use_anchor=False keeps old rolling live-window behavior.
+    - use_anchor=True tries to start from the fixed sidebar Start Date.
+      If Yahoo intraday history is too limited, it builds a hybrid:
+      older daily candles + recent intraday candles.
+    """
+    live_end = pd.to_datetime(live_end).to_pydatetime()
+    anchor_start = pd.to_datetime(anchor_start).to_pydatetime()
+    lookback_days = _live_interval_lookback_days(interval)
+    rolling_start = live_end - timedelta(days=lookback_days)
+
+    if not use_anchor:
+        return load_data(ticker, rolling_start, live_end, interval=interval)
+
+    # First try exact anchored intraday fetch.
+    exact_df = load_data(ticker, anchor_start, live_end, interval=interval)
+    if exact_df is not None and not exact_df.empty:
+        try:
+            # If it actually reaches near the requested anchor, use it directly.
+            if pd.to_datetime(exact_df.index.min()).to_pydatetime() <= anchor_start + timedelta(days=5):
+                return _recompute_price_columns(exact_df)
+        except Exception:
+            pass
+
+    # Hybrid fallback: daily history from anchor to recent live window, then intraday recent data.
+    pieces = []
+    if anchor_start < rolling_start:
+        daily_hist = load_data(ticker, anchor_start, rolling_start, interval='1d')
+        if daily_hist is not None and not daily_hist.empty:
+            pieces.append(daily_hist)
+
+    intraday_recent = load_data(ticker, rolling_start, live_end, interval=interval)
+    if intraday_recent is not None and not intraday_recent.empty:
+        pieces.append(intraday_recent)
+    elif exact_df is not None and not exact_df.empty:
+        pieces.append(exact_df)
+
+    if not pieces:
+        return exact_df
+
+    combined = pd.concat(pieces, axis=0).sort_index()
+    return _recompute_price_columns(combined)
+
 
 def load_iv_proxy_data_for_backtest(asset_index, live_mode=False, data_interval='1d', start_date=None, end_date=None):
     """
@@ -3304,7 +3375,7 @@ with st.sidebar:
         st.code(f"Raw Ticker = '{raw_ticker}'")
         st.code(f"Final TICKER = '{TICKER}'")
     
-    start_date = st.date_input("Start Date", APP_DEFAULT_START_DATE)
+    start_date = st.date_input("Start Date", DEFAULT_ANCHOR_START)
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
@@ -3348,9 +3419,20 @@ with st.sidebar:
     st.divider()
     st.header("⚡ Live Decision Mode")
     live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
+    live_use_fixed_anchor = False
+    live_anchor_start_date = DEFAULT_LIVE_ANCHOR_START.date()
     if live_mode:
         data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
-        st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
+        live_use_fixed_anchor = st.checkbox(
+            "Use fixed Start Date in Live Mode",
+            value=False,
+            help="OFF = old rolling live window. ON = anchor live backtests/signals to the Live Anchor Start Date below. If intraday history is limited, the app uses daily history + recent intraday data."
+        )
+        if live_use_fixed_anchor:
+            live_anchor_start_date = st.date_input("Live Anchor Start Date", DEFAULT_LIVE_ANCHOR_START.date())
+            st.info(f"Live mode anchored from {pd.to_datetime(live_anchor_start_date).strftime('%m/%d/%Y')}. Older history may use daily candles, then recent candles use {data_interval}.")
+        else:
+            st.info("Live mode uses the old rolling live window for tactical edge.")
         if st.button("🔄 Refresh Live Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
@@ -3456,10 +3538,13 @@ with st.sidebar:
 now_rounded = datetime.now().replace(second=0, microsecond=0)
 
 if live_mode:
-    # Intraday limits: 1m (7d), 5m-15m (60d), 60m (730d)
-    # We use 30d as a robust default for decision support models to have enough history
-    lookback_days = 7 if data_interval == '1m' else 30
-    df_main = load_data(TICKER, now_rounded - timedelta(days=lookback_days), now_rounded, interval=data_interval)
+    df_main = load_live_data_with_optional_anchor(
+        TICKER,
+        live_anchor_start_date,
+        now_rounded,
+        interval=data_interval,
+        use_anchor=bool(live_use_fixed_anchor)
+    )
 else:
     df_main = load_data(TICKER, start_date, end_date, interval='1d')
 
@@ -4666,15 +4751,15 @@ with tab7:
     # Date Selection
     col_b3 = st.container()
     with col_b3:
-        default_start = APP_DEFAULT_START_DATE
+        default_start = DEFAULT_ANCHOR_START
         bt_start_date = st.date_input("Backtest Start", default_start)
         bt_end_date = st.date_input("Backtest End", datetime.now())
 
     # Data Prep
     if live_mode:
-         # Use the global live data for backtest scope
+         # Use the global live data for backtest scope. This now respects the optional fixed live anchor.
          df_bt = df_main
-         bt_msg = f"Live Backtest ({data_interval})"
+         bt_msg = f"Live Backtest ({data_interval})" + (" | Fixed Start Anchor" if live_use_fixed_anchor else " | Rolling Window")
     else:
         if bt_start_date >= bt_end_date:
             st.error("Start date must be before end date.")
@@ -5276,7 +5361,7 @@ with tab7:
         with st.spinner(f"Fetching Benchmark Data ({bench_ticker})..."):
             try:
                 if live_mode:
-                    bench_df = load_data(bench_ticker, start_date, end_date, interval=data_interval)
+                    bench_df = load_live_data_with_optional_anchor(bench_ticker, live_anchor_start_date, now_rounded, interval=data_interval, use_anchor=bool(live_use_fixed_anchor))
                 else:
                     bench_df = load_data(bench_ticker, bt_start_date, bt_end_date, interval='1d')
                     
@@ -5524,7 +5609,7 @@ with tab7:
                         # It uses SPY relative strength when available, but safely falls back to price momentum only.
                         try:
                             if live_mode:
-                                spy_df = load_data("SPY", start_date, end_date, interval=data_interval)
+                                spy_df = load_live_data_with_optional_anchor("SPY", live_anchor_start_date, now_rounded, interval=data_interval, use_anchor=bool(live_use_fixed_anchor))
                             else:
                                 spy_df = load_data("SPY", bt_start_date, bt_end_date, interval='1d')
                             spy_close = spy_df['Close'].reindex(common_idx).ffill() if spy_df is not None and not spy_df.empty else pd.Series(np.nan, index=common_idx)
@@ -5917,8 +6002,7 @@ with tab7:
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
-                "PnL (%)": "{:.2f}%",
-                "Cumulative Return (%)": "{:.1f}%"
+                "PnL (%)": "{:.2f}%"
             }), use_container_width=True)
         else:
             st.info("No closed trades generated by the strategy.")
@@ -6263,7 +6347,7 @@ with tab11:
                     return None
                 
                 # 2. Fetch Data
-                s_df = load_data(tick, start_date, end_date, interval=data_interval if live_mode else '1d')
+                s_df = load_live_data_with_optional_anchor(tick, live_anchor_start_date, now_rounded, interval=data_interval, use_anchor=bool(live_use_fixed_anchor)) if live_mode else load_data(tick, start_date, end_date, interval='1d')
                 if s_df is None or s_df.empty:
                     return None
                 
@@ -6356,7 +6440,7 @@ with tab12:
     
     fed_date_col1, fed_date_col2 = st.columns(2)
     with fed_date_col1:
-        fed_start_date = st.date_input("FED History Start", APP_DEFAULT_START_DATE)
+        fed_start_date = st.date_input("FED History Start", datetime(2010, 1, 1))
     
     @st.fragment
     def render_fed_dashboard():
@@ -7651,10 +7735,9 @@ with tab18:
             elif vwap_type == "Anchored VWAP (from date)":
                 min_d = df_vwap.index[0].date()
                 max_d = df_vwap.index[-1].date()
-                default_anchor_date = min(max(APP_DEFAULT_START_DATE.date(), min_d), max_d)
                 anchor_date = st.date_input("Anchor Date", min_value=min_d,
                                              max_value=max_d,
-                                             value=default_anchor_date,
+                                             value=min_d,
                                              key="avwap_anchor")
                 # Find nearest index
                 anchor_ts = pd.Timestamp(anchor_date)
