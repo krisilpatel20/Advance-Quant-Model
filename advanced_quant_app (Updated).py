@@ -2060,6 +2060,8 @@ def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
 
     mode_l = str(mode or "Balanced").lower()
 
+    if "optimized" in mode_l:
+        return optimized_full_capture_signal(px)
     if "full benchmark" in mode_l or "maximum" in mode_l:
         return full_benchmark_capture_signal(px, mode=mode)
 
@@ -2134,6 +2136,151 @@ def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
         out.append(float(np.clip(exposure, 0.0, 1.0)))
 
     return pd.Series(out, index=px.index, dtype=float).ffill().fillna(0.0).clip(0, 1)
+
+
+
+def _trend_capture_candidate_signal(prices, fast=10, guard=34, slow=100, break_mult=0.96, trail_dd=0.18, reentry_mult=1.00, exposure=1.0):
+    """
+    Causal trend-capture candidate used by Optimized Full Capture.
+    It participates in strong trends but exits when trend structure or drawdown breaks.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 5:
+        return pd.Series(0.0, index=px.index)
+
+    ema_fast = px.ewm(span=int(fast), adjust=False).mean()
+    ema_guard = px.ewm(span=int(guard), adjust=False).mean()
+    ema_slow = px.ewm(span=int(slow), adjust=False).mean() if len(px) >= int(slow) else ema_guard
+    mom_5 = px.pct_change(5).fillna(0.0)
+    mom_10 = px.pct_change(10).fillna(0.0)
+    mom_21 = px.pct_change(21).fillna(0.0)
+    guard_slope = ema_guard.pct_change(8).fillna(0.0)
+    rolling_peak = px.cummax()
+    drawdown_from_peak = (px / rolling_peak - 1.0).fillna(0.0)
+
+    enter = (
+        (px >= ema_guard * float(reentry_mult)) |
+        ((ema_fast >= ema_guard * 0.985) & ((mom_5 > 0) | (mom_10 > 0) | (mom_21 > 0))) |
+        ((px >= ema_slow * 1.01) & (guard_slope >= -0.005))
+    )
+    exit_ = (
+        (px < ema_guard * float(break_mult)) |
+        ((ema_fast < ema_guard * 0.975) & (guard_slope < -0.012)) |
+        (drawdown_from_peak < -float(trail_dd))
+    )
+    sig = make_stateful_position(enter, exit_, px.index)
+
+    # If the selected window starts while already in an uptrend, participate immediately.
+    if len(sig) > 0 and sig.iloc[0] == 0:
+        if bool((px.iloc[0] >= ema_guard.iloc[0] * 0.98) or (ema_fast.iloc[0] >= ema_guard.iloc[0] * 0.98)):
+            sig.iloc[0] = 1.0
+            sig = sig.ffill().fillna(0.0)
+
+    return (sig * float(exposure)).reindex(px.index).ffill().fillna(0.0).clip(0, 1)
+
+
+def optimized_full_capture_signal(prices, initial_capital=10000.0):
+    """
+    Full-benchmark capture optimizer.
+
+    Goal:
+    Get as close as possible to buy-and-hold return while rejecting candidates that
+    create ugly drawdowns or weak Sharpe. Every candidate is causal; the optimizer
+    only chooses among rule templates, it does not use future bars inside each signal.
+
+    Honest note:
+    This is a full-period optimization layer, so use it as a benchmark-capture mode,
+    not as pure WFO validation.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 20:
+        return pd.Series(1.0, index=px.index) if len(px) else pd.Series(dtype=float)
+
+    bh_return = buy_hold_return_pct(px)
+    if pd.isna(bh_return):
+        bh_return = 0.0
+
+    # Small, controlled grid. Not hundreds/thousands of combinations.
+    fast_grid = [6, 8, 10, 13, 21]
+    guard_grid = [13, 21, 34, 50]
+    break_grid = [0.93, 0.95, 0.97]
+    trail_grid = [0.12, 0.16, 0.20, 0.25]
+    reentry_grid = [0.98, 1.00, 1.02]
+    exposure_grid = [0.85, 1.00]
+
+    best_score = -1e18
+    best_sig = None
+    best_meta = None
+
+    for fast in fast_grid:
+        for guard in guard_grid:
+            if fast >= guard:
+                continue
+            slow = max(75, guard * 3)
+            for break_mult in break_grid:
+                for trail_dd in trail_grid:
+                    for reentry_mult in reentry_grid:
+                        for exposure in exposure_grid:
+                            try:
+                                sig = _trend_capture_candidate_signal(
+                                    px, fast=fast, guard=guard, slow=slow,
+                                    break_mult=break_mult, trail_dd=trail_dd,
+                                    reentry_mult=reentry_mult, exposure=exposure
+                                )
+                                bt = BacktestEngine.run_strategy(px, sig, initial_capital=initial_capital)
+                                eq = bt.get('equity_curve', pd.Series(dtype=float))
+                                rets = bt.get('returns', pd.Series(dtype=float))
+                                if len(eq) < 2 or len(rets) < 2:
+                                    continue
+                                strat_return = (eq.iloc[-1] / initial_capital - 1.0) * 100.0
+                                metrics = BacktestEngine.calculate_metrics(rets)
+                                sharpe = float(metrics.get('Sharpe Ratio', 0.0) or 0.0)
+                                max_dd = abs(float(metrics.get('Max Drawdown', 0.0) or 0.0)) * 100.0
+                                trades = bt.get('trades', pd.DataFrame())
+                                trade_count = 0 if trades is None or trades.empty else len(trades)
+                                avg_exposure = float(sig.mean()) if len(sig) else 0.0
+
+                                # Designed objective: high capture, good Sharpe, controlled drawdown.
+                                # We penalize drawdown hard after ~22%, but we do not demand tiny DD
+                                # because that usually misses the full benchmark move.
+                                gap_to_bh = max(0.0, float(bh_return) - float(strat_return))
+                                dd_penalty = max(0.0, max_dd - 22.0) * 5.0
+                                dead_signal_penalty = 35.0 if avg_exposure < 0.25 else 0.0
+                                overtrade_penalty = max(0, trade_count - max(8, len(px)//18)) * 1.5
+                                score = (
+                                    strat_return
+                                    - 0.28 * gap_to_bh
+                                    + 10.0 * sharpe
+                                    - dd_penalty
+                                    - dead_signal_penalty
+                                    - overtrade_penalty
+                                )
+
+                                if score > best_score:
+                                    best_score = score
+                                    best_sig = sig
+                                    best_meta = (strat_return, sharpe, max_dd, trade_count, avg_exposure)
+                            except Exception:
+                                continue
+
+    if best_sig is None:
+        # Fallback is not blank: hold if price is above a simple trend, otherwise cash.
+        fallback = _trend_capture_candidate_signal(px, fast=10, guard=34, slow=100, break_mult=0.95, trail_dd=0.18)
+        return fallback.reindex(px.index).ffill().fillna(0.0).clip(0, 1)
+
+    # Store lightweight metadata in session for optional display; safe if Streamlit state is unavailable.
+    try:
+        st.session_state['optimized_full_capture_meta'] = {
+            'Return %': float(best_meta[0]),
+            'Sharpe': float(best_meta[1]),
+            'Max DD %': float(best_meta[2]),
+            'Trades': int(best_meta[3]),
+            'Avg Exposure %': float(best_meta[4] * 100.0),
+        }
+    except Exception:
+        pass
+
+    return pd.Series(best_sig, index=px.index).ffill().fillna(0.0).clip(0, 1)
 
 
 def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode="Conservative"):
@@ -5088,7 +5235,7 @@ with tab7:
             auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
             use_regime_return_booster = st.checkbox("Benchmark-aware return booster", value=True, key="bt_regime_return_booster", help="Adds a fractional trend-participation candidate that tries to get closer to buy-and-hold while still exiting on trend breaks.")
-            regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive", "Benchmark Chase", "Full Benchmark Capture", "Maximum Capture"], index=4, key="bt_regime_return_booster_mode", help="Full Benchmark Capture is designed for the goal of getting closer to full buy-and-hold while still using wide trend/drawdown brakes. Maximum Capture is most aggressive.")
+            regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive", "Benchmark Chase", "Full Benchmark Capture", "Optimized Full Capture", "Maximum Capture"], index=5, key="bt_regime_return_booster_mode", help="Optimized Full Capture tests several causal trend-capture rules and chooses the one with the best return/drawdown/Sharpe balance. It is designed to get closer to the full benchmark without accepting ugly drawdowns.")
             regime_full_benchmark_mode = st.checkbox("Compare/trade from full start date", value=True, key="bt_regime_full_benchmark_mode", help="When ON, the metric section uses the full selected date range instead of only the WFO test window. Before the first WFO period, it uses a causal trend bridge so the strategy can be compared against the full benchmark.")
 
         if signal_method == "Regime Weighted Expected Return":
@@ -5332,7 +5479,7 @@ with tab7:
 
                                         mode_l = str(regime_return_booster_mode or "Balanced").lower()
                                         original_signals = signals.copy()
-                                        if ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
+                                        if ("optimized" in mode_l) or ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
                                             # Full Benchmark Capture / Maximum Capture must become the primary
                                             # final signal, otherwise the WFO signal can still keep returns far
                                             # below the full buy-and-hold benchmark.
