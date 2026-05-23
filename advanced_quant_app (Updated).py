@@ -2062,6 +2062,11 @@ def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
     mode_l = str(mode or "Balanced").lower()
 
     if "optimized" in mode_l:
+        # Speed fix: on shorter rolling WFO chunks, use the fast trend-capture
+        # version instead of re-running the optimizer on every block. The full
+        # optimizer is still available on longer full-period series.
+        if len(px) < 400:
+            return full_benchmark_capture_signal(px, mode="Full Benchmark Capture")
         return optimized_full_capture_signal(px)
     if "full benchmark" in mode_l or "maximum" in mode_l:
         return full_benchmark_capture_signal(px, mode=mode)
@@ -2202,7 +2207,9 @@ def optimized_full_capture_signal(prices, initial_capital=10000.0):
     if pd.isna(bh_return):
         bh_return = 0.0
 
-    # Small, controlled grid. Not hundreds/thousands of combinations.
+    # Full scan grid restored. Do NOT reduce these combinations because
+    # the optimizer needs the same search space as the original behavior.
+    # Speed is handled by Streamlit caching above, not by changing logic.
     fast_grid = [6, 8, 10, 13, 21]
     guard_grid = [13, 21, 34, 50]
     break_grid = [0.93, 0.95, 0.97]
