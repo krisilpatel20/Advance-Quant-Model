@@ -1464,6 +1464,7 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
     return signal, context
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True, switch_trend=True, train_window=126, forward_window=21, conviction=0.65, min_hold=3, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, confirmed_bar=True, use_strong_runner_override=True, activity_mode="Conservative", use_return_booster=True, return_booster_mode="Balanced"):
     """
     Walk-forward validation for the Regime Switching backtest.
@@ -2179,6 +2180,7 @@ def _trend_capture_candidate_signal(prices, fast=10, guard=34, slow=100, break_m
     return (sig * float(exposure)).reindex(px.index).ffill().fillna(0.0).clip(0, 1)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def optimized_full_capture_signal(prices, initial_capital=10000.0):
     """
     Full-benchmark capture optimizer.
