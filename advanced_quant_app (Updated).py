@@ -1922,61 +1922,84 @@ def combine_regime_activity_signal(base_signal, prices_window, mode="Balanced"):
 def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
     """
     Benchmark-aware trend participation candidate for Regime WFO.
-    Purpose: when buy-and-hold is very strong, this candidate stays invested longer,
-    but it still exits on a meaningful trend break to preserve drawdown/Sharpe.
-    Uses only current/past price data. No future data.
+
+    Goal: get closer to buy-and-hold during strong runners WITHOUT simply buying blindly.
+    It stays invested while trend structure is healthy and exits only on a meaningful
+    trend break or drawdown break. Uses only current/past price data. No future data.
     """
     px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 30:
+    if len(px) < 25:
         return pd.Series(0.0, index=px.index)
 
     mode_l = str(mode or "Balanced").lower()
-    if mode_l == "aggressive":
-        floor_exposure = 0.85
+
+    # These settings intentionally make Balanced/Aggressive much more trend-capturing
+    # than the older version. The old version was too defensive and kept missing
+    # monster runners, so returns stayed far below benchmark.
+    if mode_l in ["benchmark chase", "benchmark_chase", "chase"]:
+        base_exposure = 1.00
         strong_exposure = 1.00
-        break_mult = 0.93
-        dd_exit = 0.25
-        fast, mid, slow = 10, 30, 75
+        break_mult = 0.88       # wider trend break = hold winners longer
+        dd_exit = 0.28
+        fast, mid, slow = 8, 21, 50
+        require_slope = False
+    elif mode_l == "aggressive":
+        base_exposure = 0.95
+        strong_exposure = 1.00
+        break_mult = 0.90
+        dd_exit = 0.24
+        fast, mid, slow = 10, 25, 60
+        require_slope = False
     elif mode_l == "conservative":
-        floor_exposure = 0.45
-        strong_exposure = 0.75
-        break_mult = 0.97
+        base_exposure = 0.55
+        strong_exposure = 0.80
+        break_mult = 0.96
         dd_exit = 0.16
         fast, mid, slow = 20, 50, 100
-    else:  # Balanced
-        floor_exposure = 0.65
-        strong_exposure = 0.95
-        break_mult = 0.95
+        require_slope = True
+    else:  # Balanced: now a real trend-capture mode, not a tiny overlay
+        base_exposure = 0.90
+        strong_exposure = 1.00
+        break_mult = 0.92
         dd_exit = 0.20
-        fast, mid, slow = 14, 40, 90
+        fast, mid, slow = 12, 30, 75
+        require_slope = False
 
     ema_fast = px.ewm(span=fast, adjust=False).mean()
     ema_mid = px.ewm(span=mid, adjust=False).mean()
     ema_slow = px.ewm(span=slow, adjust=False).mean() if len(px) >= slow else ema_mid
 
+    mom_5 = px.pct_change(5).fillna(0.0)
     mom_10 = px.pct_change(10).fillna(0.0)
     mom_21 = px.pct_change(21).fillna(0.0)
-    mid_slope = ema_mid.pct_change(10).fillna(0.0)
+    mid_slope = ema_mid.pct_change(8).fillna(0.0)
     rolling_peak = px.cummax()
     drawdown_from_peak = (px / rolling_peak - 1.0).fillna(0.0)
 
-    strong_trend = (px > ema_mid) & (ema_fast > ema_mid) & (mid_slope > 0) & ((mom_10 > 0) | (mom_21 > 0))
-    very_strong_trend = strong_trend & (px > ema_fast) & (ema_mid >= ema_slow * 0.98) & (mom_21 > 0.03)
-    trend_break = (px < ema_mid * break_mult) | ((ema_fast < ema_mid) & (mid_slope < 0)) | (drawdown_from_peak < -dd_exit)
+    # Broader entry logic: if price is above mid-trend and momentum is not broken, participate.
+    # This is the key change that makes the booster capable of getting closer to benchmark.
+    healthy_trend = (px > ema_mid) & (ema_fast >= ema_mid * 0.985) & ((mom_5 > -0.03) | (mom_10 > 0) | (mom_21 > 0))
+    if require_slope:
+        healthy_trend = healthy_trend & (mid_slope > 0)
+
+    strong_trend = healthy_trend & (px > ema_fast) & ((mom_10 > 0.02) | (mom_21 > 0.04) | (ema_mid >= ema_slow * 0.99))
+
+    # Exit only when structure really breaks. This protects drawdown but avoids early exits.
+    trend_break = (px < ema_mid * break_mult) | ((ema_fast < ema_mid * 0.975) & (mid_slope < -0.015)) | (drawdown_from_peak < -dd_exit)
 
     out = []
     exposure = 0.0
-    for i, dt in enumerate(px.index):
+    for dt in px.index:
         if bool(trend_break.loc[dt]):
             exposure = 0.0
-        elif bool(very_strong_trend.loc[dt]):
-            exposure = max(exposure, strong_exposure)
         elif bool(strong_trend.loc[dt]):
-            exposure = max(exposure, floor_exposure)
+            exposure = max(exposure, strong_exposure)
+        elif bool(healthy_trend.loc[dt]):
+            exposure = max(exposure, base_exposure)
         else:
-            # Do not instantly go cash during pauses; decay exposure gently.
-            exposure = exposure * 0.75 if exposure > 0 else 0.0
-            if exposure < 0.25:
+            # During normal pauses, reduce slowly instead of dumping the position.
+            exposure = exposure * 0.90 if exposure > 0 else 0.0
+            if exposure < 0.35:
                 exposure = 0.0
         out.append(float(np.clip(exposure, 0.0, 1.0)))
 
@@ -4935,7 +4958,7 @@ with tab7:
             auto_wfo_regimes = st.checkbox("Auto-select regimes inside WFO (2/3/4)", value=True, key="bt_regime_auto_wfo_regimes", help="When ON, each walk-forward training window chooses the best number of regimes from 2, 3, or 4 using only past data.")
             use_regime_runner_override = st.checkbox("Benchmark-aware strong runner override", value=True, key="bt_regime_runner_override", help="Adds a trend-hold candidate so very strong stocks are not forced into defensive cash too often.")
             use_regime_return_booster = st.checkbox("Benchmark-aware return booster", value=True, key="bt_regime_return_booster", help="Adds a fractional trend-participation candidate that tries to get closer to buy-and-hold while still exiting on trend breaks.")
-            regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive"], index=1, key="bt_regime_return_booster_mode", help="Balanced is the recommended default. Aggressive gets closer to benchmark but can increase drawdown.")
+            regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive", "Benchmark Chase"], index=1, key="bt_regime_return_booster_mode", help="Balanced is the recommended default. Benchmark Chase gets closest to buy-and-hold but can increase drawdown.")
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -5170,6 +5193,10 @@ with tab7:
                                                 st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
 
                                         signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        try:
+                                            st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
+                                        except Exception:
+                                            pass
                                     except Exception as e:
                                         st.warning(f"Return booster final overlay could not be applied: {e}")
 
