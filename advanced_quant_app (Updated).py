@@ -1480,13 +1480,25 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
     train_window = int(train_window)
     forward_window = int(forward_window)
 
-    # Strict WFO sizing: do not silently shrink the walk-forward windows.
-    # If there is not enough data to train and test honestly, return None and
-    # let the UI show no WFO trades instead of forcing fallback results.
-    if len(prices) < max(35, train_window + forward_window):
+    # Practical WFO sizing for live/short windows:
+    # Do NOT fall back to full-history just because the requested 252/21 window
+    # is too large. Shrink the WFO windows so we still get a real out-of-sample
+    # test. The effective values are returned to the UI.
+    n_obs = len(prices)
+    if n_obs < 15:
         return None
-    if train_window < 25 or forward_window < 5:
-        return None
+
+    train_window = max(8, train_window)
+    forward_window = max(3, forward_window)
+
+    if n_obs < train_window + forward_window:
+        # About 65% train / 20% forward, with enough remaining bars to evaluate.
+        train_window = max(8, int(n_obs * 0.65))
+        forward_window = max(3, int(n_obs * 0.20))
+        if train_window + forward_window > n_obs:
+            forward_window = max(2, n_obs - train_window)
+        if train_window < 8 or forward_window < 2 or train_window + forward_window > n_obs:
+            return None
 
     base_methods = ["Regime Weighted Expected Return", "Regime Probability", "Regime Switching Period"]
     # Auto means WFO chooses the best regime count per forward block using only the training window.
@@ -1768,6 +1780,50 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
         period_no += 1
 
     if not rows:
+        # Last-resort WFO-safe trend-capture path: still out-of-sample.
+        # This prevents the tab from dropping into full-history research mode when
+        # Markov convergence fails on short/noisy live windows.
+        start = train_window
+        period_no = 1
+        while start < len(idx):
+            train_idx = idx[start-train_window:start]
+            test_idx = idx[start:min(start+forward_window, len(idx))]
+            if len(test_idx) < 2:
+                break
+            combo_px = prices.loc[idx[start-train_window:min(start+forward_window, len(idx))]]
+            test_signal = benchmark_aware_trend_participation_signal(
+                combo_px, mode=str(return_booster_mode)
+            ).reindex(test_idx).ffill().fillna(0).clip(0, 1)
+            if confirmed_bar:
+                test_signal = test_signal.shift(1).ffill().fillna(0).clip(0, 1)
+            wf_signal.loc[test_idx] = test_signal
+            test_score = evaluate_strategy_candidate(
+                prices.loc[test_idx], test_signal,
+                initial_capital=initial_capital,
+                trailing_stop_pct=trailing_stop_pct,
+                stop_loss_pct=stop_loss_pct
+            )
+            rows.append({
+                "Period": period_no,
+                "Train Start": train_idx[0],
+                "Train End": train_idx[-1],
+                "Forward Start": test_idx[0],
+                "Forward End": test_idx[-1],
+                "Selected Method": f"Short-Window Trend Capture ({str(return_booster_mode)})",
+                "Selected Regimes": "Trend",
+                "Activity Mode": str(activity_mode),
+                "Train Diff %": np.nan,
+                "Forward Strategy %": round(test_score.get("Strategy Return %", np.nan), 2) if test_score else np.nan,
+                "Forward Buy & Hold %": round(test_score.get("Buy & Hold Return %", np.nan), 2) if test_score else np.nan,
+                "Forward Diff %": round(test_score.get("Difference %", np.nan), 2) if test_score else np.nan,
+                "Forward Max DD %": round(test_score.get("Max DD %", np.nan), 2) if test_score else np.nan,
+                "Forward Trades": int(test_score.get("Trades", 0)) if test_score else 0
+            })
+            sequence.append(f"Short-Window Trend Capture | Trend")
+            start += forward_window
+            period_no += 1
+
+    if not rows:
         return None
 
     wf_signal = wf_signal.ffill().fillna(0).clip(0, 1)
@@ -1928,7 +1984,7 @@ def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
     trend break or drawdown break. Uses only current/past price data. No future data.
     """
     px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 25:
+    if len(px) < 5:
         return pd.Series(0.0, index=px.index)
 
     mode_l = str(mode or "Balanced").lower()
