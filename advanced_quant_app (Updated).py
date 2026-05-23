@@ -1259,7 +1259,7 @@ class BacktestEngine:
                 'Buy Price': float(entry_price),
                 'Sell Price': float(exit_price),
                 'PnL (%)': float(trade_return_pct),              # single trade price return
-                'Cumulative Return (%)': float(cumulative_return_pct),  # total account return after this trade
+                'Cumulative Return (%)': round(float(cumulative_return_pct), 1),  # total account return after this trade, rounded to nearest tenth
                 'Status': status_msg
             })
 
@@ -5342,14 +5342,14 @@ with tab7:
 
         wf_col1, wf_col2, wf_col3, wf_col4 = st.columns(4)
         with wf_col1:
-            enable_iv_walk_forward = st.checkbox("Walk-forward validation", value=True)
+            enable_iv_walk_forward = st.checkbox("Walk-forward validation", value=False)
         with wf_col2:
             wf_train_window = st.number_input("WF Train Bars", min_value=60, max_value=756, value=126, step=21)
         with wf_col3:
             wf_forward_window = st.number_input("WF Forward Bars", min_value=5, max_value=126, value=21, step=5)
         with wf_col4:
-            use_wf_signal = st.checkbox("Use WF signal for backtest", value=True)
-        wf_confirmed_bar = st.checkbox("WF confirmed-bar execution: use previous closed signal", value=True, help="More realistic. It prevents same-candle lookahead by trading from the prior completed signal.")
+            use_wf_signal = st.checkbox("Use WF signal for backtest", value=False)
+        wf_confirmed_bar = st.checkbox("WF confirmed-bar execution: use previous closed signal", value=False, help="More realistic. It prevents same-candle lookahead by trading from the prior completed signal.")
 
         with st.expander("Institutional WFO Controls", expanded=True):
             st.caption("These settings make WFO less overfit: top-3 ensemble, risk-adjusted scoring, strategy-switch penalty, and momentum override for strong runners.")
