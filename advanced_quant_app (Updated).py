@@ -1537,7 +1537,7 @@ def walk_forward_regime_selection(prices, returns, n_regimes=2, switch_vol=True,
                 n_candidate = int(n_candidate)
                 if (not has_markov_training_data) or len(train_returns) < max(20, n_candidate * 8):
                     continue
-                res = fit_regime_model(train_returns, n_candidate, switch_vol, switch_trend, search_reps=8)
+                res = fit_regime_model(train_returns, n_candidate, switch_vol, switch_trend, search_reps=3)
                 if res is None:
                     continue
 
@@ -2062,6 +2062,11 @@ def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
     mode_l = str(mode or "Balanced").lower()
 
     if "optimized" in mode_l:
+        # Speed fix: on shorter rolling WFO chunks, use the fast trend-capture
+        # version instead of re-running the optimizer on every block. The full
+        # optimizer is still available on longer full-period series.
+        if len(px) < 400:
+            return full_benchmark_capture_signal(px, mode="Full Benchmark Capture")
         return optimized_full_capture_signal(px)
     if "full benchmark" in mode_l or "maximum" in mode_l:
         return full_benchmark_capture_signal(px, mode=mode)
@@ -2202,13 +2207,16 @@ def optimized_full_capture_signal(prices, initial_capital=10000.0):
     if pd.isna(bh_return):
         bh_return = 0.0
 
-    # Small, controlled grid. Not hundreds/thousands of combinations.
-    fast_grid = [6, 8, 10, 13, 21]
-    guard_grid = [13, 21, 34, 50]
-    break_grid = [0.93, 0.95, 0.97]
-    trail_grid = [0.12, 0.16, 0.20, 0.25]
-    reentry_grid = [0.98, 1.00, 1.02]
-    exposure_grid = [0.85, 1.00]
+    # Speed fix: keep the same optimizer idea, but use a much smaller
+    # high-signal grid. The old 1,440-combination grid made the Regime
+    # tab painfully slow on every fresh run. This version tests 72
+    # practical combinations instead.
+    fast_grid = [8, 13, 21]
+    guard_grid = [21, 34, 50]
+    break_grid = [0.93, 0.96]
+    trail_grid = [0.16, 0.24]
+    reentry_grid = [0.99, 1.01]
+    exposure_grid = [1.00]
 
     best_score = -1e18
     best_sig = None
