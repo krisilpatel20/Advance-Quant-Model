@@ -19,9 +19,6 @@ from pathlib import Path
 import json
 import smtplib
 from email.message import EmailMessage
-
-# User default: keep historical/backtest start anchored unless manually changed
-DEFAULT_APP_START_DATE = datetime(2024, 1, 1)
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -1262,7 +1259,7 @@ class BacktestEngine:
                 'Buy Price': float(entry_price),
                 'Sell Price': float(exit_price),
                 'PnL (%)': float(trade_return_pct),              # single trade price return
-                'Cumulative Return (%)': round(float(cumulative_return_pct), 1),  # total account return after this trade
+                'Cumulative Return (%)': float(cumulative_return_pct),  # total account return after this trade
                 'Status': status_msg
             })
 
@@ -3304,7 +3301,7 @@ with st.sidebar:
         st.code(f"Raw Ticker = '{raw_ticker}'")
         st.code(f"Final TICKER = '{TICKER}'")
     
-    start_date = st.date_input("Start Date", DEFAULT_APP_START_DATE)
+    start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
     end_date = st.date_input("End Date", datetime.now())
     
     st.subheader("Model Settings")
@@ -4666,7 +4663,7 @@ with tab7:
     # Date Selection
     col_b3 = st.container()
     with col_b3:
-        default_start = DEFAULT_APP_START_DATE
+        default_start = datetime.now() - timedelta(days=365)
         bt_start_date = st.date_input("Backtest Start", default_start)
         bt_end_date = st.date_input("Backtest End", datetime.now())
 
@@ -5345,14 +5342,14 @@ with tab7:
 
         wf_col1, wf_col2, wf_col3, wf_col4 = st.columns(4)
         with wf_col1:
-            enable_iv_walk_forward = st.checkbox("Walk-forward validation", value=False)
+            enable_iv_walk_forward = st.checkbox("Walk-forward validation", value=True)
         with wf_col2:
             wf_train_window = st.number_input("WF Train Bars", min_value=60, max_value=756, value=126, step=21)
         with wf_col3:
             wf_forward_window = st.number_input("WF Forward Bars", min_value=5, max_value=126, value=21, step=5)
         with wf_col4:
-            use_wf_signal = st.checkbox("Use WF signal for backtest", value=False)
-        wf_confirmed_bar = st.checkbox("WF confirmed-bar execution: use previous closed signal", value=False, help="More realistic. It prevents same-candle lookahead by trading from the prior completed signal.")
+            use_wf_signal = st.checkbox("Use WF signal for backtest", value=True)
+        wf_confirmed_bar = st.checkbox("WF confirmed-bar execution: use previous closed signal", value=True, help="More realistic. It prevents same-candle lookahead by trading from the prior completed signal.")
 
         with st.expander("Institutional WFO Controls", expanded=True):
             st.caption("These settings make WFO less overfit: top-3 ensemble, risk-adjusted scoring, strategy-switch penalty, and momentum override for strong runners.")
@@ -5571,8 +5568,26 @@ with tab7:
                             best_name, best_logic, best_sig, best_score = next(x for x in scored_candidates if x[0] == best_name)
                             
                             st.write("#### 🧠 Robust IV Proxy Strategy Ranking")
-                            st.caption("In-sample ranking is now a reference table. When walk-forward is enabled, the main backtest below uses the walk-forward-selected signal by default.")
+                            st.caption("In-sample ranking is now a reference table. You can also manually choose any IV rule below and view its own trade log.")
                             st.dataframe(rank_df, use_container_width=True)
+
+                            manual_iv_strategy_override = st.checkbox(
+                                "Manually select IV proxy strategy for backtest/trade log",
+                                value=False,
+                                help="Turn this on when you want to inspect a specific rule instead of the auto-selected best rule."
+                            )
+                            manual_iv_choice = None
+                            if manual_iv_strategy_override:
+                                available_iv_rules = rank_df['Rule'].tolist()
+                                default_manual_idx = available_iv_rules.index(best_name) if best_name in available_iv_rules else 0
+                                manual_iv_choice = st.selectbox(
+                                    "Choose IV proxy strategy to review",
+                                    available_iv_rules,
+                                    index=default_manual_idx,
+                                    help="Example: choose Vol Compression Breakout to see its own performance and trades."
+                                )
+                                best_name, best_logic, best_sig, best_score = next(x for x in scored_candidates if x[0] == manual_iv_choice)
+                                st.info(f"Manual IV strategy mode: main metrics and trade log will use **{best_name}**. Auto/WFO results remain reference only.")
                             
                             wf_result = None
                             if enable_iv_walk_forward:
@@ -5674,7 +5689,9 @@ with tab7:
                                 else:
                                     st.error("This IV proxy winner is unstable. Treat it as research only, not a strong trading edge.")
 
-                            if enable_iv_walk_forward and use_wf_signal and wf_result is not None:
+                            if manual_iv_strategy_override:
+                                st.info(f"Chosen manual IV proxy rule: **{best_name}** — {best_logic}")
+                            elif enable_iv_walk_forward and use_wf_signal and wf_result is not None:
                                 st.info("Primary result below uses **walk-forward-selected IV rules**. The in-sample chosen rule is shown only as reference.")
                                 st.caption(f"In-sample reference winner: {best_name} — {best_logic}")
                             else:
@@ -5684,7 +5701,7 @@ with tab7:
                             # IMPORTANT: when WFO is enabled, make the main performance metrics use ONLY
                             # the out-of-sample walk-forward segment, not the training/history segment.
                             signals = pd.Series(np.nan, index=prices_bt.index)
-                            using_wfo_primary = bool(enable_iv_walk_forward and use_wf_signal and wf_result is not None)
+                            using_wfo_primary = bool((not manual_iv_strategy_override) and enable_iv_walk_forward and use_wf_signal and wf_result is not None)
                             using_wfo_primary_for_metrics = using_wfo_primary
                             if using_wfo_primary:
                                 benchmark_label_for_metrics = "WFO Test Benchmark"
@@ -6355,7 +6372,7 @@ with tab12:
     
     fed_date_col1, fed_date_col2 = st.columns(2)
     with fed_date_col1:
-        fed_start_date = st.date_input("FED History Start", DEFAULT_APP_START_DATE)
+        fed_start_date = st.date_input("FED History Start", datetime(2010, 1, 1))
     
     @st.fragment
     def render_fed_dashboard():
@@ -7650,10 +7667,9 @@ with tab18:
             elif vwap_type == "Anchored VWAP (from date)":
                 min_d = df_vwap.index[0].date()
                 max_d = df_vwap.index[-1].date()
-                default_anchor_d = min(max(DEFAULT_APP_START_DATE.date(), min_d), max_d)
                 anchor_date = st.date_input("Anchor Date", min_value=min_d,
                                              max_value=max_d,
-                                             value=default_anchor_d,
+                                             value=min_d,
                                              key="avwap_anchor")
                 # Find nearest index
                 anchor_ts = pd.Timestamp(anchor_date)
