@@ -2062,11 +2062,6 @@ def benchmark_aware_trend_participation_signal(prices, mode="Balanced"):
     mode_l = str(mode or "Balanced").lower()
 
     if "optimized" in mode_l:
-        # Speed fix: on shorter rolling WFO chunks, use the fast trend-capture
-        # version instead of re-running the optimizer on every block. The full
-        # optimizer is still available on longer full-period series.
-        if len(px) < 400:
-            return full_benchmark_capture_signal(px, mode="Full Benchmark Capture")
         return optimized_full_capture_signal(px)
     if "full benchmark" in mode_l or "maximum" in mode_l:
         return full_benchmark_capture_signal(px, mode=mode)
@@ -2207,9 +2202,7 @@ def optimized_full_capture_signal(prices, initial_capital=10000.0):
     if pd.isna(bh_return):
         bh_return = 0.0
 
-    # Full scan grid restored. Do NOT reduce these combinations because
-    # the optimizer needs the same search space as the original behavior.
-    # Speed is handled by Streamlit caching above, not by changing logic.
+    # Small, controlled grid. Not hundreds/thousands of combinations.
     fast_grid = [6, 8, 10, 13, 21]
     guard_grid = [13, 21, 34, 50]
     break_grid = [0.93, 0.95, 0.97]
@@ -2718,121 +2711,54 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_rep
     """
     Cached helper to fit Markov Regression.
     Returns the fitted result object.
-
-    Robust fix:
-    Statsmodels can occasionally fail with "Could not untransform parameters" during
-    randomized Markov starting-parameter search. That is a fit-start problem, not a
-    dashboard logic problem. We keep the original full scan/search_reps, but add safe
-    fallback attempts so one bad window does not break the Regime tab.
     """
     # PREPARE DATA
-    # Ensure input is a clean 1D float array, then wrap back into Series
+    # Ensure input is a clean 1D float array, then wrap back into Series 
     # to preserve Statsmodels pandas-compatibility (param names, indices)
     if hasattr(model_data, 'values'):
         clean_values = model_data.values.flatten().astype(float)
         idx = model_data.index
     else:
         clean_values = np.array(model_data).flatten().astype(float)
+        # Create dummy index if none exists, to satisfy Statsmodels internal checks
         idx = pd.RangeIndex(len(clean_values))
 
     # VALIDATION: Check for NaNs or Infinite values
     if np.any(np.isnan(clean_values)) or np.any(np.isinf(clean_values)):
-        # Return quietly because WFO may test many windows/candidates.
+        st.error("❌ Data contains NaNs or Infinite values. Cannot fit model.")
         return None
-
+        
     # VALIDATION: Check for constant data (no variance)
     if np.std(clean_values) < 1e-9:
+        st.error("❌ Data is constant (no variance). Cannot fit model.")
         return None
-
+        
     # Reconstruct robust 1D Series for Statsmodels
     endog_series = pd.Series(clean_values, index=idx)
 
-    def _normalize_result(res_markov):
-        """Force pandas-like params so downstream code can use names safely."""
+    try:
+        mod_markov = MarkovRegression(
+            endog_series,
+            k_regimes=n_regimes,
+            trend='c',
+            switching_variance=switch_vol,
+            switching_trend=switch_trend
+        )
+        res_markov = mod_markov.fit(search_reps=search_reps, disp=False)
+             
+        # ENFORCE PANDAS OUTPUT: Statsmodels sometimes returns numpy arrays
         if isinstance(res_markov.params, np.ndarray):
             names = res_markov.model.param_names
             res_markov.params = pd.Series(res_markov.params, index=names)
             res_markov.bse = pd.Series(res_markov.bse, index=names)
             res_markov.pvalues = pd.Series(res_markov.pvalues, index=names)
+            
         return res_markov
-
-    # Keep original primary attempt first. Fallbacks only run if primary fails.
-    # This preserves the full-scan behavior while preventing hard crashes.
-    attempts = []
-    attempts.append({
-        'label': 'primary',
-        'switching_variance': bool(switch_vol),
-        'switching_trend': bool(switch_trend),
-        'search_reps': int(search_reps),
-        'em_iter': 10,
-        'maxiter': 200,
-        'method': 'lbfgs'
-    })
-    attempts.append({
-        'label': 'deterministic_start',
-        'switching_variance': bool(switch_vol),
-        'switching_trend': bool(switch_trend),
-        'search_reps': 0,
-        'em_iter': 10,
-        'maxiter': 300,
-        'method': 'lbfgs'
-    })
-    attempts.append({
-        'label': 'powell_start',
-        'switching_variance': bool(switch_vol),
-        'switching_trend': bool(switch_trend),
-        'search_reps': 0,
-        'em_iter': 5,
-        'maxiter': 300,
-        'method': 'powell'
-    })
-    # If the fully switching model is unstable, try simpler Markov specifications.
-    # These are only safety fallbacks; they do not reduce the outer full scan.
-    if switch_vol or switch_trend:
-        attempts.append({
-            'label': 'simple_switching_variance_only',
-            'switching_variance': bool(switch_vol),
-            'switching_trend': False,
-            'search_reps': 0,
-            'em_iter': 5,
-            'maxiter': 250,
-            'method': 'lbfgs'
-        })
-        attempts.append({
-            'label': 'simple_constant_variance',
-            'switching_variance': False,
-            'switching_trend': False,
-            'search_reps': 0,
-            'em_iter': 5,
-            'maxiter': 250,
-            'method': 'lbfgs'
-        })
-
-    last_error = None
-    for attempt in attempts:
-        try:
-            mod_markov = MarkovRegression(
-                endog_series,
-                k_regimes=int(n_regimes),
-                trend='c',
-                switching_variance=attempt['switching_variance'],
-                switching_trend=attempt['switching_trend']
-            )
-            res_markov = mod_markov.fit(
-                search_reps=attempt['search_reps'],
-                em_iter=attempt['em_iter'],
-                maxiter=attempt['maxiter'],
-                method=attempt['method'],
-                disp=False
-            )
-            return _normalize_result(res_markov)
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-    # Do not spam Streamlit with red errors during WFO loops. A failed candidate/window
-    # should simply be skipped so other candidates can continue.
-    return None
+    except Exception as e:
+        st.error(f"❌ Fit failed: {str(e)}")
+        if "Singular matrix" in str(e):
+             st.warning("Hint: underlying data might be too flat or collinear.")
+        return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
