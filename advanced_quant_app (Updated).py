@@ -1890,6 +1890,77 @@ def buy_hold_return_pct(prices):
     return (px.iloc[-1] / px.iloc[0] - 1) * 100
 
 
+def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=0.18, vol_throttle=True):
+    """
+    Causal risk-control overlay for IV Proxy signals.
+    Goal: improve Sharpe and reduce max drawdown without changing the underlying IV rule selection.
+
+    It does not look into the future. It only uses price/volatility/trend information available
+    up to each bar. Output can be fractional exposure: 1.0 full long, 0.5 reduced, 0.0 cash.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    sig = pd.Series(base_signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
+    if len(px) < 25:
+        return sig
+
+    mode_l = str(mode).lower()
+    if mode_l == "strict":
+        fast_span, slow_span, long_span = 10, 30, 100
+        reduce_exposure = 0.35
+        dd_mult = 0.75
+        vol_mult = 1.35
+    elif mode_l == "loose":
+        fast_span, slow_span, long_span = 20, 50, 150
+        reduce_exposure = 0.70
+        dd_mult = 1.25
+        vol_mult = 2.00
+    else:  # Balanced
+        fast_span, slow_span, long_span = 15, 40, 120
+        reduce_exposure = 0.50
+        dd_mult = 1.00
+        vol_mult = 1.60
+
+    ema_fast = px.ewm(span=fast_span, adjust=False).mean()
+    ema_slow = px.ewm(span=slow_span, adjust=False).mean()
+    ema_long = px.ewm(span=long_span, adjust=False).mean()
+    ret = px.pct_change().fillna(0.0)
+    vol_20 = ret.rolling(20, min_periods=5).std()
+    vol_med = vol_20.rolling(100, min_periods=20).median()
+
+    rolling_peak = px.cummax()
+    price_dd = (px / rolling_peak - 1.0).fillna(0.0)
+    dd_limit = -abs(float(max_price_dd)) * dd_mult
+
+    healthy_trend = (px > ema_slow) & (ema_fast >= ema_slow)
+    super_trend = healthy_trend & (px > ema_long) & (ema_slow.pct_change(5).fillna(0) > 0)
+    weak_trend = (px < ema_slow) | (ema_fast < ema_slow)
+    major_break = (price_dd <= dd_limit) & weak_trend
+
+    if vol_throttle:
+        vol_stress = (vol_20 > (vol_med * vol_mult)) & (ret < 0) & weak_trend
+    else:
+        vol_stress = pd.Series(False, index=px.index)
+
+    out = pd.Series(0.0, index=px.index, dtype=float)
+    current = 0.0
+    for dt in px.index:
+        desired = float(sig.loc[dt])
+        if desired <= 0:
+            current = 0.0
+        else:
+            if bool(major_break.loc[dt]) or bool(vol_stress.loc[dt]):
+                current = 0.0
+            elif bool(super_trend.loc[dt]):
+                current = 1.0
+            elif bool(healthy_trend.loc[dt]):
+                current = max(reduce_exposure, desired * reduce_exposure)
+            else:
+                current = min(reduce_exposure, desired * reduce_exposure)
+        out.loc[dt] = current
+
+    return out.ffill().fillna(0.0).clip(0.0, 1.0)
+
+
 def strong_runner_trend_hold_signal(prices, fast=20, slow=50, long=100):
     """
     Benchmark-aware trend-hold candidate.
@@ -6028,6 +6099,19 @@ with tab7:
                 iv_ensemble_threshold = st.number_input("Ensemble Long Threshold", min_value=0.10, max_value=0.90, value=0.45, step=0.05)
             iv_trend_override = st.checkbox("Momentum / trend override for strong runners", value=True, help="Keeps the strategy from going fully defensive when the stock is above major trend filters and showing momentum.")
             iv_min_trades = st.number_input("Minimum Trades Penalty Level", min_value=1, max_value=20, value=3, step=1)
+
+        with st.expander("IV Sharpe / Drawdown Guard", expanded=True):
+            st.caption("Optional final risk overlay for IV Proxy. It keeps the selected IV strategy, but throttles exposure when price trend/volatility risk worsens. Designed to improve Sharpe and reduce max drawdown.")
+            gd1, gd2, gd3, gd4 = st.columns(4)
+            with gd1:
+                enable_iv_risk_guard = st.checkbox("Enable IV Sharpe/DD Guard", value=True, key="iv_enable_sharpe_dd_guard")
+            with gd2:
+                iv_guard_mode = st.selectbox("Guard Mode", ["Balanced", "Strict", "Loose"], index=0, key="iv_guard_mode")
+            with gd3:
+                iv_guard_dd = st.number_input("Price DD Exit Guard (%)", min_value=5.0, max_value=50.0, value=18.0, step=1.0, key="iv_guard_dd_pct")
+            with gd4:
+                iv_guard_vol = st.checkbox("Volatility throttle", value=True, key="iv_guard_vol_throttle")
+            st.caption("Strict = lower drawdown but more missed upside. Loose = more return capture but higher drawdown risk. Balanced is the recommended default.")
             
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
@@ -6205,6 +6289,25 @@ with tab7:
                             "Allows strong relative-strength uptrends to stay long unless IV stress becomes severe. Designed to avoid missing huge runners.",
                             stateful(protected_entry, protected_exit, start_long=True)
                         ))
+
+                        # Optional Sharpe/DD guard: apply to each IV candidate before ranking so the selected rule,
+                        # manual rule, and trade log all reflect the same risk-controlled signal.
+                        if bool(enable_iv_risk_guard):
+                            guarded_candidates = []
+                            for cname, clogic, csig in candidates:
+                                guarded_sig = apply_iv_sharpe_dd_guard(
+                                    asset_prices,
+                                    csig,
+                                    mode=str(iv_guard_mode),
+                                    max_price_dd=float(iv_guard_dd) / 100.0,
+                                    vol_throttle=bool(iv_guard_vol)
+                                )
+                                guarded_candidates.append((
+                                    cname,
+                                    clogic + f" Risk guard applied: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard.",
+                                    guarded_sig
+                                ))
+                            candidates = guarded_candidates
                         
                         # Rank all candidates on the same selected history.
                         ranking_rows = []
@@ -6353,6 +6456,9 @@ with tab7:
                                 else:
                                     st.error("This IV proxy winner is unstable. Treat it as research only, not a strong trading edge.")
 
+                            if bool(enable_iv_risk_guard):
+                                st.success(f"IV Sharpe/DD Guard is ON: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard, volatility throttle {'ON' if bool(iv_guard_vol) else 'OFF'}.")
+
                             if manual_iv_strategy_override:
                                 st.info(f"Chosen manual IV proxy rule: **{best_name}** — {best_logic}")
                             elif enable_iv_walk_forward and use_wf_signal and wf_result is not None:
@@ -6371,6 +6477,14 @@ with tab7:
                                 benchmark_label_for_metrics = "WFO Test Benchmark"
                                 full_period_benchmark_pct_for_metrics = buy_hold_return_pct(asset_prices)
                                 wf_sig = wf_result['signal'].reindex(common_idx).ffill().fillna(0).clip(0, 1)
+                                if bool(enable_iv_risk_guard):
+                                    wf_sig = apply_iv_sharpe_dd_guard(
+                                        asset_prices,
+                                        wf_sig,
+                                        mode=str(iv_guard_mode),
+                                        max_price_dd=float(iv_guard_dd) / 100.0,
+                                        vol_throttle=bool(iv_guard_vol)
+                                    )
                                 signals.loc[common_idx] = wf_sig
                                 first_forward_start = wf_result.get('rows', pd.DataFrame()).iloc[0]['Forward Start'] if not wf_result.get('rows', pd.DataFrame()).empty else common_idx[0]
                                 signals = signals.loc[signals.index >= first_forward_start]
