@@ -1446,8 +1446,13 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
             else:
                 mean_val = float(res_model.params.get('const', 0.0))
             expected_ret += probs_df.iloc[:, i] * mean_val
-        momentum_override = (bull_probs > 0.40) & (expected_ret > expected_ret.rolling(4, min_periods=1).mean())
-        raw_signal = (((expected_ret > 0) & (bull_probs > float(conviction))) | momentum_override).astype(float)
+        soft_conviction = float(conviction) * 0.70
+        trend_participating = (
+            (expected_ret > 0) & (bull_probs > soft_conviction)
+        ) | (
+            (bull_probs > float(conviction))
+        )
+        raw_signal = trend_participating.astype(float)
         context = {"expected_ret": expected_ret, "bull_probs": bull_probs, "dominant_regime": dominant_regime, "bull_regime_idx": bull_regime_idx}
 
     elif signal_method == "Regime Probability":
