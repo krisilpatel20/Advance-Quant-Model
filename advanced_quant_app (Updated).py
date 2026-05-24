@@ -1890,13 +1890,17 @@ def buy_hold_return_pct(prices):
     return (px.iloc[-1] / px.iloc[0] - 1) * 100
 
 
-def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=0.18, vol_throttle=True):
+def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=0.18, vol_throttle=True, equity_dd_guard=True, max_equity_dd=0.20):
     """
     Causal risk-control overlay for IV Proxy signals.
     Goal: improve Sharpe and reduce max drawdown without changing the underlying IV rule selection.
 
     It does not look into the future. It only uses price/volatility/trend information available
     up to each bar. Output can be fractional exposure: 1.0 full long, 0.5 reduced, 0.0 cash.
+
+    Equity DD Guard watches the strategy equity curve itself. If account equity drops too far
+    from its own peak, it forces cash until price trend recovers. This is different from the
+    price DD guard, which only watches the stock price drawdown from its peak.
     """
     px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
     sig = pd.Series(base_signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
@@ -1957,6 +1961,52 @@ def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=
             else:
                 current = min(reduce_exposure, desired * reduce_exposure)
         out.loc[dt] = current
+
+    out = out.ffill().fillna(0.0).clip(0.0, 1.0)
+
+    # Account-level drawdown guard. This is intentionally applied AFTER the price/trend/vol guard.
+    # It simulates the strategy equity using the final exposure from the prior bar. If account equity
+    # falls more than the selected limit from its own peak, it forces cash and waits for trend recovery.
+    if bool(equity_dd_guard):
+        max_equity_dd = abs(float(max_equity_dd))
+        max_equity_dd = min(max(max_equity_dd, 0.01), 0.80)
+        final = pd.Series(0.0, index=px.index, dtype=float)
+        px_ret = px.pct_change().fillna(0.0)
+        equity = 1.0
+        peak_equity = 1.0
+        prev_exposure = 0.0
+        locked = False
+        recovery_count = 0
+        for dt in px.index:
+            # Existing position is marked-to-market before today’s new signal is allowed.
+            equity *= (1.0 + prev_exposure * float(px_ret.loc[dt]))
+            peak_equity = max(peak_equity, equity)
+            equity_dd = (equity / peak_equity) - 1.0 if peak_equity > 0 else 0.0
+
+            trend_recovered = bool(healthy_trend.loc[dt]) and bool(ema_fast.loc[dt] > ema_slow.loc[dt])
+            if equity_dd <= -max_equity_dd:
+                locked = True
+                recovery_count = 0
+
+            desired = float(out.loc[dt])
+            if locked:
+                # Do not instantly re-enter after an account DD stop. Require a few healthy bars.
+                if trend_recovered and desired > 0:
+                    recovery_count += 1
+                else:
+                    recovery_count = 0
+                if recovery_count >= 3:
+                    locked = False
+                    peak_equity = max(peak_equity, equity)
+                    final_exp = min(desired, reduce_exposure if not bool(super_trend.loc[dt]) else 1.0)
+                else:
+                    final_exp = 0.0
+            else:
+                final_exp = desired
+
+            final.loc[dt] = final_exp
+            prev_exposure = final_exp
+        out = final.ffill().fillna(0.0).clip(0.0, 1.0)
 
     return out.ffill().fillna(0.0).clip(0.0, 1.0)
 
@@ -6111,7 +6161,12 @@ with tab7:
                 iv_guard_dd = st.number_input("Price DD Exit Guard (%)", min_value=5.0, max_value=50.0, value=18.0, step=1.0, key="iv_guard_dd_pct")
             with gd4:
                 iv_guard_vol = st.checkbox("Volatility throttle", value=True, key="iv_guard_vol_throttle")
-            st.caption("Strict = lower drawdown but more missed upside. Loose = more return capture but higher drawdown risk. Balanced is the recommended default.")
+            gd5, gd6 = st.columns(2)
+            with gd5:
+                iv_guard_equity_dd_on = st.checkbox("Equity DD Guard", value=True, key="iv_guard_equity_dd_on")
+            with gd6:
+                iv_guard_equity_dd = st.number_input("Max Account DD Guard (%)", min_value=5.0, max_value=60.0, value=20.0, step=1.0, key="iv_guard_equity_dd_pct")
+            st.caption("Strict = lower drawdown but more missed upside. Loose = more return capture but higher drawdown risk. Equity DD Guard watches the strategy account curve, not just stock price.")
             
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
@@ -6300,11 +6355,13 @@ with tab7:
                                     csig,
                                     mode=str(iv_guard_mode),
                                     max_price_dd=float(iv_guard_dd) / 100.0,
-                                    vol_throttle=bool(iv_guard_vol)
+                                    vol_throttle=bool(iv_guard_vol),
+                                    equity_dd_guard=bool(iv_guard_equity_dd_on),
+                                    max_equity_dd=float(iv_guard_equity_dd) / 100.0
                                 )
                                 guarded_candidates.append((
                                     cname,
-                                    clogic + f" Risk guard applied: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard.",
+                                    clogic + f" Risk guard applied: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard, {float(iv_guard_equity_dd):.0f}% account-DD guard {'ON' if bool(iv_guard_equity_dd_on) else 'OFF'}.",
                                     guarded_sig
                                 ))
                             candidates = guarded_candidates
@@ -6457,7 +6514,7 @@ with tab7:
                                     st.error("This IV proxy winner is unstable. Treat it as research only, not a strong trading edge.")
 
                             if bool(enable_iv_risk_guard):
-                                st.success(f"IV Sharpe/DD Guard is ON: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard, volatility throttle {'ON' if bool(iv_guard_vol) else 'OFF'}.")
+                                st.success(f"IV Sharpe/DD Guard is ON: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard, account-DD guard {float(iv_guard_equity_dd):.0f}% {'ON' if bool(iv_guard_equity_dd_on) else 'OFF'}, volatility throttle {'ON' if bool(iv_guard_vol) else 'OFF'}.")
 
                             if manual_iv_strategy_override:
                                 st.info(f"Chosen manual IV proxy rule: **{best_name}** — {best_logic}")
