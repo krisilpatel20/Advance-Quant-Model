@@ -1437,8 +1437,8 @@ def get_price_trend_override(prices_index, model_index, strat_prices):
             (px > ema20) &
             (ema20 > ema50) &
             (ema50 > ema200) &
-            (mom_20 > 0.05) &
-            (mom_60 > 0.10)
+            (mom_20 > 0.02) &
+            (mom_60 > 0.05)
         ).astype(float)
 
         return strong_trend.reindex(prices_index).ffill().fillna(0)
