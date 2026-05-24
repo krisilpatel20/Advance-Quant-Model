@@ -1890,7 +1890,7 @@ def buy_hold_return_pct(prices):
     return (px.iloc[-1] / px.iloc[0] - 1) * 100
 
 
-def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=0.18, vol_throttle=True, equity_dd_guard=True, max_equity_dd=0.20):
+def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=0.18, vol_throttle=True, equity_dd_guard=True, max_equity_dd=0.20, equity_guard_action="Soft Throttle"):
     """
     Causal risk-control overlay for IV Proxy signals.
     Goal: improve Sharpe and reduce max drawdown without changing the underlying IV rule selection.
@@ -1898,9 +1898,10 @@ def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=
     It does not look into the future. It only uses price/volatility/trend information available
     up to each bar. Output can be fractional exposure: 1.0 full long, 0.5 reduced, 0.0 cash.
 
-    Equity DD Guard watches the strategy equity curve itself. If account equity drops too far
-    from its own peak, it forces cash until price trend recovers. This is different from the
-    price DD guard, which only watches the stock price drawdown from its peak.
+    Equity DD Guard watches the strategy equity curve itself. In Soft Throttle mode, it
+    reduces exposure after account drawdown stress instead of locking the model fully in cash.
+    In Hard Cash mode, it exits to cash until recovery. This is different from the price DD
+    guard, which only watches the stock price drawdown from its peak.
     """
     px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
     sig = pd.Series(base_signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
@@ -1965,11 +1966,13 @@ def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=
     out = out.ffill().fillna(0.0).clip(0.0, 1.0)
 
     # Account-level drawdown guard. This is intentionally applied AFTER the price/trend/vol guard.
-    # It simulates the strategy equity using the final exposure from the prior bar. If account equity
-    # falls more than the selected limit from its own peak, it forces cash and waits for trend recovery.
+    # Soft Throttle is the default because a hard lockout can protect drawdown but miss huge runners.
+    # It simulates strategy equity using the prior bar's exposure, then reduces exposure when the
+    # account is under drawdown stress. Hard Cash mode is still available for maximum protection.
     if bool(equity_dd_guard):
         max_equity_dd = abs(float(max_equity_dd))
         max_equity_dd = min(max(max_equity_dd, 0.01), 0.80)
+        action_l = str(equity_guard_action).lower()
         final = pd.Series(0.0, index=px.index, dtype=float)
         px_ret = px.pct_change().fillna(0.0)
         equity = 1.0
@@ -1978,31 +1981,48 @@ def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=
         locked = False
         recovery_count = 0
         for dt in px.index:
-            # Existing position is marked-to-market before today’s new signal is allowed.
+            # Mark-to-market first using yesterday's exposure. No future data is used.
             equity *= (1.0 + prev_exposure * float(px_ret.loc[dt]))
             peak_equity = max(peak_equity, equity)
             equity_dd = (equity / peak_equity) - 1.0 if peak_equity > 0 else 0.0
 
-            trend_recovered = bool(healthy_trend.loc[dt]) and bool(ema_fast.loc[dt] > ema_slow.loc[dt])
-            if equity_dd <= -max_equity_dd:
-                locked = True
-                recovery_count = 0
-
             desired = float(out.loc[dt])
-            if locked:
-                # Do not instantly re-enter after an account DD stop. Require a few healthy bars.
-                if trend_recovered and desired > 0:
-                    recovery_count += 1
-                else:
+            trend_recovered = bool(healthy_trend.loc[dt]) and bool(ema_fast.loc[dt] > ema_slow.loc[dt])
+            trend_broken = bool(weak_trend.loc[dt]) and not bool(super_trend.loc[dt])
+
+            if action_l.startswith("hard"):
+                # Old behavior: full cash lockout after account DD breach.
+                if equity_dd <= -max_equity_dd:
+                    locked = True
                     recovery_count = 0
-                if recovery_count >= 3:
-                    locked = False
-                    peak_equity = max(peak_equity, equity)
-                    final_exp = min(desired, reduce_exposure if not bool(super_trend.loc[dt]) else 1.0)
+                if locked:
+                    if trend_recovered and desired > 0:
+                        recovery_count += 1
+                    else:
+                        recovery_count = 0
+                    if recovery_count >= 3:
+                        locked = False
+                        peak_equity = max(peak_equity, equity)
+                        final_exp = min(desired, reduce_exposure if not bool(super_trend.loc[dt]) else 1.0)
+                    else:
+                        final_exp = 0.0
                 else:
-                    final_exp = 0.0
+                    final_exp = desired
             else:
-                final_exp = desired
+                # New behavior: soft account DD throttle. This protects the account without
+                # completely missing the next leg up in strong runners.
+                stress_1 = equity_dd <= -max_equity_dd
+                stress_2 = equity_dd <= -(max_equity_dd * 1.50)
+                if stress_2 and trend_broken:
+                    final_exp = 0.0
+                elif stress_2:
+                    final_exp = min(desired, reduce_exposure * 0.50)
+                elif stress_1 and trend_broken:
+                    final_exp = min(desired, reduce_exposure * 0.50)
+                elif stress_1:
+                    final_exp = min(desired, max(reduce_exposure, 0.50))
+                else:
+                    final_exp = desired
 
             final.loc[dt] = final_exp
             prev_exposure = final_exp
@@ -6161,12 +6181,14 @@ with tab7:
                 iv_guard_dd = st.number_input("Price DD Exit Guard (%)", min_value=5.0, max_value=50.0, value=18.0, step=1.0, key="iv_guard_dd_pct")
             with gd4:
                 iv_guard_vol = st.checkbox("Volatility throttle", value=True, key="iv_guard_vol_throttle")
-            gd5, gd6 = st.columns(2)
+            gd5, gd6, gd7 = st.columns(3)
             with gd5:
                 iv_guard_equity_dd_on = st.checkbox("Equity DD Guard", value=True, key="iv_guard_equity_dd_on")
             with gd6:
                 iv_guard_equity_dd = st.number_input("Max Account DD Guard (%)", min_value=5.0, max_value=60.0, value=20.0, step=1.0, key="iv_guard_equity_dd_pct")
-            st.caption("Strict = lower drawdown but more missed upside. Loose = more return capture but higher drawdown risk. Equity DD Guard watches the strategy account curve, not just stock price.")
+            with gd7:
+                iv_guard_equity_action = st.selectbox("Equity DD Action", ["Soft Throttle", "Hard Cash"], index=0, key="iv_guard_equity_action")
+            st.caption("Soft Throttle = reduces exposure after account DD stress without fully missing strong runners. Hard Cash = exits fully to cash until recovery.")
             
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
@@ -6357,7 +6379,8 @@ with tab7:
                                     max_price_dd=float(iv_guard_dd) / 100.0,
                                     vol_throttle=bool(iv_guard_vol),
                                     equity_dd_guard=bool(iv_guard_equity_dd_on),
-                                    max_equity_dd=float(iv_guard_equity_dd) / 100.0
+                                    max_equity_dd=float(iv_guard_equity_dd) / 100.0,
+                                    equity_guard_action=str(iv_guard_equity_action)
                                 )
                                 guarded_candidates.append((
                                     cname,
@@ -6540,7 +6563,10 @@ with tab7:
                                         wf_sig,
                                         mode=str(iv_guard_mode),
                                         max_price_dd=float(iv_guard_dd) / 100.0,
-                                        vol_throttle=bool(iv_guard_vol)
+                                        vol_throttle=bool(iv_guard_vol),
+                                        equity_dd_guard=bool(iv_guard_equity_dd_on),
+                                        max_equity_dd=float(iv_guard_equity_dd) / 100.0,
+                                        equity_guard_action=str(iv_guard_equity_action)
                                     )
                                 signals.loc[common_idx] = wf_sig
                                 first_forward_start = wf_result.get('rows', pd.DataFrame()).iloc[0]['Forward Start'] if not wf_result.get('rows', pd.DataFrame()).empty else common_idx[0]
