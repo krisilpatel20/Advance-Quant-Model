@@ -1418,6 +1418,33 @@ def enforce_min_hold_period(raw_signal, min_hold=1):
     return pd.Series(out, index=raw_signal.index, dtype=float)
 
 
+
+def get_price_trend_override(prices_index, model_index, strat_prices):
+    """
+    Causal price trend override.
+    Stays long when price structure is clearly bullish
+    regardless of regime uncertainty.
+    """
+    try:
+        px = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
+        ema20 = px.ewm(span=20, adjust=False).mean()
+        ema50 = px.ewm(span=50, adjust=False).mean()
+        ema200 = px.ewm(span=200, adjust=False).mean()
+        mom_20 = px.pct_change(20).fillna(0)
+        mom_60 = px.pct_change(60).fillna(0)
+
+        strong_trend = (
+            (px > ema20) &
+            (ema20 > ema50) &
+            (ema50 > ema200) &
+            (mom_20 > 0.05) &
+            (mom_60 > 0.10)
+        ).astype(float)
+
+        return strong_trend.reindex(prices_index).ffill().fillna(0)
+    except Exception:
+        return pd.Series(0.0, index=prices_index)
+
 def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes, signal_method, conviction=0.65, min_hold=1):
     """
     Converts Markov filtered probabilities into a tradable long/cash signal.
@@ -5593,6 +5620,18 @@ with tab7:
                         conviction=float(conviction),
                         min_hold=int(min_hold_period)
                     )
+
+                    # Price trend override for strong runners
+                    price_override = get_price_trend_override(
+                        strat_prices.index,
+                        model_data_bt.index,
+                        strat_prices
+                    )
+                    signals = pd.Series(
+                        np.maximum(signals.values, price_override.reindex(signals.index).fillna(0).values),
+                        index=signals.index
+                    ).clip(0, 1)
+
                     if confirmed_regime_bar:
                         signals = signals.shift(1).ffill().fillna(0).clip(0, 1)
 
