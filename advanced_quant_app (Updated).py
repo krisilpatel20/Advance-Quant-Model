@@ -6995,6 +6995,30 @@ with tab7:
             extra_note=f"Backtest tab strategy: {strategy_type}"
         )
         
+        # For weekly Regime Switching in live/current week, the trade log may mark an
+        # open position to the latest raw/live price for display. Keep the original
+        # strategy logic intact, but make the displayed performance metrics use that
+        # same latest open-trade mark so Total Return matches the trade log.
+        try:
+            if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                _metric_trades = bt_results['trades'].copy()
+                if not _metric_trades.empty:
+                    _metric_trades = map_weekly_trade_log_dates_only(_metric_trades, prices_bt)
+                    _metric_trades = apply_weekly_live_trigger_display_overrides(
+                        _metric_trades, prices_bt, signals, ticker=TICKER, strategy_name=strategy_type
+                    )
+                    if "Status" in _metric_trades.columns and "Cumulative Return (%)" in _metric_trades.columns:
+                        _open_rows = _metric_trades[_metric_trades["Status"].astype(str).str.lower().eq("open")]
+                        if not _open_rows.empty:
+                            _live_cum_pct = float(_open_rows.iloc[0]["Cumulative Return (%)"])
+                            if np.isfinite(_live_cum_pct) and len(bt_results['equity_curve']) > 0:
+                                _live_equity = float(initial_cap) * (1.0 + _live_cum_pct / 100.0)
+                                bt_results['equity_curve'] = bt_results['equity_curve'].copy()
+                                bt_results['equity_curve'].iloc[-1] = _live_equity
+                                bt_results['returns'] = bt_results['equity_curve'].pct_change().fillna(0.0)
+        except Exception:
+            pass
+
         # Metrics
         strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
         bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
