@@ -1382,36 +1382,6 @@ class BacktestEngine:
 
 
 
-def prepare_execution_prices_for_regime(prices_model, signals, raw_prices, use_weekly_execution=False):
-    """
-    For weekly regime signals, keep the model signal weekly but execute/mark-to-market
-    on the raw daily/live price series. This fixes confusing weekly labels like Sunday
-    dates and keeps OPEN trade PnL fresh using the latest available price.
-    """
-    try:
-        prices_model = pd.Series(prices_model).replace([np.inf, -np.inf], np.nan).dropna()
-        signals = pd.Series(signals).reindex(prices_model.index).ffill().fillna(0).clip(0, 1)
-        if not use_weekly_execution:
-            return prices_model, signals
-
-        raw = pd.Series(raw_prices).replace([np.inf, -np.inf], np.nan).dropna()
-        if raw.empty:
-            return prices_model, signals
-
-        # Start from the first model bar so we do not create fake pre-signal exposure.
-        raw = raw.loc[raw.index >= prices_model.index.min()]
-        if raw.empty:
-            return prices_model, signals
-
-        exec_signals = signals.reindex(raw.index, method='ffill').fillna(0).clip(0, 1)
-        return raw, exec_signals
-    except Exception:
-        return prices_model, signals
-
-
-
-
-
 
 
 def make_stateful_position(entry_cond, exit_cond, index):
@@ -5532,7 +5502,7 @@ with tab7:
             with st.spinner("Analyzing model complexity and performance..."):
                 comp_results = []
                 # Setup local data context
-                loc_prices = prices_bt.resample('W-FRI').last().dropna() if bt_freq == "Weekly" else prices_bt
+                loc_prices = prices_bt.resample('W').last().dropna() if bt_freq == "Weekly" else prices_bt
                 loc_returns = loc_prices.pct_change().dropna()
                 if bt_stability > 0:
                     loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
@@ -5596,7 +5566,7 @@ with tab7:
         # Resample if Weekly
         if bt_freq == "Weekly":
             # Resample Prices to Weekly (Last Close)
-            prices_bt_resampled = prices_bt.resample('W-FRI').last().dropna()
+            prices_bt_resampled = prices_bt.resample('W').last().dropna()
         else:
             prices_bt_resampled = prices_bt.dropna()
 
@@ -6793,24 +6763,8 @@ with tab7:
 
     # Run Backtest Engine if signals exist
     if signals is not None:
-        # For Regime Switching on Weekly frequency, execute on raw daily/live prices while
-        # using the weekly model signal. This gives exact trading dates and fresh OPEN PnL.
-        exec_prices = strat_prices
-        exec_signals = signals
-        try:
-            use_weekly_exec = (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly")
-            exec_prices, exec_signals = prepare_execution_prices_for_regime(
-                strat_prices, signals, prices_bt, use_weekly_execution=use_weekly_exec
-            )
-        except Exception:
-            exec_prices, exec_signals = strat_prices, signals
-
-        bt_results = BacktestEngine.run_strategy(exec_prices, exec_signals, initial_cap, trailing_stop, stop_loss)
+        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
         
-        # Use execution series for the signal banner, alerting, metrics, and chart labels.
-        strat_prices = exec_prices
-        signals = exec_signals
-
         # --- STRATEGY SIGNAL BANNER ---
         last_sig = signals.iloc[-1]
         last_dt = signals.index[-1]
