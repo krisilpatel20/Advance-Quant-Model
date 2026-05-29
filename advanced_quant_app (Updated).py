@@ -1496,6 +1496,100 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
 
 
 
+def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
+    """
+    DISPLAY-ONLY helper for Weekly Regime Switching.
+
+    Weekly bars are period-labeled, so a live weekly signal can appear with an upcoming
+    Friday/week-end label. This helper remembers the first raw trading day/price when
+    the app actually observes a live weekly BUY/SELL flip, then displays that date/price
+    in the trade log for open/latest trades. It does not change backtest metrics,
+    equity curve, or historical strategy logic.
+
+    Important: it can only know the exact live trigger date if the app was running when
+    the trigger first appeared. Otherwise it uses the first refresh where it sees the flip.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        raw = pd.Series(raw_prices).replace([np.inf, -np.inf], np.nan).dropna()
+        sig = pd.Series(signals).replace([np.inf, -np.inf], np.nan).dropna()
+        if raw.empty or sig.empty:
+            return trades_df
+
+        raw.index = pd.to_datetime(raw.index)
+        sig.index = pd.to_datetime(sig.index)
+        latest_raw_date = raw.index[-1]
+        latest_raw_price = float(raw.iloc[-1])
+        latest_sig = float(sig.iloc[-1]) > 0
+
+        state_key = f"weekly_live_trigger_state::{ticker}::{strategy_name}"
+        state = st.session_state.get(state_key, {
+            "last_sig": None,
+            "open_entry_date": None,
+            "open_entry_price": None,
+            "last_exit_date": None,
+            "last_exit_price": None,
+        })
+
+        last_sig = state.get("last_sig")
+
+        # First time we see this ticker/strategy, initialize state but do not fake a past trigger.
+        if last_sig is None:
+            state["last_sig"] = latest_sig
+            if latest_sig:
+                # This is the first observed live long state. Use this refresh as the live trigger.
+                state["open_entry_date"] = latest_raw_date
+                state["open_entry_price"] = latest_raw_price
+            st.session_state[state_key] = state
+        else:
+            # Live BUY flip observed while app is running.
+            if (not bool(last_sig)) and latest_sig:
+                state["open_entry_date"] = latest_raw_date
+                state["open_entry_price"] = latest_raw_price
+                state["last_exit_date"] = None
+                state["last_exit_price"] = None
+            # Live SELL flip observed while app is running.
+            elif bool(last_sig) and (not latest_sig):
+                state["last_exit_date"] = latest_raw_date
+                state["last_exit_price"] = latest_raw_price
+            state["last_sig"] = latest_sig
+            st.session_state[state_key] = state
+
+        out = trades_df.copy()
+
+        # If current/latest trade is open, use remembered live entry date/price and latest raw price.
+        if latest_sig and "Status" in out.columns:
+            open_mask = out["Status"].astype(str).str.lower().eq("open")
+            if open_mask.any():
+                # newest open row after sorting may be row 0, but use the first open row found safely.
+                i = out.index[open_mask][0]
+                entry_date = state.get("open_entry_date")
+                entry_price = state.get("open_entry_price")
+                if entry_date is not None and entry_price is not None and float(entry_price) > 0:
+                    out.loc[i, "Entry Date"] = pd.Timestamp(entry_date)
+                    out.loc[i, "Buy Price"] = float(entry_price)
+                    out.loc[i, "Sell Price"] = latest_raw_price
+                    out.loc[i, "PnL (%)"] = ((latest_raw_price - float(entry_price)) / float(entry_price)) * 100.0
+
+        # If a SELL flip was observed live, adjust the latest closed row display date/price only.
+        # Metrics/returns remain unchanged.
+        if (not latest_sig) and state.get("last_exit_date") is not None and "Status" in out.columns:
+            closed_mask = out["Status"].astype(str).str.lower().isin(["closed", "stop loss", "trailing stop"])
+            if closed_mask.any():
+                i = out.index[closed_mask][0]
+                out.loc[i, "Exit Date"] = pd.Timestamp(state.get("last_exit_date"))
+                if state.get("last_exit_price") is not None and "Sell Price" in out.columns:
+                    out.loc[i, "Sell Price"] = float(state.get("last_exit_price"))
+                    bp = float(out.loc[i, "Buy Price"]) if "Buy Price" in out.columns else 0.0
+                    if bp > 0:
+                        out.loc[i, "PnL (%)"] = ((float(state.get("last_exit_price")) - bp) / bp) * 100.0
+
+        return out
+    except Exception:
+        return trades_df
+
+
 def make_stateful_position(entry_cond, exit_cond, index):
     """
     Converts entry/exit booleans into a 0/1 long-only position series.
@@ -6955,6 +7049,9 @@ with tab7:
             try:
                 if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
                     trades_df = map_weekly_trade_log_dates_only(trades_df, prices_bt)
+                    trades_df = apply_weekly_live_trigger_display_overrides(
+                        trades_df, prices_bt, signals, ticker=TICKER, strategy_name=strategy_type
+                    )
             except Exception:
                 pass
 
