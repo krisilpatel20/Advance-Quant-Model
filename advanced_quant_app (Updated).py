@@ -1462,8 +1462,37 @@ def prepare_execution_prices_for_regime(prices_model, signals, raw_prices, use_w
         return prices_model, signals
 
 
+def map_weekly_trade_log_dates_only(trades_df, raw_prices):
+    """Display-only weekly date fix. Does not change returns, PnL, prices, stops, or metrics."""
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        raw = pd.Series(raw_prices).replace([np.inf, -np.inf], np.nan).dropna()
+        if raw.empty:
+            return trades_df
+        raw.index = pd.to_datetime(raw.index)
 
+        def _map_one(dt):
+            if pd.isna(dt) or dt == "Open":
+                return dt
+            d = pd.Timestamp(dt)
+            bucket_start = d - pd.Timedelta(days=6)
+            bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= d)]
+            if bucket.empty and d > raw.index.max():
+                bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= raw.index.max())]
+            if bucket.empty:
+                prior = raw.loc[raw.index <= d]
+                return prior.index[-1] if not prior.empty else d
+            return bucket.index[-1]
 
+        out = trades_df.copy()
+        if 'Entry Date' in out.columns:
+            out['Entry Date'] = out['Entry Date'].apply(_map_one)
+        if 'Exit Date' in out.columns:
+            out['Exit Date'] = out['Exit Date'].apply(_map_one)
+        return out
+    except Exception:
+        return trades_df
 
 
 
@@ -6846,23 +6875,10 @@ with tab7:
 
     # Run Backtest Engine if signals exist
     if signals is not None:
-        # For Regime Switching on Weekly frequency, execute on raw daily/live prices while
-        # using the weekly model signal. This gives exact trading dates and fresh OPEN PnL.
-        exec_prices = strat_prices
-        exec_signals = signals
-        try:
-            use_weekly_exec = (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly")
-            exec_prices, exec_signals = prepare_execution_prices_for_regime(
-                strat_prices, signals, prices_bt, use_weekly_execution=use_weekly_exec
-            )
-        except Exception:
-            exec_prices, exec_signals = strat_prices, signals
-
-        bt_results = BacktestEngine.run_strategy(exec_prices, exec_signals, initial_cap, trailing_stop, stop_loss)
-        
-        # Use execution series for the signal banner, alerting, metrics, and chart labels.
-        strat_prices = exec_prices
-        signals = exec_signals
+        # Keep original weekly model price/signal series for execution so returns,
+        # PnL, stops, equity curve, and metrics remain EXACTLY the same.
+        # Only the trade-log dates are mapped to actual raw trading dates for display.
+        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
 
         # --- STRATEGY SIGNAL BANNER ---
         last_sig = signals.iloc[-1]
@@ -6934,6 +6950,14 @@ with tab7:
         st.write("#### 📝 Trade Log")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
+            # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
+            # actual raw trading date in that week. Returns/metrics are unchanged.
+            try:
+                if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                    trades_df = map_weekly_trade_log_dates_only(trades_df, prices_bt)
+            except Exception:
+                pass
+
             # Show newest trades first by default
             if 'Entry Date' in trades_df.columns:
                 trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
