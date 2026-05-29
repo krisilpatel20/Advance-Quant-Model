@@ -1463,7 +1463,12 @@ def prepare_execution_prices_for_regime(prices_model, signals, raw_prices, use_w
 
 
 def map_weekly_trade_log_dates_only(trades_df, raw_prices):
-    """Display-only weekly date fix. Does not change returns, PnL, prices, stops, or metrics."""
+    """
+    DISPLAY ONLY for weekly trade logs.
+    Keeps returns/metrics unchanged, but maps weekly Entry/Exit labels to the actual
+    raw trading date inside that week by matching the trade price to the closest raw
+    price in that weekly bucket.
+    """
     try:
         if trades_df is None or trades_df.empty:
             return trades_df
@@ -1472,8 +1477,8 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
             return trades_df
         raw.index = pd.to_datetime(raw.index)
 
-        def _map_one(dt):
-            if pd.isna(dt) or dt == "Open":
+        def _map_by_price(dt, target_price=None):
+            if pd.isna(dt) or str(dt).lower() == "open":
                 return dt
             d = pd.Timestamp(dt)
             bucket_start = d - pd.Timedelta(days=6)
@@ -1481,113 +1486,108 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
             if bucket.empty and d > raw.index.max():
                 bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= raw.index.max())]
             if bucket.empty:
-                prior = raw.loc[raw.index <= d]
+                prior = raw.loc[raw.index <= min(d, raw.index.max())]
                 return prior.index[-1] if not prior.empty else d
+
+            # Key fix: do NOT always use the latest/today candle. Use the raw candle
+            # inside that week whose price is closest to the trade's displayed price.
+            try:
+                tp = float(target_price)
+                if np.isfinite(tp) and tp > 0:
+                    return (bucket - tp).abs().idxmin()
+            except Exception:
+                pass
             return bucket.index[-1]
 
         out = trades_df.copy()
         if 'Entry Date' in out.columns:
-            out['Entry Date'] = out['Entry Date'].apply(_map_one)
+            out['Entry Date'] = [
+                _map_by_price(dt, bp) for dt, bp in zip(out['Entry Date'], out.get('Buy Price', pd.Series([np.nan]*len(out))))
+            ]
         if 'Exit Date' in out.columns:
-            out['Exit Date'] = out['Exit Date'].apply(_map_one)
+            mapped_exit = []
+            for dt, sp, status in zip(out['Exit Date'], out.get('Sell Price', pd.Series([np.nan]*len(out))), out.get('Status', pd.Series(['']*len(out)))):
+                if str(status).lower() == 'open' or pd.isna(dt):
+                    mapped_exit.append(dt)
+                else:
+                    mapped_exit.append(_map_by_price(dt, sp))
+            out['Exit Date'] = mapped_exit
         return out
     except Exception:
         return trades_df
 
 
-
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
-    DISPLAY-ONLY helper for Weekly Regime Switching.
+    DISPLAY ONLY for the latest/open weekly trade.
 
-    Weekly bars are period-labeled, so a live weekly signal can appear with an upcoming
-    Friday/week-end label. This helper remembers the first raw trading day/price when
-    the app actually observes a live weekly BUY/SELL flip, then displays that date/price
-    in the trade log for open/latest trades. It does not change backtest metrics,
-    equity curve, or historical strategy logic.
-
-    Important: it can only know the exact live trigger date if the app was running when
-    the trigger first appeared. Otherwise it uses the first refresh where it sees the flip.
+    Fixes the two live weekly display issues without changing strategy metrics:
+    1) Entry Date is the raw candle inside that week whose price matches the trade Buy Price,
+       not today's/latest candle.
+    2) Open trade Sell Price and PnL update with the latest raw/live price.
     """
     try:
         if trades_df is None or trades_df.empty:
             return trades_df
         raw = pd.Series(raw_prices).replace([np.inf, -np.inf], np.nan).dropna()
-        sig = pd.Series(signals).replace([np.inf, -np.inf], np.nan).dropna()
-        if raw.empty or sig.empty:
+        if raw.empty:
             return trades_df
-
         raw.index = pd.to_datetime(raw.index)
-        sig.index = pd.to_datetime(sig.index)
-        latest_raw_date = raw.index[-1]
         latest_raw_price = float(raw.iloc[-1])
-        latest_sig = float(sig.iloc[-1]) > 0
-
-        state_key = f"weekly_live_trigger_state::{ticker}::{strategy_name}"
-        state = st.session_state.get(state_key, {
-            "last_sig": None,
-            "open_entry_date": None,
-            "open_entry_price": None,
-            "last_exit_date": None,
-            "last_exit_price": None,
-        })
-
-        last_sig = state.get("last_sig")
-
-        # First time we see this ticker/strategy, initialize state but do not fake a past trigger.
-        if last_sig is None:
-            state["last_sig"] = latest_sig
-            if latest_sig:
-                # This is the first observed live long state. Use this refresh as the live trigger.
-                state["open_entry_date"] = latest_raw_date
-                state["open_entry_price"] = latest_raw_price
-            st.session_state[state_key] = state
-        else:
-            # Live BUY flip observed while app is running.
-            if (not bool(last_sig)) and latest_sig:
-                state["open_entry_date"] = latest_raw_date
-                state["open_entry_price"] = latest_raw_price
-                state["last_exit_date"] = None
-                state["last_exit_price"] = None
-            # Live SELL flip observed while app is running.
-            elif bool(last_sig) and (not latest_sig):
-                state["last_exit_date"] = latest_raw_date
-                state["last_exit_price"] = latest_raw_price
-            state["last_sig"] = latest_sig
-            st.session_state[state_key] = state
 
         out = trades_df.copy()
+        if "Status" not in out.columns:
+            return out
 
-        # If current/latest trade is open, use remembered live entry date/price and latest raw price.
-        if latest_sig and "Status" in out.columns:
-            open_mask = out["Status"].astype(str).str.lower().eq("open")
-            if open_mask.any():
-                # newest open row after sorting may be row 0, but use the first open row found safely.
-                i = out.index[open_mask][0]
-                entry_date = state.get("open_entry_date")
-                entry_price = state.get("open_entry_price")
-                if entry_date is not None and entry_price is not None and float(entry_price) > 0:
-                    out.loc[i, "Entry Date"] = pd.Timestamp(entry_date)
-                    out.loc[i, "Buy Price"] = float(entry_price)
-                    out.loc[i, "Sell Price"] = latest_raw_price
-                    out.loc[i, "PnL (%)"] = ((latest_raw_price - float(entry_price)) / float(entry_price)) * 100.0
+        open_mask = out["Status"].astype(str).str.lower().eq("open")
+        if not open_mask.any():
+            return out
 
-        # If a SELL flip was observed live, adjust the latest closed row display date/price only.
-        # Metrics/returns remain unchanged.
-        if (not latest_sig) and state.get("last_exit_date") is not None and "Status" in out.columns:
-            closed_mask = out["Status"].astype(str).str.lower().isin(["closed", "stop loss", "trailing stop"])
-            if closed_mask.any():
-                i = out.index[closed_mask][0]
-                out.loc[i, "Exit Date"] = pd.Timestamp(state.get("last_exit_date"))
-                if state.get("last_exit_price") is not None and "Sell Price" in out.columns:
-                    out.loc[i, "Sell Price"] = float(state.get("last_exit_price"))
-                    bp = float(out.loc[i, "Buy Price"]) if "Buy Price" in out.columns else 0.0
-                    if bp > 0:
-                        out.loc[i, "PnL (%)"] = ((float(state.get("last_exit_price")) - bp) / bp) * 100.0
+        for i in out.index[open_mask]:
+            try:
+                old_sell_price = float(out.loc[i, "Sell Price"]) if "Sell Price" in out.columns else np.nan
+            except Exception:
+                old_sell_price = np.nan
+            try:
+                buy_price = float(out.loc[i, "Buy Price"])
+            except Exception:
+                buy_price = np.nan
+
+            # Entry date should already be mapped by price in map_weekly_trade_log_dates_only.
+            # If not, map it here using Buy Price, never latest/today by default.
+            try:
+                entry_dt = out.loc[i, "Entry Date"]
+                if pd.notna(entry_dt) and np.isfinite(buy_price) and buy_price > 0:
+                    d = pd.Timestamp(entry_dt)
+                    bucket_start = d - pd.Timedelta(days=6)
+                    bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= min(d, raw.index.max()))]
+                    if bucket.empty and d > raw.index.max():
+                        bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= raw.index.max())]
+                    if not bucket.empty:
+                        out.loc[i, "Entry Date"] = (bucket - buy_price).abs().idxmin()
+            except Exception:
+                pass
+
+            # Fresh live/open mark-to-market display.
+            if np.isfinite(buy_price) and buy_price > 0:
+                out.loc[i, "Sell Price"] = latest_raw_price
+                out.loc[i, "PnL (%)"] = ((latest_raw_price - buy_price) / buy_price) * 100.0
+
+                # Display-only cumulative refresh using the old displayed cumulative as the
+                # account value at the old mark price, then scale by latest/old mark price.
+                # This keeps the table fresh without changing the backtest equity curve.
+                try:
+                    if "Cumulative Return (%)" in out.columns and np.isfinite(old_sell_price) and old_sell_price > 0:
+                        old_cum = float(out.loc[i, "Cumulative Return (%)"])
+                        new_cum = ((1.0 + old_cum / 100.0) * (latest_raw_price / old_sell_price) - 1.0) * 100.0
+                        out.loc[i, "Cumulative Return (%)"] = new_cum
+                except Exception:
+                    pass
 
         return out
     except Exception:
         return trades_df
+
 
 
 def make_stateful_position(entry_cond, exit_cond, index):
