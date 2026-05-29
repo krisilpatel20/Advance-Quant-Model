@@ -1382,6 +1382,89 @@ class BacktestEngine:
 
 
 
+def prepare_execution_prices_for_regime(prices_model, signals, raw_prices, use_weekly_execution=False):
+    """
+    For weekly regime signals, keep the weekly model decision, but move each weekly
+    signal timestamp to the REAL latest raw trading candle inside that week.
+
+    This fixes the confusing issue where an in-progress weekly bar is labeled as the
+    upcoming Friday/Sunday even though the actual latest candle is Tuesday/Wednesday.
+    Strategy logic is unchanged; only the execution/trade-log timestamp is mapped to
+    the actual available raw date.
+    """
+    try:
+        prices_model = pd.Series(prices_model).replace([np.inf, -np.inf], np.nan).dropna()
+        signals = pd.Series(signals).reindex(prices_model.index).ffill().fillna(0).clip(0, 1)
+        if not use_weekly_execution:
+            return prices_model, signals
+
+        raw = pd.Series(raw_prices).replace([np.inf, -np.inf], np.nan).dropna()
+        if raw.empty:
+            return prices_model, signals
+
+        raw.index = pd.to_datetime(raw.index)
+        prices_model.index = pd.to_datetime(prices_model.index)
+        signals.index = pd.to_datetime(signals.index)
+
+        # Start close to the first weekly model bar, but include the whole first week so
+        # a signal dated at a weekly period-end can execute on the actual raw date inside it.
+        first_model_date = prices_model.index.min()
+        start_floor = first_model_date - pd.Timedelta(days=7)
+        raw = raw.loc[raw.index >= start_floor]
+        if raw.empty:
+            return prices_model, signals
+
+        # Map each weekly signal date to the last actual raw trading date available in
+        # that same weekly period. For a live/incomplete week, this becomes today's/latest
+        # raw candle instead of the future Friday/Sunday period label.
+        mapped_points = []
+        for sig_date, sig_val in signals.items():
+            sig_date = pd.Timestamp(sig_date)
+
+            # Determine the weekly bucket using the signal label as period end.
+            # Works for W-FRI labels and default W-SUN labels.
+            bucket_start = sig_date - pd.Timedelta(days=6)
+            bucket_raw = raw.loc[(raw.index >= bucket_start) & (raw.index <= sig_date)]
+
+            # If the weekly label is in the future/current incomplete week, use all raw
+            # data up to the latest available candle in that bucket.
+            if bucket_raw.empty and sig_date > raw.index.max():
+                bucket_raw = raw.loc[raw.index <= raw.index.max()]
+                bucket_raw = bucket_raw.loc[bucket_raw.index >= bucket_start]
+
+            if bucket_raw.empty:
+                # Safe fallback: closest raw candle at or before the signal date.
+                prior_raw = raw.loc[raw.index <= sig_date]
+                if prior_raw.empty:
+                    continue
+                actual_date = prior_raw.index[-1]
+            else:
+                actual_date = bucket_raw.index[-1]
+
+            mapped_points.append((actual_date, float(sig_val)))
+
+        if not mapped_points:
+            exec_signals = signals.reindex(raw.index, method='ffill').fillna(0).clip(0, 1)
+            return raw, exec_signals
+
+        mapped_sig = pd.Series(
+            [v for _, v in mapped_points],
+            index=pd.DatetimeIndex([d for d, _ in mapped_points]),
+            dtype=float
+        )
+        # If multiple weekly labels map to the same latest raw candle, keep the newest value.
+        mapped_sig = mapped_sig.groupby(mapped_sig.index).last().sort_index()
+
+        raw = raw.loc[raw.index >= mapped_sig.index.min()]
+        exec_signals = mapped_sig.reindex(raw.index).ffill().fillna(0).clip(0, 1)
+        return raw, exec_signals
+    except Exception:
+        return prices_model, signals
+
+
+
+
+
 
 
 def make_stateful_position(entry_cond, exit_cond, index):
@@ -5502,7 +5585,7 @@ with tab7:
             with st.spinner("Analyzing model complexity and performance..."):
                 comp_results = []
                 # Setup local data context
-                loc_prices = prices_bt.resample('W').last().dropna() if bt_freq == "Weekly" else prices_bt
+                loc_prices = prices_bt.resample('W-FRI').last().dropna() if bt_freq == "Weekly" else prices_bt
                 loc_returns = loc_prices.pct_change().dropna()
                 if bt_stability > 0:
                     loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
@@ -5566,7 +5649,7 @@ with tab7:
         # Resample if Weekly
         if bt_freq == "Weekly":
             # Resample Prices to Weekly (Last Close)
-            prices_bt_resampled = prices_bt.resample('W').last().dropna()
+            prices_bt_resampled = prices_bt.resample('W-FRI').last().dropna()
         else:
             prices_bt_resampled = prices_bt.dropna()
 
@@ -6763,8 +6846,24 @@ with tab7:
 
     # Run Backtest Engine if signals exist
     if signals is not None:
-        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
+        # For Regime Switching on Weekly frequency, execute on raw daily/live prices while
+        # using the weekly model signal. This gives exact trading dates and fresh OPEN PnL.
+        exec_prices = strat_prices
+        exec_signals = signals
+        try:
+            use_weekly_exec = (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly")
+            exec_prices, exec_signals = prepare_execution_prices_for_regime(
+                strat_prices, signals, prices_bt, use_weekly_execution=use_weekly_exec
+            )
+        except Exception:
+            exec_prices, exec_signals = strat_prices, signals
+
+        bt_results = BacktestEngine.run_strategy(exec_prices, exec_signals, initial_cap, trailing_stop, stop_loss)
         
+        # Use execution series for the signal banner, alerting, metrics, and chart labels.
+        strat_prices = exec_prices
+        signals = exec_signals
+
         # --- STRATEGY SIGNAL BANNER ---
         last_sig = signals.iloc[-1]
         last_dt = signals.index[-1]
