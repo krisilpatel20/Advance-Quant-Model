@@ -5683,8 +5683,8 @@ with tab7:
 
         with st.expander("🧭 Regime WFO Settings", expanded=True):
             wf_c1, wf_c2, wf_c3, wf_c4, wf_c5 = st.columns(5)
-            enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=True, key="bt_regime_enable_wfo")
-            use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=True, key="bt_regime_use_wfo")
+            enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=False, key="bt_regime_enable_wfo")
+            use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=False, key="bt_regime_use_wfo")
             regime_wf_train = wf_c3.number_input("Regime WFO train bars", min_value=30, max_value=1000, value=126, step=21, key="bt_regime_wf_train")
             regime_wf_forward = wf_c4.number_input("Regime WFO forward bars", min_value=5, max_value=252, value=42, step=5, key="bt_regime_wf_forward")
             regime_activity_mode = wf_c5.selectbox("Regime WFO activity", ["Conservative", "Balanced", "Active"], index=1, key="bt_regime_activity_mode", help="Conservative = original Markov behavior. Balanced = Markov plus moderate trend-pulse. Active = faster trend-pulse candidates for more trades.")
@@ -6425,7 +6425,7 @@ with tab7:
             st.caption("Optional final risk overlay for IV Proxy. It keeps the selected IV strategy, but throttles exposure when price trend/volatility risk worsens. Designed to improve Sharpe and reduce max drawdown.")
             gd1, gd2, gd3, gd4 = st.columns(4)
             with gd1:
-                enable_iv_risk_guard = st.checkbox("Enable IV Sharpe/DD Guard", value=True, key="iv_enable_sharpe_dd_guard")
+                enable_iv_risk_guard = st.checkbox("Enable IV Sharpe/DD Guard", value=False, key="iv_enable_sharpe_dd_guard")
             with gd2:
                 iv_guard_mode = st.selectbox("Guard Mode", ["Balanced", "Strict", "Loose"], index=0, key="iv_guard_mode")
             with gd3:
