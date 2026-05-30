@@ -1465,9 +1465,11 @@ def prepare_execution_prices_for_regime(prices_model, signals, raw_prices, use_w
 def map_weekly_trade_log_dates_only(trades_df, raw_prices):
     """
     DISPLAY ONLY for weekly trade logs.
-    Keeps returns/metrics unchanged, but maps weekly Entry/Exit labels to the actual
-    raw trading date inside that week by matching the trade price to the closest raw
-    price in that weekly bucket.
+    Keeps strategy logic/metrics unchanged, but forces displayed Entry/Exit dates
+    AND displayed Buy/Sell prices to come from the raw tradable market Close.
+
+    This prevents impossible trade-log prices caused by smoothed/weekly/model prices
+    being shown as if they were real intraday/daily market fills.
     """
     try:
         if trades_df is None or trades_df.empty:
@@ -1476,21 +1478,30 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
         if raw.empty:
             return trades_df
         raw.index = pd.to_datetime(raw.index)
+        raw = raw.sort_index()
+
+        def _bucket_for_date(dt):
+            d = pd.Timestamp(dt)
+            bucket_start = d - pd.Timedelta(days=6)
+            bucket_end = min(d, raw.index.max())
+            bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= bucket_end)]
+            if bucket.empty and d > raw.index.max():
+                bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= raw.index.max())]
+            if bucket.empty:
+                prior = raw.loc[raw.index <= bucket_end]
+                if not prior.empty:
+                    bucket = prior.tail(1)
+            return bucket
 
         def _map_by_price(dt, target_price=None):
             if pd.isna(dt) or str(dt).lower() == "open":
                 return dt
-            d = pd.Timestamp(dt)
-            bucket_start = d - pd.Timedelta(days=6)
-            bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= d)]
-            if bucket.empty and d > raw.index.max():
-                bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= raw.index.max())]
+            bucket = _bucket_for_date(dt)
             if bucket.empty:
-                prior = raw.loc[raw.index <= min(d, raw.index.max())]
-                return prior.index[-1] if not prior.empty else d
+                return pd.Timestamp(dt)
 
-            # Key fix: do NOT always use the latest/today candle. Use the raw candle
-            # inside that week whose price is closest to the trade's displayed price.
+            # Do NOT always use today's/latest candle. Use the raw candle inside that
+            # weekly bucket whose raw Close is closest to the model trade price.
             try:
                 tp = float(target_price)
                 if np.isfinite(tp) and tp > 0:
@@ -1499,23 +1510,62 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
                 pass
             return bucket.index[-1]
 
+        def _raw_price_at(dt):
+            if pd.isna(dt) or str(dt).lower() == "open":
+                return np.nan
+            d = pd.Timestamp(dt)
+            if d in raw.index:
+                return float(raw.loc[d])
+            prior = raw.loc[raw.index <= min(d, raw.index.max())]
+            if not prior.empty:
+                return float(prior.iloc[-1])
+            return np.nan
+
         out = trades_df.copy()
+
+        mapped_entries = []
         if 'Entry Date' in out.columns:
-            out['Entry Date'] = [
-                _map_by_price(dt, bp) for dt, bp in zip(out['Entry Date'], out.get('Buy Price', pd.Series([np.nan]*len(out))))
-            ]
+            for dt, bp in zip(out['Entry Date'], out.get('Buy Price', pd.Series([np.nan] * len(out), index=out.index))):
+                mapped_entries.append(_map_by_price(dt, bp))
+            out['Entry Date'] = mapped_entries
+
+            # Key fix: displayed Buy Price must be raw tradable Close at displayed Entry Date,
+            # not smoothed/model/weekly price.
+            if 'Buy Price' in out.columns:
+                out['Buy Price'] = [_raw_price_at(dt) if pd.notna(dt) else bp for dt, bp in zip(out['Entry Date'], out['Buy Price'])]
+
         if 'Exit Date' in out.columns:
             mapped_exit = []
-            for dt, sp, status in zip(out['Exit Date'], out.get('Sell Price', pd.Series([np.nan]*len(out))), out.get('Status', pd.Series(['']*len(out)))):
+            for dt, sp, status in zip(out['Exit Date'], out.get('Sell Price', pd.Series([np.nan] * len(out), index=out.index)), out.get('Status', pd.Series([''] * len(out), index=out.index))):
                 if str(status).lower() == 'open' or pd.isna(dt):
                     mapped_exit.append(dt)
                 else:
                     mapped_exit.append(_map_by_price(dt, sp))
             out['Exit Date'] = mapped_exit
+
+            # Key fix: displayed Sell Price for CLOSED trades must be raw tradable Close
+            # at displayed Exit Date. Open trades are refreshed in apply_weekly_live_trigger_display_overrides.
+            if 'Sell Price' in out.columns:
+                new_sell = []
+                for dt, old_sp, status in zip(out['Exit Date'], out['Sell Price'], out.get('Status', pd.Series([''] * len(out), index=out.index))):
+                    if str(status).lower() == 'open' or pd.isna(dt):
+                        new_sell.append(old_sp)
+                    else:
+                        rp = _raw_price_at(dt)
+                        new_sell.append(rp if np.isfinite(rp) else old_sp)
+                out['Sell Price'] = new_sell
+
+        # Recalculate displayed trade PnL from displayed raw tradable prices only.
+        # This is display-only and does not alter the backtest equity curve/metrics.
+        if {'Buy Price', 'Sell Price', 'PnL (%)'}.issubset(out.columns):
+            bp = pd.to_numeric(out['Buy Price'], errors='coerce')
+            sp = pd.to_numeric(out['Sell Price'], errors='coerce')
+            valid = bp.notna() & sp.notna() & (bp > 0)
+            out.loc[valid, 'PnL (%)'] = ((sp[valid] - bp[valid]) / bp[valid]) * 100.0
+
         return out
     except Exception:
         return trades_df
-
 
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
@@ -1564,11 +1614,16 @@ def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, 
                     if bucket.empty and d > raw.index.max():
                         bucket = raw.loc[(raw.index >= bucket_start) & (raw.index <= raw.index.max())]
                     if not bucket.empty:
-                        out.loc[i, "Entry Date"] = (bucket - buy_price).abs().idxmin()
+                        mapped_entry = (bucket - buy_price).abs().idxmin()
+                        out.loc[i, "Entry Date"] = mapped_entry
+                        # Key fix: open-trade Buy Price must be raw tradable Close at the
+                        # displayed trigger date, not smoothed/model/weekly price.
+                        buy_price = float(raw.loc[mapped_entry])
+                        out.loc[i, "Buy Price"] = buy_price
             except Exception:
                 pass
 
-            # Fresh live/open mark-to-market display.
+            # Fresh live/open mark-to-market display using raw latest price and raw entry price.
             if np.isfinite(buy_price) and buy_price > 0:
                 out.loc[i, "Sell Price"] = latest_raw_price
                 out.loc[i, "PnL (%)"] = ((latest_raw_price - buy_price) / buy_price) * 100.0
