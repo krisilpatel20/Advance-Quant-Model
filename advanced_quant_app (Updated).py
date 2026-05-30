@@ -1603,46 +1603,51 @@ def _normalize_market_frame(raw_market):
 
 def _tradable_display_price(row, target_price=None):
     """
-    Choose a realistic displayed fill price from an actual raw market candle/window.
+    Display-only realistic fill price for weekly trade logs.
 
-    Important: do NOT blindly replace with the Close. If the model's trigger price is
-    inside the real High/Low range of the candle/window, keep that price because it
-    was tradable sometime during that candle. If it is outside the real range, clip it
-    to the nearest real traded boundary. This prevents impossible prices while not
-    forcing every fill to the daily close.
+    Rule:
+    - If the model trigger price was actually inside the real OHLC range, keep it.
+    - If it was outside the real OHLC range, DO NOT force the fill to the day's Low/High
+      and DO NOT blindly use the Close. Use a neutral OHLC midpoint instead.
+
+    This avoids fake perfect low/high fills while also avoiding the earlier mistake of
+    replacing every trade with the close.
     """
     try:
         if row is None or (hasattr(row, 'empty') and row.empty):
             return np.nan
         if isinstance(row, pd.DataFrame):
-            lo = float(pd.to_numeric(row['Low'], errors='coerce').min())
-            hi = float(pd.to_numeric(row['High'], errors='coerce').max())
-            open_px = float(pd.to_numeric(row['Open'], errors='coerce').iloc[-1])
-            close = float(pd.to_numeric(row['Close'], errors='coerce').iloc[-1])
+            open_px = float(pd.to_numeric(row['Open'], errors='coerce').iloc[0]) if 'Open' in row.columns else np.nan
+            hi = float(pd.to_numeric(row['High'], errors='coerce').max()) if 'High' in row.columns else np.nan
+            lo = float(pd.to_numeric(row['Low'], errors='coerce').min()) if 'Low' in row.columns else np.nan
+            close = float(pd.to_numeric(row['Close'], errors='coerce').iloc[-1]) if 'Close' in row.columns else np.nan
         else:
-            lo = float(row.get('Low', row.get('Close', np.nan)))
-            hi = float(row.get('High', row.get('Close', np.nan)))
             open_px = float(row.get('Open', row.get('Close', np.nan)))
+            hi = float(row.get('High', row.get('Close', np.nan)))
+            lo = float(row.get('Low', row.get('Close', np.nan)))
             close = float(row.get('Close', np.nan))
-        if not (np.isfinite(lo) and np.isfinite(hi)):
-            return close
+        vals = [v for v in [open_px, hi, lo, close] if np.isfinite(v)]
+        if not vals:
+            try:
+                return float(target_price)
+            except Exception:
+                return np.nan
+        if not np.isfinite(hi):
+            hi = max(vals)
+        if not np.isfinite(lo):
+            lo = min(vals)
         if lo > hi:
             lo, hi = hi, lo
         try:
             tp = float(target_price)
         except Exception:
             tp = np.nan
-        if np.isfinite(tp) and tp > 0:
-            # If the model trigger price was actually touched inside the real candle range,
-            # keep it because it was tradable intraday. If it was NOT touched, do NOT clip
-            # to the day's Low/High because that creates fake perfect fills at extremes.
-            # Use the candle Open as the neutral tradable fallback instead.
-            if lo <= tp <= hi:
-                return float(tp)
-            if np.isfinite(open_px) and open_px > 0:
-                return float(open_px)
-            return close
-        return close
+        if np.isfinite(tp) and tp > 0 and lo <= tp <= hi:
+            return float(tp)
+        # Neutral fallback: inside the real candle range, but not the perfect low/high or always close.
+        midpoint_vals = [v for v in [open_px, hi, lo, close] if np.isfinite(v)]
+        fill = float(np.mean(midpoint_vals))
+        return float(np.clip(fill, lo, hi))
     except Exception:
         try:
             return float(target_price)
@@ -1697,9 +1702,10 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
                     touched = bucket[(lows <= tp) & (tp <= highs)]
                     if not touched.empty:
                         return touched.index[0]
-                    # If the target price was not actually touched, do NOT pick the candle
-                    # closest to the Low/High because that can create misleading low/high fills.
-                    # Keep the original signal-period date by using the latest raw candle in the bucket.
+                    # If the target price was not actually touched in the week,
+                    # do NOT pick a candle because its Low/High is closest. That creates
+                    # misleading perfect-low/perfect-high fills. Keep the signal-period
+                    # candle and let _tradable_display_price use a neutral OHLC midpoint.
                     return bucket.index[-1]
             except Exception:
                 pass
@@ -1809,11 +1815,8 @@ def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, 
                             mapped_entry = touched.index[0]
                             entry_row = touched.iloc[0]
                         else:
-                            # If the trigger price was not touched in the raw candle range,
-                            # do not force the fill to the day's Low/High. Use the latest
-                            # candle in the signal bucket and let _tradable_display_price
-                            # fall back to that candle's Open.
-                            mapped_entry = bucket.index[-1]
+                            dist = np.minimum((lows - buy_price).abs(), (highs - buy_price).abs())
+                            mapped_entry = dist.idxmin() if dist.notna().any() else bucket.index[-1]
                             entry_row = bucket.loc[mapped_entry]
                         out.loc[i, "Entry Date"] = mapped_entry
                         buy_price = _tradable_display_price(entry_row, buy_price)
