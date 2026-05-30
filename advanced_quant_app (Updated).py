@@ -1382,6 +1382,117 @@ class BacktestEngine:
 
 
 
+def make_stateful_position(entry_cond, exit_cond, index):
+    """
+    Converts entry/exit booleans into a 0/1 long-only position series.
+    Entry = 1, Exit = 0, then forward-filled.
+    """
+    pos = pd.Series(np.nan, index=index, dtype=float)
+    entry_cond = pd.Series(entry_cond, index=index).fillna(False)
+    exit_cond = pd.Series(exit_cond, index=index).fillna(False)
+    pos.loc[entry_cond] = 1.0
+    pos.loc[exit_cond] = 0.0
+    return pos.ffill().fillna(0.0).clip(lower=0, upper=1)
+
+
+def enforce_min_hold_period(raw_signal, min_hold=1):
+    """
+    Applies a minimum hold period to a 0/1 signal so the strategy does not flip too quickly.
+    This makes the Regime Switching Period method materially different from a simple probability rule.
+    """
+    raw_signal = pd.Series(raw_signal).fillna(0).astype(float).clip(0, 1)
+    min_hold = max(1, int(min_hold))
+    out = []
+    position = 0.0
+    bars_held = min_hold
+    for desired in raw_signal.values:
+        desired = 1.0 if desired > 0 else 0.0
+        if desired != position and bars_held >= min_hold:
+            position = desired
+            bars_held = 1
+        else:
+            bars_held += 1
+        out.append(position)
+    return pd.Series(out, index=raw_signal.index, dtype=float)
+
+
+def get_price_trend_override(prices_index, model_index, strat_prices):
+    """
+    Causal price trend override.
+    Stays long when price structure is clearly bullish regardless of regime uncertainty.
+    """
+    try:
+        px = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
+        ema20 = px.ewm(span=20, adjust=False).mean()
+        ema50 = px.ewm(span=50, adjust=False).mean()
+        ema200 = px.ewm(span=200, adjust=False).mean()
+        mom_20 = px.pct_change(20).fillna(0)
+        mom_60 = px.pct_change(60).fillna(0)
+
+        strong_trend = (
+            (px > ema20) &
+            (ema20 > ema50) &
+            (ema50 > ema200) &
+            (mom_20 > 0.02) &
+            (mom_60 > 0.05)
+        ).astype(float)
+
+        return strong_trend.reindex(prices_index).ffill().fillna(0)
+    except Exception:
+        return pd.Series(0.0, index=prices_index)
+
+
+def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes, signal_method, conviction=0.65, min_hold=1):
+    """
+    Converts Markov filtered probabilities into a tradable long/cash signal.
+    Uses filtered probabilities only, so it is causal for closed bars.
+    """
+    probs_df = res_model.filtered_marginal_probabilities.copy()
+    probs_df.index = model_index
+
+    regime_means = []
+    for i in range(n_regimes):
+        if f'const[{i}]' in res_model.params:
+            mean_val = res_model.params[f'const[{i}]']
+        else:
+            mean_val = res_model.params.get('const', 0.0)
+        regime_means.append((i, float(mean_val)))
+    bull_regime_idx = sorted(regime_means, key=lambda x: x[1], reverse=True)[0][0]
+
+    bull_probs = probs_df.iloc[:, bull_regime_idx]
+    dominant_regime = probs_df.idxmax(axis=1)
+
+    if signal_method == "Regime Weighted Expected Return":
+        expected_ret = pd.Series(0.0, index=model_index)
+        for i in range(n_regimes):
+            if f'const[{i}]' in res_model.params:
+                mean_val = float(res_model.params[f'const[{i}]'])
+            else:
+                mean_val = float(res_model.params.get('const', 0.0))
+            expected_ret += probs_df.iloc[:, i] * mean_val
+        soft_conviction = float(conviction) * 0.70
+        trend_participating = (
+            (expected_ret > 0) & (bull_probs > soft_conviction)
+        ) | (
+            (bull_probs > float(conviction))
+        )
+        raw_signal = trend_participating.astype(float)
+        context = {"expected_ret": expected_ret, "bull_probs": bull_probs, "dominant_regime": dominant_regime, "bull_regime_idx": bull_regime_idx}
+
+    elif signal_method == "Regime Probability":
+        raw_signal = (bull_probs > float(conviction)).astype(float)
+        context = {"bull_probs": bull_probs, "dominant_regime": dominant_regime, "bull_regime_idx": bull_regime_idx}
+
+    else:  # Regime Switching Period
+        raw_signal = ((dominant_regime == bull_regime_idx) & (bull_probs > float(conviction))).astype(float)
+        raw_signal = enforce_min_hold_period(raw_signal, min_hold=min_hold)
+        context = {"bull_probs": bull_probs, "dominant_regime": dominant_regime, "bull_regime_idx": bull_regime_idx}
+
+    signal = raw_signal.reindex(prices_index).ffill().fillna(0).clip(0, 1)
+    return signal, context
+
+
+
 def prepare_execution_prices_for_regime(prices_model, signals, raw_prices, use_weekly_execution=False):
     """
     For weekly regime signals, keep the weekly model decision, but move each weekly
