@@ -62,7 +62,7 @@ GARCH/EGARCH | Regime Switching (Filtered) | Jump Diffusion | Heston Stochastic 
 """)
 
 if not ARCH_AVAILABLE:
-    st.error("â ï¸ The 'arch' library is not installed. GARCH/EGARCH modules will be limited. Run `pip install arch`.")
+    st.error("⚠️ The 'arch' library is not installed. GARCH/EGARCH modules will be limited. Run `pip install arch`.")
 
 # ==========================================
 # 2. HELPER CLASSES & FUNCTIONS
@@ -333,7 +333,7 @@ def merton_jump_diffusion(S0, T, r, sigma, lam, mu_j, sigma_j, steps, paths):
     
     # Drift correction for jumps so it remains risk-neutral
     # Drift correction for jumps so it remains risk-neutral
-    # drift = r - 0.5 * sigma**2 - lam * (exp(mu_j + 0.5*sigma_jÂ²) - 1)
+    # drift = r - 0.5 * sigma**2 - lam * (exp(mu_j + 0.5*sigma_j²) - 1)
     drift = r - 0.5 * sigma**2 - lam * (np.exp(mu_j + 0.5 * sigma_j**2) - 1)
     
     for t in range(1, steps + 1):
@@ -1109,7 +1109,7 @@ def get_iv_metrics(ticker: str) -> dict | None:
             signals.append(("Bullish Call Skew", "green", f"Skew={skew:.1f}% (calls premium over puts)"))
         elif skew > 5.0:
             score -= 1.0
-            signals.append(("Bearish Put Skew", "red", f"Skew={skew:.1f}% (puts heavily bid â hedging)"))
+            signals.append(("Bearish Put Skew", "red", f"Skew={skew:.1f}% (puts heavily bid — hedging)"))
         if pc_ratio < 0.6 and current_atm_iv > hv_30:
             score += 2.0
             signals.append(("Call Buying Dominance", "green", f"P/C={pc_ratio:.2f} (call-heavy), IV > HV"))
@@ -1118,10 +1118,10 @@ def get_iv_metrics(ticker: str) -> dict | None:
             signals.append(("IV Crush Setup", "orange", f"IVR={iv_rank:.0f} (elevated), IV/HV={iv_hv_ratio:.2f}"))
         if term_structure_slope > 1.0:
             score += 1.0
-            signals.append(("Contango IV Structure", "green", f"NearâFar slope: +{term_structure_slope:.1f}%"))
+            signals.append(("Contango IV Structure", "green", f"Near→Far slope: +{term_structure_slope:.1f}%"))
         elif term_structure_slope < -3.0:
             score -= 1.0
-            signals.append(("Backwardation IV Structure", "orange", f"NearâFar slope: {term_structure_slope:.1f}% (event risk near)"))
+            signals.append(("Backwardation IV Structure", "orange", f"Near→Far slope: {term_structure_slope:.1f}% (event risk near)"))
         if pc_oi_ratio < 0.5:
             score += 1.0
             signals.append(("Heavy Call OI", "green", f"P/C OI={pc_oi_ratio:.2f} (call-heavy positioning)"))
@@ -3014,13 +3014,13 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
     """
     prices = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
 
-    st.write(f"#### ð {title}: Adaptive Rule Optimizer")
+    st.write(f"#### 🚀 {title}: Adaptive Rule Optimizer")
     st.caption(
         "Walk-forward mode trains on past data, chooses the best rule, then tests it on the next unseen window. "
         "This is more realistic than picking the best rule from the full chart."
     )
 
-    with st.expander(f"âï¸ {title} Walk-Forward Settings", expanded=True):
+    with st.expander(f"⚙️ {title} Walk-Forward Settings", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
         enable_wfo = c1.checkbox(f"Enable {title} WFO", value=True, key=f"{file_prefix}_enable_wfo")
         use_wfo_primary = c2.checkbox(f"Use WFO as main result", value=True, key=f"{file_prefix}_use_wfo_primary")
@@ -3077,7 +3077,7 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
             confirmed_bar=confirmed_bar
         )
 
-        st.write(f"#### ð§­ {title} Walk-Forward Result")
+        st.write(f"#### 🧭 {title} Walk-Forward Result")
         if wf_result is None or wf_result.get('overall') is None:
             st.warning(f"Not enough data to run {title} walk-forward validation. Falling back to full-history adaptive winner.")
         else:
@@ -3104,7 +3104,7 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
                     wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
                 st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
                 st.download_button(
-                    f"ð¥ Download {title} WFO Periods",
+                    f"📥 Download {title} WFO Periods",
                     wf_rows.to_csv(index=False),
                     file_name=f"{file_prefix}_WalkForward_Periods_{TICKER}.csv",
                     mime="text/csv",
@@ -3112,7 +3112,7 @@ def display_adaptive_strategy_lab(title, prices, candidates, initial_capital=100
                 )
 
     if show_insample:
-        st.write(f"#### ð {title} Full-History Ranking / Research Reference")
+        st.write(f"#### 📌 {title} Full-History Ranking / Research Reference")
         st.caption("This ranking uses the whole selected chart. It is useful for research, but it can overfit more than WFO.")
         st.dataframe(rank_df, use_container_width=True)
 
@@ -3170,7 +3170,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         if not trades_df.empty and 'Entry Date' in trades_df.columns:
             trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
 
-        st.write(f"#### ð {title}: Strategy vs Buy & Hold")
+        st.write(f"#### 📊 {title}: Strategy vs Buy & Hold")
         if full_period_prices is not None and pd.notna(full_benchmark_pct):
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
@@ -3200,7 +3200,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         )
         st.plotly_chart(fig_perf, use_container_width=True)
 
-        st.write(f"#### ð {title} Trade Log")
+        st.write(f"#### 📝 {title} Trade Log")
         if not trades_df.empty:
             trades_df['Entry Date'] = pd.to_datetime(trades_df['Entry Date']).dt.date
             trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).apply(lambda x: x.date() if pd.notnull(x) else "Open")
@@ -3211,7 +3211,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
                 "Cumulative Return (%)": "{:.2f}"
             }), use_container_width=True)
             st.download_button(
-                f"ð¥ Download {title} Trade Log",
+                f"📥 Download {title} Trade Log",
                 trades_df.to_csv(index=False),
                 file_name=f"{file_prefix}_TradeLog_{TICKER}.csv",
                 mime="text/csv"
@@ -3810,7 +3810,7 @@ This is a model alert, not financial advice. Confirm price/liquidity before trad
             state["last_alert_message"] = subject
             state["last_alert_time"] = datetime.now().isoformat()
             _save_alert_state(state)
-            st.toast(f"ð {msg}")
+            st.toast(f"🔔 {msg}")
         else:
             st.warning(msg)
     except Exception as e:
@@ -3918,7 +3918,7 @@ def get_total_us_stocks():
         except:
             continue
 
-    st.warning("â ï¸ Total Market Connection Issue. Using expanded internal mid-cap universe (Top 500).")
+    st.warning("⚠️ Total Market Connection Issue. Using expanded internal mid-cap universe (Top 500).")
     # Massive internal fallback
     return get_sp500_tickers() + ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "SQ", "PYPL", "COIN", "MARA", "RIOT"]
 
@@ -3934,7 +3934,7 @@ def get_total_us_etfs():
     except:
         pass
     
-    st.warning("â ï¸ ETF Universe Connection Issue. Using expanded fallback list.")
+    st.warning("⚠️ ETF Universe Connection Issue. Using expanded fallback list.")
     return get_etf_universe()
 
 
@@ -4365,7 +4365,7 @@ with st.sidebar:
     ])
     
     if market_region == "Indian Market (INR)":
-        CURRENCY = "â¹"
+        CURRENCY = "₹"
         BENCHMARK = "^NSEI"
         DEFAULT_RF = 7.0
         SUFFIX = ".NS"
@@ -4394,7 +4394,7 @@ with st.sidebar:
     st.caption(f"Active Ticker: {TICKER}")
     
     # DEBUG: Temporary visualization to prove logic
-    with st.expander("ð ï¸ Debug Info (Remove Later)", expanded=True):
+    with st.expander("🛠️ Debug Info (Remove Later)", expanded=True):
         st.write(f"Region: {market_region}")
         st.code(f"SUFFIX = '{SUFFIX}'")
         st.code(f"Raw Ticker = '{raw_ticker}'")
@@ -4408,7 +4408,7 @@ with st.sidebar:
     st.info(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
 
     st.divider()
-    st.header("ð¬ Model Configuration")
+    st.header("🔬 Model Configuration")
     regime_mode = st.selectbox("Regime Detection Mode", 
                                ["Fixed: 4 States (Inst.)", 
                                 "Fixed: 2 States (Bull/Bear)", 
@@ -4426,7 +4426,7 @@ with st.sidebar:
     }
     regime_param = regime_val_map[regime_mode]
 
-    with st.expander("ð ï¸ Advanced Model Sync", expanded=False):
+    with st.expander("🛠️ Advanced Model Sync", expanded=False):
         reg_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=0)
         reg_engine_param = "Markov" if "Markov" in reg_engine else "GMM"
         reg_stability = st.slider("Signal Stability (Smoothing)", 0, 10, 4)
@@ -4442,19 +4442,19 @@ with st.sidebar:
         stop_loss = st.slider("Hard Stop Loss (%)", 0.0, 30.0, 8.0, step=0.5) / 100 if use_stop_loss else 0.0
 
     st.divider()
-    st.header("â¡ Live Decision Mode")
+    st.header("⚡ Live Decision Mode")
     live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
     if live_mode:
         data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
         st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
-        if st.button("ð Refresh Live Data", use_container_width=True):
+        if st.button("🔄 Refresh Live Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
     else:
         data_interval = '1d'
 
     st.divider()
-    st.header("ð Live Buy/Sell Alerts")
+    st.header("🔔 Live Buy/Sell Alerts")
     alert_enabled = st.toggle(
         "Enable live signal alerts",
         value=False,
@@ -4498,7 +4498,7 @@ with st.sidebar:
 
     st.subheader("Report Export")
     if not EXPORT_AVAILABLE:
-        st.error("ð¥ Export libraries missing.")
+        st.error("📥 Export libraries missing.")
         st.info("To enable PDF/Excel exports, add `fpdf2` and `xlsxwriter` to your `requirements.txt` or run: `pip install fpdf2 xlsxwriter`")
     else:
         if 'report_gen' not in st.session_state:
@@ -4521,7 +4521,7 @@ with st.sidebar:
                         pdf_bytes = bytes(raw_pdf)
                         
                     st.download_button(
-                        label="ð¥ PDF Report",
+                        label="📥 PDF Report",
                         data=pdf_bytes,
                         file_name=f"Quant_Report_{TICKER}.pdf",
                         mime="application/pdf",
@@ -4535,7 +4535,7 @@ with st.sidebar:
                 try:
                     excel_bytes = st.session_state.report_gen.generate_excel()
                     st.download_button(
-                        label="ð¥ Excel Data",
+                        label="📥 Excel Data",
                         data=excel_bytes,
                         file_name=f"Quant_Data_{TICKER}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -4564,7 +4564,7 @@ st.subheader("Asset & Macro Analysis Suite")
 # 5. UNIFIED TAB ARCHITECTURE
 # ==========================================
 tabs = st.tabs([
-    "ð¡ Decision Summary",
+    "💡 Decision Summary",
     "Volatility (GARCH)", 
     "Regime Switching", 
     "Stochastic (Heston/Jump)", 
@@ -4575,15 +4575,15 @@ tabs = st.tabs([
     "Volatility Clustering",
     "Advanced Regime",
     "SML & Alpha",
-    "ð¡ Multi-Asset Scan",
-    "ð¦ FED Balance Sheet",
-    "ð² Options IV Surface",
-    "ð² Hurst Exponent",
-    "ð¥ Hot 10 (Daily)",
-    "ð¯ Institutional IV Scanner",
-    "ð CVD & Volume Delta",
-    "ð Institutional VWAP",
-    "ð¬ Time Series Analysis"
+    "📡 Multi-Asset Scan",
+    "🏦 FED Balance Sheet",
+    "🎲 Options IV Surface",
+    "🎲 Hurst Exponent",
+    "🔥 Hot 10 (Daily)",
+    "🎯 Institutional IV Scanner",
+    "📊 CVD & Volume Delta",
+    "📈 Institutional VWAP",
+    "🔬 Time Series Analysis"
 ])
 
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19 = tabs
@@ -4597,7 +4597,7 @@ if df_main is not None:
     # ==========================================
     with st.sidebar:
         st.divider()
-        st.caption("ð Processing Model Signals...")
+        st.caption("🔍 Processing Model Signals...")
         prog_bar = st.progress(0)
     
     analysis = get_master_signal(TICKER, df_main, 
@@ -4652,10 +4652,10 @@ else:
 # ==========================================
 with tab0:
     if df_main is None:
-        st.info("ð¡ **Welcome to the Quant Suite**. Currently, no ticker is loaded. Enter a ticker in the sidebar and enable 'Load Data' to begin technical and statistical analysis.")
-        st.write("Meanwhile, you can explore the **ð¦ FED Balance Sheet** tab for macroeconomic context.")
+        st.info("💡 **Welcome to the Quant Suite**. Currently, no ticker is loaded. Enter a ticker in the sidebar and enable 'Load Data' to begin technical and statistical analysis.")
+        st.write("Meanwhile, you can explore the **🏦 FED Balance Sheet** tab for macroeconomic context.")
     else:
-        st.write("### ð§  Executive Decision Dashboard")
+        st.write("### 🧠 Executive Decision Dashboard")
     st.markdown(f"**Unified Quant Signal for {TICKER}** | Interval: `{data_interval}` | Mode: {'Live' if live_mode else 'Historical'}")
     
     # 2. DASHBOARD DISPLAY
@@ -4690,24 +4690,24 @@ with tab0:
         st.write("#### Master Quant Score")
         # Score range approx -5 to +4
         if sentiment_score >= 2: 
-            st.header(f"ð¢ BULLISH ({sentiment_score})")
-            st.button("ð EXECUTE BUY", use_container_width=True, type="primary")
+            st.header(f"🟢 BULLISH ({sentiment_score})")
+            st.button("🚀 EXECUTE BUY", use_container_width=True, type="primary")
         elif sentiment_score <= -2:
-            st.header(f"ð´ BEARISH ({sentiment_score})")
-            st.button("â ï¸ EXECUTE SELL/HEDGE", use_container_width=True, type="primary")
+            st.header(f"🔴 BEARISH ({sentiment_score})")
+            st.button("⚠️ EXECUTE SELL/HEDGE", use_container_width=True, type="primary")
         else:
-            st.header(f"ð¡ NEUTRAL ({sentiment_score})")
-            st.button("âï¸ MAINTAIN NEUTRAL", use_container_width=True)
+            st.header(f"🟡 NEUTRAL ({sentiment_score})")
+            st.button("⚖️ MAINTAIN NEUTRAL", use_container_width=True)
             
     with m_col2:
         st.write("#### Risk Alerts")
         if jump_detected:
-            st.error("ð¨ **FAT TAIL RISK**: Significant price jumps detected. Stochastic models (Heston/Jump) recommended for testing tail risk.")
+            st.error("🚨 **FAT TAIL RISK**: Significant price jumps detected. Stochastic models (Heston/Jump) recommended for testing tail risk.")
         else:
-            st.success("â **SMOOTH DYNAMICS**: No significant jumps. Gaussian models are stable.")
+            st.success("✅ **SMOOTH DYNAMICS**: No significant jumps. Gaussian models are stable.")
         
         if vol_state == "HIGH":
-            st.warning("â ï¸ **VOL CLUSTERING**: Recent shocks are likely to trigger further volatility. See Hawkes tab.")
+            st.warning("⚠️ **VOL CLUSTERING**: Recent shocks are likely to trigger further volatility. See Hawkes tab.")
         
         # Recommendation
         st.info(f"**Recommendation**: {regime_sig}. Target Exposure: {min(1.0, 0.5 + 0.1*sentiment_score):.0%} of risk parity weight.")
@@ -4722,20 +4722,20 @@ with tab1:
     if df_main is None:
         st.warning("Please load a ticker to view Volatility models.")
     else:
-        st.write("### ð Advanced Volatility Analysis")
+        st.write("### 📉 Advanced Volatility Analysis")
     # --- MODEL VERDICT BANNER ---
     if res_sum is not None:
         latest_vol = res_sum.conditional_volatility.iloc[-1]
         vol_msg = f"Volatility is currently **{vol_state}** ({latest_vol:.2f}% daily)."
-        if vol_state == "HIGH": st.error(f"ð¯ **MODEL VERDICT**: {vol_msg} Defensive sizing recommended.")
-        else: st.success(f"ð¯ **MODEL VERDICT**: {vol_msg} Risk environment is stable.")
+        if vol_state == "HIGH": st.error(f"🎯 **MODEL VERDICT**: {vol_msg} Defensive sizing recommended.")
+        else: st.success(f"🎯 **MODEL VERDICT**: {vol_msg} Risk environment is stable.")
     
     if ARCH_AVAILABLE and df_main is not None:
         returns_pct = df_main['Returns'] * 100 # Rescale for better optimization
         
         # 1. CONFIGURATION
         # ---------------------------
-        with st.expander("âï¸ Model Configuration", expanded=True):
+        with st.expander("⚙️ Model Configuration", expanded=True):
             c_mdl1, c_mdl2, c_mdl3 = st.columns(3)
             with c_mdl1:
                 vol_model_type = st.selectbox("Volatility Model", ["GARCH", "GJR-GARCH", "EGARCH"])
@@ -4801,7 +4801,7 @@ with tab1:
                     gamma_val = res.params['gamma[1]']
                     st.metric("Leverage (Gamma)", f"{gamma_val:.4f}")
                     if gamma_val > 0.05:
-                        st.success("â Leverage Effect Confirmed: Market drops increase volatility more than rises.")
+                        st.success("✅ Leverage Effect Confirmed: Market drops increase volatility more than rises.")
                     elif gamma_val < -0.05:
                         st.info("Inverse Leverage Structure.")
                     else:
@@ -4813,7 +4813,7 @@ with tab1:
 
             # 3. DIAGNOSTICS & FORECASTING
             # ---------------------------
-            tab_diag, tab_cast, tab_risk = st.tabs(["ð Diagnostics", "ð® Forecasting", "ð¡ï¸ Risk Management"])
+            tab_diag, tab_cast, tab_risk = st.tabs(["🔍 Diagnostics", "🔮 Forecasting", "🛡️ Risk Management"])
             
             # --- A. DIAGNOSTICS ---
             with tab_diag:
@@ -4960,7 +4960,7 @@ with tab1:
             st.info("Try a different distribution or simpler model (GARCH).")
             
     else:
-        st.warning("â ï¸ 'arch' library not found. Please run `pip install arch`.")
+        st.warning("⚠️ 'arch' library not found. Please run `pip install arch`.")
 
 # ==========================================
 # TAB 2: REGIME SWITCHING
@@ -4971,9 +4971,9 @@ with tab2:
     else:
         st.write("### Markov Regime Switching Model")
     # --- MODEL VERDICT BANNER ---
-    if "LONG" in regime_sig: st.success(f"ð¯ **MODEL VERDICT**: Confirmed **{regime_sig}** in {regime_data['label']}. High conviction for bullish exposure.")
-    elif "SHORT" in regime_sig: st.error(f"ð¯ **MODEL VERDICT**: Confirmed **{regime_sig}**. Market risk is elevated.")
-    else: st.info(f"ð¯ **MODEL VERDICT**: {regime_sig}. Await confirmation of a clear regime shift.")
+    if "LONG" in regime_sig: st.success(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}** in {regime_data['label']}. High conviction for bullish exposure.")
+    elif "SHORT" in regime_sig: st.error(f"🎯 **MODEL VERDICT**: Confirmed **{regime_sig}**. Market risk is elevated.")
+    else: st.info(f"🎯 **MODEL VERDICT**: {regime_sig}. Await confirmation of a clear regime shift.")
 
     st.markdown("""
     Identifies hidden market states (e.g., Bull vs Bear) from return dynamics.  
@@ -5013,13 +5013,13 @@ with tab2:
     # ===== PRE-FLIGHT CHECKS =====
     warnings = []
     if lookback_years <= 1:
-        warnings.append("â ï¸ Very short history - consider 3+ years for stable regimes")
+        warnings.append("⚠️ Very short history - consider 3+ years for stable regimes")
         if regime_freq == "Weekly":
-            warnings.append("â Cannot use Weekly with <1 year. Switch to Daily.")
+            warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
             regime_freq = "Daily"
     
     if regime_freq == "Daily" and switch_trend and lookback_years < 3:
-        warnings.append("â ï¸ Daily + Switching Trend needs 3+ years. Disabling...")
+        warnings.append("⚠️ Daily + Switching Trend needs 3+ years. Disabling...")
         switch_trend = False
     
     if warnings:
@@ -5043,7 +5043,7 @@ with tab2:
     # Apply Pre-Smoothing (EWMA) if requested
     if stability > 0:
         returns = returns.ewm(span=stability, adjust=False).mean()
-        st.caption(f"â¹ï¸ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
+        st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
     
     # FIX: Ensure data is strictly 1D Series with Float dtype
     try:
@@ -5083,7 +5083,7 @@ with tab2:
         
     # ===== CONVERGENCE CHECKS =====
     if not res_markov.mle_retvals['converged']:
-        st.error("â Model did not converge. Try longer history or simpler model.")
+        st.error("⛔ Model did not converge. Try longer history or simpler model.")
         st.stop()
     
     trans_matrix = np.squeeze(res_markov.regime_transition)
@@ -5094,7 +5094,7 @@ with tab2:
     
     # Check for degenerate regimes
     if np.any(trans_matrix > 0.99):
-        st.warning("â ï¸ Near-permanent regimes detected - consider fewer regimes")
+        st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
     
     # ===== REGIME CHARACTERIZATION =====
     regime_stats = []
@@ -5122,10 +5122,10 @@ with tab2:
     regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
     
     # ===== DISPLAY REGIMES =====
-    st.write("### ð Identified Regimes")
+    st.write("### 📊 Identified Regimes")
     
     cols = st.columns(n_regimes)
-    labels = ['ð¢ Bull', 'ð¡ Normal', 'ð´ Bear', 'â« Crisis']
+    labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
     
     for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
         with col:
@@ -5163,7 +5163,7 @@ with tab2:
             st.subheader(f"{regime_label}")
             st.success(f"High Conviction ({current_prob:.1%})")
         else:
-            st.subheader("âª Mixed / Uncertain")
+            st.subheader("⚪ Mixed / Uncertain")
             st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
     
     with c_dash2:
@@ -5186,7 +5186,7 @@ with tab2:
     st.divider()
     
     # ===== VISUALIZATION =====
-    st.write("### ð Regime Analysis (Real-time / Filtered)")
+    st.write("### 📈 Regime Analysis (Real-time / Filtered)")
     
     fig_m = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
                           subplot_titles=("Returns", "Regime Probabilities (Filtered/Real-time)", "Regime-Weighted Expected Return"))
@@ -5242,7 +5242,7 @@ with tab2:
     st.session_state.report_gen.add_plot("Regime Switching Analysis", fig_m)
     
     # ===== PARAMETERS TABLE =====
-    with st.expander("ð Technical Parameters"):
+    with st.expander("📋 Technical Parameters"):
         summary_data = {
             "Parameter": res_markov.params.index,
             "Value": res_markov.params.values.astype(float),
@@ -5552,9 +5552,9 @@ with tab4:
     else:
         st.write("### Kalman Filter Analysis")
     # --- MODEL VERDICT BANNER ---
-    if trend_diff > 0.03: st.success(f"ð¯ **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend. Structural uptrend intact.")
-    elif trend_diff < -0.03: st.error(f"ð¯ **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend. Structural breakdown in progress.")
-    else: st.info(f"ð¯ **MODEL VERDICT**: Price is trading within **{abs(trend_diff):.1%}** of the Kalman Trend (Neutral/Consolidation).")
+    if trend_diff > 0.03: st.success(f"🎯 **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend. Structural uptrend intact.")
+    elif trend_diff < -0.03: st.error(f"🎯 **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend. Structural breakdown in progress.")
+    else: st.info(f"🎯 **MODEL VERDICT**: Price is trading within **{abs(trend_diff):.1%}** of the Kalman Trend (Neutral/Consolidation).")
 
     
     kf_mode = st.radio("Analysis Mode", ["Pairs Trading (Relative Value)", "Single Asset (Trend)"])
@@ -5754,7 +5754,7 @@ with tab7:
     if df_main is None:
         st.warning("Please load a ticker to run Backtests.")
     else:
-        st.write("### ð ï¸ Strategy Backtest")
+        st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
     strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
@@ -5820,7 +5820,7 @@ with tab7:
         with col_sig3:
             confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
 
-        with st.expander("ð§­ Regime WFO Settings", expanded=True):
+        with st.expander("🧭 Regime WFO Settings", expanded=True):
             wf_c1, wf_c2, wf_c3, wf_c4, wf_c5 = st.columns(5)
             enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=False, key="bt_regime_enable_wfo")
             use_regime_wfo = wf_c2.checkbox("Use WFO as main result", value=False, key="bt_regime_use_wfo")
@@ -5841,9 +5841,9 @@ with tab7:
             st.markdown("**Strategy:** Long when Bull Regime is dominant and above conviction, then hold for at least the minimum hold period before switching.")
 
         # --- MODEL FITNESS INFO ---
-        st.info("ð¡ **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'Compare Fitness' button below to find the best fit.")
+        st.info("💡 **Pro Tip**: Blue-chips often favor **2 states** (Bull/Bear). High-beta tech often favors **3 states** (Bull/Bear/Consolidation). Use the 'Compare Fitness' button below to find the best fit.")
 
-        if st.button("ð Compare Regime Fitness (N=2,3,4)", use_container_width=True):
+        if st.button("📊 Compare Regime Fitness (N=2,3,4)", use_container_width=True):
             with st.spinner("Analyzing model complexity and performance..."):
                 comp_results = []
                 # Setup local data context
@@ -5900,12 +5900,12 @@ with tab7:
                     
                     c_fit, c_perf = st.columns(2)
                     with c_fit:
-                        st.success(f"âï¸ **Robustness**: {best_bic} Regimes (Best BIC)")
+                        st.success(f"⚖️ **Robustness**: {best_bic} Regimes (Best BIC)")
                     with c_perf:
-                        st.success(f"ð **Performance**: {best_pnl} Regimes (Best PnL)")
+                        st.success(f"🚀 **Performance**: {best_pnl} Regimes (Best PnL)")
                     
                     if best_bic != best_pnl:
-                        st.warning(f"â ï¸ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest returnâit often leads to overfitting!")
+                        st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
 
 
         # Resample if Weekly
@@ -5919,7 +5919,7 @@ with tab7:
         # This fixes the old mismatch where model data was smoothed but execution prices were raw.
         if bt_stability > 0:
             prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
-            st.caption(f"â¹ï¸ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
+            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
         else:
             prices_bt_model = prices_bt_resampled.copy()
 
@@ -5935,12 +5935,12 @@ with tab7:
             )
         
         if len(model_data_bt) < 10:
-             st.error(f"â **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
+             st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
              st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
              if live_mode and bt_freq == "Weekly":
-                 st.warning("ð¡ **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
+                 st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
              elif not live_mode:
-                 st.warning("ð¡ **Hint**: Try increasing your backtest date range in the sidebar.")
+                 st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
         else:
             with st.spinner("Fitting Regime Model..."):
                 # Fit Model
@@ -6003,7 +6003,7 @@ with tab7:
                                 return_booster_mode=str(regime_return_booster_mode)
                             )
 
-                        st.write("#### ð§­ Regime Walk-Forward Result")
+                        st.write("#### 🧭 Regime Walk-Forward Result")
                         if wf_regime is None or wf_regime.get("overall") is None:
                             st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
                             using_wfo_primary_for_metrics = False
@@ -6012,7 +6012,7 @@ with tab7:
                             eff_train = wf_regime.get("effective_train_window", regime_wf_train)
                             eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
                             if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
-                                st.caption(f"â¹ï¸ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
+                                st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
                             full_bh = buy_hold_return_pct(strat_prices)
                             wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
                             wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
@@ -6059,7 +6059,7 @@ with tab7:
                                     full_period_benchmark_pct_for_metrics = full_bh
                                     using_wfo_primary_for_metrics = True
                                     try:
-                                        st.caption(f"â¹ï¸ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
+                                        st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
                                     except Exception:
                                         pass
                                 else:
@@ -6105,13 +6105,13 @@ with tab7:
                                             changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
                                             if changed_bars == 0:
                                                 signals = booster_full
-                                                st.caption("â¹ï¸ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
+                                                st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
                                             else:
-                                                st.caption(f"â¹ï¸ Return booster changed {changed_bars} bars in the final backtest signal.")
+                                                st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
 
                                         signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
                                         try:
-                                            st.caption(f"â¹ï¸ Return booster final average exposure: {signals.mean()*100:.1f}%")
+                                            st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
                                         except Exception:
                                             pass
                                     except Exception as e:
@@ -6140,7 +6140,7 @@ with tab7:
                         st.plotly_chart(fig_ctx, use_container_width=True)
 
                     # Debug Dataframe
-                    with st.expander("ð Debug: Signal Details"):
+                    with st.expander("🔍 Debug: Signal Details"):
                         debug_df = pd.DataFrame({
                             "Price": strat_prices,
                             "Signal": signals
@@ -6241,7 +6241,7 @@ with tab7:
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "MAD Trend Modes":
-        st.markdown("### ð MAD Trend Modes Settings")
+        st.markdown("### 📊 MAD Trend Modes Settings")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             sig_mode = st.selectbox("Signal Mode", ["Bollinger Bands", "For Loop", "Combined Signal"])
@@ -6305,7 +6305,7 @@ with tab7:
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Dual MA Cross":
-        st.markdown("### ð Dual Moving Average Cross Settings")
+        st.markdown("### 🔀 Dual Moving Average Cross Settings")
         ma_options = ["SMA", "EMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"]
         
         c_ma1, c_ma2 = st.columns(2)
@@ -6352,7 +6352,7 @@ with tab7:
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Ehlers SuperSmoother":
-        st.markdown("### ð Ehlers SuperSmoother Settings")
+        st.markdown("### 🌊 Ehlers SuperSmoother Settings")
         st.markdown("Filters high frequency noise to create a zero-lag trendline.")
         
         ss_period = st.slider("SuperSmoother Period", 5, 252, 15)
@@ -6375,7 +6375,7 @@ with tab7:
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Ehlers Simple Decycler":
-        st.markdown("### ð§² Ehlers Simple Decycler Settings")
+        st.markdown("### 🧲 Ehlers Simple Decycler Settings")
         st.markdown("Isolates the underlying low-frequency trend by removing market cycles.")
         
         dec_period = st.slider("Decycler High-Pass Period", 20, 252, 60)
@@ -6398,7 +6398,7 @@ with tab7:
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Institutional Mean Reversion (Z-Score)":
-        st.markdown("### ð Institutional Mean Reversion (Z-Score) Settings")
+        st.markdown("### 📉 Institutional Mean Reversion (Z-Score) Settings")
         st.markdown("Statistical arbitrage approach: Buy when asset is significantly oversold relative to its rolling mean, and exit when it reverts.")
         
         col_mr1, col_mr2, col_mr3 = st.columns(3)
@@ -6440,8 +6440,8 @@ with tab7:
                 # Top Chart: Price and Bands
                 fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
                 fig_ctx.add_trace(go.Scatter(x=mr_ma.index, y=mr_ma, mode='lines', line=dict(color='blue', dash='dash'), name=f'Mean ({mr_lookback})'), row=1, col=1)
-                fig_ctx.add_trace(go.Scatter(x=lower_band.index, y=lower_band, mode='lines', line=dict(color='green', width=1), opacity=0.5, name=f'Entry Band (-{mr_entry_z}Ï)'), row=1, col=1)
-                fig_ctx.add_trace(go.Scatter(x=exit_band.index, y=exit_band, mode='lines', line=dict(color='yellow', width=1), opacity=0.5, name=f'Exit Band (-{mr_exit_z}Ï)'), row=1, col=1)
+                fig_ctx.add_trace(go.Scatter(x=lower_band.index, y=lower_band, mode='lines', line=dict(color='green', width=1), opacity=0.5, name=f'Entry Band (-{mr_entry_z}σ)'), row=1, col=1)
+                fig_ctx.add_trace(go.Scatter(x=exit_band.index, y=exit_band, mode='lines', line=dict(color='yellow', width=1), opacity=0.5, name=f'Exit Band (-{mr_exit_z}σ)'), row=1, col=1)
                 
                 # Bottom Chart: Z-Score
                 fig_ctx.add_trace(go.Scatter(x=mr_z.index, y=mr_z, mode='lines', line=dict(color='orange'), name='Z-Score'), row=2, col=1)
@@ -6456,7 +6456,7 @@ with tab7:
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Relative Strength Ratio (vs Benchmark)":
-        st.markdown("### âï¸ Relative Strength Ratio (vs Benchmark) Settings")
+        st.markdown("### ⚖️ Relative Strength Ratio (vs Benchmark) Settings")
         st.markdown("Momentum strategy: Long when the asset is gaining relative strength against a benchmark, Cash when losing.")
         
         col_rs1, col_rs2 = st.columns(2)
@@ -6520,7 +6520,7 @@ with tab7:
                 signals = None
 
     elif strategy_type == "Implied Volatility Proxy (^VIX)":
-        st.markdown("### ð² Robust Implied Volatility Proxy Lab (^VIX)")
+        st.markdown("### 🎲 Robust Implied Volatility Proxy Lab (^VIX)")
         st.markdown("Instead of one fixed VIX rule, this tests several VIX + price confirmation rules and selects the strongest one for the selected history.")
         st.caption("Goal: avoid weak noisy VIX exits, reduce whipsaws, and only go risk-off when VIX stress is confirmed by price weakness.")
         
@@ -6804,7 +6804,7 @@ with tab7:
                             best_name = rank_df.iloc[0]['Rule']
                             best_name, best_logic, best_sig, best_score = next(x for x in scored_candidates if x[0] == best_name)
                             
-                            st.write("#### ð§  Robust IV Proxy Strategy Ranking")
+                            st.write("#### 🧠 Robust IV Proxy Strategy Ranking")
                             st.caption("In-sample ranking is now a reference table. You can also manually choose any IV rule below and view its own trade log.")
                             st.dataframe(rank_df, use_container_width=True)
 
@@ -6828,7 +6828,7 @@ with tab7:
                             
                             wf_result = None
                             if enable_iv_walk_forward:
-                                st.write("#### ð¶ Walk-Forward IV Proxy Validation")
+                                st.write("#### 🚶 Walk-Forward IV Proxy Validation")
                                 st.caption("This is stricter than the normal ranking: it chooses the best rule using only the past training window, then tests that rule on the next unseen forward window.")
                                 if iv_wfo_mode == "Institutional Ensemble":
                                     wf_result = walk_forward_strategy_selection_institutional(
@@ -6913,7 +6913,7 @@ with tab7:
                             stability_score = 0
                             if stable_checks:
                                 stability_score = round(100 * ((positive_windows / len(stable_checks)) * 0.55 + (top2_windows / len(stable_checks)) * 0.45), 0)
-                                st.write("#### ð§± Stability Check")
+                                st.write("#### 🧱 Stability Check")
                                 s1, s2, s3 = st.columns(3)
                                 s1.metric("Selected Best Rule", best_name)
                                 s2.metric("Stability Score", f"{stability_score:.0f}/100")
@@ -6930,12 +6930,12 @@ with tab7:
                                 st.success(f"IV Sharpe/DD Guard is ON: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard, account-DD guard {float(iv_guard_equity_dd):.0f}% {'ON' if bool(iv_guard_equity_dd_on) else 'OFF'}, volatility throttle {'ON' if bool(iv_guard_vol) else 'OFF'}.")
 
                             if manual_iv_strategy_override:
-                                st.info(f"Chosen manual IV proxy rule: **{best_name}** â {best_logic}")
+                                st.info(f"Chosen manual IV proxy rule: **{best_name}** — {best_logic}")
                             elif enable_iv_walk_forward and use_wf_signal and wf_result is not None:
                                 st.info("Primary result below uses **walk-forward-selected IV rules**. The in-sample chosen rule is shown only as reference.")
-                                st.caption(f"In-sample reference winner: {best_name} â {best_logic}")
+                                st.caption(f"In-sample reference winner: {best_name} — {best_logic}")
                             else:
-                                st.info(f"Chosen IV proxy rule: **{best_name}** â {best_logic}")
+                                st.info(f"Chosen IV proxy rule: **{best_name}** — {best_logic}")
                             
                             # Re-index selected signal back to the shared backtest engine.
                             # IMPORTANT: when WFO is enabled, make the main performance metrics use ONLY
@@ -6976,8 +6976,8 @@ with tab7:
                                 
                                 fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='IV Proxy'), row=2, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'IV Proxy Baseline ({vix_ma_len})'), row=2, col=1)
-                                fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Band (+{vix_z}Ï)'), row=2, col=1)
-                                fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Band (+{vix_cap_z}Ï)'), row=2, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Band (+{vix_z}σ)'), row=2, col=1)
+                                fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Band (+{vix_cap_z}σ)'), row=2, col=1)
                                 
                                 if enable_iv_walk_forward and use_wf_signal and wf_result is not None:
                                     chosen_aligned = wf_result['signal'].reindex(common_idx).ffill().fillna(0).clip(0, 1)
@@ -6992,7 +6992,7 @@ with tab7:
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 1, 'green', opacity=0.08, row=2, col=1)
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 0, 'red', opacity=0.08, row=2, col=1)
                                 
-                                fig_ctx.update_layout(title=f"Robust IV Proxy Context â Selected Rule: {best_name}", hovermode="x unified", template="plotly_dark", height=760)
+                                fig_ctx.update_layout(title=f"Robust IV Proxy Context — Selected Rule: {best_name}", hovermode="x unified", template="plotly_dark", height=760)
                                 fig_ctx.update_yaxes(title_text="Exposure", row=3, col=1, range=[0, 105])
                                 st.plotly_chart(fig_ctx, use_container_width=True)
                             
@@ -7001,7 +7001,7 @@ with tab7:
                 signals = None
 
     elif strategy_type == "Institutional Hurst Exponent":
-        st.markdown("### ð² Institutional Hurst Exponent (Trend vs Mean-Reversion)")
+        st.markdown("### 🎲 Institutional Hurst Exponent (Trend vs Mean-Reversion)")
         st.markdown("Trade the asset based on its mathematical persistence. \n* **Trending Regime (H > 0.55):** Buy via Momentum (EMA Cross).\n* **Mean-Reverting Regime (H < 0.45):** Buy via Mean Reversion (Bollinger Bands).\n* **Dead Zone:** Stay in CASH between 0.45 and 0.55. Uses 5-bar confirmation to kill whipsaws.")
         
         col_h1, col_h2 = st.columns(2)
@@ -7118,9 +7118,9 @@ with tab7:
         last_dt = signals.index[-1]
         st.divider()
         if last_sig > 0:
-            st.success(f"ð **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Exposure: **{last_sig*100:.0f}%** | Action: **HOLD LONG**")
+            st.success(f"🚀 **STRATEGY SIGNAL (LONG)** | Last Update: {last_dt} | Exposure: **{last_sig*100:.0f}%** | Action: **HOLD LONG**")
         else:
-            st.error(f"ð **STRATEGY SIGNAL (CASH)** | Last Update: {last_dt} | Action: **STAY IN CASH / HEDGE**")
+            st.error(f"🛑 **STRATEGY SIGNAL (CASH)** | Last Update: {last_dt} | Action: **STAY IN CASH / HEDGE**")
 
         # Live alert: only fires on actual BUY/SELL flips, not on every refresh/hold.
         maybe_send_live_signal_alert(
@@ -7163,7 +7163,7 @@ with tab7:
         bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
         
         # Display Metrics
-        st.write("#### ð Performance Metrics")
+        st.write("#### 📊 Performance Metrics")
         current_benchmark_pct = (bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100
         if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
             met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
@@ -7194,7 +7194,7 @@ with tab7:
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
             
         # Equity Curve Plot
-        st.write("#### ð Equity Curve")
+        st.write("#### 📈 Equity Curve")
         fig_bt = go.Figure()
         fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
         fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
@@ -7204,7 +7204,7 @@ with tab7:
         st.session_state.report_gen.add_data("Backtest Metrics", strat_metrics)
         
         # Trade Log
-        st.write("#### ð Trade Log")
+        st.write("#### 📝 Trade Log")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
@@ -7239,7 +7239,7 @@ with tab8:
     if df_main is None:
         st.warning("Please load a ticker to view Volatility Clustering.")
     else:
-        st.write("### ð©ï¸ Volatility Clustering & Jump Analysis")
+        st.write("### 🌩️ Volatility Clustering & Jump Analysis")
     
     # --- CALCULATION FOR VERDICT ---
     returns_arr = df_main['Returns'].values
@@ -7249,9 +7249,9 @@ with tab8:
 
     # --- MODEL VERDICT BANNER ---
     latest_rv = np.sqrt(rv)*np.sqrt(252)
-    if jump_detected: st.error(f"ð¯ **MODEL VERDICT**: Significant **JUMPS** detected. Continuous volatility ({latest_rv:.1%}) is secondary to structural shocks. Use Merton/Heston models.")
-    elif br > 0.8: st.warning(f"ð¯ **MODEL VERDICT**: High **Volatility Clustering** (Branching Ratio: {br:.2f}). Recent shocks are likely to trigger further volatility.")
-    else: st.success(f"ð¯ **MODEL VERDICT**: Volatility is **Stable**. No significant clustering or jumps detected.")
+    if jump_detected: st.error(f"🎯 **MODEL VERDICT**: Significant **JUMPS** detected. Continuous volatility ({latest_rv:.1%}) is secondary to structural shocks. Use Merton/Heston models.")
+    elif br > 0.8: st.warning(f"🎯 **MODEL VERDICT**: High **Volatility Clustering** (Branching Ratio: {br:.2f}). Recent shocks are likely to trigger further volatility.")
+    else: st.success(f"🎯 **MODEL VERDICT**: Volatility is **Stable**. No significant clustering or jumps detected.")
 
     st.caption("Institutional analysis of volatility properties using High-Frequency logic applied to Daily data.")
     
@@ -7287,7 +7287,7 @@ with tab8:
         st.metric("Baseline Intensity", f"{hawkes.mu:.4f}")
 
     if br > 0.9:
-        st.warning("â ï¸ Critical Instability: Volatility is self-reinforcing rapidly.")
+        st.warning("⚠️ Critical Instability: Volatility is self-reinforcing rapidly.")
     elif br > 0.5:
         st.info("Moderate Clustering: Recent shocks affect near-term future.")
     else:
@@ -7319,12 +7319,12 @@ with tab9:
     if df_main is None:
         st.warning("Please load a ticker to view Advanced Regime diagnostics.")
     else:
-        st.write("### ð§  Pro Regime Detection (Multi-Factor)")
+        st.write("### 🧠 Pro Regime Detection (Multi-Factor)")
     
     if not SKLEARN_AVAILABLE:
-        st.error("â ï¸ `scikit-learn` library is missing. Institutional upgrade requires it.")
+        st.error("⚠️ `scikit-learn` library is missing. Institutional upgrade requires it.")
     elif pro_detector is None:
-        st.info("ðï¸ **Active Engine**: Markov Switching Model (High Accuracy)")
+        st.info("🏛️ **Active Engine**: Markov Switching Model (High Accuracy)")
         st.write(f"The current analysis is using the **Markov Regression** engine. This model identifies the current state based on transition probabilities and filtered marginals.")
         st.success(f"Current State: **{regime_label}** ({regime_prob:.1%} confidence)")
         st.caption(f"Number of States: {regime_data.get('n_states', 'Unknown')}")
@@ -7338,7 +7338,7 @@ with tab9:
         with m_col2:
             st.metric("Model AIC", f"{pro_detector.metrics.get('aic', 0):.0f}")
         
-        st.write("#### ð Regime Probability Stream")
+        st.write("#### 🌊 Regime Probability Stream")
         fig_pro = go.Figure()
         probs = pro_detector.regimes['probs']
         labels = [pro_detector.state_labels.get(i, f"State {i}") for i in range(probs.shape[1])]
@@ -7349,7 +7349,7 @@ with tab9:
         st.session_state.report_gen.add_plot("Institutional Regime Probabilities", fig_pro)
         
         # Feature breakdown
-        st.write("#### ð Institutional Feature Space")
+        st.write("#### 📊 Institutional Feature Space")
         feat_df = pd.DataFrame(pro_detector.features, columns=['Momentum', 'Vol_Z', 'Trend_Dev'], index=df_main.index)
         fig_feat = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=('Feature 1: Momentum (Returns)', 'Feature 2: Volatility (Z-Score)', 'Feature 3: Structural Dev (Kalman)'))
         fig_feat.add_trace(go.Scatter(x=feat_df.index, y=feat_df['Momentum'], mode='lines', line=dict(color='blue'), opacity=0.7, name='Momentum'), row=1, col=1)
@@ -7370,7 +7370,7 @@ with tab10:
     if df_main is None:
         st.warning("Please load a ticker to view SML/Alpha analysis.")
     else:
-        st.write("### ð Securities Market Line (SML) & Alpha Analysis")
+        st.write("### 📐 Securities Market Line (SML) & Alpha Analysis")
     st.caption("Institutional Factor Analysis: Rolling Beta, Jensen's Alpha, and Mispricing Spreads (Robust OLS).")
 
     # Configuration
@@ -7466,7 +7466,7 @@ with tab10:
 # TAB 11: INSTITUTIONAL TOTAL MARKET SCANNER
 # ==========================================
 with tab11:
-    st.write("### ð¡ Institutional Total Market Scanner")
+    st.write("### 📡 Institutional Total Market Scanner")
     st.markdown("""
     **Massive Scale Quant Discovery**. Scan the entire US listing universe (~9,000+ assets). 
     Categorize every stock and ETF into **Long (Open)** vs **Cash (Closed)** lists using the Master Quant Score.
@@ -7496,7 +7496,7 @@ with tab11:
         scan_depth = st.number_input("Scan Limit (Depth)", min_value=1, max_value=10000, value=50, 
                                     help="Limits number of tickers to scan for speed. 50-100 is recommended for 'Auto' mode.")
         if scan_depth > 500:
-            st.warning("â ï¸ High Depth: Scanning thousands of assets with deep quant models can take 30+ minutes.")
+            st.warning("⚠️ High Depth: Scanning thousands of assets with deep quant models can take 30+ minutes.")
     
     scan_col1b, scan_col2b, scan_col3b = st.columns(3)
     with scan_col1b:
@@ -7510,9 +7510,9 @@ with tab11:
     with scan_col3b:
         scan_freq = st.selectbox("Scanner Frequency", ["Daily", "Weekly"], index=0)
         if scan_regime_mode == "Auto: Best Fit":
-            st.info("ð¡ Auto-Performance mode ensures results match best historical backtest.")
+            st.info("💡 Auto-Performance mode ensures results match best historical backtest.")
         
-    with st.expander("ð ï¸ Advanced Model Sync (Backtest Alignment)", expanded=False):
+    with st.expander("🛠️ Advanced Model Sync (Backtest Alignment)", expanded=False):
         async_col1, async_col2, async_col3 = st.columns(3)
         with async_col1:
             scan_engine = st.selectbox("Model Engine", ["Markov (High Accuracy)", "GMM (Fast)"], index=1,
@@ -7533,7 +7533,7 @@ with tab11:
             scan_switch_trend = st.toggle("Switching Mean", value=True)
 
     if live_mode and scan_freq == "Weekly":
-        st.warning("â ï¸ **Invalid Combo**: Weekly frequency on Live Intraday data typically has too few bars (< 15) for the models. Scanner may skip all assets. Switch Frequency to 'Daily' or disable 'Live Mode'.")
+        st.warning("⚠️ **Invalid Combo**: Weekly frequency on Live Intraday data typically has too few bars (< 15) for the models. Scanner may skip all assets. Switch Frequency to 'Daily' or disable 'Live Mode'.")
 
     # Custom list area only shows if needed
     custom_input = ""
@@ -7542,7 +7542,7 @@ with tab11:
 
     st.divider()
     
-    if st.button("ð EXECUTE TOTAL MARKET SCAN", use_container_width=True, type="primary"):
+    if st.button("🚀 EXECUTE TOTAL MARKET SCAN", use_container_width=True, type="primary"):
         # Determine Tickers
         if universe_type == "Total US Stocks (6,000+)":
             full_list = get_total_us_stocks()
@@ -7643,7 +7643,7 @@ with tab11:
         res_col1, res_col2 = st.columns(2)
         
         with res_col1:
-            st.subheader(f"ð LONG / OPEN ({len(long_list)})")
+            st.subheader(f"🚀 LONG / OPEN ({len(long_list)})")
             if long_list:
                 ldf = pd.DataFrame(long_list).sort_values(by='Score', ascending=False)
                 st.dataframe(ldf.style.background_gradient(subset=['Score'], cmap='Greens'), use_container_width=True)
@@ -7651,7 +7651,7 @@ with tab11:
                 st.info("No bullish signals found in current scan window.")
                 
         with res_col2:
-            st.subheader(f"ð CLOSED / CASH / HEDGE ({len(cash_list)})")
+            st.subheader(f"🛑 CLOSED / CASH / HEDGE ({len(cash_list)})")
             if cash_list:
                 cdf = pd.DataFrame(cash_list).sort_values(by='Score', ascending=True)
                 st.dataframe(cdf.style.background_gradient(subset=['Score'], cmap='Reds'), use_container_width=True)
@@ -7659,10 +7659,10 @@ with tab11:
                 st.info("No bearish/neutral signals found in current scan window.")
 
         st.divider()
-        st.success(f"â **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
+        st.success(f"✅ **Total Market Review Complete**: Analyzed {res['count']} assets from `{res['universe']}` universe.")
 
 with tab12:
-    st.write("### ð¦ Federal Reserve Balance Sheet (Assets & Liabilities)")
+    st.write("### 🏦 Federal Reserve Balance Sheet (Assets & Liabilities)")
     st.caption("Macroeconomic dashboard tracking FED liquidity and monetary policy shifts via FRED.")
     
     fed_date_col1, fed_date_col2 = st.columns(2)
@@ -7734,7 +7734,7 @@ with tab12:
 # TAB 13: OPTIONS IV SURFACE
 # ==========================================
 with tab13:
-    st.write("### ð² 3D Implied Volatility Surface")
+    st.write("### 🎲 3D Implied Volatility Surface")
     st.markdown("Visualizes the Volatility Smile and Term Structure using live options data.")
     
     if df_main is None:
@@ -7808,7 +7808,7 @@ with tab14:
     if df_main is None:
         st.warning("Please load a ticker to view Hurst Exponent Analysis.")
     else:
-        st.write("### ð² Institutional Hurst Exponent")
+        st.write("### 🎲 Institutional Hurst Exponent")
         st.markdown("The Hurst Exponent (H) measures the long-term memory of a time series. \n* **H < 0.5**: Mean-Reverting (Anti-persistent)\n* **H = 0.5**: Random Walk (Geometric Brownian Motion)\n* **H > 0.5**: Trending (Persistent)")
         
         col_h1, col_h2 = st.columns(2)
@@ -7848,7 +7848,7 @@ with tab14:
 # TAB 15: HOT 10 (DAILY)
 # ==========================================
 with tab15:
-    st.write("### ð¥ Daily Top 10 (Hot Stocks)")
+    st.write("### 🔥 Daily Top 10 (Hot Stocks)")
     st.markdown("High-speed pre-scanner for identifying the best tactical momentum plays across the entire US market.")
     
     scan_col1, scan_col2, scan_col3, scan_col4 = st.columns(4)
@@ -7861,7 +7861,7 @@ with tab15:
     with scan_col4:
         top_n_buys = st.number_input("Target Top 'Buys'", value=10, min_value=1, max_value=50, step=1)
         
-    if st.button("ð SCAN MARKET (HOT LIST)", use_container_width=True, type="primary", key="hot_scan_btn"):
+    if st.button("🚀 SCAN MARKET (HOT LIST)", use_container_width=True, type="primary", key="hot_scan_btn"):
         with st.spinner(f"Fetching {hot_universe} universe..."):
             if hot_universe == "S&P 500":
                 all_tickers = get_sp500_tickers()
@@ -7913,7 +7913,7 @@ with tab15:
                         vix_daily_move_pct = (latest_vix / np.sqrt(252)) / 100
                         adaptive_thresh = vix_daily_move_pct * vix_multiplier
                         
-                        st.info(f"ð Market VIX is {latest_vix:.2f}. Adaptive Daily Move Threshold: {adaptive_thresh*100:.2f}%")
+                        st.info(f"📈 Market VIX is {latest_vix:.2f}. Adaptive Daily Move Threshold: {adaptive_thresh*100:.2f}%")
                         
                         # Vectorized calculations across all 6000+ assets instantly
                         last_close = closes.iloc[-1]
@@ -7978,7 +7978,7 @@ with tab15:
                         if not hot_results:
                             st.warning("No stocks met the criteria today.")
                         else:
-                            st.write("#### ð§  Institutional Deep Verification (Strict BUY Filter)")
+                            st.write("#### 🧠 Institutional Deep Verification (Strict BUY Filter)")
                             st.caption("Running the advanced Regime Model on high-momentum candidates. Only displaying confirmed pure BUY signals...")
                             
                             # Rank ALL candidates by momentum
@@ -8019,7 +8019,7 @@ with tab15:
                             prog.progress(1.0)
                             
                             if final_hot_list:
-                                st.success(f"ð¥ Found {len(final_hot_list)} Institutional-Grade BUY Stocks out of the top momentum leaders!")
+                                st.success(f"🔥 Found {len(final_hot_list)} Institutional-Grade BUY Stocks out of the top momentum leaders!")
                                 final_df = pd.DataFrame(final_hot_list)
                                 st.dataframe(final_df.style.background_gradient(subset=["Daily Return %", "VIX Multiple"], cmap="YlOrRd"), use_container_width=True)
                                 
@@ -8027,14 +8027,14 @@ with tab15:
                                 vdf = pd.DataFrame(verif_results)
                                 st.dataframe(vdf, use_container_width=True)
                             else:
-                                st.error("â No momentum candidates passed the strict Institutional BUY Verification today. Cash is a position.")
+                                st.error("❌ No momentum candidates passed the strict Institutional BUY Verification today. Cash is a position.")
                     else:
                         st.warning("Not enough data returned from API to compute metrics.")
             except Exception as e:
                 st.error(f"Error during bulk scan: {e}")
 
     st.markdown("---")
-    with st.expander("ð§ Automated Email Reporter (Full Market Scan)"):
+    with st.expander("📧 Automated Email Reporter (Full Market Scan)"):
         st.markdown("Run the complete 3-universe scan (S&P 500, NASDAQ 100, Total Market) and dispatch the final Institutional Hot List directly to your inbox.")
         
         email_col1, email_col2 = st.columns(2)
@@ -8047,9 +8047,9 @@ with tab15:
             
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
-            run_manual = st.button("ð¨ Run Deep Scan & Send Email Report", use_container_width=True, type="primary")
+            run_manual = st.button("📨 Run Deep Scan & Send Email Report", use_container_width=True, type="primary")
         with col_btn2:
-            run_auto = st.button("â° Schedule Daily 8:15 AM Automation", use_container_width=True)
+            run_auto = st.button("⏰ Schedule Daily 8:15 AM Automation", use_container_width=True)
             
         if run_auto:
             if not sender_email or not sender_pass or not receiver_email:
@@ -8081,7 +8081,7 @@ with tab15:
                     process = subprocess.Popen(['/usr/bin/crontab', '-'], stdin=subprocess.PIPE, text=True)
                     process.communicate(new_cron)
                     
-                    st.success("â **Automation scheduled!** Your Mac will now silently run the scan every weekday at 8:15 AM and email you the results. You do not need to keep the app open.")
+                    st.success("✅ **Automation scheduled!** Your Mac will now silently run the scan every weekday at 8:15 AM and email you the results. You do not need to keep the app open.")
                 except Exception as e:
                     st.error(f"Failed to schedule automation. Error: {e}")
                     
@@ -8207,7 +8207,7 @@ with tab15:
                 
                 scan_prog = st.progress(0)
                 for idx, (univ, n_buys) in enumerate(universes.items()):
-                    st.write(f"ð Scanning {univ}...")
+                    st.write(f"🔍 Scanning {univ}...")
                     results[univ] = scan_universe_headless(univ, n_buys, 5.0, 1.5)
                     scan_prog.progress((idx + 1) / len(universes))
                     
@@ -8243,7 +8243,7 @@ with tab15:
                     from email.mime.text import MIMEText
                     
                     msg = MIMEMultipart('alternative')
-                    msg['Subject'] = f"ð Institutional Hot List: {datetime.now().strftime('%Y-%m-%d')}"
+                    msg['Subject'] = f"🚀 Institutional Hot List: {datetime.now().strftime('%Y-%m-%d')}"
                     msg['From'] = sender_email
                     msg['To'] = receiver_email
                     msg.attach(MIMEText(html, 'html'))
@@ -8253,15 +8253,15 @@ with tab15:
                     server.sendmail(sender_email, receiver_email, msg.as_string())
                     server.quit()
                     
-                    st.success(f"â Full report successfully emailed to {receiver_email}!")
+                    st.success(f"✅ Full report successfully emailed to {receiver_email}!")
                 except Exception as e:
                     st.error(f"Failed to send email. Check credentials. Error: {str(e)}")
 
 with tab16:
-    st.markdown("## ð¯ Institutional IV-Based Stock Scanner")
-    st.markdown("**Precision targeting using Implied Volatility dynamics â the way hedge funds screen for high-conviction setups.**\n\nThe model identifies stocks where IV structure signals institutional accumulation or directional conviction.")
+    st.markdown("## 🎯 Institutional IV-Based Stock Scanner")
+    st.markdown("**Precision targeting using Implied Volatility dynamics — the way hedge funds screen for high-conviction setups.**\n\nThe model identifies stocks where IV structure signals institutional accumulation or directional conviction.")
     
-    with st.expander("âï¸ Scanner Configuration", expanded=True):
+    with st.expander("⚙️ Scanner Configuration", expanded=True):
         col_c1, col_c2, col_c3 = st.columns(3)
         with col_c1:
             universe_choice = st.selectbox("Universe", ["S&P 500 (503 stocks)", "NASDAQ 100 (101 stocks)", "Custom Watchlist"])
@@ -8283,7 +8283,7 @@ with tab16:
             
         setup_filter = st.multiselect("Include Setups", ["IV Expansion from Low Base", "Bullish Call Skew", "Call Buying Dominance", "IV Crush Setup", "Contango IV Structure", "Heavy Call OI"], default=["IV Expansion from Low Base", "Bullish Call Skew", "Call Buying Dominance"])
 
-    st.subheader("ð Single Ticker Deep Dive")
+    st.subheader("🔍 Single Ticker Deep Dive")
     col_td1, col_td2 = st.columns([1, 3])
     with col_td1:
         single_ticker = st.text_input("Deep Dive Ticker", "AAPL").upper()
@@ -8302,7 +8302,7 @@ with tab16:
             c3.metric("IV Rank", f"{result['iv_rank']:.0f}/100", delta="High" if result['iv_rank'] > 50 else "Low", delta_color="inverse" if result['iv_rank'] > 70 else "normal")
             c4.metric("IV/HV Ratio", f"{result['iv_hv_ratio']:.2f}", delta="Rich" if result['iv_hv_ratio'] > 1.2 else "Cheap")
             c5.metric("P/C Ratio", f"{result['pc_ratio']:.2f}", delta="Calls dominant" if result['pc_ratio'] < 0.8 else "Puts dominant", delta_color="normal" if result['pc_ratio'] < 0.8 else "inverse")
-            c6.metric("Skew", f"{result['skew']:.1f}%", delta="Call skew â" if result['skew'] < -2 else "Put skew â", delta_color="normal" if result['skew'] < -2 else "inverse")
+            c6.metric("Skew", f"{result['skew']:.1f}%", delta="Call skew ↑" if result['skew'] < -2 else "Put skew ↑", delta_color="normal" if result['skew'] < -2 else "inverse")
             st.divider()
             
             score = result['score']
@@ -8314,7 +8314,7 @@ with tab16:
                 st.write("#### Active Signals")
                 if result['signals']:
                     for sig_name, sig_color, sig_detail in result['signals']:
-                        icon = {"green": "â", "orange": "â ï¸", "red": "ð´"}.get(sig_color, "â¢")
+                        icon = {"green": "✅", "orange": "⚠️", "red": "🔴"}.get(sig_color, "•")
                         st.markdown(f"{icon} **{sig_name}**: {sig_detail}")
                 else:
                     st.info("No strong directional signals detected.")
@@ -8357,10 +8357,10 @@ with tab16:
             st.plotly_chart(fig_gauge, use_container_width=True)
 
     st.divider()
-    st.subheader("ð¡ Bulk IV Scanner")
+    st.subheader("📡 Bulk IV Scanner")
     st.markdown("Scans the selected universe and ranks stocks by institutional IV conviction.")
     
-    if st.button("ð Run IV Scan", type="primary", use_container_width=True):
+    if st.button("🚀 Run IV Scan", type="primary", use_container_width=True):
         if universe_choice == "S&P 500 (503 stocks)":
             full_universe = get_sp500()
         elif universe_choice == "NASDAQ 100 (101 stocks)":
@@ -8426,13 +8426,13 @@ with tab16:
                 st.dataframe(styled, use_container_width=True, height=500)
                 
                 csv = display_df.to_csv(index=False)
-                st.download_button("ð¥ Download Results CSV", csv, file_name=f"iv_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
+                st.download_button("📥 Download Results CSV", csv, file_name=f"iv_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
                 
                 st.divider()
                 st.write("#### Top 10 Institutional IV Setups")
                 top10 = filtered.head(10)
                 for _, row in top10.iterrows():
-                    with st.expander(f"{'ð¢' if 'BUY' in row['verdict'] else 'ð¡'} {row['ticker']} â {row['name']} | Score: {row['score']:.1f} | {row['verdict']}"):
+                    with st.expander(f"{'🟢' if 'BUY' in row['verdict'] else '🟡'} {row['ticker']} — {row['name']} | Score: {row['score']:.1f} | {row['verdict']}"):
                         m1, m2, m3, m4, m5 = st.columns(5)
                         m1.metric("Price", f"${row['price']:.2f}")
                         m2.metric("ATM IV", f"{row['atm_iv']:.1f}%")
@@ -8441,7 +8441,7 @@ with tab16:
                         m5.metric("P/C", f"{row['pc_ratio']:.2f}")
                         st.write("**Active signals:**")
                         for sig_name, sig_color, sig_detail in row['signals']:
-                            icon = "â" if sig_color == "green" else "â ï¸" if sig_color == "orange" else "ð´"
+                            icon = "✅" if sig_color == "green" else "⚠️" if sig_color == "orange" else "🔴"
                             st.markdown(f"{icon} **{sig_name}**: {sig_detail}")
                             
                         fig_mini = go.Figure(go.Bar(x=['HV 30d', 'HV 252d', 'ATM IV'], y=[row['hv_30'], row['hv_252'], row['atm_iv']], marker_color=['#4488ff', '#2266dd', '#ff6b35'], text=[f"{v:.1f}%" for v in [row['hv_30'], row['hv_252'], row['atm_iv']]], textposition='outside'))
@@ -8459,9 +8459,9 @@ with tab16:
                 # ==========================================
 # *** PASTE INSTRUCTIONS ***
 # 1. In the existing tabs = st.tabs([...]) block, ADD these 3 entries at the end of the list:
-#    "ð CVD & Volume Delta",
-#    "ð Institutional VWAP",
-#    "ð¬ Time Series Analysis"
+#    "📊 CVD & Volume Delta",
+#    "📈 Institutional VWAP",
+#    "🔬 Time Series Analysis"
 #
 # 2. Change the unpacking line from:
 #    tab0, tab1, ... tab16 = tabs
@@ -8480,7 +8480,7 @@ with tab16:
 # TAB 17: CUMULATIVE VOLUME DELTA (CVD)
 # ==========================================
 with tab17:
-    st.write("### ð Institutional Cumulative Volume Delta (CVD)")
+    st.write("### 📊 Institutional Cumulative Volume Delta (CVD)")
     st.markdown("""
     **CVD** measures the net buying vs selling pressure over time by classifying each bar's volume
     as buy-initiated or sell-initiated. Rising CVD + Rising Price = Confirmed Uptrend.
@@ -8490,7 +8490,7 @@ with tab17:
     if df_main is None:
         st.warning("Please load a ticker to view CVD analysis.")
     else:
-        # ââ Configuration ââââââââââââââââââââââââââââââââââââââââââââââââââ
+        # ── Configuration ──────────────────────────────────────────────────
         cvd_col1, cvd_col2, cvd_col3 = st.columns(3)
         with cvd_col1:
             cvd_method = st.selectbox("Volume Classification Method", [
@@ -8507,7 +8507,7 @@ with tab17:
 
         df_cvd = df_main.copy()
 
-        # ââ Volume Delta Calculation ââââââââââââââââââââââââââââââââââââââââ
+        # ── Volume Delta Calculation ────────────────────────────────────────
         try:
             hi = df_cvd['High']
             lo = df_cvd['Low']
@@ -8551,17 +8551,17 @@ with tab17:
             else:
                 cvd_plot = cvd
 
-            # ââ Divergence Detection ââââââââââââââââââââââââââââââââââââââââ
+            # ── Divergence Detection ────────────────────────────────────────
             price_change = cl - cl.shift(cvd_lookback)
             cvd_change   = cvd - cvd.shift(cvd_lookback)
 
-            bull_div = (price_change < 0) & (cvd_change > 0)   # Price down, CVD up  â hidden bull
-            bear_div = (price_change > 0) & (cvd_change < 0)   # Price up, CVD down  â hidden bear
+            bull_div = (price_change < 0) & (cvd_change > 0)   # Price down, CVD up  → hidden bull
+            bear_div = (price_change > 0) & (cvd_change < 0)   # Price up, CVD down  → hidden bear
 
-            # ââ Rolling Delta Bars (daily net flow) âââââââââââââââââââââââââ
+            # ── Rolling Delta Bars (daily net flow) ─────────────────────────
             rolling_delta = delta.rolling(window=5).sum()
 
-            # ââ Metrics ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+            # ── Metrics ────────────────────────────────────────────────────
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Cumulative Delta (Total)", f"{cvd.iloc[-1]:+,.0f}")
             m2.metric("Last Bar Delta", f"{delta.iloc[-1]:+,.0f}")
@@ -8572,13 +8572,13 @@ with tab17:
                       delta_color="normal" if latest_pressure == "BUYING" else "inverse")
 
             if bear_div.iloc[-1]:
-                st.error("ð¨ **BEARISH DIVERGENCE**: Price rising but CVD declining â institutional distribution detected.")
+                st.error("🚨 **BEARISH DIVERGENCE**: Price rising but CVD declining — institutional distribution detected.")
             elif bull_div.iloc[-1]:
-                st.success("â **BULLISH DIVERGENCE**: Price falling but CVD rising â institutional accumulation detected.")
+                st.success("✅ **BULLISH DIVERGENCE**: Price falling but CVD rising — institutional accumulation detected.")
             else:
-                st.info("ð No significant CVD divergence at current bar.")
+                st.info("📊 No significant CVD divergence at current bar.")
 
-            # ââ Main Chart âââââââââââââââââââââââââââââââââââââââââââââââââ
+            # ── Main Chart ─────────────────────────────────────────────────
             fig_cvd = make_subplots(
                 rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
                 row_heights=[0.35, 0.25, 0.25, 0.15],
@@ -8590,7 +8590,7 @@ with tab17:
                 )
             )
 
-            # Row 1 â Price (candlestick if possible, else line)
+            # Row 1 – Price (candlestick if possible, else line)
             if all(c in df_cvd.columns for c in ['Open', 'High', 'Low', 'Close']):
                 fig_cvd.add_trace(go.Candlestick(
                     x=df_cvd.index, open=df_cvd['Open'], high=df_cvd['High'],
@@ -8620,7 +8620,7 @@ with tab17:
                     name="Bear Divergence"
                 ), row=1, col=1)
 
-            # Row 2 â CVD
+            # Row 2 – CVD
             fig_cvd.add_trace(go.Scatter(
                 x=df_cvd.index, y=cvd_plot, mode='lines',
                 line=dict(color='#00f2ff', width=2), name="CVD"
@@ -8641,14 +8641,14 @@ with tab17:
                 fillcolor='rgba(255,50,50,0.15)', showlegend=False
             ), row=2, col=1)
 
-            # Row 3 â Bar Delta (colored bars)
+            # Row 3 – Bar Delta (colored bars)
             bar_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in delta]
             fig_cvd.add_trace(go.Bar(
                 x=df_cvd.index, y=delta,
                 marker_color=bar_colors, name="Bar Delta"
             ), row=3, col=1)
 
-            # Row 4 â Rolling Net Flow
+            # Row 4 – Rolling Net Flow
             roll_colors = ['#00ff88' if v >= 0 else '#ff4444' for v in rolling_delta]
             fig_cvd.add_trace(go.Bar(
                 x=df_cvd.index, y=rolling_delta,
@@ -8657,15 +8657,15 @@ with tab17:
 
             fig_cvd.update_layout(
                 height=900, hovermode="x unified", template="plotly_dark",
-                title=f"Institutional CVD Dashboard â {TICKER}",
+                title=f"Institutional CVD Dashboard — {TICKER}",
                 xaxis_rangeslider_visible=False
             )
             st.plotly_chart(fig_cvd, use_container_width=True)
 
-            # ââ CVD Trade Log ââââââââââââââââââââââââââââââââââââââââââââââ
+            # ── CVD Trade Log ──────────────────────────────────────────────
             st.divider()
-            st.write("#### ð CVD Trade Signal Log")
-            st.caption("Signals fired when CVD crosses its own rolling mean â institutional-grade entry/exit confirmation.")
+            st.write("#### 📝 CVD Trade Signal Log")
+            st.caption("Signals fired when CVD crosses its own rolling mean — institutional-grade entry/exit confirmation.")
 
             cvd_ma = cvd.rolling(window=cvd_lookback).mean()
             cvd_cross_up   = (cvd > cvd_ma) & (cvd.shift(1) <= cvd_ma.shift(1))
@@ -8675,7 +8675,7 @@ with tab17:
             for dt in df_cvd.index[cvd_cross_up]:
                 trade_log_rows.append({
                     "Date": dt.date(),
-                    "Signal": "ð¢ BUY (CVD Cross Up)",
+                    "Signal": "🟢 BUY (CVD Cross Up)",
                     "Price": round(float(cl.loc[dt]), 2),
                     "CVD at Signal": round(float(cvd.loc[dt]), 0),
                     "Bar Delta": round(float(delta.loc[dt]), 0),
@@ -8685,7 +8685,7 @@ with tab17:
             for dt in df_cvd.index[cvd_cross_down]:
                 trade_log_rows.append({
                     "Date": dt.date(),
-                    "Signal": "ð´ SELL (CVD Cross Down)",
+                    "Signal": "🔴 SELL (CVD Cross Down)",
                     "Price": round(float(cl.loc[dt]), 2),
                     "CVD at Signal": round(float(cvd.loc[dt]), 0),
                     "Bar Delta": round(float(delta.loc[dt]), 0),
@@ -8704,14 +8704,14 @@ with tab17:
 
                 # Download
                 csv_cvd = tlog_df.to_csv(index=False)
-                st.download_button("ð¥ Download CVD Signal Log", csv_cvd,
+                st.download_button("📥 Download CVD Signal Log", csv_cvd,
                                    file_name=f"CVD_SignalLog_{TICKER}.csv", mime="text/csv")
             else:
                 st.info("No CVD crossover signals in the selected date range.")
 
-            # ââ CVD Adaptive Strategy Backtest ââââââââââââââââââââââââââââââ
+            # ── CVD Adaptive Strategy Backtest ──────────────────────────────
             st.divider()
-            st.write("#### ð§ª CVD Strategy Backtest")
+            st.write("#### 🧪 CVD Strategy Backtest")
             st.caption("Goal: beat buy & hold by using CVD confirmation, price trend, and risk-off exits instead of one weak CVD mean-cross rule.")
 
             cvd_ma = cvd.rolling(window=cvd_lookback).mean()
@@ -8778,9 +8778,9 @@ with tab17:
 
             display_adaptive_strategy_lab("CVD", cl, cvd_candidates, file_prefix="CVD_Adaptive_Strategy")
 
-            # ââ Delta Profile (Volume at Price bucket) âââââââââââââââââââââ
+            # ── Delta Profile (Volume at Price bucket) ─────────────────────
             st.divider()
-            st.write("#### ð Delta Profile (Buy vs Sell by Price Bucket)")
+            st.write("#### 📊 Delta Profile (Buy vs Sell by Price Bucket)")
             n_buckets = st.slider("Price Buckets", 10, 50, 20)
 
             price_min = float(cl.min())
@@ -8805,7 +8805,7 @@ with tab17:
             ))
             fig_profile.update_layout(
                 barmode='overlay', template="plotly_dark",
-                title="Volume Delta Profile (Price Ã Buy/Sell Pressure)",
+                title="Volume Delta Profile (Price × Buy/Sell Pressure)",
                 xaxis_title="Delta Volume (Buy=+, Sell=-)",
                 yaxis_title="Price Level",
                 height=500, hovermode="y unified"
@@ -8826,7 +8826,7 @@ with tab17:
 # TAB 18: INSTITUTIONAL VWAP
 # ==========================================
 with tab18:
-    st.write("### ð Institutional VWAP Suite")
+    st.write("### 📈 Institutional VWAP Suite")
     st.markdown("""
     **VWAP** (Volume Weighted Average Price) is the primary institutional execution benchmark.
     Price above VWAP = bullish bias; below = bearish. **Anchored VWAP** from key dates
@@ -8849,7 +8849,7 @@ with tab18:
         with vwap_col2:
             vwap_bands = st.multiselect(
                 "Standard Deviation Bands",
-                ["1Ï", "2Ï", "3Ï"], default=["1Ï", "2Ï"]
+                ["1σ", "2σ", "3σ"], default=["1σ", "2σ"]
             )
         with vwap_col3:
             vwap_reset = st.selectbox("VWAP Reset Period", ["Daily", "Weekly", "Monthly", "None (Cumulative)"])
@@ -8867,7 +8867,7 @@ with tab18:
         vol = df_vwap['Volume'].replace(0, np.nan).fillna(1)
         tp  = (hi + lo + cl) / 3.0   # Typical Price
 
-        # ââ VWAP Calculation Helpers ââââââââââââââââââââââââââââââââââââââââ
+        # ── VWAP Calculation Helpers ────────────────────────────────────────
         def compute_rolling_vwap(tp_series, vol_series, window):
             tp_vol = tp_series * vol_series
             vwap_v = tp_vol.rolling(window).sum() / vol_series.rolling(window).sum()
@@ -8923,7 +8923,7 @@ with tab18:
 
             return vwap_out, std_out
 
-        # ââ Build chart âââââââââââââââââââââââââââââââââââââââââââââââââââââ
+        # ── Build chart ─────────────────────────────────────────────────────
         try:
             fig_vwap = make_subplots(
                 rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
@@ -8949,10 +8949,10 @@ with tab18:
                     line=dict(color='gray', width=1.5), name="Price"
                 ), row=1, col=1)
 
-            sigma_colors = {'1Ï': ('rgba(255,215,0,0.3)', 'rgba(255,215,0,0.3)'),
-                            '2Ï': ('rgba(255,140,0,0.25)', 'rgba(255,140,0,0.25)'),
-                            '3Ï': ('rgba(255,50,50,0.2)', 'rgba(255,50,50,0.2)')}
-            sigma_vals   = {'1Ï': 1, '2Ï': 2, '3Ï': 3}
+            sigma_colors = {'1σ': ('rgba(255,215,0,0.3)', 'rgba(255,215,0,0.3)'),
+                            '2σ': ('rgba(255,140,0,0.25)', 'rgba(255,140,0,0.25)'),
+                            '3σ': ('rgba(255,50,50,0.2)', 'rgba(255,50,50,0.2)')}
+            sigma_vals   = {'1σ': 1, '2σ': 2, '3σ': 3}
 
             if vwap_type == "Rolling VWAP (N-bar)":
                 roll_win = st.slider("Rolling VWAP Window (bars)", 5, 252, 20)
@@ -9032,7 +9032,7 @@ with tab18:
                     ), row=1, col=1)
                     band_traces_added.add(band)
 
-            # Row 2 â Distance from VWAP
+            # Row 2 – Distance from VWAP
             dist_pct = (cl - vwap_s) / vwap_s * 100
             dist_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in dist_pct]
             fig_vwap.add_trace(go.Bar(
@@ -9042,7 +9042,7 @@ with tab18:
             fig_vwap.add_hline(y=0, line_dash="dash", line_color="white",
                                opacity=0.4, row=2, col=1)
 
-            # Row 3 â Volume bars
+            # Row 3 – Volume bars
             if 'Volume' in df_vwap.columns:
                 vol_colors = ['#26a69a' if c >= o else '#ef5350'
                               for c, o in zip(df_vwap['Close'], df_vwap.get('Open', df_vwap['Close']))]
@@ -9053,14 +9053,14 @@ with tab18:
 
             fig_vwap.update_layout(
                 height=850, hovermode="x unified", template="plotly_dark",
-                title=f"Institutional VWAP Suite â {TICKER}",
+                title=f"Institutional VWAP Suite — {TICKER}",
                 xaxis_rangeslider_visible=False
             )
             st.plotly_chart(fig_vwap, use_container_width=True)
 
-            # ââ VWAP Metrics Dashboard ââââââââââââââââââââââââââââââââââââââ
+            # ── VWAP Metrics Dashboard ──────────────────────────────────────
             st.divider()
-            st.write("#### ð VWAP Institutional Metrics")
+            st.write("#### 📊 VWAP Institutional Metrics")
 
             curr_price = float(cl.iloc[-1])
             curr_vwap  = float(vwap_s.iloc[-1]) if not pd.isna(vwap_s.iloc[-1]) else curr_price
@@ -9073,19 +9073,19 @@ with tab18:
                       delta="Above" if curr_dist > 0 else "Below",
                       delta_color="normal" if curr_dist > 0 else "inverse")
             v3.metric("VWAP Std Dev", f"{CURRENCY}{curr_std:.2f}")
-            v4.metric("1Ï Upper Band", f"{CURRENCY}{curr_vwap + curr_std:.2f}")
+            v4.metric("1σ Upper Band", f"{CURRENCY}{curr_vwap + curr_std:.2f}")
 
             if curr_dist > 2:
-                st.warning(f"â ï¸ Price is **{curr_dist:.1f}%** above VWAP â extended, watch for mean reversion to {CURRENCY}{curr_vwap:.2f}.")
+                st.warning(f"⚠️ Price is **{curr_dist:.1f}%** above VWAP — extended, watch for mean reversion to {CURRENCY}{curr_vwap:.2f}.")
             elif curr_dist < -2:
-                st.success(f"â Price is **{abs(curr_dist):.1f}%** below VWAP â potential institutional buy zone near {CURRENCY}{curr_vwap:.2f}.")
+                st.success(f"✅ Price is **{abs(curr_dist):.1f}%** below VWAP — potential institutional buy zone near {CURRENCY}{curr_vwap:.2f}.")
             else:
-                st.info(f"ð Price is hugging VWAP (Â±{abs(curr_dist):.1f}%) â balanced order flow.")
+                st.info(f"📍 Price is hugging VWAP (±{abs(curr_dist):.1f}%) — balanced order flow.")
 
-            # ââ VWAP Touch Log (Support/Resistance Tests) âââââââââââââââââ
+            # ── VWAP Touch Log (Support/Resistance Tests) ─────────────────
             st.divider()
-            st.write("#### ð VWAP Touch Log (Institutional S/R Tests)")
-            st.caption("Logs every time price crosses VWAP â key institutional re-pricing events.")
+            st.write("#### 📝 VWAP Touch Log (Institutional S/R Tests)")
+            st.caption("Logs every time price crosses VWAP — key institutional re-pricing events.")
 
             cross_up   = (cl > vwap_s) & (cl.shift(1) <= vwap_s.shift(1))
             cross_down = (cl < vwap_s) & (cl.shift(1) >= vwap_s.shift(1))
@@ -9093,7 +9093,7 @@ with tab18:
             vwap_log = []
             for dt in df_vwap.index[cross_up]:
                 vwap_log.append({
-                    "Date": dt.date(), "Event": "ð¢ Price crossed ABOVE VWAP",
+                    "Date": dt.date(), "Event": "🟢 Price crossed ABOVE VWAP",
                     "Price": round(float(cl.loc[dt]), 2),
                     "VWAP": round(float(vwap_s.loc[dt]), 2),
                     "Dist %": round(float((cl.loc[dt] - vwap_s.loc[dt]) / vwap_s.loc[dt] * 100), 3),
@@ -9101,7 +9101,7 @@ with tab18:
                 })
             for dt in df_vwap.index[cross_down]:
                 vwap_log.append({
-                    "Date": dt.date(), "Event": "ð´ Price crossed BELOW VWAP",
+                    "Date": dt.date(), "Event": "🔴 Price crossed BELOW VWAP",
                     "Price": round(float(cl.loc[dt]), 2),
                     "VWAP": round(float(vwap_s.loc[dt]), 2),
                     "Dist %": round(float((cl.loc[dt] - vwap_s.loc[dt]) / vwap_s.loc[dt] * 100), 3),
@@ -9112,14 +9112,14 @@ with tab18:
                 vlog_df = pd.DataFrame(vwap_log).sort_values("Date", ascending=False)
                 st.dataframe(vlog_df, use_container_width=True)
                 csv_vwap = vlog_df.to_csv(index=False)
-                st.download_button("ð¥ Download VWAP Touch Log", csv_vwap,
+                st.download_button("📥 Download VWAP Touch Log", csv_vwap,
                                    file_name=f"VWAP_Log_{TICKER}.csv", mime="text/csv")
             else:
                 st.info("No VWAP crossovers in the selected date range.")
 
-            # ââ VWAP Adaptive Strategy Backtest ââââââââââââââââââââââââââââ
+            # ── VWAP Adaptive Strategy Backtest ────────────────────────────
             st.divider()
-            st.write("#### ð§ª VWAP Strategy Backtest")
+            st.write("#### 🧪 VWAP Strategy Backtest")
             st.caption("Adaptive VWAP rules: trend, reclaim, band breakout, and mean-reversion candidates ranked against buy & hold.")
 
             ema20_v = cl.ewm(span=20, adjust=False).mean()
@@ -9182,7 +9182,7 @@ with tab18:
 # TAB 19: TIME SERIES ANALYSIS
 # ==========================================
 with tab19:
-    st.write("### ð¬ Institutional Time Series Analysis")
+    st.write("### 🔬 Institutional Time Series Analysis")
     st.markdown("""
     Deep statistical analysis of price and return dynamics:
     **Stationarity** | **ACF/PACF** | **ARIMA Forecasting** | **Cointegration** |
@@ -9193,13 +9193,13 @@ with tab19:
         st.warning("Please load a ticker to run Time Series Analysis.")
     else:
         ts_subtab = st.tabs([
-            "ð Stationarity Tests",
-            "ð ACF / PACF",
-            "ð® ARIMA Forecast",
-            "ð Cointegration & Causality",
-            "ð Spectral / Frequency",
-            "ð Long Memory (ARFIMA)",
-            "ð§ª TS Signal Backtest"
+            "📐 Stationarity Tests",
+            "📊 ACF / PACF",
+            "🔮 ARIMA Forecast",
+            "🔗 Cointegration & Causality",
+            "🌊 Spectral / Frequency",
+            "📉 Long Memory (ARFIMA)",
+            "🧪 TS Signal Backtest"
         ])
 
         ts_series_choice = st.radio(
@@ -9208,12 +9208,12 @@ with tab19:
         )
         ts_data = df_main['Log_Returns'].dropna() if ts_series_choice == "Log Returns" else df_main['Close'].dropna()
 
-        # ââ Sub-tab 1: Stationarity âââââââââââââââââââââââââââââââââââââââââ
+        # ── Sub-tab 1: Stationarity ─────────────────────────────────────────
         with ts_subtab[0]:
-            st.write("#### ð Stationarity & Unit Root Tests")
+            st.write("#### 📐 Stationarity & Unit Root Tests")
             st.caption("""
-            **ADF**: Null = unit root (non-stationary). Reject â stationary.
-            **KPSS**: Null = stationary. Reject â non-stationary.
+            **ADF**: Null = unit root (non-stationary). Reject → stationary.
+            **KPSS**: Null = stationary. Reject → non-stationary.
             **PP**: Phillips-Perron skipped here because your statsmodels build does not include it.
             """)
 
@@ -9228,7 +9228,7 @@ with tab19:
                     "p-value": round(adf_result[1], 4),
                     "Lags Used": adf_result[2],
                     "Critical Value 5%": round(adf_result[4]['5%'], 4),
-                    "Conclusion": "â Stationary" if adf_result[1] < 0.05 else "â Non-Stationary"
+                    "Conclusion": "✅ Stationary" if adf_result[1] < 0.05 else "❌ Non-Stationary"
                 }
 
                 # KPSS Test
@@ -9239,7 +9239,7 @@ with tab19:
                     "p-value": round(kpss_result[1], 4),
                     "Lags Used": kpss_result[2],
                     "Critical Value 5%": round(kpss_result[3]['5%'], 4),
-                    "Conclusion": "â Non-Stationary" if kpss_result[1] < 0.05 else "â Stationary"
+                    "Conclusion": "❌ Non-Stationary" if kpss_result[1] < 0.05 else "✅ Stationary"
                 }
 
                 stat_df = pd.DataFrame([adf_row, kpss_row])
@@ -9250,11 +9250,11 @@ with tab19:
                 kpss_stat = kpss_result[1] >= 0.05
 
                 if adf_stat and kpss_stat:
-                    st.success("ð¢ **STATIONARY**: Both ADF rejects unit root AND KPSS fails to reject stationarity. Series is mean-reverting and safe for linear models.")
+                    st.success("🟢 **STATIONARY**: Both ADF rejects unit root AND KPSS fails to reject stationarity. Series is mean-reverting and safe for linear models.")
                 elif not adf_stat and not kpss_stat:
-                    st.error("ð´ **NON-STATIONARY**: ADF fails to reject unit root AND KPSS rejects stationarity. Difference the series before modeling.")
+                    st.error("🔴 **NON-STATIONARY**: ADF fails to reject unit root AND KPSS rejects stationarity. Difference the series before modeling.")
                 else:
-                    st.warning("ð¡ **FRACTIONALLY INTEGRATED**: Tests conflict â likely long-memory process. Use ARFIMA or consider first-differencing.")
+                    st.warning("🟡 **FRACTIONALLY INTEGRATED**: Tests conflict — likely long-memory process. Use ARFIMA or consider first-differencing.")
 
                 # Rolling ADF p-value (structural stability)
                 st.divider()
@@ -9287,12 +9287,12 @@ with tab19:
             except Exception as e:
                 st.error(f"Stationarity test error: {e}")
 
-        # ââ Sub-tab 2: ACF / PACF âââââââââââââââââââââââââââââââââââââââââââ
+        # ── Sub-tab 2: ACF / PACF ───────────────────────────────────────────
         with ts_subtab[1]:
-            st.write("#### ð Autocorrelation & Partial Autocorrelation")
+            st.write("#### 📊 Autocorrelation & Partial Autocorrelation")
             st.caption("""
-            **ACF**: Measures correlation with lagged values. Tailing off â AR process.
-            **PACF**: Removes intermediate lag effects. Sharp cutoff â order of AR.
+            **ACF**: Measures correlation with lagged values. Tailing off → AR process.
+            **PACF**: Removes intermediate lag effects. Sharp cutoff → order of AR.
             """)
 
             try:
@@ -9304,9 +9304,9 @@ with tab19:
                 fig_acf_pacf, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7))
                 plt.style.use('dark_background')
                 plot_acf(ts_data, lags=max_lags, ax=ax1, color='cyan',
-                         vlines_kwargs={"colors": "cyan"}, title=f"ACF â {TICKER} ({ts_series_choice})")
+                         vlines_kwargs={"colors": "cyan"}, title=f"ACF — {TICKER} ({ts_series_choice})")
                 plot_pacf(ts_data, lags=max_lags, ax=ax2, color='orange',
-                          vlines_kwargs={"colors": "orange"}, title=f"PACF â {TICKER} ({ts_series_choice})")
+                          vlines_kwargs={"colors": "orange"}, title=f"PACF — {TICKER} ({ts_series_choice})")
                 ax1.set_facecolor('#1a1a2e'); ax2.set_facecolor('#1a1a2e')
                 fig_acf_pacf.patch.set_facecolor('#1a1a2e')
                 plt.tight_layout()
@@ -9317,7 +9317,7 @@ with tab19:
                 st.write("##### Ljung-Box Test (Serial Correlation by Lag)")
                 lb = acorr_ljungbox(ts_data, lags=list(range(1, min(21, max_lags))), return_df=True)
                 lb['Conclusion'] = lb['lb_pvalue'].apply(
-                    lambda p: "â No autocorr" if p > 0.05 else "â Autocorr present"
+                    lambda p: "✅ No autocorr" if p > 0.05 else "❌ Autocorr present"
                 )
                 st.dataframe(lb.style.format({"lb_stat": "{:.3f}", "lb_pvalue": "{:.4f}"}),
                              use_container_width=True)
@@ -9331,14 +9331,14 @@ with tab19:
                 elif dw > 2.5:
                     st.warning("Negative autocorrelation detected (DW > 2.5). Mean-reverting behaviour.")
                 else:
-                    st.success("No significant autocorrelation (DW â 2).")
+                    st.success("No significant autocorrelation (DW ≈ 2).")
 
             except Exception as e:
                 st.error(f"ACF/PACF error: {e}")
 
-        # ââ Sub-tab 3: ARIMA Forecast âââââââââââââââââââââââââââââââââââââââ
+        # ── Sub-tab 3: ARIMA Forecast ───────────────────────────────────────
         with ts_subtab[2]:
-            st.write("#### ð® ARIMA / SARIMA Forecast")
+            st.write("#### 🔮 ARIMA / SARIMA Forecast")
 
             try:
                 from statsmodels.tsa.arima.model import ARIMA
@@ -9355,7 +9355,7 @@ with tab19:
                     arima_series = df_main['Close'].dropna() if ts_series_choice == "Close Price" else df_main['Log_Returns'].dropna()
 
                 if auto_order:
-                    with st.spinner("Grid searching ARIMA order (p,d,q â {0,1,2})..."):
+                    with st.spinner("Grid searching ARIMA order (p,d,q ∈ {0,1,2})..."):
                         best_aic = float('inf')
                         best_order = (1, 1, 1)
                         for p_ in range(3):
@@ -9369,7 +9369,7 @@ with tab19:
                                     except Exception:
                                         pass
                         p, d, q = best_order
-                        st.success(f"Best order: ARIMA({p},{d},{q}) â AIC: {best_aic:.2f}")
+                        st.success(f"Best order: ARIMA({p},{d},{q}) — AIC: {best_aic:.2f}")
 
                 with st.spinner(f"Fitting ARIMA({p},{d},{q})..."):
                     arima_model = ARIMA(arima_series, order=(p, d, q)).fit()
@@ -9410,14 +9410,14 @@ with tab19:
                     name="95% CI"
                 ))
                 fig_arima.update_layout(
-                    title=f"ARIMA({p},{d},{q}) â {n_forecast}-Step Forecast",
+                    title=f"ARIMA({p},{d},{q}) — {n_forecast}-Step Forecast",
                     template="plotly_dark", height=450,
                     hovermode="x unified"
                 )
                 st.plotly_chart(fig_arima, use_container_width=True)
 
                 # Residual diagnostics
-                with st.expander("ð ARIMA Residual Diagnostics"):
+                with st.expander("📋 ARIMA Residual Diagnostics"):
                     resid = arima_model.resid.dropna()
                     lb_arima = acorr_ljungbox(resid, lags=[10], return_df=True)
                     arch_arima = het_arch(resid)
@@ -9426,8 +9426,8 @@ with tab19:
                         "Test": ["Ljung-Box (residuals)", "ARCH-LM (residuals)"],
                         "p-value": [lb_arima['lb_pvalue'].iloc[0], arch_arima[1]],
                         "Pass?": [
-                            "â Pass" if lb_arima['lb_pvalue'].iloc[0] > 0.05 else "â Fail",
-                            "â Pass" if arch_arima[1] > 0.05 else "â Fail"
+                            "✅ Pass" if lb_arima['lb_pvalue'].iloc[0] > 0.05 else "❌ Fail",
+                            "✅ Pass" if arch_arima[1] > 0.05 else "❌ Fail"
                         ]
                     }
                     st.table(pd.DataFrame(diag_arima).set_index("Test"))
@@ -9444,9 +9444,9 @@ with tab19:
             except Exception as e:
                 st.error(f"ARIMA error: {e}")
 
-        # ââ Sub-tab 4: Cointegration & Granger âââââââââââââââââââââââââââââ
+        # ── Sub-tab 4: Cointegration & Granger ─────────────────────────────
         with ts_subtab[3]:
-            st.write("#### ð Cointegration & Granger Causality")
+            st.write("#### 🔗 Cointegration & Granger Causality")
 
             pair_ticker_ts = st.text_input("Second Ticker for Cointegration / Causality", "SPY", key="ts_pair")
 
@@ -9475,12 +9475,12 @@ with tab19:
                             "Crit 1%": round(crit_vals[0], 4),
                             "Crit 5%": round(crit_vals[1], 4),
                             "Crit 10%": round(crit_vals[2], 4),
-                            "Cointegrated?": "â YES (p<0.05)" if coint_p < 0.05 else "â NO"
+                            "Cointegrated?": "✅ YES (p<0.05)" if coint_p < 0.05 else "❌ NO"
                         }])
                         st.table(coint_row.set_index("Cointegrated?"))
 
                         if coint_p < 0.05:
-                            st.success(f"**{TICKER}** and **{pair_ticker_ts}** are cointegrated â pairs trade opportunity exists!")
+                            st.success(f"**{TICKER}** and **{pair_ticker_ts}** are cointegrated — pairs trade opportunity exists!")
                             # Spread
                             spread = s1 - s2
                             spread_z = (spread - spread.mean()) / spread.std()
@@ -9523,20 +9523,20 @@ with tab19:
                                 "Lag": lag,
                                 "F-stat": round(f_test[0], 4),
                                 "p-value": round(f_test[1], 4),
-                                "Granger Cause?": "â YES" if f_test[1] < 0.05 else "â NO"
+                                "Granger Cause?": "✅ YES" if f_test[1] < 0.05 else "❌ NO"
                             })
                         gc_df = pd.DataFrame(gc_rows).set_index("Lag")
                         st.dataframe(gc_df.style.applymap(
-                            lambda v: 'color: lime' if 'â' in str(v) else 'color: salmon',
+                            lambda v: 'color: lime' if '✅' in str(v) else 'color: salmon',
                             subset=["Granger Cause?"]
                         ), use_container_width=True)
 
                 except Exception as e:
                     st.error(f"Cointegration/Granger error: {e}")
 
-        # ââ Sub-tab 5: Spectral Analysis ââââââââââââââââââââââââââââââââââââ
+        # ── Sub-tab 5: Spectral Analysis ────────────────────────────────────
         with ts_subtab[4]:
-            st.write("#### ð Spectral & Frequency Domain Analysis")
+            st.write("#### 🌊 Spectral & Frequency Domain Analysis")
             st.caption("""
             **Power Spectral Density** decomposes the return series into frequency components.
             Dominant frequencies reveal hidden market cycles (weekly, monthly, quarterly rhythms).
@@ -9605,15 +9605,15 @@ with tab19:
             except Exception as e:
                 st.error(f"Spectral analysis error: {e}")
 
-        # ââ Sub-tab 6: Long Memory (ARFIMA) ââââââââââââââââââââââââââââââââ
+        # ── Sub-tab 6: Long Memory (ARFIMA) ────────────────────────────────
         with ts_subtab[5]:
-            st.write("#### ð Long Memory & Fractional Integration (ARFIMA)")
+            st.write("#### 📉 Long Memory & Fractional Integration (ARFIMA)")
             st.caption("""
             **ARFIMA(p,d,q)** models long-range dependence. The fractional differencing parameter **d**
             captures how strongly past shocks persist:
             - **d = 0**: Short memory (standard ARMA)
             - **0 < d < 0.5**: Long memory, stationary
-            - **d â¥ 0.5**: Non-stationary long memory
+            - **d ≥ 0.5**: Non-stationary long memory
             """)
 
             try:
@@ -9658,7 +9658,7 @@ with tab19:
                     elif H_rs < 0.45:
                         st.warning(f"**Anti-Persistent / Mean-Reverting** (H={H_rs:.3f} < 0.5). Mean reversion strategies favored.")
                     else:
-                        st.info(f"**Near Random Walk** (H={H_rs:.3f} â 0.5). Standard ARMA adequate.")
+                        st.info(f"**Near Random Walk** (H={H_rs:.3f} ≈ 0.5). Standard ARMA adequate.")
 
                 with lm_col2:
                     # Variance ratio test (Lo-MacKinlay style)
@@ -9679,7 +9679,7 @@ with tab19:
                             "Variance Ratio": round(vr, 4),
                             "Z-stat": round(z, 3),
                             "p-value": round(p_val, 4),
-                            "Random Walk?": "â Fail to reject" if p_val > 0.05 else "â Reject RW"
+                            "Random Walk?": "✅ Fail to reject" if p_val > 0.05 else "❌ Reject RW"
                         })
                     vr_df = pd.DataFrame(vr_rows).set_index("Lag q")
                     st.dataframe(vr_df, use_container_width=True)
@@ -9735,9 +9735,9 @@ with tab19:
 
 
 
-        # ââ Sub-tab 7: Time Series Signal Backtest âââââââââââââââââââââââââ
+        # ── Sub-tab 7: Time Series Signal Backtest ─────────────────────────
         with ts_subtab[6]:
-            st.write("#### ð§ª Time Series Adaptive Backtest")
+            st.write("#### 🧪 Time Series Adaptive Backtest")
             st.caption("Instead of one fixed signal, this tests several time-series rules and ranks them versus buy & hold.")
 
             try:
@@ -9783,7 +9783,7 @@ with tab19:
 
                 ts_candidates = [
                     ("AR(1) Momentum", "Long when serial correlation is positive and 5-bar momentum is positive.", ts_ar_mom),
-                    ("Mean Reversion Z-Score", "Buy when price is more than 1Ï below rolling mean; exit near mean.", ts_mean_rev),
+                    ("Mean Reversion Z-Score", "Buy when price is more than 1σ below rolling mean; exit near mean.", ts_mean_rev),
                     ("Hurst Trend Regime", "Long only when Hurst suggests trend behavior and price is above EMA50.", ts_hurst_trend),
                     ("EMA Trend Stack", "Long when price > EMA20 > EMA50 with positive 20-bar momentum.", ts_trend_stack),
                     ("Low-Vol Momentum", "Long when momentum is positive, price is above EMA50, and realized volatility is calm.", ts_low_vol_momentum),
