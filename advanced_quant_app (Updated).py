@@ -1493,6 +1493,127 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
 
 
 
+def _nearest_price_at_or_before(price_series, target_date):
+    """Return last available raw market close at or before target_date."""
+    try:
+        s = pd.Series(price_series).replace([np.inf, -np.inf], np.nan).dropna()
+        if s.empty:
+            return np.nan, None
+        target_date = pd.Timestamp(target_date)
+        sub = s.loc[s.index <= target_date]
+        if sub.empty:
+            return float(s.iloc[0]), s.index[0]
+        return float(sub.iloc[-1]), sub.index[-1]
+    except Exception:
+        return np.nan, None
+
+
+def _scan_one_regime_recent_trigger(ticker, start_date, end_date, frequency, n_regimes, stability, switch_vol, switch_trend, signal_method, conviction, min_hold, confirmed_bar, trigger_days):
+    """Scan one ticker for recent Regime Switching open/close events."""
+    try:
+        t = str(ticker).strip().upper().replace('.', '-')
+        if not t:
+            return []
+        end_plus = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).to_pydatetime()
+        df_scan = load_data(t, pd.Timestamp(start_date).to_pydatetime(), end_plus, interval='1d')
+        if df_scan is None or df_scan.empty or 'Close' not in df_scan.columns:
+            return []
+        raw_prices = df_scan['Close'].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(raw_prices) < 40:
+            return []
+
+        if str(frequency).lower().startswith('week'):
+            scan_prices = raw_prices.resample('W-FRI').last().dropna()
+        else:
+            scan_prices = raw_prices.copy()
+        scan_returns = scan_prices.pct_change().dropna()
+        scan_model_data = (scan_returns.ewm(span=int(stability), adjust=False).mean().dropna() if int(stability) > 0 else scan_returns.dropna()) * 100
+
+        n_reg = int(n_regimes)
+        if len(scan_model_data) < max(25, n_reg * 10):
+            return []
+        # Scanner-only speed setting. Main current-ticker backtest is unchanged.
+        res_scan = fit_regime_model(scan_model_data, n_reg, bool(switch_vol), bool(switch_trend), search_reps=3)
+        if res_scan is None:
+            return []
+
+        sig_scan, ctx = build_regime_backtest_signal(
+            res_scan, scan_model_data.index, scan_prices.index, n_reg, str(signal_method),
+            conviction=float(conviction), min_hold=int(min_hold)
+        )
+        if bool(confirmed_bar):
+            sig_scan = sig_scan.shift(1).ffill().fillna(0).clip(0, 1)
+        sig_scan = sig_scan.reindex(scan_prices.index).ffill().fillna(0).clip(0, 1)
+        if len(sig_scan) < 2:
+            return []
+
+        cutoff = pd.Timestamp(end_date) - pd.Timedelta(days=int(trigger_days))
+        changes = sig_scan.diff().fillna(0)
+        recent_changes = changes[(changes.index >= cutoff) & (changes.abs() > 0)]
+        if recent_changes.empty:
+            return []
+
+        latest_price = float(raw_prices.iloc[-1])
+        latest_date = raw_prices.index[-1]
+        latest_signal = float(sig_scan.iloc[-1])
+        rows = []
+        for trig_dt, chg in recent_changes.items():
+            action = 'OPENED LONG' if chg > 0 else 'CLOSED LONG'
+            trigger_price, actual_date = _nearest_price_at_or_before(raw_prices, trig_dt)
+            if actual_date is None:
+                actual_date = trig_dt
+            live_pnl = ((latest_price / trigger_price) - 1.0) * 100 if action == 'OPENED LONG' and trigger_price and trigger_price > 0 else np.nan
+            try:
+                bull_prob = float(ctx.get('bull_probs', pd.Series(dtype=float)).reindex(scan_prices.index).ffill().loc[trig_dt])
+            except Exception:
+                bull_prob = np.nan
+            rows.append({
+                'Ticker': t,
+                'Action': action,
+                'Trigger Date': pd.Timestamp(actual_date).date(),
+                'Signal Bar Date': pd.Timestamp(trig_dt).date(),
+                'Trigger Price': round(float(trigger_price), 2) if pd.notna(trigger_price) else np.nan,
+                'Latest Price': round(float(latest_price), 2),
+                'Open PnL %': round(float(live_pnl), 2) if pd.notna(live_pnl) else np.nan,
+                'Current Status': 'Open' if latest_signal > 0 else 'Cash',
+                'Bull Prob': round(float(bull_prob), 3) if pd.notna(bull_prob) else np.nan,
+                'Frequency': str(frequency),
+                'Latest Date': pd.Timestamp(latest_date).date()
+            })
+        return rows
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_regime_recent_triggers_cached(tickers_tuple, start_date_str, end_date_str, frequency, n_regimes, stability, switch_vol, switch_trend, signal_method, conviction, min_hold, confirmed_bar, trigger_days, max_tickers):
+    """Cached multi-ticker scanner for recent Regime Switching open/close events."""
+    tickers = []
+    seen = set()
+    for x in list(tickers_tuple)[:int(max_tickers)]:
+        t = str(x).strip().upper().replace('.', '-')
+        if t and t not in seen:
+            seen.add(t)
+            tickers.append(t)
+    all_rows = []
+    for t in tickers:
+        rows = _scan_one_regime_recent_trigger(
+            t, start_date_str, end_date_str, frequency, int(n_regimes), int(stability),
+            bool(switch_vol), bool(switch_trend), str(signal_method), float(conviction),
+            int(min_hold), bool(confirmed_bar), int(trigger_days)
+        )
+        if rows:
+            all_rows.extend(rows)
+    if not all_rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(all_rows)
+    try:
+        out = out.sort_values(['Trigger Date', 'Ticker'], ascending=[False, True]).reset_index(drop=True)
+    except Exception:
+        pass
+    return out
+
+
 def prepare_execution_prices_for_regime(prices_model, signals, raw_prices, use_weekly_execution=False):
     """
     For weekly regime signals, keep the weekly model decision, but move each weekly
@@ -5832,6 +5953,58 @@ with tab7:
             use_regime_return_booster = st.checkbox("Benchmark-aware return booster", value=True, key="bt_regime_return_booster", help="Adds a fractional trend-participation candidate that tries to get closer to buy-and-hold while still exiting on trend breaks.")
             regime_return_booster_mode = st.selectbox("Return booster mode", ["Conservative", "Balanced", "Aggressive", "Benchmark Chase", "Full Benchmark Capture", "Optimized Full Capture", "Maximum Capture"], index=5, key="bt_regime_return_booster_mode", help="Optimized Full Capture tests several causal trend-capture rules and chooses the one with the best return/drawdown/Sharpe balance. It is designed to get closer to the full benchmark without accepting ugly drawdowns.")
             regime_full_benchmark_mode = st.checkbox("Compare/trade from full start date", value=True, key="bt_regime_full_benchmark_mode", help="When ON, the metric section uses the full selected date range instead of only the WFO test window. Before the first WFO period, it uses a causal trend bridge so the strategy can be compared against the full benchmark.")
+
+        with st.expander("🔎 Regime Signal Scanner — opened/closed within last 1 week", expanded=False):
+            st.caption("Scans many tickers for Regime Switching signal flips. This does not change the current ticker backtest.")
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            scanner_universe = sc1.selectbox("Scanner universe", ["Current ticker", "Nasdaq 100", "S&P 500", "S&P 500 + Nasdaq 100", "Custom list"], index=1, key="regime_scanner_universe")
+            scanner_days = sc2.number_input("Lookback days", min_value=1, max_value=30, value=7, step=1, key="regime_scanner_days")
+            scanner_max = sc3.number_input("Max tickers to scan", min_value=1, max_value=2000, value=100, step=25, key="regime_scanner_max")
+            scanner_freq = sc4.selectbox("Scanner frequency", ["Daily", "Weekly"], index=0 if bt_freq == "Daily" else 1, key="regime_scanner_freq")
+
+            custom_scanner_text = ""
+            if scanner_universe == "Custom list":
+                custom_scanner_text = st.text_area("Custom tickers separated by comma / space / new line", value=TICKER, key="regime_scanner_custom")
+
+            if st.button("Run Regime Scanner", key="run_regime_scanner", use_container_width=True):
+                if scanner_universe == "Current ticker":
+                    scan_tickers = [TICKER]
+                elif scanner_universe == "Nasdaq 100":
+                    scan_tickers = get_nasdaq100()
+                elif scanner_universe == "S&P 500":
+                    scan_tickers = get_sp500()
+                elif scanner_universe == "S&P 500 + Nasdaq 100":
+                    scan_tickers = sorted(set(get_sp500() + get_nasdaq100()))
+                else:
+                    scan_tickers = [x.strip().upper() for x in custom_scanner_text.replace(',', ' ').replace('\n', ' ').split() if x.strip()]
+
+                with st.spinner(f"Scanning {min(len(scan_tickers), int(scanner_max))} tickers for recent Regime Switching triggers..."):
+                    scan_df = scan_regime_recent_triggers_cached(
+                        tuple(scan_tickers), str(bt_start_date), str(bt_end_date), str(scanner_freq),
+                        int(bt_n_regimes), int(bt_stability), bool(bt_switch_vol), bool(bt_switch_trend),
+                        str(signal_method), float(conviction), int(min_hold_period), bool(confirmed_regime_bar),
+                        int(scanner_days), int(scanner_max)
+                    )
+                if scan_df is None or scan_df.empty:
+                    st.info("No Regime Switching open/close triggers found in the selected lookback window.")
+                else:
+                    st.success(f"Found {len(scan_df)} recent Regime Switching trigger(s).")
+                    st.dataframe(
+                        scan_df.style.format({
+                            "Trigger Price": "{:.2f}",
+                            "Latest Price": "{:.2f}",
+                            "Open PnL %": "{:.2f}%",
+                            "Bull Prob": "{:.3f}"
+                        }),
+                        use_container_width=True
+                    )
+                    st.download_button(
+                        "📥 Download Regime Scanner Results",
+                        scan_df.to_csv(index=False),
+                        file_name=f"Regime_Scanner_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv"
+                    )
+
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
