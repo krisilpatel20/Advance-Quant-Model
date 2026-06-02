@@ -64,6 +64,12 @@ GARCH/EGARCH | Regime Switching (Filtered) | Jump Diffusion | Heston Stochastic 
 if not ARCH_AVAILABLE:
     st.error("⚠️ The 'arch' library is not installed. GARCH/EGARCH modules will be limited. Run `pip install arch`.")
 
+# Safe global defaults for optional Regime-only return booster flags.
+# These prevent VWAP/CVD or other tabs from crashing if a copied helper block
+# references the Regime booster variable outside the Regime section.
+use_return_booster = False
+return_booster_mode = "Balanced"
+
 # ==========================================
 # 2. HELPER CLASSES & FUNCTIONS
 # ==========================================
