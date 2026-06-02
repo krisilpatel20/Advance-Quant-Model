@@ -4704,10 +4704,11 @@ tabs = st.tabs([
     "🎯 Institutional IV Scanner",
     "📊 CVD & Volume Delta",
     "📈 Institutional VWAP",
-    "🔬 Time Series Analysis"
+    "🔬 Time Series Analysis",
+    "🧬 Market Microstructure"
 ])
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19 = tabs
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20 = tabs
 
 if df_main is not None:
     # Initialize Report Generator
@@ -9983,3 +9984,234 @@ st.caption("Enhanced with: Institutional CVD | VWAP Suite | Time Series Analysis
 # Footer
 st.markdown("---")
 st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
+
+# ==========================================
+# MARKET MICROSTRUCTURE TAB (OHLCV PROXY)
+# ==========================================
+
+def _clean_ohlcv_for_microstructure(df):
+    """Return a clean OHLCV dataframe with standard columns for microstructure proxy work."""
+    try:
+        d = df.copy()
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
+        needed = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for c in needed:
+            if c not in d.columns:
+                return pd.DataFrame()
+        d = d[needed].replace([np.inf, -np.inf], np.nan).dropna()
+        d = d[d['Close'] > 0]
+        d['Volume'] = d['Volume'].fillna(0).clip(lower=0)
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_microstructure_features(df, toxicity_window=20, impact_window=20):
+    """
+    Builds practical market microstructure proxies from OHLCV data.
+    True LOB depth, queue position, and latency-arb data require Level 2/tick feeds;
+    these features are OHLCV approximations for retail-accessible data.
+    """
+    d = _clean_ohlcv_for_microstructure(df)
+    if d.empty or len(d) < 10:
+        return pd.DataFrame()
+
+    px = d['Close'].astype(float)
+    vol = d['Volume'].astype(float).replace(0, np.nan)
+    ret = px.pct_change().fillna(0.0)
+    hl_range = (d['High'] - d['Low']).replace(0, np.nan)
+
+    # Trade direction proxy: close above open = buyer pressure, below open = seller pressure.
+    direction = np.sign(d['Close'] - d['Open']).replace(0, np.nan).ffill().fillna(0.0)
+    signed_volume = direction * d['Volume'].fillna(0.0)
+
+    # VPIN-style toxicity proxy: high absolute volume imbalance vs total volume.
+    imbalance = signed_volume.rolling(toxicity_window, min_periods=max(3, toxicity_window // 3)).sum().abs()
+    total_volume = d['Volume'].rolling(toxicity_window, min_periods=max(3, toxicity_window // 3)).sum().replace(0, np.nan)
+    toxicity = (imbalance / total_volume).clip(0, 1).fillna(0.0)
+
+    # Price impact / Amihud-style illiquidity proxy.
+    dollar_volume = (px * d['Volume']).replace(0, np.nan)
+    impact = (ret.abs() / dollar_volume).replace([np.inf, -np.inf], np.nan)
+    impact_z = (impact - impact.rolling(impact_window, min_periods=5).mean()) / (impact.rolling(impact_window, min_periods=5).std() + 1e-12)
+
+    # LOB pressure proxy: close location in the candle range, volume-weighted.
+    close_location = ((px - d['Low']) / hl_range).clip(0, 1).fillna(0.5)
+    lob_pressure = ((close_location - 0.5) * 2.0 * np.log1p(d['Volume'])).rolling(5, min_periods=2).mean().fillna(0.0)
+
+    # Intraperiod VWAP proxy from typical price and cumulative volume.
+    typical_price = (d['High'] + d['Low'] + d['Close']) / 3.0
+    cum_pv = (typical_price * d['Volume']).cumsum()
+    cum_vol = d['Volume'].replace(0, np.nan).cumsum()
+    vwap = (cum_pv / cum_vol).ffill().fillna(px)
+    twap = px.rolling(20, min_periods=3).mean().fillna(px)
+
+    out = pd.DataFrame(index=d.index)
+    out['Close'] = px
+    out['Volume'] = d['Volume']
+    out['Return'] = ret
+    out['Signed Volume'] = signed_volume
+    out['Order Flow Imbalance'] = (signed_volume.rolling(5, min_periods=2).sum() / d['Volume'].rolling(5, min_periods=2).sum().replace(0, np.nan)).fillna(0.0).clip(-1, 1)
+    out['Toxicity Proxy'] = toxicity
+    out['Price Impact Z'] = impact_z.fillna(0.0).clip(-10, 10)
+    out['LOB Pressure Proxy'] = lob_pressure
+    out['VWAP Proxy'] = vwap
+    out['TWAP Proxy'] = twap
+    out['Spread Proxy (%)'] = ((d['High'] - d['Low']) / px * 100).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return out.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def build_microstructure_signals(ms):
+    """Create several long/cash signals using microstructure proxy features."""
+    if ms.empty:
+        return {}
+    close = ms['Close']
+    tox = ms['Toxicity Proxy']
+    ofi = ms['Order Flow Imbalance']
+    lob = ms['LOB Pressure Proxy']
+    impact_z = ms['Price Impact Z']
+    vwap = ms['VWAP Proxy']
+    twap = ms['TWAP Proxy']
+
+    tox_cap = tox.rolling(60, min_periods=10).quantile(0.75).fillna(tox.quantile(0.75))
+    impact_cap = impact_z.rolling(60, min_periods=10).quantile(0.80).fillna(impact_z.quantile(0.80))
+
+    signals = {}
+
+    # 1) Flow breakout: buyer pressure + above VWAP + not toxic.
+    signals['Order Flow Breakout'] = ((ofi > 0.10) & (close > vwap) & (tox < tox_cap)).astype(float)
+
+    # 2) Toxicity guard trend: long trend only when toxic flow is not elevated.
+    trend = close > close.ewm(span=20, adjust=False).mean()
+    signals['Toxicity Guard Trend'] = (trend & (tox < tox_cap) & (impact_z < impact_cap)).astype(float)
+
+    # 3) LOB pressure proxy: candle closes near highs with volume pressure.
+    signals['LOB Pressure Proxy'] = ((lob > 0) & (ofi > 0) & (close > twap)).astype(float)
+
+    # 4) VWAP/TWAP execution trend: proxy for execution-friendly participation.
+    signals['VWAP/TWAP Execution Trend'] = ((close > vwap) & (close > twap) & (ofi > -0.20)).astype(float)
+
+    # 5) Conservative composite: 2-of-4 vote.
+    vote_df = pd.DataFrame(signals).reindex(ms.index).fillna(0.0)
+    signals['Microstructure Composite'] = (vote_df.sum(axis=1) >= 2).astype(float)
+
+    return {k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1) for k, v in signals.items()}
+
+
+def summarize_microstructure_backtest(prices, signals, initial_capital=10000.0):
+    rows = []
+    results = {}
+    for name, sig in signals.items():
+        bt = BacktestEngine.run_strategy(prices, sig, initial_capital=initial_capital)
+        eq = bt.get('equity_curve', pd.Series(dtype=float))
+        if eq.empty:
+            continue
+        total_ret = ((eq.iloc[-1] / initial_capital) - 1) * 100
+        metrics = BacktestEngine.calculate_metrics(bt.get('returns', pd.Series(dtype=float)))
+        trades = bt.get('trades', pd.DataFrame())
+        rows.append({
+            'Strategy': name,
+            'Total Return (%)': round(float(total_ret), 2),
+            'Sharpe': round(float(metrics.get('Sharpe Ratio', 0.0)), 2),
+            'Max Drawdown (%)': round(float(metrics.get('Max Drawdown', 0.0) * 100), 2),
+            'Trades': int(len(trades)) if isinstance(trades, pd.DataFrame) else 0,
+        })
+        results[name] = bt
+    return pd.DataFrame(rows).sort_values('Total Return (%)', ascending=False), results
+
+
+try:
+    if df_main is not None:
+        with tab20:
+            st.header("🧬 Market Microstructure")
+            st.caption("Uses OHLCV proxy data. True order book depth, queue position, and latency arbitrage require Level 2/tick data, so this tab labels those as practical proxies rather than exact exchange microstructure.")
+
+            mm_c1, mm_c2, mm_c3 = st.columns(3)
+            with mm_c1:
+                tox_window = st.number_input("Toxicity Window", min_value=5, max_value=100, value=20, step=5, key="mm_tox_window")
+            with mm_c2:
+                impact_window = st.number_input("Impact Window", min_value=5, max_value=100, value=20, step=5, key="mm_impact_window")
+            with mm_c3:
+                mm_initial_capital = st.number_input("Initial Capital", min_value=1000.0, max_value=1000000.0, value=10000.0, step=1000.0, key="mm_initial_capital")
+
+            ms = build_microstructure_features(df_main, toxicity_window=int(tox_window), impact_window=int(impact_window))
+            if ms.empty or len(ms) < 20:
+                st.warning("Not enough OHLCV data to build market microstructure proxy signals.")
+            else:
+                latest = ms.iloc[-1]
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Order Flow Imbalance", f"{latest['Order Flow Imbalance']:.2f}")
+                m2.metric("Toxicity Proxy", f"{latest['Toxicity Proxy']:.2f}")
+                m3.metric("Price Impact Z", f"{latest['Price Impact Z']:.2f}")
+                m4.metric("LOB Pressure Proxy", f"{latest['LOB Pressure Proxy']:.2f}")
+
+                st.subheader("Microstructure Proxy Chart")
+                fig_mm = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.50, 0.25, 0.25])
+                fig_mm.add_trace(go.Scatter(x=ms.index, y=ms['Close'], name='Close', line=dict(width=2)), row=1, col=1)
+                fig_mm.add_trace(go.Scatter(x=ms.index, y=ms['VWAP Proxy'], name='VWAP Proxy', line=dict(width=1)), row=1, col=1)
+                fig_mm.add_trace(go.Scatter(x=ms.index, y=ms['TWAP Proxy'], name='TWAP Proxy', line=dict(width=1)), row=1, col=1)
+                fig_mm.add_trace(go.Scatter(x=ms.index, y=ms['Order Flow Imbalance'], name='Order Flow Imbalance'), row=2, col=1)
+                fig_mm.add_trace(go.Scatter(x=ms.index, y=ms['Toxicity Proxy'], name='Toxicity Proxy'), row=3, col=1)
+                fig_mm.update_layout(height=700, template='plotly_dark', showlegend=True)
+                st.plotly_chart(fig_mm, use_container_width=True)
+
+                signals_mm = build_microstructure_signals(ms)
+                rank_df, bt_results = summarize_microstructure_backtest(ms['Close'], signals_mm, initial_capital=float(mm_initial_capital))
+
+                st.subheader("Microstructure Strategy Ranking")
+                st.dataframe(rank_df, use_container_width=True, hide_index=True)
+
+                strategy_names = list(signals_mm.keys())
+                best_strategy = rank_df.iloc[0]['Strategy'] if not rank_df.empty else strategy_names[0]
+                manual_mm = st.checkbox("Manually select microstructure strategy for trade log", value=False, key="mm_manual_strategy")
+                if manual_mm:
+                    chosen_mm = st.selectbox("Choose Microstructure Strategy", strategy_names, index=strategy_names.index(best_strategy) if best_strategy in strategy_names else 0, key="mm_strategy_choice")
+                else:
+                    chosen_mm = best_strategy
+                    st.info(f"Auto-selected best microstructure strategy by return: {chosen_mm}")
+
+                selected_bt = bt_results.get(chosen_mm)
+                if selected_bt is not None:
+                    eq = selected_bt['equity_curve']
+                    bench = selected_bt['benchmark_curve']
+                    rets = selected_bt['returns']
+                    metrics = BacktestEngine.calculate_metrics(rets)
+                    strat_ret = ((eq.iloc[-1] / float(mm_initial_capital)) - 1) * 100 if not eq.empty else 0.0
+                    bench_ret = ((bench.iloc[-1] / float(mm_initial_capital)) - 1) * 100 if not bench.empty else 0.0
+
+                    st.subheader(f"Trade Log — {chosen_mm}")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Strategy Return", f"{strat_ret:.2f}%")
+                    c2.metric("Benchmark Return", f"{bench_ret:.2f}%")
+                    c3.metric("Sharpe", f"{metrics.get('Sharpe Ratio', 0.0):.2f}")
+                    c4.metric("Max Drawdown", f"{metrics.get('Max Drawdown', 0.0)*100:.2f}%")
+
+                    eq_fig = go.Figure()
+                    eq_fig.add_trace(go.Scatter(x=eq.index, y=eq, name='Strategy Equity'))
+                    eq_fig.add_trace(go.Scatter(x=bench.index, y=bench, name='Buy & Hold'))
+                    eq_fig.update_layout(height=450, template='plotly_dark', title=f'{chosen_mm}: Strategy vs Buy & Hold')
+                    st.plotly_chart(eq_fig, use_container_width=True)
+
+                    trades_mm = selected_bt.get('trades', pd.DataFrame())
+                    if isinstance(trades_mm, pd.DataFrame) and not trades_mm.empty:
+                        if 'Cumulative Return (%)' in trades_mm.columns:
+                            trades_mm['Cumulative Return (%)'] = pd.to_numeric(trades_mm['Cumulative Return (%)'], errors='coerce').round(2)
+                        st.dataframe(trades_mm.sort_values('Entry Date', ascending=False), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No closed/open trades generated by the selected microstructure strategy.")
+
+                with st.expander("What each proxy means"):
+                    st.markdown("""
+- **Order Flow Toxicity Proxy:** VPIN-style imbalance between buyer/seller pressure using signed volume from OHLCV.
+- **LOB Pressure Proxy:** Not real order book depth. It approximates bid/ask pressure from where price closes inside the candle range with volume weight.
+- **Price Impact Z:** Amihud-style return per dollar volume. High values mean price moves more for the same trading volume.
+- **VWAP/TWAP Execution Trend:** Simulates execution-friendly participation using VWAP/TWAP style trend confirmation.
+- **Latency Arbitrage:** True latency arbitrage cannot be modeled from Yahoo OHLCV. It needs cross-exchange tick feeds and timestamps in milliseconds/microseconds.
+                    """)
+except Exception as e:
+    try:
+        with tab20:
+            st.error(f"Market Microstructure tab error: {e}")
+    except Exception:
+        pass
