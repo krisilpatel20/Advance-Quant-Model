@@ -10096,6 +10096,46 @@ def build_microstructure_signals(ms):
     vote_df = pd.DataFrame(signals).reindex(ms.index).fillna(0.0)
     signals['Microstructure Composite'] = (vote_df.sum(axis=1) >= 2).astype(float)
 
+    # 6) Benchmark-aware runner capture.
+    # Honest purpose: pure microstructure proxies are usually too short-term and
+    # can miss monster buy-and-hold trends. This signal stays long during strong
+    # price structure, while still using toxicity/impact as a risk guard.
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    mom20 = close.pct_change(20).fillna(0.0)
+    mom60 = close.pct_change(60).fillna(0.0)
+
+    strong_runner = (
+        (close > ema20) &
+        (ema20 > ema50) &
+        (mom20 > 0.02)
+    )
+    long_trend = (
+        (close > ema50) &
+        ((ema50 > ema100) | (close > ema200)) &
+        (mom60 > 0.05)
+    )
+    extreme_toxicity = tox > tox.rolling(80, min_periods=20).quantile(0.90).fillna(tox.quantile(0.90))
+    extreme_impact = impact_z > impact_z.rolling(80, min_periods=20).quantile(0.90).fillna(impact_z.quantile(0.90))
+
+    signals['Benchmark-Aware Runner Capture'] = ((strong_runner | long_trend) & ~(extreme_toxicity & extreme_impact)).astype(float)
+
+    # 7) Microstructure + trend participation. More aggressive than the composite,
+    # but still avoids obvious toxic/illiquid stress.
+    micro_ok = (tox < tox_cap) & (impact_z < impact_cap)
+    signals['Microstructure Trend Participation'] = (((close > ema20) & (ofi > -0.30)) | ((close > ema50) & micro_ok)).astype(float)
+
+    # 8) Hybrid vote: lets trend keep the model in big runners, but still requires
+    # either microstructure support or a strong runner condition.
+    hybrid_votes = pd.DataFrame({
+        'runner': signals['Benchmark-Aware Runner Capture'],
+        'micro': signals['Microstructure Composite'],
+        'participation': signals['Microstructure Trend Participation'],
+    }, index=ms.index).fillna(0.0)
+    signals['Hybrid Microstructure Runner'] = (hybrid_votes.sum(axis=1) >= 1.5).astype(float)
+
     return {k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1) for k, v in signals.items()}
 
 
