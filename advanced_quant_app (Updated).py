@@ -10162,26 +10162,47 @@ def build_microstructure_signals(ms):
     return {k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1) for k, v in signals.items()}
 
 
-def summarize_microstructure_backtest(prices, signals, initial_capital=10000.0):
+def summarize_microstructure_backtest(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, rank_mode="Risk-Adjusted"):
     rows = []
     results = {}
     for name, sig in signals.items():
-        bt = BacktestEngine.run_strategy(prices, sig, initial_capital=initial_capital)
+        bt = BacktestEngine.run_strategy(
+            prices, sig,
+            initial_capital=initial_capital,
+            trailing_stop_pct=float(trailing_stop_pct),
+            stop_loss_pct=float(stop_loss_pct)
+        )
         eq = bt.get('equity_curve', pd.Series(dtype=float))
         if eq.empty:
             continue
         total_ret = ((eq.iloc[-1] / initial_capital) - 1) * 100
         metrics = BacktestEngine.calculate_metrics(bt.get('returns', pd.Series(dtype=float)))
+        sharpe = float(metrics.get('Sharpe Ratio', 0.0))
+        max_dd_pct = float(metrics.get('Max Drawdown', 0.0) * 100)
         trades = bt.get('trades', pd.DataFrame())
+
+        # Risk-aware score: still rewards return, but penalizes ugly drawdown.
+        # This helps avoid auto-selecting strategies that only win by accepting -30% to -50% DD.
+        risk_score = float(total_ret) + (20.0 * sharpe) + (2.0 * max_dd_pct)
+
         rows.append({
             'Strategy': name,
             'Total Return (%)': round(float(total_ret), 2),
-            'Sharpe': round(float(metrics.get('Sharpe Ratio', 0.0)), 2),
-            'Max Drawdown (%)': round(float(metrics.get('Max Drawdown', 0.0) * 100), 2),
+            'Sharpe': round(sharpe, 2),
+            'Max Drawdown (%)': round(max_dd_pct, 2),
+            'Risk Score': round(risk_score, 2),
             'Trades': int(len(trades)) if isinstance(trades, pd.DataFrame) else 0,
         })
         results[name] = bt
-    return pd.DataFrame(rows).sort_values('Total Return (%)', ascending=False), results
+
+    rank_df = pd.DataFrame(rows)
+    if rank_df.empty:
+        return rank_df, results
+    if str(rank_mode).lower().startswith('risk') and 'Risk Score' in rank_df.columns:
+        rank_df = rank_df.sort_values('Risk Score', ascending=False)
+    else:
+        rank_df = rank_df.sort_values('Total Return (%)', ascending=False)
+    return rank_df, results
 
 
 try:
@@ -10197,6 +10218,16 @@ try:
                 impact_window = st.number_input("Impact Window", min_value=5, max_value=100, value=20, step=5, key="mm_impact_window")
             with mm_c3:
                 mm_initial_capital = st.number_input("Initial Capital", min_value=1000.0, max_value=1000000.0, value=10000.0, step=1000.0, key="mm_initial_capital")
+
+            mm_g1, mm_g2, mm_g3, mm_g4 = st.columns(4)
+            with mm_g1:
+                mm_dd_guard = st.checkbox("Enable Microstructure DD Guard", value=True, key="mm_dd_guard")
+            with mm_g2:
+                mm_trailing_stop = st.number_input("Trailing DD Stop (%)", min_value=0.0, max_value=50.0, value=18.0, step=1.0, key="mm_trailing_stop")
+            with mm_g3:
+                mm_hard_stop = st.number_input("Hard Stop Loss (%)", min_value=0.0, max_value=50.0, value=10.0, step=1.0, key="mm_hard_stop")
+            with mm_g4:
+                mm_rank_mode = st.selectbox("Auto-select by", ["Risk-Adjusted", "Return Only"], index=0, key="mm_rank_mode")
 
             ms = build_microstructure_features(df_main, toxicity_window=int(tox_window), impact_window=int(impact_window))
             if ms.empty or len(ms) < 20:
@@ -10220,9 +10251,19 @@ try:
                 st.plotly_chart(fig_mm, use_container_width=True)
 
                 signals_mm = build_microstructure_signals(ms)
-                rank_df, bt_results = summarize_microstructure_backtest(ms['Close'], signals_mm, initial_capital=float(mm_initial_capital))
+                mm_trailing_stop_pct = float(mm_trailing_stop) / 100.0 if bool(mm_dd_guard) else 0.0
+                mm_hard_stop_pct = float(mm_hard_stop) / 100.0 if bool(mm_dd_guard) else 0.0
+                rank_df, bt_results = summarize_microstructure_backtest(
+                    ms['Close'], signals_mm,
+                    initial_capital=float(mm_initial_capital),
+                    trailing_stop_pct=mm_trailing_stop_pct,
+                    stop_loss_pct=mm_hard_stop_pct,
+                    rank_mode=str(mm_rank_mode)
+                )
 
                 st.subheader("Microstructure Strategy Ranking")
+                if bool(mm_dd_guard):
+                    st.caption(f"DD Guard ON: trailing stop {float(mm_trailing_stop):.0f}% and hard stop {float(mm_hard_stop):.0f}% are applied to the displayed ranking, metrics, equity curve, and trade log.")
                 st.dataframe(rank_df, use_container_width=True, hide_index=True)
 
                 strategy_names = list(signals_mm.keys())
