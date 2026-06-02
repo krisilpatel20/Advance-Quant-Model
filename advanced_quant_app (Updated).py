@@ -10136,6 +10136,29 @@ def build_microstructure_signals(ms):
     }, index=ms.index).fillna(0.0)
     signals['Hybrid Microstructure Runner'] = (hybrid_votes.sum(axis=1) >= 1.5).astype(float)
 
+    # 9) Benchmark participation / runner hold.
+    # This is intentionally included as a real tradable comparison strategy, not just a benchmark line.
+    # It lets the user manually select a high-participation runner strategy and see actual trade logs.
+    # It is still causal: it only uses current/past EMA and momentum information.
+    runner_hold = (
+        ((close > ema20) & (mom20 > 0.00)) |
+        ((close > ema50) & (mom60 > 0.00)) |
+        ((ema20 > ema50) & (close > ema20))
+    )
+    # Once a strong runner is confirmed, do not exit on tiny noise; exit only when structure breaks.
+    runner_exit = (close < ema50) & (ema20 < ema50)
+    runner_state = pd.Series(np.nan, index=ms.index, dtype=float)
+    runner_state.loc[runner_hold] = 1.0
+    runner_state.loc[runner_exit] = 0.0
+    signals['Benchmark Participation Runner'] = runner_state.ffill().fillna(0.0).clip(0, 1)
+
+    # 10) Maximum benchmark capture. This is basically long exposure with a light trend brake.
+    # Use this when the goal is to get closest to buy-and-hold while still having a basic exit rule.
+    max_capture = pd.Series(1.0, index=ms.index, dtype=float)
+    risk_break = (close < ema100) & (mom60 < -0.10) & (tox > tox_cap)
+    max_capture.loc[risk_break] = 0.0
+    signals['Maximum Benchmark Capture'] = max_capture.ffill().fillna(1.0).clip(0, 1)
+
     return {k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1) for k, v in signals.items()}
 
 
