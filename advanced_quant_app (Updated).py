@@ -1212,9 +1212,10 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
 
-    Intraday/live bars keep their real timestamp.
-    Daily/weekly bars usually arrive as date-only / midnight timestamps; for display,
-    show an assumed candle-close time so every trade log has a timestamp.
+    Fixes confusing duplicate-looking rows by keeping seconds for intraday/live bars.
+    Daily/weekly/date-only rows still get an assumed candle-close timestamp.
+    Open trades show Exit Date as "Open" instead of NaT.
+
     This does not change strategy logic, prices, equity curves, or metrics.
     """
     try:
@@ -1222,28 +1223,46 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
             return trades_df
         out = trades_df.copy()
 
-        def _format_one(x):
+        def _format_one(x, is_exit=False, status=None):
+            # Open positions should not display NaT in the exit column.
+            try:
+                if is_exit and str(status).strip().lower() == "open":
+                    return "Open"
+            except Exception:
+                pass
+
             if x is None:
-                return x
+                return "Open" if is_exit else x
             if isinstance(x, str):
-                if x.strip().lower() in {"open", "", "nan", "none", "nat"}:
-                    return x
+                xl = x.strip().lower()
+                if xl in {"open", "", "nan", "none", "nat"}:
+                    return "Open" if is_exit else x
             try:
                 ts = pd.Timestamp(x)
                 if pd.isna(ts):
-                    return x
-                # If the data is daily/weekly/date-only, pandas usually stores it at 00:00.
-                # For display we mark it as candle close time, not a real intraday trigger.
+                    return "Open" if is_exit else x
+
+                # If data is daily/weekly/date-only, mark display as candle close time.
                 if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
                     hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
-                    ts = ts.replace(hour=hh, minute=mm)
-                return ts.strftime("%Y-%m-%d %H:%M")
+                    ts = ts.replace(hour=hh, minute=mm, second=0)
+                    return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+                # Intraday/live: keep seconds so two trades in the same minute do not look duplicated.
+                return ts.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 return x
 
-        for col in ["Entry Date", "Exit Date", "Entry Time", "Exit Time", "Trigger Date", "Trigger Time"]:
+        status_series = out["Status"] if "Status" in out.columns else pd.Series([None] * len(out), index=out.index)
+
+        for col in ["Entry Date", "Entry Time", "Trigger Date", "Trigger Time"]:
             if col in out.columns:
-                out[col] = out[col].apply(_format_one)
+                out[col] = out[col].apply(lambda v: _format_one(v, is_exit=False))
+
+        for col in ["Exit Date", "Exit Time"]:
+            if col in out.columns:
+                out[col] = [_format_one(v, is_exit=True, status=status_series.loc[i]) for i, v in out[col].items()]
+
         return out
     except Exception:
         return trades_df
