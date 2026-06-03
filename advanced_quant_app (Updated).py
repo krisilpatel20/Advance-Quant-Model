@@ -1214,64 +1214,115 @@ def clean_overlapping_duplicate_trades(trades_df):
     """
     Display/log-cleaning only.
 
-    Some weekly/daily mapped trade logs can create duplicate rows with the exact
-    same entry timestamp after the date-mapping layer. One position should not be
-    shown as both closed and open from the same exact entry timestamp.
+    Cleans impossible long-only trade-log overlaps created by weekly/daily
+    date-mapping display layers. This does NOT change the underlying strategy,
+    signals, equity curve, prices used by the backtest engine, or metrics.
 
-    Rule:
-    - If duplicate Entry Date rows exist, keep the Open row when present.
-    - Otherwise keep the row with the longest holding span.
-    - This does not change signals, prices used by the backtest engine, equity
-      curve, or performance metrics.
+    Rules:
+    1) If an Open trade exists, keep the latest Open trade and remove any
+       closed trade whose entry/exit overlaps that open position.
+    2) Remove duplicate same-entry rows.
+    3) Remove remaining overlapping closed rows so the displayed log is a
+       clean one-position-at-a-time timeline.
     """
     try:
         if trades_df is None or trades_df.empty or "Entry Date" not in trades_df.columns:
             return trades_df
+
         out = trades_df.copy()
 
-        def _entry_key(x):
+        def _parse_ts(x):
             try:
-                ts = pd.Timestamp(x)
+                if x is None:
+                    return pd.NaT
+                xs = str(x).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                if xs.lower() in {"open", "nat", "nan", "none", ""}:
+                    return pd.NaT
+                ts = pd.Timestamp(xs)
                 if pd.isna(ts):
-                    return str(x)
-                # Use full timestamp precision available. Do not round.
+                    return pd.NaT
                 if getattr(ts, "tzinfo", None) is not None:
                     ts = ts.tz_convert(None)
-                return ts.strftime("%Y-%m-%d %H:%M:%S")
+                return ts
             except Exception:
-                return str(x)
+                return pd.NaT
 
-        out["__entry_key__"] = out["Entry Date"].apply(_entry_key)
-        keep_idx = []
-        for _, g in out.groupby("__entry_key__", sort=False):
+        out["__entry_ts__"] = out["Entry Date"].apply(_parse_ts)
+        if "Exit Date" in out.columns:
+            out["__exit_ts__"] = out["Exit Date"].apply(_parse_ts)
+        else:
+            out["__exit_ts__"] = pd.NaT
+
+        status = out["Status"].astype(str).str.lower() if "Status" in out.columns else pd.Series([""] * len(out), index=out.index)
+        out["__is_open__"] = status.eq("open") | out["__exit_ts__"].isna()
+
+        # Keep only the latest open trade. A long-only strategy cannot have
+        # multiple open positions in this display table.
+        open_rows = out[out["__is_open__"] & out["__entry_ts__"].notna()].sort_values("__entry_ts__")
+        keep_open_idx = None
+        open_entry = None
+        if not open_rows.empty:
+            keep_open_idx = open_rows.index[-1]
+            open_entry = out.loc[keep_open_idx, "__entry_ts__"]
+
+            # Remove every other row that overlaps the current open position:
+            # - any duplicate/older open row
+            # - any closed row entered after the open started
+            # - any closed row that exits after the open started
+            mask_current_open = out.index == keep_open_idx
+            safe_before_open = (
+                (~out["__is_open__"]) &
+                out["__entry_ts__"].notna() &
+                out["__exit_ts__"].notna() &
+                (out["__entry_ts__"] < open_entry) &
+                (out["__exit_ts__"] <= open_entry)
+            )
+            out = out[mask_current_open | safe_before_open].copy()
+
+        # Remove exact same entry duplicates. If duplicate rows remain, prefer Open,
+        # otherwise prefer the longer holding period because the shorter row is usually
+        # a display-mapping artifact.
+        dedup_keep = []
+        for _, g in out.groupby("__entry_ts__", sort=False):
             if len(g) == 1:
-                keep_idx.append(g.index[0])
+                dedup_keep.append(g.index[0])
                 continue
-
-            status = g["Status"].astype(str).str.lower() if "Status" in g.columns else pd.Series([""] * len(g), index=g.index)
-            open_rows = g[status.eq("open")]
-            if not open_rows.empty:
-                # If there is an open duplicate, keep the latest open representation.
-                keep_idx.append(open_rows.index[-1])
+            g_open = g[g["__is_open__"]]
+            if not g_open.empty:
+                dedup_keep.append(g_open.index[-1])
                 continue
+            durations = (g["__exit_ts__"] - g["__entry_ts__"]).fillna(pd.Timedelta(0))
+            dedup_keep.append(durations.idxmax())
+        out = out.loc[dedup_keep].copy()
 
-            def _duration(row):
-                try:
-                    a = pd.Timestamp(row.get("Entry Date"))
-                    b = pd.Timestamp(row.get("Exit Date"))
-                    if pd.isna(a) or pd.isna(b):
-                        return pd.Timedelta(0)
-                    return b - a
-                except Exception:
-                    return pd.Timedelta(0)
+        # Clean remaining closed-trade overlaps before the open trade using interval
+        # scheduling. This gives one clean long-only timeline. Keep open row at end.
+        open_part = out[out["__is_open__"]].copy()
+        closed = out[~out["__is_open__"] & out["__entry_ts__"].notna() & out["__exit_ts__"].notna()].copy()
+        closed = closed.sort_values(["__exit_ts__", "__entry_ts__"])
 
-            durations = g.apply(_duration, axis=1)
-            keep_idx.append(durations.idxmax())
+        selected = []
+        last_exit = pd.Timestamp.min
+        for idx, row in closed.iterrows():
+            ent = row["__entry_ts__"]
+            ex = row["__exit_ts__"]
+            if pd.isna(ent) or pd.isna(ex) or ex < ent:
+                continue
+            # Allow a new trade exactly when previous one exits; block true overlap.
+            if ent >= last_exit:
+                selected.append(idx)
+                last_exit = ex
 
-        out = out.loc[keep_idx].drop(columns=["__entry_key__"], errors="ignore")
-        return out
+        clean = pd.concat([closed.loc[selected], open_part], axis=0) if len(open_part) else closed.loc[selected]
+        clean = clean.sort_values("__entry_ts__", ascending=False)
+        clean = clean.drop(columns=["__entry_ts__", "__exit_ts__", "__is_open__"], errors="ignore")
+
+        return clean.reset_index(drop=True)
     except Exception:
-        return trades_df
+        try:
+            return trades_df.drop(columns=["__entry_ts__", "__exit_ts__", "__is_open__"], errors="ignore")
+        except Exception:
+            return trades_df
 
 def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
