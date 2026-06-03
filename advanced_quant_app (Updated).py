@@ -1481,38 +1481,72 @@ def build_live_regime_hybrid_signal(anchor_signal, anchor_prices, live_prices, e
             return base.reindex(live_px.index).ffill().fillna(0.0).clip(0, 1)
 
         mode_l = str(mode or "Balanced").lower()
-        if "active" in mode_l:
-            confirm_n, break_n, mom_bars = 2, 2, 4
+        benchmark_capture = ("benchmark" in mode_l) or ("capture" in mode_l)
+        if benchmark_capture:
+            # More participation for live runner stocks.  The weekly/daily regime is still
+            # the main brain, but live mode should not exit on tiny intraday noise.
+            confirm_n, break_n, mom_bars = 2, 5, 4
+            ema_fast_span, ema_slow_span, ema_guard_span = 6, 18, 34
+            drawdown_guard = 0.045  # live runner protection; not a tight scalping stop
+        elif "active" in mode_l:
+            confirm_n, break_n, mom_bars = 2, 3, 4
+            ema_fast_span, ema_slow_span, ema_guard_span = 8, 21, 34
+            drawdown_guard = 0.035
         elif "conservative" in mode_l:
-            confirm_n, break_n, mom_bars = 5, 4, 8
+            confirm_n, break_n, mom_bars = 5, 5, 8
+            ema_fast_span, ema_slow_span, ema_guard_span = 8, 21, 34
+            drawdown_guard = 0.025
         else:
-            confirm_n, break_n, mom_bars = 3, 3, 6
+            confirm_n, break_n, mom_bars = 3, 4, 6
+            ema_fast_span, ema_slow_span, ema_guard_span = 8, 21, 34
+            drawdown_guard = 0.030
 
-        ema_fast = live_px.ewm(span=8, adjust=False).mean()
-        ema_slow = live_px.ewm(span=21, adjust=False).mean()
-        ema_guard = live_px.ewm(span=34, adjust=False).mean()
+        ema_fast = live_px.ewm(span=ema_fast_span, adjust=False).mean()
+        ema_slow = live_px.ewm(span=ema_slow_span, adjust=False).mean()
+        ema_guard = live_px.ewm(span=ema_guard_span, adjust=False).mean()
         mom = live_px.pct_change(mom_bars).fillna(0.0)
+        mom_long = live_px.pct_change(max(8, mom_bars * 2)).fillna(0.0)
 
         early_long_raw = (live_px > ema_fast) & (ema_fast > ema_slow) & (mom > 0)
-        breakdown_raw = (live_px < ema_guard) & (ema_fast < ema_slow)
+        if benchmark_capture:
+            # If price is clearly trending above the live anchor averages, participate even
+            # when the regime anchor is slow to flip. This is designed for RKLB/PLTR/ASTS-style runners.
+            early_long_raw = early_long_raw | ((live_px > ema_slow) & (ema_fast >= ema_slow) & (mom_long > 0.003))
+            breakdown_raw = (live_px < ema_guard) & (ema_fast < ema_slow) & (mom < 0) & (mom_long < 0)
+        else:
+            breakdown_raw = (live_px < ema_guard) & (ema_fast < ema_slow)
+
         early_long = early_long_raw.rolling(confirm_n, min_periods=confirm_n).sum().fillna(0) >= confirm_n
         breakdown = breakdown_raw.rolling(break_n, min_periods=break_n).sum().fillna(0) >= break_n
 
         out = []
         position = 1.0 if float(base.iloc[0]) > 0 else 0.0
+        peak_since_entry = float(live_px.iloc[0]) if position > 0 else 0.0
         for dt in live_px.index:
+            px_now = float(live_px.loc[dt])
             b = float(base.loc[dt]) if dt in base.index else position
-            if b > 0:
-                # Stable anchor says long. Stay long unless intraday breaks clearly.
-                position = 1.0
-                if bool(breakdown.loc[dt]):
-                    position = 0.0
+
+            if position > 0:
+                peak_since_entry = max(peak_since_entry, px_now)
+                live_dd = (px_now / peak_since_entry - 1.0) if peak_since_entry > 0 else 0.0
             else:
-                # Stable anchor says cash. Allow early tactical entry only if live trend confirms.
+                live_dd = 0.0
+
+            if b > 0:
+                # Stable anchor says long. Stay long unless live damage is real.
+                position = 1.0
+                peak_since_entry = max(peak_since_entry, px_now) if peak_since_entry else px_now
+                if bool(breakdown.loc[dt]) or live_dd <= -drawdown_guard:
+                    position = 0.0
+                    peak_since_entry = 0.0
+            else:
+                # Stable anchor says cash. Allow tactical live entry only if intraday trend confirms.
                 if bool(early_long.loc[dt]):
                     position = 1.0
-                elif bool(breakdown.loc[dt]):
+                    peak_since_entry = px_now
+                elif bool(breakdown.loc[dt]) or live_dd <= -drawdown_guard:
                     position = 0.0
+                    peak_since_entry = 0.0
             out.append(position)
 
         return pd.Series(out, index=live_px.index, dtype=float).ffill().fillna(0.0).clip(0, 1)
@@ -6025,8 +6059,8 @@ with tab7:
                 lrc1, lrc2, lrc3 = st.columns(3)
                 live_regime_anchor_freq = lrc1.selectbox("Live regime anchor", ["Weekly", "Daily"], index=0, key="bt_live_regime_anchor_freq")
                 live_regime_overlay = lrc2.checkbox("Intraday early trigger overlay", value=True, key="bt_live_regime_overlay")
-                live_regime_sensitivity = lrc3.selectbox("Live trigger sensitivity", ["Conservative", "Balanced", "Active"], index=1, key="bt_live_regime_sensitivity")
-                st.caption("Weekly/Daily anchor = stable regime brain. Intraday overlay = live timing. Turn this OFF if you want pure intraday regime fitting.")
+                live_regime_sensitivity = lrc3.selectbox("Live trigger sensitivity", ["Conservative", "Balanced", "Active", "Benchmark Capture"], index=3, key="bt_live_regime_sensitivity")
+                st.caption("Weekly/Daily anchor = stable regime brain. Intraday overlay = live timing. Benchmark Capture is designed for live runner stocks and stays invested longer unless live trend damage is real.")
         
         col_r4, col_r5 = st.columns(2)
         with col_r4:
