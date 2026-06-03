@@ -2,15 +2,14 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')   # prevent X-server init on headless servers — must come before pyplot
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import scipy.stats as stats
-from scipy.optimize import minimize
 import statsmodels.api as sm
-from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
-from statsmodels.tsa.seasonal import seasonal_decompose
 from datetime import datetime, timedelta
 try:
     from zoneinfo import ZoneInfo
@@ -21,10 +20,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import json
-import smtplib
 import os
-from email.message import EmailMessage
-import os
+
+# ── Heavy / optional imports (lazy-loaded at first use) ──────────────────────
+# These are NOT imported at module level so the app starts fast.
+# scipy.optimize.minimize  → inside merton_jump_diffusion()
+# statsmodels MarkovRegression → inside fit_regime_model() (already @st.cache_data)
+# statsmodels seasonal_decompose → inside the seasonal-decomp tab block
+# statsmodels diagnostics (acorr_ljungbox, het_arch) → inside the GARCH result blocks
+# smtplib / email → inside the email-alert function
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Databento is optional and lazy-loaded only when the user clicks the pull button.
@@ -56,9 +61,7 @@ except ImportError:
     SKLEARN_AVAILABLE = False
 
 
-# Statsmodels Diagnostic Imports
-
-from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
+# Statsmodels diagnostic imports are lazy (inside the blocks that use them).
 
 # ==========================================
 # 1. CONFIGURATION & STYLING
@@ -455,6 +458,7 @@ class HawkesVolatility:
             
         try:
             # Bounds: mu>0, alpha>0, beta>alpha (stationarity)
+            from scipy.optimize import minimize
             res = minimize(neg_log_likelihood, [0.1, 0.2, 1.0], 
                            bounds=[(1e-4, 2.0), (1e-4, 5.0), (0.1, 10.0)], method='L-BFGS-B')
             self.mu, self.alpha, self.beta = res.x
@@ -3398,6 +3402,9 @@ def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_rep
     # Reconstruct robust 1D Series for Statsmodels
     endog_series = pd.Series(clean_values, index=idx)
 
+    # Lazy import: only runs on first cache-miss, then cached result is reused
+    from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+
     def _normalize_result(res_markov):
         """Force pandas-like params so downstream code can use names safely."""
         if isinstance(res_markov.params, np.ndarray):
@@ -3840,6 +3847,8 @@ def _save_alert_state(state):
 
 def _send_email_alert(subject, body, recipients, smtp_server, smtp_port, sender_email, sender_password, use_tls=True):
     """Send an email alert. SMS works by using carrier email-to-text addresses as recipients."""
+    import smtplib
+    from email.message import EmailMessage
     recipients = [r.strip() for r in str(recipients).replace(";", ",").split(",") if r.strip()]
     if not recipients:
         return False, "No alert recipients entered."
@@ -4979,6 +4988,7 @@ with tab1:
                     
                 # 3. Serial Correlation Tests
                 st.markdown("**Residual Diagnostics (Autocorrelation)**")
+                from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
                 lb_test = acorr_ljungbox(std_resid, lags=[10], return_df=True)
                 arch_test = het_arch(std_resid)
                 
@@ -5867,6 +5877,7 @@ with tab6:
     period = st.selectbox("Seasonality Period", [5, 21, 63, 252], index=1)
     
     if len(df_main) > period * 2:
+        from statsmodels.tsa.seasonal import seasonal_decompose
         decomp = seasonal_decompose(df_main['Close'], model='multiplicative', period=period)
         
         fig_dec = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=('Trend', 'Seasonal Component', 'Residuals'))
@@ -9500,6 +9511,7 @@ with tab19:
 
                 # Ljung-Box Table
                 st.write("##### Ljung-Box Test (Serial Correlation by Lag)")
+                from statsmodels.stats.diagnostic import acorr_ljungbox
                 lb = acorr_ljungbox(ts_data, lags=list(range(1, min(21, max_lags))), return_df=True)
                 lb['Conclusion'] = lb['lb_pvalue'].apply(
                     lambda p: "✅ No autocorr" if p > 0.05 else "❌ Autocorr present"
@@ -9603,6 +9615,7 @@ with tab19:
 
                 # Residual diagnostics
                 with st.expander("📋 ARIMA Residual Diagnostics"):
+                    from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
                     resid = arima_model.resid.dropna()
                     lb_arima = acorr_ljungbox(resid, lags=[10], return_df=True)
                     arch_arima = het_arch(resid)
