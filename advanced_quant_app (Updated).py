@@ -10155,6 +10155,188 @@ def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds:
     }, None
 
 
+def _normalize_databento_mbp1_df(df):
+    """Convert Databento MBP-1 dataframe into clean top-of-book rows."""
+    try:
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        d = df.copy()
+        if isinstance(d.index, pd.MultiIndex):
+            try:
+                d = d.reset_index()
+            except Exception:
+                pass
+        else:
+            try:
+                d = d.reset_index()
+            except Exception:
+                pass
+        lower_map = {str(c).lower(): c for c in d.columns}
+
+        def pick_col(*names):
+            for nm in names:
+                key = nm.lower()
+                if key in lower_map:
+                    return lower_map[key]
+            return None
+
+        bid_px_col = pick_col('bid_px_00', 'bid_px', 'bid_price', 'best_bid')
+        ask_px_col = pick_col('ask_px_00', 'ask_px', 'ask_price', 'best_ask')
+        bid_sz_col = pick_col('bid_sz_00', 'bid_sz', 'bid_size', 'best_bid_size')
+        ask_sz_col = pick_col('ask_sz_00', 'ask_sz', 'ask_size', 'best_ask_size')
+        ts_col = pick_col('ts_event', 'ts_recv', 'index', 'datetime', 'time')
+
+        if bid_px_col is None or ask_px_col is None:
+            return pd.DataFrame()
+
+        out = pd.DataFrame()
+        out['timestamp'] = pd.to_datetime(d[ts_col], errors='coerce') if ts_col is not None else pd.NaT
+        out['bid_px'] = d[bid_px_col].apply(_db_px_to_float)
+        out['ask_px'] = d[ask_px_col].apply(_db_px_to_float)
+        out['bid_sz'] = d[bid_sz_col].apply(_db_size_to_float) if bid_sz_col is not None else np.nan
+        out['ask_sz'] = d[ask_sz_col].apply(_db_size_to_float) if ask_sz_col is not None else np.nan
+        out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=['bid_px', 'ask_px'])
+        out = out[(out['bid_px'] > 0) & (out['ask_px'] > 0)]
+        out['spread'] = out['ask_px'] - out['bid_px']
+        out['mid'] = (out['bid_px'] + out['ask_px']) / 2.0
+        out['imbalance'] = out['bid_sz'] / (out['bid_sz'] + out['ask_sz'] + 1e-9)
+        out['microprice'] = np.where(
+            (out['bid_sz'].fillna(0) + out['ask_sz'].fillna(0)) > 0,
+            ((out['ask_px'] * out['bid_sz'].fillna(0)) + (out['bid_px'] * out['ask_sz'].fillna(0))) / (out['bid_sz'].fillna(0) + out['ask_sz'].fillna(0) + 1e-9),
+            out['mid']
+        )
+        return out.sort_values('timestamp').reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt, limit: int = 5000):
+    """Pull historical EQUS.MINI MBP-1 top-of-book records for today/yesterday replay."""
+    try:
+        import databento as db
+    except Exception:
+        return None, "Databento package is not installed in this environment. Add 'databento' to requirements.txt and redeploy, or run: pip install databento"
+
+    if not api_key:
+        return None, "Databento API key is missing. Add DATABENTO_API_KEY to Streamlit secrets or environment."
+
+    try:
+        client = db.Historical(str(api_key))
+        data = client.timeseries.get_range(
+            dataset="EQUS.MINI",
+            schema="mbp-1",
+            symbols=[str(ticker).upper().strip()],
+            start=pd.Timestamp(start_dt).isoformat(),
+            end=pd.Timestamp(end_dt).isoformat(),
+            limit=int(limit),
+        )
+        raw_df = data.to_df()
+        topbook_df = _normalize_databento_mbp1_df(raw_df)
+        if topbook_df.empty:
+            return None, "No historical MBP-1 top-of-book records found for that ticker/time range. Try regular market hours, a shorter range, or confirm entitlement."
+
+        latest = topbook_df.iloc[-1]
+        summary = {
+            "ticker": str(ticker).upper().strip(),
+            "bid_px": float(latest.get('bid_px', np.nan)),
+            "ask_px": float(latest.get('ask_px', np.nan)),
+            "bid_sz": float(latest.get('bid_sz', 0.0)) if pd.notna(latest.get('bid_sz', np.nan)) else 0.0,
+            "ask_sz": float(latest.get('ask_sz', 0.0)) if pd.notna(latest.get('ask_sz', np.nan)) else 0.0,
+            "spread": float(latest.get('spread', np.nan)),
+            "mid": float(latest.get('mid', np.nan)),
+            "imbalance": float(latest.get('imbalance', np.nan)),
+            "microprice": float(latest.get('microprice', np.nan)),
+            "records": topbook_df,
+            "timestamp_utc": datetime.utcnow(),
+        }
+        return summary, None
+    except Exception as e:
+        return None, str(e)
+
+
+def build_databento_mbp1_trade_log(topbook_df, imbalance_open=0.65, imbalance_close=0.45, min_hold_records=5, cooldown_records=5):
+    """Build a simple historical MBP-1 replay trade log from top-of-book imbalance."""
+    try:
+        d = topbook_df.copy()
+        if d.empty or 'imbalance' not in d.columns:
+            return pd.DataFrame(), pd.Series(dtype=float)
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=['mid', 'imbalance'])
+        if d.empty:
+            return pd.DataFrame(), pd.Series(dtype=float)
+
+        position = 0
+        entry_price = 0.0
+        entry_time = None
+        bars_held = 0
+        cooldown = 0
+        equity = 10000.0
+        shares = 0.0
+        cash = equity
+        trades = []
+        equity_vals = []
+        times = []
+
+        for _, row in d.iterrows():
+            px = float(row['microprice']) if pd.notna(row.get('microprice', np.nan)) else float(row['mid'])
+            ts = row.get('timestamp', pd.NaT)
+            imb = float(row['imbalance'])
+            if cooldown > 0:
+                cooldown -= 1
+            if position == 0 and cooldown == 0 and imb >= float(imbalance_open):
+                position = 1
+                entry_price = px
+                entry_time = ts
+                shares = cash / px if px > 0 else 0.0
+                cash = 0.0
+                bars_held = 0
+            elif position == 1:
+                bars_held += 1
+                if bars_held >= int(min_hold_records) and imb <= float(imbalance_close):
+                    cash = shares * px
+                    pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+                    cum = ((cash / 10000.0) - 1.0) * 100.0
+                    trades.append({
+                        'Side': 'Long',
+                        'Entry Time': entry_time,
+                        'Exit Time': ts,
+                        'Buy Price': entry_price,
+                        'Sell Price': px,
+                        'PnL (%)': pnl,
+                        'Cumulative Return (%)': cum,
+                        'Status': 'Closed',
+                        'Reason': f'Imbalance fell to {imb:.2f}',
+                    })
+                    shares = 0.0
+                    position = 0
+                    cooldown = int(cooldown_records)
+            equity_now = cash + shares * px
+            equity_vals.append(equity_now)
+            times.append(ts)
+
+        if position == 1 and len(d) > 0:
+            px = float(d.iloc[-1]['microprice']) if pd.notna(d.iloc[-1].get('microprice', np.nan)) else float(d.iloc[-1]['mid'])
+            ts = d.iloc[-1].get('timestamp', pd.NaT)
+            equity_now = cash + shares * px
+            pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+            cum = ((equity_now / 10000.0) - 1.0) * 100.0
+            trades.append({
+                'Side': 'Long',
+                'Entry Time': entry_time,
+                'Exit Time': None,
+                'Buy Price': entry_price,
+                'Sell Price': px,
+                'PnL (%)': pnl,
+                'Cumulative Return (%)': cum,
+                'Status': 'Open',
+                'Reason': 'Open; latest historical record mark-to-market',
+            })
+
+        eq = pd.Series(equity_vals, index=pd.to_datetime(times), dtype=float) if equity_vals else pd.Series(dtype=float)
+        return pd.DataFrame(trades), eq
+    except Exception:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+
 def build_microstructure_features(df, toxicity_window=20, impact_window=20):
     """
     Builds practical market microstructure proxies from OHLCV data.
@@ -10402,6 +10584,86 @@ try:
                         st.info("This is live top-of-book pressure, not full MBP-10 Level 2 depth. Full L2 needs XNAS.ITCH / MBP-10 entitlement.")
                 elif use_databento_mbp1:
                     st.info("Databento is enabled, but no live request is running. Click the button to pull one snapshot.")
+
+            with st.expander("🕒 Databento historical replay — today/yesterday MBP-1", expanded=False):
+                hist_c1, hist_c2, hist_c3 = st.columns(3)
+                with hist_c1:
+                    use_db_history = st.checkbox("Enable Databento historical replay", value=False, key="mm_use_db_history")
+                with hist_c2:
+                    hist_date = st.date_input("Replay date", value=datetime.today().date(), key="mm_db_hist_date")
+                with hist_c3:
+                    hist_limit = st.number_input("Max records", min_value=100, max_value=50000, value=5000, step=500, key="mm_db_hist_limit")
+
+                hist_t1, hist_t2 = st.columns(2)
+                with hist_t1:
+                    hist_start_time = st.time_input("Start time", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_db_hist_start_time")
+                with hist_t2:
+                    hist_end_time = st.time_input("End time", value=datetime.strptime("16:00", "%H:%M").time(), key="mm_db_hist_end_time")
+
+                hist_s1, hist_s2, hist_s3 = st.columns(3)
+                with hist_s1:
+                    hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.65, 0.01, key="mm_db_hist_open_imb")
+                with hist_s2:
+                    hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.45, 0.01, key="mm_db_hist_close_imb")
+                with hist_s3:
+                    hist_min_hold = st.number_input("Min records held", min_value=1, max_value=100, value=5, step=1, key="mm_db_hist_min_hold")
+
+                db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
+                if use_db_history and not db_api_key_hist:
+                    db_api_key_hist = st.text_input("Databento API key for historical replay", type="password", key="mm_db_hist_api_key_input")
+
+                run_db_history = False
+                if use_db_history:
+                    st.caption("Historical replay works after market close too. It uses db.Historical, not db.Live.")
+                    run_db_history = st.button("Pull Databento historical MBP-1 replay", key="mm_db_hist_pull_now")
+
+                if use_db_history and run_db_history:
+                    hist_start_dt = datetime.combine(hist_date, hist_start_time)
+                    hist_end_dt = datetime.combine(hist_date, hist_end_time)
+                    if hist_end_dt <= hist_start_dt:
+                        st.warning("End time must be after start time.")
+                    else:
+                        with st.spinner(f"Pulling historical EQUS.MINI MBP-1 for {TICKER}..."):
+                            hist_snapshot, hist_err = get_databento_equs_mbp1_history(str(TICKER), str(db_api_key_hist), hist_start_dt, hist_end_dt, int(hist_limit))
+                        if hist_err:
+                            st.warning(f"Databento historical MBP-1 not available: {hist_err}")
+                        elif hist_snapshot:
+                            hd1, hd2, hd3, hd4 = st.columns(4)
+                            hd1.metric("Last Bid", f"${hist_snapshot['bid_px']:.4f}")
+                            hd2.metric("Last Ask", f"${hist_snapshot['ask_px']:.4f}")
+                            hd3.metric("Last Spread", f"${hist_snapshot['spread']:.4f}")
+                            hd4.metric("Last Bid Pressure", f"{hist_snapshot['imbalance']*100:.1f}%")
+
+                            hist_records = hist_snapshot.get("records", pd.DataFrame())
+                            if isinstance(hist_records, pd.DataFrame) and not hist_records.empty:
+                                st.subheader("Historical MBP-1 top-of-book records")
+                                show_cols = [c for c in ["timestamp", "bid_px", "ask_px", "bid_sz", "ask_sz", "spread", "imbalance", "microprice"] if c in hist_records.columns]
+                                st.dataframe(hist_records[show_cols].tail(100), use_container_width=True, hide_index=True)
+
+                                hist_trades, hist_eq = build_databento_mbp1_trade_log(
+                                    hist_records,
+                                    imbalance_open=float(hist_open_imb),
+                                    imbalance_close=float(hist_close_imb),
+                                    min_hold_records=int(hist_min_hold),
+                                    cooldown_records=5,
+                                )
+                                st.subheader("Databento historical MBP-1 trade log")
+                                if hist_trades.empty:
+                                    st.info("No historical MBP-1 trade triggers found for this replay window/settings.")
+                                else:
+                                    for col in ["Buy Price", "Sell Price", "PnL (%)", "Cumulative Return (%)"]:
+                                        if col in hist_trades.columns:
+                                            hist_trades[col] = pd.to_numeric(hist_trades[col], errors='coerce').round(2)
+                                    st.dataframe(hist_trades.sort_values('Entry Time', ascending=False), use_container_width=True, hide_index=True)
+                                if isinstance(hist_eq, pd.Series) and not hist_eq.empty:
+                                    hist_ret = ((hist_eq.iloc[-1] / hist_eq.iloc[0]) - 1.0) * 100.0 if hist_eq.iloc[0] != 0 else 0.0
+                                    st.metric("Replay Strategy Return", f"{hist_ret:.2f}%")
+                                    fig_hist = go.Figure()
+                                    fig_hist.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq.values, name="MBP-1 replay equity"))
+                                    fig_hist.update_layout(height=350, template='plotly_dark')
+                                    st.plotly_chart(fig_hist, use_container_width=True)
+                elif use_db_history:
+                    st.info("Historical replay is enabled, but no request is running. Click the button to pull today/yesterday records.")
 
             mm_c1, mm_c2, mm_c3 = st.columns(3)
             with mm_c1:
