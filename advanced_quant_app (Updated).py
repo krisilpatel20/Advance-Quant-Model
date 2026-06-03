@@ -10555,45 +10555,83 @@ def build_databento_mbp1_trade_log(
         if len(bars) > skip_n:
             after_open_noise.iloc[skip_n:] = True
 
-        # Session VWAP and trend filters.
+        # Session VWAP and common indicators (used by both modes).
         bars['vwap'] = (bars['price'] * bars['size_proxy']).cumsum() / (bars['size_proxy'].cumsum() + 1e-9)
         bars['ema_fast'] = bars['price'].ewm(span=5, adjust=False).mean()
         bars['ema_slow'] = bars['price'].ewm(span=15, adjust=False).mean()
         bars['imb_smooth'] = bars['imbalance'].rolling(max(2, int(confirm_records)), min_periods=1).mean()
         bars['vwap_slope'] = bars['vwap'].diff(3).fillna(0)
         bars['mom_5'] = bars['price'].pct_change(5).fillna(0)
+        bars['mom_10'] = bars['price'].pct_change(10).fillna(0)
         bars['spread_pct'] = (bars['spread'] / bars['price'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
         spread_cap = max(float(bars['spread_pct'].quantile(0.90)), 0.0010)
 
-        # MBP-1 is confirmation only. The main idea is trend + VWAP + healthy pressure.
-        trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['vwap_slope'] >= 0) & (bars['mom_5'] >= -0.002)
-        pressure_ok = bars['imb_smooth'] >= float(imbalance_open)
+        # Auto-detect full-day ohlcv-1m vs short-window mbp-1 mode.
+        # 150+ bars strongly implies a full trading session from ohlcv-1m.
+        _full_day = len(bars) >= 150
+
+        if _full_day:
+            # ── ohlcv-1m FULL-DAY TREND MODE ────────────────────────────────────────
+            # Session VWAP anchors to high-volume opening prices on gap-up days,
+            # causing VWAP slope to go NEGATIVE during normal consolidation while the
+            # stock is still clearly in an uptrend. This blocks almost all entries.
+            #
+            # Fix: use EMA structure instead. The 5-EMA crossing above the 15-EMA
+            # (and price holding above the 15-EMA) gives a clean, early-session trend
+            # signal that works on gap-up days without VWAP anchoring issues.
+            #
+            # Imbalance proxy: ohlcv close-location is noisier than real MBP-1 bid/ask.
+            # Auto-scale the threshold down 15 % so consolidation dips don't block entry.
+            _eff_imb = min(float(imbalance_open) * 0.85, 0.54)
+            trend_ok = (
+                (bars['ema_fast'] >= bars['ema_slow']) &   # EMA crossover: trend is active
+                (bars['price'] > bars['ema_slow']) &         # price above medium-term EMA
+                (bars['mom_5'] >= -0.005)                    # not in an active 5-min selloff
+            )
+            # Exit on EMA bearish cross, sharp 10-bar reversal, or pressure + EMA break.
+            # Use 10-bar momentum (not 5-bar) so normal 1-min noise doesn't trigger exits.
+            close_cond = (
+                (bars['ema_fast'] < bars['ema_slow']) |
+                (bars['mom_10'] < -0.020) |
+                ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['ema_slow']))
+            )
+        else:
+            # ── mbp-1 SHORT-WINDOW MODE (original logic) ────────────────────────────
+            # Real bid/ask imbalance data; tight VWAP+slope+pressure entry is appropriate
+            # for 1–2 hour intraday scalp/swing windows.
+            _eff_imb = float(imbalance_open)
+            trend_ok = (
+                (bars['price'] > bars['vwap']) &
+                (bars['ema_fast'] >= bars['ema_slow']) &
+                (bars['vwap_slope'] >= 0) &
+                (bars['mom_5'] >= -0.002)
+            )
+            close_cond = (
+                ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
+                (bars['mom_5'] < -0.012) |
+                ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
+            )
+
+        pressure_ok = bars['imb_smooth'] >= _eff_imb
         spread_ok = bars['spread_pct'] <= spread_cap
         open_cond = after_open_noise & trend_ok & pressure_ok & spread_ok
 
-        # Adaptive fallback: when the A+ filter is too strict for the selected window,
-        # use a runner-confirmation rule instead of returning zero trades for every stock.
-        # This still avoids raw tick scalping: it requires VWAP/trend support and some
-        # bid pressure, but it does not demand the very high default pressure threshold.
+        # Adaptive fallback: when the primary filter has zero hits, relax pressure.
         if int(open_cond.sum()) == 0:
-            soft_pressure = max(0.52, float(imbalance_open) - 0.18)
-            relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.004)
-            relaxed_pressure_ok = bars['imb_smooth'] >= soft_pressure
-            open_cond = after_open_noise & relaxed_trend_ok & relaxed_pressure_ok & spread_ok
+            soft_pressure = max(0.48, _eff_imb - 0.12)
+            if _full_day:
+                relaxed_trend_ok = (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.008)
+            else:
+                relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.004)
+            open_cond = after_open_noise & relaxed_trend_ok & (bars['imb_smooth'] >= soft_pressure) & spread_ok
 
-        # Last-resort trend participation for short historical pulls. If the record limit only
-        # returns a small slice of the session, pressure may not reach the threshold even when
-        # price is trending cleanly. Use a very small number of entries, still with risk guards.
+        # Last-resort: any bar where trend structure is intact, no pressure requirement.
         if int(open_cond.sum()) == 0 and len(bars) >= 6:
-            trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= 0)
+            if _full_day:
+                trend_participation = (bars['ema_fast'] >= bars['ema_slow']) & (bars['price'] > bars['ema_slow'])
+            else:
+                trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= 0)
             open_cond = after_open_noise & trend_participation & spread_ok
-
-        # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
-        close_cond = (
-            ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
-            (bars['mom_5'] < -0.012) |
-            ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
-        )
 
         position = 0
         entry_price = 0.0
@@ -11044,6 +11082,8 @@ try:
                 hist_s1, hist_s2, hist_s3 = st.columns(3)
                 with hist_s1:
                     hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.62, 0.01, key="mm_db_hist_open_imb")
+                    if _use_ohlcv:
+                        st.caption(f"ohlcv-1m: effective threshold auto-scaled to {min(hist_open_imb*0.85, 0.54):.2f} (close-location proxy is noisier than real bid/ask)")
                 with hist_s2:
                     hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.45, 0.01, key="mm_db_hist_close_imb")
                 with hist_s3:
