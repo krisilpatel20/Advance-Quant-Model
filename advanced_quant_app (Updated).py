@@ -10301,75 +10301,108 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
 
 def build_databento_mbp1_trade_log(
     topbook_df,
-    imbalance_open=0.72,
-    imbalance_close=0.48,
-    min_hold_records=50,
-    cooldown_records=150,
-    confirm_records=60,
-    per_trade_stop_pct=0.35,
-    trailing_stop_pct=0.65,
-    max_day_loss_pct=1.0,
+    imbalance_open=0.62,
+    imbalance_close=0.40,
+    min_hold_records=8,
+    cooldown_records=10,
+    confirm_records=3,
+    per_trade_stop_pct=1.50,
+    trailing_stop_pct=3.00,
+    max_day_loss_pct=2.50,
     max_trades=2,
 ):
     """
-    Safer historical MBP-1 replay trade log.
+    Databento MBP-1 historical replay trade log — runner-aware version.
 
-    Raw top-of-book imbalance is extremely noisy. This version avoids the old
-    problem where the strategy could get chopped for huge one-day losses by:
-      - requiring sustained bid pressure confirmation before entry
-      - avoiding wide-spread/noisy records
-      - using per-trade stop and trailing stop
-      - stopping the replay after a max daily equity drawdown
-      - limiting the number of trades in one replay window
+    Important fix:
+    MBP-1 updates are too noisy record-by-record. The old version could enter/exit
+    several times within seconds at the market open. This version first compresses
+    the top-of-book stream into 1-minute decision bars, then uses MBP-1 pressure as
+    confirmation of a VWAP/trend setup instead of as a standalone scalping signal.
     """
     try:
         d = topbook_df.copy()
         if d.empty or 'imbalance' not in d.columns:
             return pd.DataFrame(), pd.Series(dtype=float)
-        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=['mid', 'imbalance'])
+
+        # Normalize timestamp.
+        if 'timestamp' in d.columns:
+            d['timestamp'] = pd.to_datetime(d['timestamp'], errors='coerce', utc=True)
+            d = d.dropna(subset=['timestamp']).sort_values('timestamp')
+            d = d.set_index('timestamp', drop=False)
+        else:
+            d.index = pd.to_datetime(d.index, errors='coerce', utc=True)
+            d = d[~d.index.isna()].sort_index()
+            d['timestamp'] = d.index
+
         if d.empty:
             return pd.DataFrame(), pd.Series(dtype=float)
 
-        if 'timestamp' in d.columns:
-            d = d.sort_values('timestamp')
-
-        # Use real top-of-book midpoint/microprice as replay price.
-        px_series = d['microprice'] if 'microprice' in d.columns else d['mid']
-        px_series = pd.to_numeric(px_series, errors='coerce').fillna(pd.to_numeric(d['mid'], errors='coerce'))
-        d['_px'] = px_series.astype(float)
-
-        # Spread filter: do not trade records where the spread is abnormally wide.
-        if 'spread' in d.columns:
-            spread = pd.to_numeric(d['spread'], errors='coerce').fillna(0.0)
+        # Use a real top-of-book tradable proxy, but do NOT trade every tick.
+        if 'microprice' in d.columns:
+            px = pd.to_numeric(d['microprice'], errors='coerce')
+        elif 'mid' in d.columns:
+            px = pd.to_numeric(d['mid'], errors='coerce')
         else:
-            spread = (pd.to_numeric(d.get('ask_px', np.nan), errors='coerce') - pd.to_numeric(d.get('bid_px', np.nan), errors='coerce')).fillna(0.0)
-        d['_spread_pct'] = (spread / d['_px'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        spread_cap = max(float(d['_spread_pct'].quantile(0.80)), 0.0005)
-        spread_ok = d['_spread_pct'] <= spread_cap
+            bid = pd.to_numeric(d.get('bid_px', np.nan), errors='coerce')
+            ask = pd.to_numeric(d.get('ask_px', np.nan), errors='coerce')
+            px = (bid + ask) / 2.0
+        d['_px'] = px
 
-        confirm_records = max(3, int(confirm_records))
-        imb = pd.to_numeric(d['imbalance'], errors='coerce').fillna(0.5).clip(0, 1)
-        d['_imb_smooth'] = imb.rolling(confirm_records, min_periods=max(3, confirm_records // 2)).mean().fillna(imb)
+        if 'spread' in d.columns:
+            d['_spread'] = pd.to_numeric(d['spread'], errors='coerce')
+        else:
+            bid = pd.to_numeric(d.get('bid_px', np.nan), errors='coerce')
+            ask = pd.to_numeric(d.get('ask_px', np.nan), errors='coerce')
+            d['_spread'] = ask - bid
 
-        # A+ setup filter: MBP-1 alone is too noisy. Only allow a trade when
-        # book pressure, session VWAP, short trend, and spread quality all agree.
-        ema_fast = d['_px'].ewm(span=max(8, confirm_records), adjust=False).mean()
-        ema_slow = d['_px'].ewm(span=max(20, confirm_records * 3), adjust=False).mean()
+        d['_imbalance'] = pd.to_numeric(d['imbalance'], errors='coerce').clip(0, 1)
+        d['_bid_sz'] = pd.to_numeric(d.get('bid_sz', 0), errors='coerce').fillna(0)
+        d['_ask_sz'] = pd.to_numeric(d.get('ask_sz', 0), errors='coerce').fillna(0)
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=['_px', '_imbalance'])
+        if d.empty:
+            return pd.DataFrame(), pd.Series(dtype=float)
 
-        # Session VWAP proxy using the top-of-book midpoint and available displayed size.
-        size_proxy = (pd.to_numeric(d.get('bid_sz', 0), errors='coerce').fillna(0) +
-                      pd.to_numeric(d.get('ask_sz', 0), errors='coerce').fillna(0)).replace(0, np.nan)
-        if size_proxy.isna().all():
-            size_proxy = pd.Series(1.0, index=d.index)
-        session_vwap = (d['_px'] * size_proxy.fillna(1.0)).cumsum() / (size_proxy.fillna(1.0).cumsum() + 1e-9)
-        vwap_slope = session_vwap.diff(max(5, confirm_records // 3)).fillna(0)
-        price_mom = d['_px'].pct_change(max(5, confirm_records // 2)).fillna(0)
+        # KEY FIX: compress noisy top-of-book records into 1-minute bars.
+        bars = pd.DataFrame(index=d.resample('1min').last().dropna(subset=['_px']).index)
+        bars['timestamp'] = bars.index
+        bars['price'] = d['_px'].resample('1min').last().reindex(bars.index)
+        bars['high'] = d['_px'].resample('1min').max().reindex(bars.index)
+        bars['low'] = d['_px'].resample('1min').min().reindex(bars.index)
+        bars['imbalance'] = d['_imbalance'].resample('1min').mean().reindex(bars.index).fillna(0.5)
+        bars['spread'] = d['_spread'].resample('1min').median().reindex(bars.index).fillna(0)
+        bars['size_proxy'] = (d['_bid_sz'] + d['_ask_sz']).resample('1min').sum().reindex(bars.index).replace(0, np.nan).fillna(1.0)
+        bars = bars.dropna(subset=['price'])
+        if len(bars) < 10:
+            return pd.DataFrame(), pd.Series(dtype=float)
 
-        trend_ok = (d['_px'] > session_vwap) & (ema_fast >= ema_slow) & (vwap_slope > 0) & (price_mom > 0)
-        pressure_ok = (d['_imb_smooth'] >= float(imbalance_open)) & (imb >= max(0.55, float(imbalance_open) - 0.04))
+        # Avoid the first few noisy opening minutes. Your bad ASTS logs were all at 13:30 UTC.
+        first_ts = bars.index.min()
+        open_noise_cutoff = first_ts + pd.Timedelta(minutes=10)
+        after_open_noise = bars.index >= open_noise_cutoff
 
-        open_cond = pressure_ok & spread_ok & trend_ok
-        close_cond = (d['_imb_smooth'] <= float(imbalance_close)) | (~spread_ok & (imb < 0.50)) | (d['_px'] < session_vwap) | (ema_fast < ema_slow)
+        # Session VWAP and trend filters.
+        bars['vwap'] = (bars['price'] * bars['size_proxy']).cumsum() / (bars['size_proxy'].cumsum() + 1e-9)
+        bars['ema_fast'] = bars['price'].ewm(span=5, adjust=False).mean()
+        bars['ema_slow'] = bars['price'].ewm(span=15, adjust=False).mean()
+        bars['imb_smooth'] = bars['imbalance'].rolling(max(2, int(confirm_records)), min_periods=1).mean()
+        bars['vwap_slope'] = bars['vwap'].diff(3).fillna(0)
+        bars['mom_5'] = bars['price'].pct_change(5).fillna(0)
+        bars['spread_pct'] = (bars['spread'] / bars['price'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
+        spread_cap = max(float(bars['spread_pct'].quantile(0.90)), 0.0010)
+
+        # MBP-1 is confirmation only. The main idea is trend + VWAP + healthy pressure.
+        trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['vwap_slope'] >= 0) & (bars['mom_5'] >= -0.002)
+        pressure_ok = bars['imb_smooth'] >= float(imbalance_open)
+        spread_ok = bars['spread_pct'] <= spread_cap
+        open_cond = after_open_noise & trend_ok & pressure_ok & spread_ok
+
+        # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
+        close_cond = (
+            ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
+            (bars['mom_5'] < -0.012) |
+            ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
+        )
 
         position = 0
         entry_price = 0.0
@@ -10387,11 +10420,8 @@ def build_databento_mbp1_trade_log(
         equity_vals = []
         times = []
 
-        for i, row in d.iterrows():
-            px = float(row['_px'])
-            ts = row.get('timestamp', pd.NaT)
-            current_imb = float(row['imbalance']) if pd.notna(row.get('imbalance', np.nan)) else 0.5
-
+        for ts, row in bars.iterrows():
+            px = float(row['price'])
             if cooldown > 0:
                 cooldown -= 1
 
@@ -10399,7 +10429,6 @@ def build_databento_mbp1_trade_log(
             peak_equity = max(peak_equity, equity_now)
             day_dd_pct = ((equity_now / peak_equity) - 1.0) * 100.0 if peak_equity else 0.0
 
-            # Hard session-level damage control. If this hits, exit and stop replay trading.
             if position == 1 and day_dd_pct <= -abs(float(max_day_loss_pct)):
                 cash = shares * px
                 equity_now = cash
@@ -10410,7 +10439,7 @@ def build_databento_mbp1_trade_log(
                     'Buy Price': entry_price, 'Sell Price': px,
                     'PnL (%)': pnl, 'Cumulative Return (%)': cum,
                     'Status': 'Closed',
-                    'Reason': f'Max daily equity DD guard hit ({day_dd_pct:.2f}%)',
+                    'Reason': f'Max replay equity DD guard hit ({day_dd_pct:.2f}%)',
                 })
                 shares = 0.0
                 position = 0
@@ -10421,7 +10450,7 @@ def build_databento_mbp1_trade_log(
                 times.append(ts)
                 continue
 
-            if position == 0 and cooldown == 0 and trade_count < int(max_trades) and bool(open_cond.loc[i]):
+            if position == 0 and cooldown == 0 and trade_count < int(max_trades) and bool(open_cond.loc[ts]):
                 position = 1
                 entry_price = px
                 entry_time = ts
@@ -10434,13 +10463,12 @@ def build_databento_mbp1_trade_log(
             elif position == 1:
                 bars_held += 1
                 high_since_entry = max(high_since_entry, px)
-
                 pnl_pct = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
                 trail_dd_pct = ((px - high_since_entry) / high_since_entry * 100.0) if high_since_entry else 0.0
 
                 stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
-                trailing_hit = trail_dd_pct <= -abs(float(trailing_stop_pct))
-                signal_exit = bars_held >= int(min_hold_records) and bool(close_cond.loc[i])
+                trailing_hit = (bars_held >= max(5, int(min_hold_records))) and (trail_dd_pct <= -abs(float(trailing_stop_pct)))
+                signal_exit = (bars_held >= max(8, int(min_hold_records))) and bool(close_cond.loc[ts])
 
                 if stop_hit or trailing_hit or signal_exit:
                     cash = shares * px
@@ -10451,7 +10479,7 @@ def build_databento_mbp1_trade_log(
                     elif trailing_hit:
                         reason = f'Trailing stop hit ({trail_dd_pct:.2f}%)'
                     else:
-                        reason = f'Sustained bid pressure faded to {float(row.get("_imb_smooth", current_imb)):.2f}'
+                        reason = 'VWAP/trend structure broke'
                     trades.append({
                         'Side': 'Long', 'Entry Time': entry_time, 'Exit Time': ts,
                         'Buy Price': entry_price, 'Sell Price': px,
@@ -10466,9 +10494,9 @@ def build_databento_mbp1_trade_log(
             equity_vals.append(equity_now)
             times.append(ts)
 
-        if position == 1 and len(d) > 0:
-            px = float(d.iloc[-1]['_px'])
-            ts = d.iloc[-1].get('timestamp', pd.NaT)
+        if position == 1 and len(bars) > 0:
+            px = float(bars.iloc[-1]['price'])
+            ts = bars.index[-1]
             equity_now = cash + shares * px
             pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
             cum = ((equity_now / equity0) - 1.0) * 100.0
@@ -10477,7 +10505,7 @@ def build_databento_mbp1_trade_log(
                 'Buy Price': entry_price, 'Sell Price': px,
                 'PnL (%)': pnl, 'Cumulative Return (%)': cum,
                 'Status': 'Open',
-                'Reason': 'Open; latest historical record mark-to-market',
+                'Reason': 'Open; runner-aware VWAP/MBP-1 structure still healthy',
             })
 
         eq = pd.Series(equity_vals, index=pd.to_datetime(times), dtype=float) if equity_vals else pd.Series(dtype=float)
