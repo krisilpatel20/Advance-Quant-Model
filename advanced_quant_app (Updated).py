@@ -12,6 +12,10 @@ import statsmodels.api as sm
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from statsmodels.tsa.seasonal import seasonal_decompose
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 import io
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10210,6 +10214,39 @@ def _normalize_databento_mbp1_df(df):
         return pd.DataFrame()
 
 
+
+def _market_time_to_utc_iso(dt_value):
+    """
+    Databento expects UTC timestamps. User inputs are New York market time.
+    Convert naive Streamlit date/time values from America/New_York to UTC ISO.
+    """
+    ts = pd.Timestamp(dt_value)
+    try:
+        if ts.tzinfo is None:
+            if ZoneInfo is not None:
+                ts = ts.tz_localize(ZoneInfo("America/New_York"))
+            else:
+                ts = ts.tz_localize("America/New_York")
+        else:
+            ts = ts.tz_convert("America/New_York")
+        return ts.tz_convert("UTC").isoformat()
+    except Exception:
+        # Safe fallback: still return ISO instead of crashing app.
+        return pd.Timestamp(dt_value).isoformat()
+
+
+def _previous_business_date(d):
+    """Return previous weekday date. Simple fallback for after-hours historical availability."""
+    try:
+        cur = pd.Timestamp(d).date()
+        prev = cur - timedelta(days=1)
+        while prev.weekday() >= 5:
+            prev = prev - timedelta(days=1)
+        return prev
+    except Exception:
+        return (datetime.today() - timedelta(days=1)).date()
+
+
 def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt, limit: int = 5000):
     """Pull historical EQUS.MINI MBP-1 top-of-book records for today/yesterday replay."""
     try:
@@ -10226,8 +10263,8 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
             dataset="EQUS.MINI",
             schema="mbp-1",
             symbols=[str(ticker).upper().strip()],
-            start=pd.Timestamp(start_dt).isoformat(),
-            end=pd.Timestamp(end_dt).isoformat(),
+            start=_market_time_to_utc_iso(start_dt),
+            end=_market_time_to_utc_iso(end_dt),
             limit=int(limit),
         )
         raw_df = data.to_df()
@@ -10251,11 +10288,40 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
         }
         return summary, None
     except Exception as e:
-        return None, str(e)
+        err = str(e)
+        if "data_start_after_available_end" in err or "after the available end" in err:
+            return None, (
+                "Requested historical range is newer than Databento's available historical EQUS.MINI data. "
+                "Use an earlier replay date, usually the previous trading day. "
+                "For same-day real-time data while market is open, use the Live MBP-1 snapshot instead. "
+                f"Raw error: {err}"
+            )
+        return None, err
 
 
-def build_databento_mbp1_trade_log(topbook_df, imbalance_open=0.65, imbalance_close=0.45, min_hold_records=5, cooldown_records=5):
-    """Build a simple historical MBP-1 replay trade log from top-of-book imbalance."""
+def build_databento_mbp1_trade_log(
+    topbook_df,
+    imbalance_open=0.65,
+    imbalance_close=0.45,
+    min_hold_records=5,
+    cooldown_records=25,
+    confirm_records=20,
+    per_trade_stop_pct=0.75,
+    trailing_stop_pct=1.25,
+    max_day_loss_pct=3.0,
+    max_trades=8,
+):
+    """
+    Safer historical MBP-1 replay trade log.
+
+    Raw top-of-book imbalance is extremely noisy. This version avoids the old
+    problem where the strategy could get chopped for huge one-day losses by:
+      - requiring sustained bid pressure confirmation before entry
+      - avoiding wide-spread/noisy records
+      - using per-trade stop and trailing stop
+      - stopping the replay after a max daily equity drawdown
+      - limiting the number of trades in one replay window
+    """
     try:
         d = topbook_df.copy()
         if d.empty or 'imbalance' not in d.columns:
@@ -10264,69 +10330,140 @@ def build_databento_mbp1_trade_log(topbook_df, imbalance_open=0.65, imbalance_cl
         if d.empty:
             return pd.DataFrame(), pd.Series(dtype=float)
 
+        if 'timestamp' in d.columns:
+            d = d.sort_values('timestamp')
+
+        # Use real top-of-book midpoint/microprice as replay price.
+        px_series = d['microprice'] if 'microprice' in d.columns else d['mid']
+        px_series = pd.to_numeric(px_series, errors='coerce').fillna(pd.to_numeric(d['mid'], errors='coerce'))
+        d['_px'] = px_series.astype(float)
+
+        # Spread filter: do not trade records where the spread is abnormally wide.
+        if 'spread' in d.columns:
+            spread = pd.to_numeric(d['spread'], errors='coerce').fillna(0.0)
+        else:
+            spread = (pd.to_numeric(d.get('ask_px', np.nan), errors='coerce') - pd.to_numeric(d.get('bid_px', np.nan), errors='coerce')).fillna(0.0)
+        d['_spread_pct'] = (spread / d['_px'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        spread_cap = max(float(d['_spread_pct'].quantile(0.80)), 0.0005)
+        spread_ok = d['_spread_pct'] <= spread_cap
+
+        confirm_records = max(3, int(confirm_records))
+        imb = pd.to_numeric(d['imbalance'], errors='coerce').fillna(0.5).clip(0, 1)
+        d['_imb_smooth'] = imb.rolling(confirm_records, min_periods=max(3, confirm_records // 2)).mean().fillna(imb)
+
+        # Small trend filter so we do not buy every temporary bid-size flicker.
+        ema_fast = d['_px'].ewm(span=max(5, confirm_records), adjust=False).mean()
+        ema_slow = d['_px'].ewm(span=max(10, confirm_records * 3), adjust=False).mean()
+        trend_ok = (d['_px'] >= ema_fast) | (ema_fast >= ema_slow)
+
+        open_cond = (d['_imb_smooth'] >= float(imbalance_open)) & (imb >= max(0.50, float(imbalance_open) - 0.05)) & spread_ok & trend_ok
+        close_cond = (d['_imb_smooth'] <= float(imbalance_close)) | (~spread_ok & (imb < 0.50))
+
         position = 0
         entry_price = 0.0
         entry_time = None
         bars_held = 0
         cooldown = 0
-        equity = 10000.0
+        equity0 = 10000.0
+        cash = equity0
         shares = 0.0
-        cash = equity
+        high_since_entry = 0.0
+        peak_equity = equity0
+        trade_count = 0
+        halted = False
         trades = []
         equity_vals = []
         times = []
 
-        for _, row in d.iterrows():
-            px = float(row['microprice']) if pd.notna(row.get('microprice', np.nan)) else float(row['mid'])
+        for i, row in d.iterrows():
+            px = float(row['_px'])
             ts = row.get('timestamp', pd.NaT)
-            imb = float(row['imbalance'])
+            current_imb = float(row['imbalance']) if pd.notna(row.get('imbalance', np.nan)) else 0.5
+
             if cooldown > 0:
                 cooldown -= 1
-            if position == 0 and cooldown == 0 and imb >= float(imbalance_open):
+
+            equity_now = cash + shares * px
+            peak_equity = max(peak_equity, equity_now)
+            day_dd_pct = ((equity_now / peak_equity) - 1.0) * 100.0 if peak_equity else 0.0
+
+            # Hard session-level damage control. If this hits, exit and stop replay trading.
+            if position == 1 and day_dd_pct <= -abs(float(max_day_loss_pct)):
+                cash = shares * px
+                equity_now = cash
+                pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+                cum = ((cash / equity0) - 1.0) * 100.0
+                trades.append({
+                    'Side': 'Long', 'Entry Time': entry_time, 'Exit Time': ts,
+                    'Buy Price': entry_price, 'Sell Price': px,
+                    'PnL (%)': pnl, 'Cumulative Return (%)': cum,
+                    'Status': 'Closed',
+                    'Reason': f'Max daily equity DD guard hit ({day_dd_pct:.2f}%)',
+                })
+                shares = 0.0
+                position = 0
+                halted = True
+
+            if halted:
+                equity_vals.append(equity_now)
+                times.append(ts)
+                continue
+
+            if position == 0 and cooldown == 0 and trade_count < int(max_trades) and bool(open_cond.loc[i]):
                 position = 1
                 entry_price = px
                 entry_time = ts
+                high_since_entry = px
                 shares = cash / px if px > 0 else 0.0
                 cash = 0.0
                 bars_held = 0
+                trade_count += 1
+
             elif position == 1:
                 bars_held += 1
-                if bars_held >= int(min_hold_records) and imb <= float(imbalance_close):
+                high_since_entry = max(high_since_entry, px)
+
+                pnl_pct = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+                trail_dd_pct = ((px - high_since_entry) / high_since_entry * 100.0) if high_since_entry else 0.0
+
+                stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
+                trailing_hit = trail_dd_pct <= -abs(float(trailing_stop_pct))
+                signal_exit = bars_held >= int(min_hold_records) and bool(close_cond.loc[i])
+
+                if stop_hit or trailing_hit or signal_exit:
                     cash = shares * px
                     pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
-                    cum = ((cash / 10000.0) - 1.0) * 100.0
+                    cum = ((cash / equity0) - 1.0) * 100.0
+                    if stop_hit:
+                        reason = f'Per-trade stop hit ({pnl_pct:.2f}%)'
+                    elif trailing_hit:
+                        reason = f'Trailing stop hit ({trail_dd_pct:.2f}%)'
+                    else:
+                        reason = f'Sustained bid pressure faded to {float(row.get("_imb_smooth", current_imb)):.2f}'
                     trades.append({
-                        'Side': 'Long',
-                        'Entry Time': entry_time,
-                        'Exit Time': ts,
-                        'Buy Price': entry_price,
-                        'Sell Price': px,
-                        'PnL (%)': pnl,
-                        'Cumulative Return (%)': cum,
-                        'Status': 'Closed',
-                        'Reason': f'Imbalance fell to {imb:.2f}',
+                        'Side': 'Long', 'Entry Time': entry_time, 'Exit Time': ts,
+                        'Buy Price': entry_price, 'Sell Price': px,
+                        'PnL (%)': pnl, 'Cumulative Return (%)': cum,
+                        'Status': 'Closed', 'Reason': reason,
                     })
                     shares = 0.0
                     position = 0
                     cooldown = int(cooldown_records)
+
             equity_now = cash + shares * px
             equity_vals.append(equity_now)
             times.append(ts)
 
         if position == 1 and len(d) > 0:
-            px = float(d.iloc[-1]['microprice']) if pd.notna(d.iloc[-1].get('microprice', np.nan)) else float(d.iloc[-1]['mid'])
+            px = float(d.iloc[-1]['_px'])
             ts = d.iloc[-1].get('timestamp', pd.NaT)
             equity_now = cash + shares * px
             pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
-            cum = ((equity_now / 10000.0) - 1.0) * 100.0
+            cum = ((equity_now / equity0) - 1.0) * 100.0
             trades.append({
-                'Side': 'Long',
-                'Entry Time': entry_time,
-                'Exit Time': None,
-                'Buy Price': entry_price,
-                'Sell Price': px,
-                'PnL (%)': pnl,
-                'Cumulative Return (%)': cum,
+                'Side': 'Long', 'Entry Time': entry_time, 'Exit Time': None,
+                'Buy Price': entry_price, 'Sell Price': px,
+                'PnL (%)': pnl, 'Cumulative Return (%)': cum,
                 'Status': 'Open',
                 'Reason': 'Open; latest historical record mark-to-market',
             })
@@ -10335,7 +10472,6 @@ def build_databento_mbp1_trade_log(topbook_df, imbalance_open=0.65, imbalance_cl
         return pd.DataFrame(trades), eq
     except Exception:
         return pd.DataFrame(), pd.Series(dtype=float)
-
 
 def build_microstructure_features(df, toxicity_window=20, impact_window=20):
     """
@@ -10590,7 +10726,7 @@ try:
                 with hist_c1:
                     use_db_history = st.checkbox("Enable Databento historical replay", value=False, key="mm_use_db_history")
                 with hist_c2:
-                    hist_date = st.date_input("Replay date", value=datetime.today().date(), key="mm_db_hist_date")
+                    hist_date = st.date_input("Replay date", value=_previous_business_date(datetime.today().date()), key="mm_db_hist_date")
                 with hist_c3:
                     hist_limit = st.number_input("Max records", min_value=100, max_value=50000, value=5000, step=500, key="mm_db_hist_limit")
 
@@ -10602,11 +10738,25 @@ try:
 
                 hist_s1, hist_s2, hist_s3 = st.columns(3)
                 with hist_s1:
-                    hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.65, 0.01, key="mm_db_hist_open_imb")
+                    hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.68, 0.01, key="mm_db_hist_open_imb")
                 with hist_s2:
-                    hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.45, 0.01, key="mm_db_hist_close_imb")
+                    hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.42, 0.01, key="mm_db_hist_close_imb")
                 with hist_s3:
-                    hist_min_hold = st.number_input("Min records held", min_value=1, max_value=100, value=5, step=1, key="mm_db_hist_min_hold")
+                    hist_min_hold = st.number_input("Min records held", min_value=1, max_value=250, value=25, step=1, key="mm_db_hist_min_hold")
+
+                hist_r1, hist_r2, hist_r3, hist_r4 = st.columns(4)
+                with hist_r1:
+                    hist_confirm_records = st.number_input("Confirm records", min_value=3, max_value=250, value=30, step=1, key="mm_db_hist_confirm_records")
+                with hist_r2:
+                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=0.75, step=0.05, key="mm_db_hist_trade_stop")
+                with hist_r3:
+                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=1.25, step=0.05, key="mm_db_hist_trail_stop")
+                with hist_r4:
+                    hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.50, max_value=20.0, value=3.0, step=0.50, key="mm_db_hist_max_day_loss")
+
+                hist_r5, _ = st.columns([1, 3])
+                with hist_r5:
+                    hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=8, step=1, key="mm_db_hist_max_trades")
 
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if use_db_history and not db_api_key_hist:
@@ -10614,7 +10764,7 @@ try:
 
                 run_db_history = False
                 if use_db_history:
-                    st.caption("Historical replay works after market close too. It uses db.Historical, not db.Live.")
+                    st.caption("Historical replay uses New York market time and converts to UTC for Databento. If today's data is not available yet, use the previous trading day.")
                     run_db_history = st.button("Pull Databento historical MBP-1 replay", key="mm_db_hist_pull_now")
 
                 if use_db_history and run_db_history:
@@ -10645,7 +10795,12 @@ try:
                                     imbalance_open=float(hist_open_imb),
                                     imbalance_close=float(hist_close_imb),
                                     min_hold_records=int(hist_min_hold),
-                                    cooldown_records=5,
+                                    cooldown_records=25,
+                                    confirm_records=int(hist_confirm_records),
+                                    per_trade_stop_pct=float(hist_trade_stop),
+                                    trailing_stop_pct=float(hist_trail_stop),
+                                    max_day_loss_pct=float(hist_max_day_loss),
+                                    max_trades=int(hist_max_trades),
                                 )
                                 st.subheader("Databento historical MBP-1 trade log")
                                 if hist_trades.empty:
