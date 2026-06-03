@@ -10358,7 +10358,7 @@ try:
                 with db_c1:
                     use_databento_mbp1 = st.checkbox("Enable Databento live MBP-1", value=False, key="mm_use_databento_mbp1")
                 with db_c2:
-                    db_timeout = st.number_input("Live pull seconds", min_value=3, max_value=30, value=8, step=1, key="mm_db_timeout")
+                    db_timeout = st.number_input("Live pull seconds", min_value=2, max_value=10, value=3, step=1, key="mm_db_timeout")
                 with db_c3:
                     st.caption("Ticker comes from Thesis Parameters automatically.")
 
@@ -10367,7 +10367,12 @@ try:
                     db_api_key = st.text_input("Databento API key", type="password", key="mm_db_api_key_input")
                     st.caption("Better: put it in Streamlit secrets as DATABENTO_API_KEY so you do not paste it every time.")
 
+                run_databento_pull = False
                 if use_databento_mbp1:
+                    st.caption("For app speed, Databento live pull runs only when you click the button below. It will not auto-run on every Streamlit refresh.")
+                    run_databento_pull = st.button("Pull Databento MBP-1 snapshot now", key="mm_db_pull_now")
+
+                if use_databento_mbp1 and run_databento_pull:
                     with st.spinner(f"Pulling live EQUS.MINI MBP-1 for {TICKER}..."):
                         db_snapshot, db_err = get_databento_equs_mbp1_snapshot(str(TICKER), str(db_api_key), int(db_timeout))
                     if db_err:
@@ -10389,6 +10394,8 @@ try:
                             show_cols = [c for c in ["received_at", "bid_px", "ask_px", "bid_sz", "ask_sz"] if c in rec_df.columns]
                             st.dataframe(rec_df[show_cols].tail(20), use_container_width=True, hide_index=True)
                         st.info("This is live top-of-book pressure, not full MBP-10 Level 2 depth. Full L2 needs XNAS.ITCH / MBP-10 entitlement.")
+                elif use_databento_mbp1:
+                    st.info("Databento is enabled, but no live request is running. Click the button to pull one snapshot.")
 
             mm_c1, mm_c2, mm_c3 = st.columns(3)
             with mm_c1:
