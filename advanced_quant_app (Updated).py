@@ -10317,6 +10317,131 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
         return None, err
 
 
+def _normalize_databento_ohlcv1m_df(raw_df):
+    """Convert a Databento ohlcv-1m DataFrame into the pseudo-topbook format
+    expected by build_databento_mbp1_trade_log.
+
+    Imbalance proxy = candle close location inside [low, high]:
+      1.0 → close at high  = all buyer pressure
+      0.0 → close at low   = all seller pressure
+    This is not real L1 bid/ask data, but it captures direction and conviction
+    cleanly for the VWAP/trend entry logic.
+    """
+    try:
+        d = raw_df.copy()
+        try:
+            d = d.reset_index()
+        except Exception:
+            pass
+
+        lower_map = {str(c).lower(): c for c in d.columns}
+
+        def pick(*names):
+            for nm in names:
+                if nm.lower() in lower_map:
+                    return lower_map[nm.lower()]
+            return None
+
+        close_col  = pick('close', 'close_price', 'close_px')
+        high_col   = pick('high',  'high_price',  'high_px')
+        low_col    = pick('low',   'low_price',   'low_px')
+        vol_col    = pick('volume', 'vol', 'quantity', 'size')
+        ts_col     = pick('ts_event', 'ts_recv', 'index', 'timestamp', 'datetime', 'time')
+
+        if close_col is None:
+            return pd.DataFrame()
+
+        out = pd.DataFrame()
+        out['timestamp'] = (
+            pd.to_datetime(d[ts_col], errors='coerce', utc=True)
+            if ts_col else pd.Series(pd.NaT, index=d.index)
+        )
+
+        close = d[close_col].apply(_db_px_to_float)
+        high  = d[high_col].apply(_db_px_to_float) if high_col else close
+        low   = d[low_col].apply(_db_px_to_float)  if low_col  else close
+        vol   = (
+            pd.to_numeric(d[vol_col], errors='coerce').fillna(0)
+            if vol_col else pd.Series(1.0, index=d.index)
+        )
+
+        hl = (high - low).clip(lower=0).replace(0, np.nan)
+        cl_loc = ((close - low) / (hl + 1e-9)).clip(0, 1)   # close location [0,1]
+
+        out['bid_px']     = low
+        out['ask_px']     = high
+        out['bid_sz']     = (vol * cl_loc).fillna(0)
+        out['ask_sz']     = (vol * (1.0 - cl_loc)).fillna(0)
+        out['spread']     = hl.fillna(0)
+        out['mid']        = close
+        out['imbalance']  = cl_loc.fillna(0.5)
+        out['microprice'] = close
+
+        out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=['microprice', 'imbalance'])
+        out = out[out['microprice'] > 0]
+        return out.sort_values('timestamp').reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_databento_ohlcv1m_history(ticker: str, api_key: str, start_dt, end_dt):
+    """Pull Databento EQUS.MINI ohlcv-1m bars (one per minute) for full-day replay.
+
+    Unlike mbp-1, which can require 50,000–200,000 records to cover a full session on
+    a volatile stock, ohlcv-1m delivers at most 390 bars per day (one per trading minute)
+    with no record-limit issues. Use this for full-day trend replay.
+    """
+    try:
+        import databento as db
+    except Exception:
+        return None, "Databento package not installed. Add 'databento' to requirements.txt."
+    if not api_key:
+        return None, "Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets."
+
+    try:
+        client = db.Historical(str(api_key))
+        data = client.timeseries.get_range(
+            dataset="EQUS.MINI",
+            schema="ohlcv-1m",
+            symbols=[str(ticker).upper().strip()],
+            start=_market_time_to_utc_iso(start_dt),
+            end=_market_time_to_utc_iso(end_dt),
+        )
+        raw_df = data.to_df()
+        topbook_df = _normalize_databento_ohlcv1m_df(raw_df)
+        if topbook_df.empty:
+            return None, (
+                "No ohlcv-1m records found for that ticker/date. "
+                "Check the ticker symbol, date, and your Databento entitlement for EQUS.MINI ohlcv-1m."
+            )
+        latest = topbook_df.iloc[-1]
+        n_bars = len(topbook_df)
+        summary = {
+            "ticker":       str(ticker).upper().strip(),
+            "bid_px":       float(latest.get('bid_px',     np.nan)),
+            "ask_px":       float(latest.get('ask_px',     np.nan)),
+            "bid_sz":       float(latest.get('bid_sz',     0.0)),
+            "ask_sz":       float(latest.get('ask_sz',     0.0)),
+            "spread":       float(latest.get('spread',     np.nan)),
+            "mid":          float(latest.get('microprice', np.nan)),
+            "imbalance":    float(latest.get('imbalance',  np.nan)),
+            "microprice":   float(latest.get('microprice', np.nan)),
+            "records":      topbook_df,
+            "n_bars":       n_bars,
+            "timestamp_utc": datetime.utcnow(),
+        }
+        return summary, None
+    except Exception as e:
+        err = str(e)
+        if "data_start_after_available_end" in err or "after the available end" in err:
+            return None, (
+                "Requested range is newer than Databento's available ohlcv-1m data. "
+                "Use an earlier replay date. "
+                f"Raw error: {err}"
+            )
+        return None, err
+
+
 def build_databento_mbp1_trade_log(
     topbook_df,
     imbalance_open=0.62,
@@ -10875,20 +11000,46 @@ try:
                 elif use_databento_mbp1:
                     st.info("Databento is enabled, but no live request is running. Click the button to pull one snapshot.")
 
-            with st.expander("🕒 Databento historical replay — today/yesterday MBP-1", expanded=False):
+            with st.expander("🕒 Databento historical replay — ohlcv-1m or mbp-1", expanded=False):
                 hist_c1, hist_c2, hist_c3 = st.columns(3)
                 with hist_c1:
                     use_db_history = st.checkbox("Enable Databento historical replay", value=False, key="mm_use_db_history")
                 with hist_c2:
                     hist_date = st.date_input("Replay date", value=_previous_business_date(datetime.today().date()), key="mm_db_hist_date")
                 with hist_c3:
-                    hist_limit = st.number_input("Max records", min_value=100, max_value=50000, value=20000, step=1000, key="mm_db_hist_limit")
+                    hist_schema = st.selectbox(
+                        "Schema",
+                        ["ohlcv-1m  (full day, recommended)", "mbp-1  (tick pressure, short window)"],
+                        index=0,
+                        key="mm_db_hist_schema",
+                        help=(
+                            "ohlcv-1m: exactly 390 bars/day, covers the full session, no record-limit issues. "
+                            "Imbalance is proxied from candle close location. Best for full-day trend replay.\n\n"
+                            "mbp-1: real bid/ask pressure at tick resolution. Best for short windows "
+                            "(1–2 h) with Max records ≥ 20,000. On volatile stocks like ASTS, "
+                            "even 50,000 records can cover only 1–2 hours."
+                        ),
+                    )
+                    _use_ohlcv = "ohlcv" in hist_schema
 
                 hist_t1, hist_t2 = st.columns(2)
                 with hist_t1:
                     hist_start_time = st.time_input("Start time", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_db_hist_start_time")
                 with hist_t2:
                     hist_end_time = st.time_input("End time", value=datetime.strptime("16:00", "%H:%M").time(), key="mm_db_hist_end_time")
+
+                if not _use_ohlcv:
+                    st.caption(
+                        "mbp-1 mode — Max records controls how much of the session you get. "
+                        "On volatile stocks 20,000+ records still covers only 1–2 hours. "
+                        "Switch to **ohlcv-1m** for reliable full-day coverage."
+                    )
+                    _mbp1_limit_col, _ = st.columns([1, 2])
+                    with _mbp1_limit_col:
+                        hist_limit = st.number_input("Max records", min_value=100, max_value=50000, value=20000, step=1000, key="mm_db_hist_limit")
+                else:
+                    hist_limit = 0  # unused for ohlcv-1m
+                    st.caption("ℹ️ ohlcv-1m schema — pulls all available 1-min bars for the selected date/window (≤ 390 for a full US session). No record limit needed.")
 
                 hist_s1, hist_s2, hist_s3 = st.columns(3)
                 with hist_s1:
@@ -10915,7 +11066,7 @@ try:
                     hist_cooldown_records = st.number_input("Cooldown bars after exit", min_value=3, max_value=200, value=25, step=5, key="mm_db_hist_cooldown")
                 with hist_r7:
                     hist_halt_on_dd = st.checkbox("Hard-stop after DD guard", value=False, key="mm_db_hist_halt_on_dd",
-                                                  help="OFF (default): extended cooldown after DD guard, allows re-entry later in the day. ON: permanently halt all trading once DD guard fires (old behaviour).")
+                                                  help="OFF (default): extended cooldown, allows re-entry later. ON: permanently halt once DD guard fires.")
 
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if use_db_history and not db_api_key_hist:
@@ -10923,8 +11074,8 @@ try:
 
                 run_db_history = False
                 if use_db_history:
-                    st.caption("Historical replay uses New York market time and converts to UTC for Databento. Default is now A+ only: no trade is better than forced bad trades. If today's data is not available yet, use the previous trading day.")
-                    run_db_history = st.button("Pull Databento historical MBP-1 replay", key="mm_db_hist_pull_now")
+                    _btn_label = "Pull Databento ohlcv-1m replay" if _use_ohlcv else "Pull Databento mbp-1 replay"
+                    run_db_history = st.button(_btn_label, key="mm_db_hist_pull_now")
 
                 if use_db_history and run_db_history:
                     hist_start_dt = datetime.combine(hist_date, hist_start_time)
@@ -10932,10 +11083,19 @@ try:
                     if hist_end_dt <= hist_start_dt:
                         st.warning("End time must be after start time.")
                     else:
-                        with st.spinner(f"Pulling historical EQUS.MINI MBP-1 for {TICKER}..."):
-                            hist_snapshot, hist_err = get_databento_equs_mbp1_history(str(TICKER), str(db_api_key_hist), hist_start_dt, hist_end_dt, int(hist_limit))
+                        _schema_label = "ohlcv-1m" if _use_ohlcv else "mbp-1"
+                        with st.spinner(f"Pulling {_schema_label} data for {TICKER}…"):
+                            if _use_ohlcv:
+                                hist_snapshot, hist_err = get_databento_ohlcv1m_history(
+                                    str(TICKER), str(db_api_key_hist), hist_start_dt, hist_end_dt
+                                )
+                            else:
+                                hist_snapshot, hist_err = get_databento_equs_mbp1_history(
+                                    str(TICKER), str(db_api_key_hist), hist_start_dt, hist_end_dt, int(hist_limit)
+                                )
+
                         if hist_err:
-                            st.warning(f"Databento historical MBP-1 not available: {hist_err}")
+                            st.warning(f"Databento {_schema_label} not available: {hist_err}")
                         elif hist_snapshot:
                             hd1, hd2, hd3, hd4 = st.columns(4)
                             hd1.metric("Last Bid", f"${hist_snapshot['bid_px']:.4f}")
@@ -10945,36 +11105,37 @@ try:
 
                             hist_records = hist_snapshot.get("records", pd.DataFrame())
                             if isinstance(hist_records, pd.DataFrame) and not hist_records.empty:
-                                # ── Data coverage diagnostic ──────────────────────────────────
-                                n_rec = len(hist_records)
-                                try:
-                                    _ts = hist_records.get('timestamp') if hasattr(hist_records, 'get') else None
-                                    if _ts is None and 'timestamp' in hist_records.columns:
-                                        _ts = hist_records['timestamp']
-                                    if _ts is not None and len(_ts) > 1:
-                                        _span_s = max(0.0, (_ts.max() - _ts.min()).total_seconds())
-                                        _span_m = _span_s / 60.0
-                                        if _span_m >= 10:
-                                            _bar_hint = "1-min bars ✅"
-                                        elif _span_s >= 50:
-                                            _bar_hint = "5s bars ⚠️ (increase Max records for 1-min bars)"
-                                        else:
-                                            _bar_hint = "1s bars 🔴 (way too few records — increase Max records)"
-                                        st.caption(f"📊 {n_rec:,} records pulled · {_span_m:.1f} min of data · {_bar_hint}")
-                                        if _span_m < 5:
-                                            st.warning(
-                                                f"⚠️ Only **{_span_m:.1f} min** of data pulled. On volatile stocks (ASTS, MSTR…) "
-                                                f"MBP-1 can have 500+ records/second at open — {n_rec:,} records covers almost nothing. "
-                                                f"**Increase Max records to 20,000–50,000** or narrow your time window (e.g., 09:35–12:00) "
-                                                f"to get proper 1-minute bars covering the full session."
-                                            )
-                                except Exception:
-                                    st.caption(f"📊 {n_rec:,} records pulled")
-                                # ─────────────────────────────────────────────────────────────
 
-                                show_raw_db_records = st.checkbox("Show raw Databento records", value=False, key="mm_show_raw_db_records")
+                                # ── Data coverage diagnostic ────────────────────────────────
+                                n_rec = len(hist_records)
+                                if _use_ohlcv:
+                                    n_bars_ohlcv = hist_snapshot.get("n_bars", n_rec)
+                                    st.caption(f"📊 {n_bars_ohlcv} × 1-min bars (ohlcv-1m) · Full session coverage ✅")
+                                else:
+                                    try:
+                                        _ts = hist_records['timestamp'] if 'timestamp' in hist_records.columns else None
+                                        if _ts is not None and len(_ts) > 1:
+                                            _span_m = max(0.0, (_ts.max() - _ts.min()).total_seconds()) / 60.0
+                                            if _span_m >= 10:
+                                                _bar_hint = "1-min bars ✅"
+                                            elif _span_m >= 50 / 60:
+                                                _bar_hint = "5s bars ⚠️ — increase Max records or switch to ohlcv-1m"
+                                            else:
+                                                _bar_hint = "1s bars 🔴 — way too few records; switch to ohlcv-1m"
+                                            st.caption(f"📊 {n_rec:,} mbp-1 records · {_span_m:.1f} min of data · {_bar_hint}")
+                                            if _span_m < 10:
+                                                st.warning(
+                                                    f"⚠️ Only **{_span_m:.1f} min** of data pulled from mbp-1. "
+                                                    f"On volatile stocks, even 50,000 records can cover < 2 hours. "
+                                                    f"**Switch Schema to ohlcv-1m** for guaranteed full-day 1-min bars."
+                                                )
+                                    except Exception:
+                                        st.caption(f"📊 {n_rec:,} mbp-1 records pulled")
+                                # ───────────────────────────────────────────────────────────
+
+                                show_raw_db_records = st.checkbox("Show raw records", value=False, key="mm_show_raw_db_records")
                                 if show_raw_db_records:
-                                    st.subheader("Historical MBP-1 top-of-book records")
+                                    st.subheader(f"Raw {_schema_label} records")
                                     show_cols = [c for c in ["timestamp", "bid_px", "ask_px", "bid_sz", "ask_sz", "spread", "imbalance", "microprice"] if c in hist_records.columns]
                                     st.dataframe(hist_records[show_cols].tail(100), use_container_width=True, hide_index=True)
 
@@ -10991,9 +11152,9 @@ try:
                                     max_trades=int(hist_max_trades),
                                     halt_on_dd=bool(hist_halt_on_dd),
                                 )
-                                st.subheader("Databento historical MBP-1 trade log")
+                                st.subheader(f"Historical {_schema_label} trade log")
                                 if hist_trades.empty:
-                                    st.info("No historical MBP-1 trade triggers found for this replay window/settings.")
+                                    st.info("No trade triggers found for this replay window/settings.")
                                 else:
                                     for col in ["Buy Price", "Sell Price", "PnL (%)", "Cumulative Return (%)"]:
                                         if col in hist_trades.columns:
@@ -11004,11 +11165,11 @@ try:
                                     st.metric("Replay Strategy Return", f"{hist_ret:.2f}%")
                                     if st.checkbox("Show replay equity chart", value=False, key="mm_show_replay_equity_chart"):
                                         fig_hist = go.Figure()
-                                        fig_hist.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq.values, name="MBP-1 replay equity"))
+                                        fig_hist.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq.values, name=f"{_schema_label} replay equity"))
                                         fig_hist.update_layout(height=350, template='plotly_dark')
                                         st.plotly_chart(fig_hist, use_container_width=True)
                 elif use_db_history:
-                    st.info("Historical replay is enabled, but no request is running. Click the button to pull today/yesterday records.")
+                    st.info("Historical replay is enabled, but no request is running. Click the pull button above.")
 
             mm_c1, mm_c2, mm_c3 = st.columns(3)
             with mm_c1:
