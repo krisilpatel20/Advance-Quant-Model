@@ -1481,13 +1481,14 @@ def build_live_regime_hybrid_signal(anchor_signal, anchor_prices, live_prices, e
             return base.reindex(live_px.index).ffill().fillna(0.0).clip(0, 1)
 
         mode_l = str(mode or "Balanced").lower()
-        benchmark_capture = ("benchmark" in mode_l) or ("capture" in mode_l)
+        benchmark_capture = ("benchmark" in mode_l) or ("capture" in mode_l) or ("trend follow" in mode_l) or ("runner" in mode_l)
         if benchmark_capture:
-            # More participation for live runner stocks.  The weekly/daily regime is still
-            # the main brain, but live mode should not exit on tiny intraday noise.
-            confirm_n, break_n, mom_bars = 2, 5, 4
-            ema_fast_span, ema_slow_span, ema_guard_span = 6, 18, 34
-            drawdown_guard = 0.045  # live runner protection; not a tight scalping stop
+            # Live runner mode: the old live overlay was still too defensive and missed
+            # strong 15m trends. This mode uses the stable regime brain as context, but
+            # lets clean intraday trend structure participate earlier and hold longer.
+            confirm_n, break_n, mom_bars = 1, 8, 3
+            ema_fast_span, ema_slow_span, ema_guard_span = 5, 13, 34
+            drawdown_guard = 0.10  # wider guard so strong runners are not shaken out by normal 15m noise
         elif "active" in mode_l:
             confirm_n, break_n, mom_bars = 2, 3, 4
             ema_fast_span, ema_slow_span, ema_guard_span = 8, 21, 34
@@ -1509,10 +1510,14 @@ def build_live_regime_hybrid_signal(anchor_signal, anchor_prices, live_prices, e
 
         early_long_raw = (live_px > ema_fast) & (ema_fast > ema_slow) & (mom > 0)
         if benchmark_capture:
-            # If price is clearly trending above the live anchor averages, participate even
-            # when the regime anchor is slow to flip. This is designed for RKLB/PLTR/ASTS-style runners.
-            early_long_raw = early_long_raw | ((live_px > ema_slow) & (ema_fast >= ema_slow) & (mom_long > 0.003))
-            breakdown_raw = (live_px < ema_guard) & (ema_fast < ema_slow) & (mom < 0) & (mom_long < 0)
+            # Stronger live participation rule: enter if the 15m trend is healthy, even if
+            # the weekly/daily regime anchor is late. Do not exit on one weak candle.
+            trend_participation = (
+                ((live_px > ema_slow) & (ema_fast >= ema_slow) & (mom_long > -0.002)) |
+                ((live_px > ema_fast) & (mom > -0.001))
+            )
+            early_long_raw = early_long_raw | trend_participation
+            breakdown_raw = (live_px < ema_guard) & (ema_fast < ema_slow) & (mom < -0.002) & (mom_long < -0.006)
         else:
             breakdown_raw = (live_px < ema_guard) & (ema_fast < ema_slow)
 
@@ -6059,8 +6064,8 @@ with tab7:
                 lrc1, lrc2, lrc3 = st.columns(3)
                 live_regime_anchor_freq = lrc1.selectbox("Live regime anchor", ["Weekly", "Daily"], index=0, key="bt_live_regime_anchor_freq")
                 live_regime_overlay = lrc2.checkbox("Intraday early trigger overlay", value=True, key="bt_live_regime_overlay")
-                live_regime_sensitivity = lrc3.selectbox("Live trigger sensitivity", ["Conservative", "Balanced", "Active", "Benchmark Capture"], index=3, key="bt_live_regime_sensitivity")
-                st.caption("Weekly/Daily anchor = stable regime brain. Intraday overlay = live timing. Benchmark Capture is designed for live runner stocks and stays invested longer unless live trend damage is real.")
+                live_regime_sensitivity = lrc3.selectbox("Live trigger sensitivity", ["Conservative", "Balanced", "Active", "Benchmark Capture", "Live Trend Follow"], index=4, key="bt_live_regime_sensitivity")
+                st.caption("Weekly/Daily anchor = stable regime brain. Intraday overlay = live timing. Live Trend Follow is the strongest live runner mode and holds until live trend damage is real.")
         
         col_r4, col_r5 = st.columns(2)
         with col_r4:
