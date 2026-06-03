@@ -11047,23 +11047,65 @@ try:
                 with hist_s2:
                     hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.45, 0.01, key="mm_db_hist_close_imb")
                 with hist_s3:
-                    hist_min_hold = st.number_input("Min bars held", min_value=1, max_value=500, value=10, step=1, key="mm_db_hist_min_hold")
+                    if _use_ohlcv:
+                        hist_min_hold = st.number_input(
+                            "Min bars held", min_value=1, max_value=500, value=30, step=5,
+                            key="mm_db_hist_min_hold_ohlcv",
+                            help="ohlcv-1m: 30 bars = at least 30 minutes in trade before signal exits can fire."
+                        )
+                    else:
+                        hist_min_hold = st.number_input("Min bars held", min_value=1, max_value=500, value=10, step=1, key="mm_db_hist_min_hold_mbp1")
+
+                if _use_ohlcv:
+                    st.caption(
+                        "📏 **ohlcv-1m stop sizing**: volatile stocks (ASTS, MSTR…) swing 3–6 % intraday on big move days. "
+                        "A 2–4 % stop fires on normal noise and kills the trade before the real move. "
+                        "Defaults below are sized for a full-day trend. Raise them further for faster movers."
+                    )
 
                 hist_r1, hist_r2, hist_r3, hist_r4 = st.columns(4)
                 with hist_r1:
                     hist_confirm_records = st.number_input("Confirm bars", min_value=3, max_value=500, value=10, step=1, key="mm_db_hist_confirm_records")
                 with hist_r2:
-                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=2.50, step=0.25, key="mm_db_hist_trade_stop")
+                    if _use_ohlcv:
+                        hist_trade_stop = st.number_input(
+                            "Per-trade stop (%)", min_value=0.50, max_value=30.0, value=8.0, step=0.5,
+                            key="mm_db_hist_trade_stop_ohlcv",
+                            help="ohlcv-1m full day: use 7–12 %. Lower than intraday volatility = premature stop-out."
+                        )
+                    else:
+                        hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=2.50, step=0.25, key="mm_db_hist_trade_stop_mbp1")
                 with hist_r3:
-                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=4.00, step=0.25, key="mm_db_hist_trail_stop")
+                    if _use_ohlcv:
+                        hist_trail_stop = st.number_input(
+                            "Trailing stop (%)", min_value=0.50, max_value=30.0, value=12.0, step=0.5,
+                            key="mm_db_hist_trail_stop_ohlcv",
+                            help="ohlcv-1m: trail from session high with 10–15 % to let the trend run. 4 % is too tight for a full-day trend."
+                        )
+                    else:
+                        hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=4.00, step=0.25, key="mm_db_hist_trail_stop_mbp1")
                 with hist_r4:
-                    hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=5.0, step=0.25, key="mm_db_hist_max_day_loss")
+                    if _use_ohlcv:
+                        hist_max_day_loss = st.number_input(
+                            "Max replay loss (%)", min_value=1.0, max_value=30.0, value=20.0, step=1.0,
+                            key="mm_db_hist_max_day_loss_ohlcv",
+                            help="ohlcv-1m: set to 20 % or higher so a single bad stop-out does not permanently block re-entry."
+                        )
+                    else:
+                        hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=5.0, step=0.25, key="mm_db_hist_max_day_loss_mbp1")
 
                 hist_r5, hist_r6, hist_r7 = st.columns(3)
                 with hist_r5:
                     hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=3, step=1, key="mm_db_hist_max_trades")
                 with hist_r6:
-                    hist_cooldown_records = st.number_input("Cooldown bars after exit", min_value=3, max_value=200, value=25, step=5, key="mm_db_hist_cooldown")
+                    if _use_ohlcv:
+                        hist_cooldown_records = st.number_input(
+                            "Cooldown bars after exit", min_value=1, max_value=200, value=5, step=1,
+                            key="mm_db_hist_cooldown_ohlcv",
+                            help="ohlcv-1m: 5 bars = 5 minutes. Short cooldown lets the system re-enter quickly on a trending day."
+                        )
+                    else:
+                        hist_cooldown_records = st.number_input("Cooldown bars after exit", min_value=3, max_value=200, value=25, step=5, key="mm_db_hist_cooldown_mbp1")
                 with hist_r7:
                     hist_halt_on_dd = st.checkbox("Hard-stop after DD guard", value=False, key="mm_db_hist_halt_on_dd",
                                                   help="OFF (default): extended cooldown, allows re-entry later. ON: permanently halt once DD guard fires.")
