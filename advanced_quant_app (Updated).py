@@ -10247,7 +10247,7 @@ def _previous_business_date(d):
         return (datetime.today() - timedelta(days=1)).date()
 
 
-def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt, limit: int = 5000):
+def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt, limit: int = 1500):
     """Pull historical EQUS.MINI MBP-1 top-of-book records for today/yesterday replay."""
     try:
         import databento as db
@@ -10265,7 +10265,7 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
             symbols=[str(ticker).upper().strip()],
             start=_market_time_to_utc_iso(start_dt),
             end=_market_time_to_utc_iso(end_dt),
-            limit=int(limit),
+            limit=int(min(max(int(limit), 100), 3000)),
         )
         raw_df = data.to_df()
         topbook_df = _normalize_databento_mbp1_df(raw_df)
@@ -10322,6 +10322,9 @@ def build_databento_mbp1_trade_log(
     """
     try:
         d = topbook_df.copy()
+        # Load-safety: keep replay processing bounded so Streamlit does not freeze.
+        if len(d) > 3000:
+            d = d.tail(3000).copy()
         if d.empty or 'imbalance' not in d.columns:
             return pd.DataFrame(), pd.Series(dtype=float)
 
@@ -10768,7 +10771,7 @@ try:
                 with hist_c2:
                     hist_date = st.date_input("Replay date", value=_previous_business_date(datetime.today().date()), key="mm_db_hist_date")
                 with hist_c3:
-                    hist_limit = st.number_input("Max records", min_value=100, max_value=50000, value=5000, step=500, key="mm_db_hist_limit")
+                    hist_limit = st.number_input("Max records", min_value=100, max_value=10000, value=1500, step=500, key="mm_db_hist_limit")
 
                 hist_t1, hist_t2 = st.columns(2)
                 with hist_t1:
@@ -10826,9 +10829,11 @@ try:
 
                             hist_records = hist_snapshot.get("records", pd.DataFrame())
                             if isinstance(hist_records, pd.DataFrame) and not hist_records.empty:
-                                st.subheader("Historical MBP-1 top-of-book records")
-                                show_cols = [c for c in ["timestamp", "bid_px", "ask_px", "bid_sz", "ask_sz", "spread", "imbalance", "microprice"] if c in hist_records.columns]
-                                st.dataframe(hist_records[show_cols].tail(100), use_container_width=True, hide_index=True)
+                                show_raw_db_records = st.checkbox("Show raw Databento records", value=False, key="mm_show_raw_db_records")
+                                if show_raw_db_records:
+                                    st.subheader("Historical MBP-1 top-of-book records")
+                                    show_cols = [c for c in ["timestamp", "bid_px", "ask_px", "bid_sz", "ask_sz", "spread", "imbalance", "microprice"] if c in hist_records.columns]
+                                    st.dataframe(hist_records[show_cols].tail(100), use_container_width=True, hide_index=True)
 
                                 hist_trades, hist_eq = build_databento_mbp1_trade_log(
                                     hist_records,
@@ -10853,10 +10858,11 @@ try:
                                 if isinstance(hist_eq, pd.Series) and not hist_eq.empty:
                                     hist_ret = ((hist_eq.iloc[-1] / hist_eq.iloc[0]) - 1.0) * 100.0 if hist_eq.iloc[0] != 0 else 0.0
                                     st.metric("Replay Strategy Return", f"{hist_ret:.2f}%")
-                                    fig_hist = go.Figure()
-                                    fig_hist.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq.values, name="MBP-1 replay equity"))
-                                    fig_hist.update_layout(height=350, template='plotly_dark')
-                                    st.plotly_chart(fig_hist, use_container_width=True)
+                                    if st.checkbox("Show replay equity chart", value=False, key="mm_show_replay_equity_chart"):
+                                        fig_hist = go.Figure()
+                                        fig_hist.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq.values, name="MBP-1 replay equity"))
+                                        fig_hist.update_layout(height=350, template='plotly_dark')
+                                        st.plotly_chart(fig_hist, use_container_width=True)
                 elif use_db_history:
                     st.info("Historical replay is enabled, but no request is running. Click the button to pull today/yesterday records.")
 
