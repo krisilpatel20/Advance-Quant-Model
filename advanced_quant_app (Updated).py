@@ -19,6 +19,16 @@ from pathlib import Path
 import json
 import smtplib
 from email.message import EmailMessage
+import os
+
+
+# Try importing Databento for optional live top-of-book / MBP-1 data
+try:
+    import databento as db
+    DATABENTO_AVAILABLE = True
+except Exception:
+    db = None
+    DATABENTO_AVAILABLE = False
 
 # Default historical/non-live anchor date
 DEFAULT_NONLIVE_START = datetime(2024, 1, 1)
@@ -63,12 +73,6 @@ GARCH/EGARCH | Regime Switching (Filtered) | Jump Diffusion | Heston Stochastic 
 
 if not ARCH_AVAILABLE:
     st.error("⚠️ The 'arch' library is not installed. GARCH/EGARCH modules will be limited. Run `pip install arch`.")
-
-# Safe global defaults for optional Regime-only return booster flags.
-# These prevent VWAP/CVD or other tabs from crashing if a copied helper block
-# references the Regime booster variable outside the Regime section.
-use_return_booster = False
-return_booster_mode = "Balanced"
 
 # ==========================================
 # 2. HELPER CLASSES & FUNCTIONS
@@ -10013,6 +10017,137 @@ def _clean_ohlcv_for_microstructure(df):
         return pd.DataFrame()
 
 
+
+
+def _safe_get_secret(name, default=""):
+    """Read a secret from Streamlit secrets or environment without crashing."""
+    try:
+        if hasattr(st, "secrets") and name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return str(os.environ.get(name, default) or default)
+
+
+def _db_px_to_float(px):
+    """Databento DBN prices are often fixed-point integers; normalize when needed."""
+    try:
+        val = float(px)
+        if abs(val) > 1_000_000:
+            return val / 1_000_000_000.0
+        return val
+    except Exception:
+        return np.nan
+
+
+def _db_size_to_float(sz):
+    try:
+        return float(sz)
+    except Exception:
+        return np.nan
+
+
+def _databento_record_to_topbook(msg):
+    """Extract best bid/ask from a Databento MBP-1 live message robustly."""
+    try:
+        # MBP messages usually carry levels[0].bid_px / ask_px / bid_sz / ask_sz.
+        levels = getattr(msg, "levels", None)
+        if levels is not None and len(levels) > 0:
+            lvl0 = levels[0]
+            bid_px = _db_px_to_float(getattr(lvl0, "bid_px", np.nan))
+            ask_px = _db_px_to_float(getattr(lvl0, "ask_px", np.nan))
+            bid_sz = _db_size_to_float(getattr(lvl0, "bid_sz", np.nan))
+            ask_sz = _db_size_to_float(getattr(lvl0, "ask_sz", np.nan))
+            if np.isfinite(bid_px) and np.isfinite(ask_px) and bid_px > 0 and ask_px > 0:
+                return {"bid_px": bid_px, "ask_px": ask_px, "bid_sz": bid_sz, "ask_sz": ask_sz}
+    except Exception:
+        pass
+
+    try:
+        # Some objects expose flat attributes or dict-like conversion.
+        if hasattr(msg, "to_dict"):
+            d = msg.to_dict()
+        else:
+            d = getattr(msg, "__dict__", {}) or {}
+        keys = {str(k).lower(): k for k in d.keys()}
+        def pick(*names):
+            for nm in names:
+                if nm.lower() in keys:
+                    return d[keys[nm.lower()]]
+            return np.nan
+        bid_px = _db_px_to_float(pick("bid_px_00", "bid_px", "bid_price", "best_bid"))
+        ask_px = _db_px_to_float(pick("ask_px_00", "ask_px", "ask_price", "best_ask"))
+        bid_sz = _db_size_to_float(pick("bid_sz_00", "bid_sz", "bid_size", "best_bid_size"))
+        ask_sz = _db_size_to_float(pick("ask_sz_00", "ask_sz", "ask_size", "best_ask_size"))
+        if np.isfinite(bid_px) and np.isfinite(ask_px) and bid_px > 0 and ask_px > 0:
+            return {"bid_px": bid_px, "ask_px": ask_px, "bid_sz": bid_sz, "ask_sz": ask_sz}
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds: int = 8, max_records: int = 80):
+    """
+    Pull a short live EQUS.MINI MBP-1 snapshot for the dashboard.
+    This is top-of-book/live quote pressure, not full MBP-10 Level 2 depth.
+    """
+    if not DATABENTO_AVAILABLE:
+        return None, "Databento package is not installed. Run: pip install databento"
+    if not api_key:
+        return None, "Databento API key is missing. Add DATABENTO_API_KEY to Streamlit secrets or environment."
+
+    records = []
+    topbooks = []
+
+    def _cb(msg):
+        try:
+            tb = _databento_record_to_topbook(msg)
+            if tb is not None:
+                tb["received_at"] = datetime.utcnow()
+                topbooks.append(tb)
+                records.append(tb.copy())
+        except Exception:
+            pass
+
+    try:
+        client = db.Live(key=str(api_key))
+        client.subscribe(dataset="EQUS.MINI", schema="mbp-1", symbols=[str(ticker).upper().strip()])
+        client.add_callback(_cb)
+        client.start()
+        client.block_for_close(timeout=int(timeout_seconds))
+    except Exception as e:
+        return None, str(e)
+
+    if not topbooks:
+        return None, "No MBP-1 top-of-book records received. Market may be closed, symbol unavailable, or entitlement missing."
+
+    latest = topbooks[-1]
+    bid_px = float(latest.get("bid_px", np.nan))
+    ask_px = float(latest.get("ask_px", np.nan))
+    bid_sz = float(latest.get("bid_sz", 0.0)) if np.isfinite(float(latest.get("bid_sz", 0.0))) else 0.0
+    ask_sz = float(latest.get("ask_sz", 0.0)) if np.isfinite(float(latest.get("ask_sz", 0.0))) else 0.0
+    spread = ask_px - bid_px if np.isfinite(bid_px) and np.isfinite(ask_px) else np.nan
+    mid = (bid_px + ask_px) / 2.0 if np.isfinite(bid_px) and np.isfinite(ask_px) else np.nan
+    imbalance = bid_sz / (bid_sz + ask_sz + 1e-9)
+    microprice = ((ask_px * bid_sz) + (bid_px * ask_sz)) / (bid_sz + ask_sz + 1e-9) if (bid_sz + ask_sz) > 0 else mid
+    df_records = pd.DataFrame(records[-int(max_records):]) if records else pd.DataFrame()
+
+    return {
+        "ticker": str(ticker).upper().strip(),
+        "bid_px": bid_px,
+        "ask_px": ask_px,
+        "bid_sz": bid_sz,
+        "ask_sz": ask_sz,
+        "spread": spread,
+        "mid": mid,
+        "imbalance": imbalance,
+        "microprice": microprice,
+        "records": df_records,
+        "timestamp_utc": datetime.utcnow(),
+    }, None
+
+
 def build_microstructure_features(df, toxicity_window=20, impact_window=20):
     """
     Builds practical market microstructure proxies from OHLCV data.
@@ -10215,7 +10350,44 @@ try:
     if df_main is not None:
         with tab20:
             st.header("🧬 Market Microstructure")
-            st.caption("Uses OHLCV proxy data. True order book depth, queue position, and latency arbitrage require Level 2/tick data, so this tab labels those as practical proxies rather than exact exchange microstructure.")
+            st.caption("Uses OHLCV proxy data by default. Optional Databento EQUS.MINI + MBP-1 adds live top-of-book bid/ask pressure for the same ticker from Thesis Parameters.")
+
+            with st.expander("📡 Databento live top-of-book — EQUS.MINI MBP-1", expanded=False):
+                db_c1, db_c2, db_c3 = st.columns(3)
+                with db_c1:
+                    use_databento_mbp1 = st.checkbox("Enable Databento live MBP-1", value=False, key="mm_use_databento_mbp1")
+                with db_c2:
+                    db_timeout = st.number_input("Live pull seconds", min_value=3, max_value=30, value=8, step=1, key="mm_db_timeout")
+                with db_c3:
+                    st.caption("Ticker comes from Thesis Parameters automatically.")
+
+                db_api_key = _safe_get_secret("DATABENTO_API_KEY", "")
+                if use_databento_mbp1 and not db_api_key:
+                    db_api_key = st.text_input("Databento API key", type="password", key="mm_db_api_key_input")
+                    st.caption("Better: put it in Streamlit secrets as DATABENTO_API_KEY so you do not paste it every time.")
+
+                if use_databento_mbp1:
+                    with st.spinner(f"Pulling live EQUS.MINI MBP-1 for {TICKER}..."):
+                        db_snapshot, db_err = get_databento_equs_mbp1_snapshot(str(TICKER), str(db_api_key), int(db_timeout))
+                    if db_err:
+                        st.warning(f"Databento MBP-1 not available right now: {db_err}")
+                    elif db_snapshot:
+                        d1, d2, d3, d4 = st.columns(4)
+                        d1.metric("Best Bid", f"${db_snapshot['bid_px']:.4f}")
+                        d2.metric("Best Ask", f"${db_snapshot['ask_px']:.4f}")
+                        d3.metric("Spread", f"${db_snapshot['spread']:.4f}")
+                        d4.metric("Bid Pressure", f"{db_snapshot['imbalance']*100:.1f}%")
+                        d5, d6, d7, d8 = st.columns(4)
+                        d5.metric("Bid Size", f"{db_snapshot['bid_sz']:,.0f}")
+                        d6.metric("Ask Size", f"{db_snapshot['ask_sz']:,.0f}")
+                        d7.metric("Microprice", f"${db_snapshot['microprice']:.4f}")
+                        d8.metric("Source", "EQUS.MINI MBP-1")
+
+                        rec_df = db_snapshot.get("records", pd.DataFrame())
+                        if isinstance(rec_df, pd.DataFrame) and not rec_df.empty:
+                            show_cols = [c for c in ["received_at", "bid_px", "ask_px", "bid_sz", "ask_sz"] if c in rec_df.columns]
+                            st.dataframe(rec_df[show_cols].tail(20), use_container_width=True, hide_index=True)
+                        st.info("This is live top-of-book pressure, not full MBP-10 Level 2 depth. Full L2 needs XNAS.ITCH / MBP-10 entitlement.")
 
             mm_c1, mm_c2, mm_c3 = st.columns(3)
             with mm_c1:
