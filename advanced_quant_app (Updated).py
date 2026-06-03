@@ -1212,8 +1212,9 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
 
-    Fixes confusing duplicate-looking rows by keeping seconds for intraday/live bars.
-    Daily/weekly/date-only rows still get an assumed candle-close timestamp.
+    Shows all trade timestamps in Central Time (CT).
+    Intraday/live bars keep seconds. Daily/weekly/date-only rows use the
+    assumed market close time, converted from Eastern market time to Central Time.
     Open trades show Exit Date as "Open" instead of NaT.
 
     This does not change strategy logic, prices, equity curves, or metrics.
@@ -1222,6 +1223,26 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
         if trades_df is None or trades_df.empty:
             return trades_df
         out = trades_df.copy()
+
+        eastern_tz = "America/New_York"
+        central_tz = "America/Chicago"
+
+        def _to_central_display(ts):
+            # Naive timestamps from Yahoo/pandas are treated as exchange/New York time.
+            # Timezone-aware Databento/UTC timestamps are converted directly to Central.
+            try:
+                if getattr(ts, "tzinfo", None) is None:
+                    ts = ts.tz_localize(eastern_tz)
+                else:
+                    ts = ts.tz_convert(central_tz)
+                    return ts.strftime("%Y-%m-%d %H:%M:%S CT")
+                ts = ts.tz_convert(central_tz)
+                return ts.strftime("%Y-%m-%d %H:%M:%S CT")
+            except Exception:
+                try:
+                    return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+                except Exception:
+                    return ts
 
         def _format_one(x, is_exit=False, status=None):
             # Open positions should not display NaT in the exit column.
@@ -1242,14 +1263,12 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
                 if pd.isna(ts):
                     return "Open" if is_exit else x
 
-                # If data is daily/weekly/date-only, mark display as candle close time.
+                # If data is daily/weekly/date-only, assume regular market close in Eastern time.
                 if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
                     hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
                     ts = ts.replace(hour=hh, minute=mm, second=0)
-                    return ts.strftime("%Y-%m-%d %H:%M:%S")
 
-                # Intraday/live: keep seconds so two trades in the same minute do not look duplicated.
-                return ts.strftime("%Y-%m-%d %H:%M:%S")
+                return _to_central_display(ts)
             except Exception:
                 return x
 
