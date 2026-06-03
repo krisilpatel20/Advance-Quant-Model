@@ -10572,24 +10572,33 @@ def build_databento_mbp1_trade_log(
 
         if _full_day:
             # ── ohlcv-1m FULL-DAY TREND MODE ────────────────────────────────────────
-            # Session VWAP anchors to high-volume opening prices on gap-up days,
-            # causing VWAP slope to go NEGATIVE during normal consolidation while the
-            # stock is still clearly in an uptrend. This blocks almost all entries.
-            #
-            # Fix: use EMA structure instead. The 5-EMA crossing above the 15-EMA
-            # (and price holding above the 15-EMA) gives a clean, early-session trend
-            # signal that works on gap-up days without VWAP anchoring issues.
-            #
             # Imbalance proxy: ohlcv close-location is noisier than real MBP-1 bid/ask.
-            # Auto-scale the threshold down 15 % so consolidation dips don't block entry.
             _eff_imb = min(float(imbalance_open) * 0.85, 0.54)
             trend_ok = (
                 (bars['ema_fast'] >= bars['ema_slow']) &   # EMA crossover: trend is active
                 (bars['price'] > bars['ema_slow']) &         # price above medium-term EMA
                 (bars['mom_5'] >= -0.005)                    # not in an active 5-min selloff
             )
+
+            # ── Consecutive-bar confirmation ─────────────────────────────────────────
+            # Require 2+ consecutive bars satisfying trend_ok before entry.
+            # This blocks the "enter on bar-1 of an EMA crossover at a local top" pattern
+            # that caused RGTI -4.97% on a +4-5% day: the EMA crossed at the peak of the
+            # morning spike, stock reversed immediately, stop fired before trend established.
+            _trend_int = trend_ok.astype(int)
+            _noncum = (~trend_ok).astype(int).cumsum()
+            bars['_confirmed'] = _trend_int.groupby(_noncum).cumsum().clip(upper=10)
+
+            # ── Anti-chase range-position filter ────────────────────────────────────
+            # Don't enter when price is in the top 15 % of its recent 30-bar range.
+            # Volatile small-caps (RGTI, MSTR, ASTS) spike 10-20 % in minutes; buying
+            # at the top of a spike means a small reversal triggers the stop.
+            _h30 = bars['price'].rolling(30, min_periods=5).max().fillna(bars['price'])
+            _l30 = bars['price'].rolling(30, min_periods=5).min().fillna(bars['price'])
+            bars['_range_pos'] = ((bars['price'] - _l30) / (_h30 - _l30 + 1e-9)).clip(0, 1)
+            not_at_top = bars['_range_pos'] <= 0.85
+
             # Exit on EMA bearish cross, sharp 10-bar reversal, or pressure + EMA break.
-            # Use 10-bar momentum (not 5-bar) so normal 1-min noise doesn't trigger exits.
             close_cond = (
                 (bars['ema_fast'] < bars['ema_slow']) |
                 (bars['mom_10'] < -0.020) |
@@ -10597,8 +10606,6 @@ def build_databento_mbp1_trade_log(
             )
         else:
             # ── mbp-1 SHORT-WINDOW MODE (original logic) ────────────────────────────
-            # Real bid/ask imbalance data; tight VWAP+slope+pressure entry is appropriate
-            # for 1–2 hour intraday scalp/swing windows.
             _eff_imb = float(imbalance_open)
             trend_ok = (
                 (bars['price'] > bars['vwap']) &
@@ -10606,6 +10613,8 @@ def build_databento_mbp1_trade_log(
                 (bars['vwap_slope'] >= 0) &
                 (bars['mom_5'] >= -0.002)
             )
+            bars['_confirmed'] = pd.Series(1, index=bars.index)   # no consecutive req for mbp-1
+            not_at_top = pd.Series(True, index=bars.index)        # no range filter for mbp-1
             close_cond = (
                 ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
                 (bars['mom_5'] < -0.012) |
@@ -10614,18 +10623,20 @@ def build_databento_mbp1_trade_log(
 
         pressure_ok = bars['imb_smooth'] >= _eff_imb
         spread_ok = bars['spread_pct'] <= spread_cap
-        open_cond = after_open_noise & trend_ok & pressure_ok & spread_ok
+        open_cond = after_open_noise & (bars['_confirmed'] >= 2) & not_at_top & pressure_ok & spread_ok
 
-        # Adaptive fallback: when the primary filter has zero hits, relax pressure.
+        # Adaptive fallback: when primary filter has zero hits, relax pressure.
+        # Keep the consecutive-bar requirement even in fallback (just use >=1 if _full_day).
         if int(open_cond.sum()) == 0:
             soft_pressure = max(0.48, _eff_imb - 0.12)
             if _full_day:
                 relaxed_trend_ok = (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.008)
+                open_cond = after_open_noise & (bars['_confirmed'] >= 1) & relaxed_trend_ok & (bars['imb_smooth'] >= soft_pressure) & spread_ok
             else:
                 relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.004)
-            open_cond = after_open_noise & relaxed_trend_ok & (bars['imb_smooth'] >= soft_pressure) & spread_ok
+                open_cond = after_open_noise & relaxed_trend_ok & (bars['imb_smooth'] >= soft_pressure) & spread_ok
 
-        # Last-resort: any bar where trend structure is intact, no pressure requirement.
+        # Last-resort: any bar with intact trend structure and no pressure requirement.
         if int(open_cond.sum()) == 0 and len(bars) >= 6:
             if _full_day:
                 trend_participation = (bars['ema_fast'] >= bars['ema_slow']) & (bars['price'] > bars['ema_slow'])
@@ -10702,7 +10713,16 @@ def build_databento_mbp1_trade_log(
                 pnl_pct = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
                 trail_dd_pct = ((px - high_since_entry) / high_since_entry * 100.0) if high_since_entry else 0.0
 
-                stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
+                # Full-day mode: per-trade stop only fires if price is ALSO below the
+                # slow EMA. This prevents getting stopped out during normal intraday
+                # pullbacks while the trend structure is still intact.
+                # mbp-1 mode: fire on raw price drop (tight window, fast decisions).
+                _ema_s_now = float(row.get('ema_slow', 0))
+                if _full_day:
+                    stop_hit = (pnl_pct <= -abs(float(per_trade_stop_pct))) and (px < _ema_s_now)
+                else:
+                    stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
+
                 trailing_hit = (bars_held >= max(5, int(min_hold_records))) and (trail_dd_pct <= -abs(float(trailing_stop_pct)))
                 signal_exit = (bars_held >= max(8, int(min_hold_records))) and bool(close_cond.loc[ts])
 
