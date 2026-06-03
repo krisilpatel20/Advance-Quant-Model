@@ -23,13 +23,9 @@ from email.message import EmailMessage
 import os
 
 
-# Try importing Databento for optional live top-of-book / MBP-1 data
-try:
-    import databento as db
-    DATABENTO_AVAILABLE = True
-except Exception:
-    db = None
-    DATABENTO_AVAILABLE = False
+# Databento is optional and lazy-loaded only when the user clicks the pull button.
+# This prevents Databento/package/network issues from slowing or blocking the app load.
+DATABENTO_AVAILABLE = None
 
 # Default historical/non-live anchor date
 DEFAULT_NONLIVE_START = datetime(2024, 1, 1)
@@ -10087,14 +10083,16 @@ def _databento_record_to_topbook(msg):
     return None
 
 
-@st.cache_data(ttl=5, show_spinner=False)
 def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds: int = 8, max_records: int = 80):
     """
     Pull a short live EQUS.MINI MBP-1 snapshot for the dashboard.
     This is top-of-book/live quote pressure, not full MBP-10 Level 2 depth.
     """
-    if not DATABENTO_AVAILABLE:
-        return None, "Databento package is not installed. Run: pip install databento"
+    try:
+        import databento as db
+    except Exception:
+        return None, "Databento package is not installed in this environment. Add 'databento' to requirements.txt and redeploy, or run: pip install databento"
+
     if not api_key:
         return None, "Databento API key is missing. Add DATABENTO_API_KEY to Streamlit secrets or environment."
 
@@ -10117,7 +10115,15 @@ def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds:
         client.add_callback(_cb)
         client.start()
         client.block_for_close(timeout=int(timeout_seconds))
+        try:
+            client.stop()
+        except Exception:
+            pass
     except Exception as e:
+        try:
+            client.stop()
+        except Exception:
+            pass
         return None, str(e)
 
     if not topbooks:
