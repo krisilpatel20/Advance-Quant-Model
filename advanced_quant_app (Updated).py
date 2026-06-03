@@ -10283,7 +10283,7 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
             symbols=[str(ticker).upper().strip()],
             start=_market_time_to_utc_iso(start_dt),
             end=_market_time_to_utc_iso(end_dt),
-            limit=int(min(max(int(limit), 100), 3000)),
+            limit=int(min(max(int(limit), 100), 100_000)),
         )
         raw_df = data.to_df()
         topbook_df = _normalize_databento_mbp1_df(raw_df)
@@ -10328,6 +10328,7 @@ def build_databento_mbp1_trade_log(
     trailing_stop_pct=3.00,
     max_day_loss_pct=2.50,
     max_trades=2,
+    halt_on_dd=False,
 ):
     """
     Databento MBP-1 historical replay trade log — runner-aware version.
@@ -10337,6 +10338,10 @@ def build_databento_mbp1_trade_log(
     several times within seconds at the market open. This version first compresses
     the top-of-book stream into 1-minute decision bars, then uses MBP-1 pressure as
     confirmation of a VWAP/trend setup instead of as a standalone scalping signal.
+
+    halt_on_dd: if True, permanently halt all trading after the DD guard fires (old behaviour).
+                if False (default), use an extended cooldown instead so the system can
+                re-enter later in the day when a real trend develops.
     """
     try:
         d = topbook_df.copy()
@@ -10398,27 +10403,32 @@ def build_databento_mbp1_trade_log(
             b['size_proxy'] = (d['_bid_sz'] + d['_ask_sz']).resample(freq).sum().reindex(b.index).replace(0, np.nan).fillna(1.0)
             return b.dropna(subset=['price'])
 
+        bar_freq_used = '1min'
         bars = _make_replay_bars('1min')
         if len(bars) < 10:
+            bar_freq_used = '5s'
             bars = _make_replay_bars('5s')
         if len(bars) < 10:
+            bar_freq_used = '1s'
             bars = _make_replay_bars('1s')
         if len(bars) < 3:
             return pd.DataFrame(), pd.Series(dtype=float)
 
-        # Avoid the first few noisy opening minutes only when the replay window is long enough.
-        # If the user pulled only a short window / limited records, a fixed 10-minute skip can
-        # remove the whole usable sample and produce "no triggers" for every stock.
-        first_ts = bars.index.min()
-        last_ts = bars.index.max()
-        span_minutes = max(0.0, (last_ts - first_ts).total_seconds() / 60.0)
-        if span_minutes >= 45:
-            open_noise_cutoff = first_ts + pd.Timedelta(minutes=10)
-        elif span_minutes >= 15:
-            open_noise_cutoff = first_ts + pd.Timedelta(minutes=3)
-        else:
-            open_noise_cutoff = first_ts
-        after_open_noise = bars.index >= open_noise_cutoff
+        # Open noise skip by BAR COUNT, not wall-clock time.
+        # Timestamp-based cutoffs fail when data covers only a few seconds (1s bar fallback).
+        # Rule: skip the first N bars regardless of their wall-clock span:
+        #   1min bars → skip first 5 (= 5 minutes of session data)
+        #   5s   bars → skip first 60 (= 5 minutes)
+        #   1s   bars → skip first 300 (= 5 minutes)
+        _skip_map = {'1min': 5, '5s': 60, '1s': 300}
+        skip_n = _skip_map.get(bar_freq_used, 5)
+        # Never skip more than 1/3 of available bars (short pulls might have < 15 bars total)
+        skip_n = min(skip_n, max(3, len(bars) // 3))
+        skip_n = max(skip_n, 3)  # always skip at least 3 bars
+
+        after_open_noise = pd.Series(False, index=bars.index, dtype=bool)
+        if len(bars) > skip_n:
+            after_open_noise.iloc[skip_n:] = True
 
         # Session VWAP and trend filters.
         bars['vwap'] = (bars['price'] * bars['size_proxy']).cumsum() / (bars['size_proxy'].cumsum() + 1e-9)
@@ -10499,7 +10509,14 @@ def build_databento_mbp1_trade_log(
                 })
                 shares = 0.0
                 position = 0
-                halted = True
+                if halt_on_dd:
+                    # Hard stop: no more trades today (old behaviour, opt-in only)
+                    halted = True
+                else:
+                    # Extended cooldown: allow re-entry after 5× normal cooldown.
+                    # This lets the system catch a real trend later in the day
+                    # instead of sitting flat after a single opening-noise stop-out.
+                    cooldown = int(cooldown_records) * 5
 
             if halted:
                 equity_vals.append(equity_now)
@@ -10572,9 +10589,9 @@ def build_databento_mbp1_trade_log(
         # still avoiding tick-by-tick scalping.
         if len(trades) == 0 and len(bars) >= 3:
             usable = bars.copy()
-            # Prefer a point after the opening-noise cutoff when possible.
+            # Prefer a point after the opening-noise skip when possible.
             try:
-                usable = usable.loc[usable.index >= open_noise_cutoff]
+                usable = usable.iloc[skip_n:]
             except Exception:
                 pass
             if len(usable) < 2:
@@ -10865,7 +10882,7 @@ try:
                 with hist_c2:
                     hist_date = st.date_input("Replay date", value=_previous_business_date(datetime.today().date()), key="mm_db_hist_date")
                 with hist_c3:
-                    hist_limit = st.number_input("Max records", min_value=100, max_value=10000, value=1500, step=500, key="mm_db_hist_limit")
+                    hist_limit = st.number_input("Max records", min_value=100, max_value=50000, value=20000, step=1000, key="mm_db_hist_limit")
 
                 hist_t1, hist_t2 = st.columns(2)
                 with hist_t1:
@@ -10885,15 +10902,20 @@ try:
                 with hist_r1:
                     hist_confirm_records = st.number_input("Confirm bars", min_value=3, max_value=500, value=10, step=1, key="mm_db_hist_confirm_records")
                 with hist_r2:
-                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=1.00, step=0.05, key="mm_db_hist_trade_stop")
+                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=2.50, step=0.25, key="mm_db_hist_trade_stop")
                 with hist_r3:
-                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=2.00, step=0.05, key="mm_db_hist_trail_stop")
+                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=4.00, step=0.25, key="mm_db_hist_trail_stop")
                 with hist_r4:
-                    hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=1.0, step=0.25, key="mm_db_hist_max_day_loss")
+                    hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=5.0, step=0.25, key="mm_db_hist_max_day_loss")
 
-                hist_r5, _ = st.columns([1, 3])
+                hist_r5, hist_r6, hist_r7 = st.columns(3)
                 with hist_r5:
                     hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=3, step=1, key="mm_db_hist_max_trades")
+                with hist_r6:
+                    hist_cooldown_records = st.number_input("Cooldown bars after exit", min_value=3, max_value=200, value=25, step=5, key="mm_db_hist_cooldown")
+                with hist_r7:
+                    hist_halt_on_dd = st.checkbox("Hard-stop after DD guard", value=False, key="mm_db_hist_halt_on_dd",
+                                                  help="OFF (default): extended cooldown after DD guard, allows re-entry later in the day. ON: permanently halt all trading once DD guard fires (old behaviour).")
 
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if use_db_history and not db_api_key_hist:
@@ -10923,6 +10945,33 @@ try:
 
                             hist_records = hist_snapshot.get("records", pd.DataFrame())
                             if isinstance(hist_records, pd.DataFrame) and not hist_records.empty:
+                                # ── Data coverage diagnostic ──────────────────────────────────
+                                n_rec = len(hist_records)
+                                try:
+                                    _ts = hist_records.get('timestamp') if hasattr(hist_records, 'get') else None
+                                    if _ts is None and 'timestamp' in hist_records.columns:
+                                        _ts = hist_records['timestamp']
+                                    if _ts is not None and len(_ts) > 1:
+                                        _span_s = max(0.0, (_ts.max() - _ts.min()).total_seconds())
+                                        _span_m = _span_s / 60.0
+                                        if _span_m >= 10:
+                                            _bar_hint = "1-min bars ✅"
+                                        elif _span_s >= 50:
+                                            _bar_hint = "5s bars ⚠️ (increase Max records for 1-min bars)"
+                                        else:
+                                            _bar_hint = "1s bars 🔴 (way too few records — increase Max records)"
+                                        st.caption(f"📊 {n_rec:,} records pulled · {_span_m:.1f} min of data · {_bar_hint}")
+                                        if _span_m < 5:
+                                            st.warning(
+                                                f"⚠️ Only **{_span_m:.1f} min** of data pulled. On volatile stocks (ASTS, MSTR…) "
+                                                f"MBP-1 can have 500+ records/second at open — {n_rec:,} records covers almost nothing. "
+                                                f"**Increase Max records to 20,000–50,000** or narrow your time window (e.g., 09:35–12:00) "
+                                                f"to get proper 1-minute bars covering the full session."
+                                            )
+                                except Exception:
+                                    st.caption(f"📊 {n_rec:,} records pulled")
+                                # ─────────────────────────────────────────────────────────────
+
                                 show_raw_db_records = st.checkbox("Show raw Databento records", value=False, key="mm_show_raw_db_records")
                                 if show_raw_db_records:
                                     st.subheader("Historical MBP-1 top-of-book records")
@@ -10934,12 +10983,13 @@ try:
                                     imbalance_open=float(hist_open_imb),
                                     imbalance_close=float(hist_close_imb),
                                     min_hold_records=int(hist_min_hold),
-                                    cooldown_records=25,
+                                    cooldown_records=int(hist_cooldown_records),
                                     confirm_records=int(hist_confirm_records),
                                     per_trade_stop_pct=float(hist_trade_stop),
                                     trailing_stop_pct=float(hist_trail_stop),
                                     max_day_loss_pct=float(hist_max_day_loss),
                                     max_trades=int(hist_max_trades),
+                                    halt_on_dd=bool(hist_halt_on_dd),
                                 )
                                 st.subheader("Databento historical MBP-1 trade log")
                                 if hist_trades.empty:
