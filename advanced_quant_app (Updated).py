@@ -11065,9 +11065,61 @@ try:
 
                         rec_df = db_snapshot.get("records", pd.DataFrame())
                         if isinstance(rec_df, pd.DataFrame) and not rec_df.empty:
-                            show_cols = [c for c in ["received_at", "bid_px", "ask_px", "bid_sz", "ask_sz"] if c in rec_df.columns]
-                            st.dataframe(rec_df[show_cols].tail(20), use_container_width=True, hide_index=True)
-                        st.info("This is live top-of-book pressure, not full MBP-10 Level 2 depth. Full L2 needs XNAS.ITCH / MBP-10 entitlement.")
+                            # ── Two-column layout: raw records | live trade log ────────────
+                            live_left, live_right = st.columns([1, 1])
+
+                            with live_left:
+                                st.caption("📋 Top-of-book quote stream")
+                                show_cols = [c for c in ["received_at", "bid_px", "ask_px", "bid_sz", "ask_sz"] if c in rec_df.columns]
+                                st.dataframe(rec_df[show_cols].tail(25), use_container_width=True, hide_index=True)
+
+                            with live_right:
+                                st.caption("🟢 Live trade signal log")
+                                try:
+                                    live_trades, live_eq = build_databento_mbp1_trade_log(
+                                        rec_df,
+                                        imbalance_open=0.60,
+                                        imbalance_close=0.40,
+                                        min_hold_records=2,
+                                        cooldown_records=3,
+                                        confirm_records=2,
+                                        per_trade_stop_pct=1.50,
+                                        trailing_stop_pct=3.00,
+                                        max_day_loss_pct=5.00,
+                                        max_trades=10,
+                                        halt_on_dd=False,
+                                    )
+                                    if isinstance(live_trades, pd.DataFrame) and not live_trades.empty:
+                                        for col in ["Buy Price", "Sell Price", "PnL (%)", "Cumulative Return (%)"]:
+                                            if col in live_trades.columns:
+                                                live_trades[col] = pd.to_numeric(live_trades[col], errors='coerce').round(3)
+                                        st.dataframe(live_trades, use_container_width=True, hide_index=True)
+                                        if isinstance(live_eq, pd.Series) and not live_eq.empty and live_eq.iloc[0] != 0:
+                                            live_ret = (live_eq.iloc[-1] / live_eq.iloc[0] - 1) * 100
+                                            st.metric("Window return", f"{live_ret:+.2f}%")
+                                    else:
+                                        # No triggered trades — show why by inspecting current conditions
+                                        st.info("No triggers in this snapshot window.")
+                                        try:
+                                            last = rec_df.iloc[-1]
+                                            bid_p  = float(last.get('bid_px',  0) or 0)
+                                            ask_p  = float(last.get('ask_px',  0) or 0)
+                                            imb    = float(last.get('imbalance', 0.5) or 0.5)
+                                            spread = float(last.get('spread',   0) or 0)
+                                            mid    = float(last.get('microprice', (bid_p + ask_p) / 2) or 0)
+                                            cond_rows = [
+                                                ("Bid pressure ≥ 0.60", f"{imb*100:.1f}%", "✅" if imb >= 0.60 else "❌"),
+                                                ("Spread OK",           f"${spread:.4f}", "✅" if mid > 0 and spread / mid < 0.002 else "❌"),
+                                                ("Records in window",   str(len(rec_df)),  "✅" if len(rec_df) >= 10 else "⚠️ need ≥10"),
+                                            ]
+                                            cond_df = pd.DataFrame(cond_rows, columns=["Condition", "Value", "Status"])
+                                            st.dataframe(cond_df, use_container_width=True, hide_index=True)
+                                            st.caption("Live window is usually 3–10 s — too short for 1-min bars. Triggers are most likely in the historical replay section.")
+                                        except Exception:
+                                            pass
+                                except Exception as e_live:
+                                    st.caption(f"Signal log error: {e_live}")
+                        st.info("Live top-of-book from EQUS.MINI MBP-1. Full L2 depth needs XNAS.ITCH / MBP-10 entitlement.")
                 elif use_databento_mbp1:
                     st.info("Databento is enabled, but no live request is running. Click the button to pull one snapshot.")
 
