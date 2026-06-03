@@ -10283,7 +10283,7 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
             symbols=[str(ticker).upper().strip()],
             start=_market_time_to_utc_iso(start_dt),
             end=_market_time_to_utc_iso(end_dt),
-            limit=int(min(max(int(limit), 100), 100_000)),
+            limit=int(min(max(int(limit), 100), 3000)),
         )
         raw_df = data.to_df()
         topbook_df = _normalize_databento_mbp1_df(raw_df)
@@ -10317,131 +10317,6 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
         return None, err
 
 
-def _normalize_databento_ohlcv1m_df(raw_df):
-    """Convert a Databento ohlcv-1m DataFrame into the pseudo-topbook format
-    expected by build_databento_mbp1_trade_log.
-
-    Imbalance proxy = candle close location inside [low, high]:
-      1.0 → close at high  = all buyer pressure
-      0.0 → close at low   = all seller pressure
-    This is not real L1 bid/ask data, but it captures direction and conviction
-    cleanly for the VWAP/trend entry logic.
-    """
-    try:
-        d = raw_df.copy()
-        try:
-            d = d.reset_index()
-        except Exception:
-            pass
-
-        lower_map = {str(c).lower(): c for c in d.columns}
-
-        def pick(*names):
-            for nm in names:
-                if nm.lower() in lower_map:
-                    return lower_map[nm.lower()]
-            return None
-
-        close_col  = pick('close', 'close_price', 'close_px')
-        high_col   = pick('high',  'high_price',  'high_px')
-        low_col    = pick('low',   'low_price',   'low_px')
-        vol_col    = pick('volume', 'vol', 'quantity', 'size')
-        ts_col     = pick('ts_event', 'ts_recv', 'index', 'timestamp', 'datetime', 'time')
-
-        if close_col is None:
-            return pd.DataFrame()
-
-        out = pd.DataFrame()
-        out['timestamp'] = (
-            pd.to_datetime(d[ts_col], errors='coerce', utc=True)
-            if ts_col else pd.Series(pd.NaT, index=d.index)
-        )
-
-        close = d[close_col].apply(_db_px_to_float)
-        high  = d[high_col].apply(_db_px_to_float) if high_col else close
-        low   = d[low_col].apply(_db_px_to_float)  if low_col  else close
-        vol   = (
-            pd.to_numeric(d[vol_col], errors='coerce').fillna(0)
-            if vol_col else pd.Series(1.0, index=d.index)
-        )
-
-        hl = (high - low).clip(lower=0).replace(0, np.nan)
-        cl_loc = ((close - low) / (hl + 1e-9)).clip(0, 1)   # close location [0,1]
-
-        out['bid_px']     = low
-        out['ask_px']     = high
-        out['bid_sz']     = (vol * cl_loc).fillna(0)
-        out['ask_sz']     = (vol * (1.0 - cl_loc)).fillna(0)
-        out['spread']     = hl.fillna(0)
-        out['mid']        = close
-        out['imbalance']  = cl_loc.fillna(0.5)
-        out['microprice'] = close
-
-        out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=['microprice', 'imbalance'])
-        out = out[out['microprice'] > 0]
-        return out.sort_values('timestamp').reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame()
-
-
-def get_databento_ohlcv1m_history(ticker: str, api_key: str, start_dt, end_dt):
-    """Pull Databento EQUS.MINI ohlcv-1m bars (one per minute) for full-day replay.
-
-    Unlike mbp-1, which can require 50,000–200,000 records to cover a full session on
-    a volatile stock, ohlcv-1m delivers at most 390 bars per day (one per trading minute)
-    with no record-limit issues. Use this for full-day trend replay.
-    """
-    try:
-        import databento as db
-    except Exception:
-        return None, "Databento package not installed. Add 'databento' to requirements.txt."
-    if not api_key:
-        return None, "Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets."
-
-    try:
-        client = db.Historical(str(api_key))
-        data = client.timeseries.get_range(
-            dataset="EQUS.MINI",
-            schema="ohlcv-1m",
-            symbols=[str(ticker).upper().strip()],
-            start=_market_time_to_utc_iso(start_dt),
-            end=_market_time_to_utc_iso(end_dt),
-        )
-        raw_df = data.to_df()
-        topbook_df = _normalize_databento_ohlcv1m_df(raw_df)
-        if topbook_df.empty:
-            return None, (
-                "No ohlcv-1m records found for that ticker/date. "
-                "Check the ticker symbol, date, and your Databento entitlement for EQUS.MINI ohlcv-1m."
-            )
-        latest = topbook_df.iloc[-1]
-        n_bars = len(topbook_df)
-        summary = {
-            "ticker":       str(ticker).upper().strip(),
-            "bid_px":       float(latest.get('bid_px',     np.nan)),
-            "ask_px":       float(latest.get('ask_px',     np.nan)),
-            "bid_sz":       float(latest.get('bid_sz',     0.0)),
-            "ask_sz":       float(latest.get('ask_sz',     0.0)),
-            "spread":       float(latest.get('spread',     np.nan)),
-            "mid":          float(latest.get('microprice', np.nan)),
-            "imbalance":    float(latest.get('imbalance',  np.nan)),
-            "microprice":   float(latest.get('microprice', np.nan)),
-            "records":      topbook_df,
-            "n_bars":       n_bars,
-            "timestamp_utc": datetime.utcnow(),
-        }
-        return summary, None
-    except Exception as e:
-        err = str(e)
-        if "data_start_after_available_end" in err or "after the available end" in err:
-            return None, (
-                "Requested range is newer than Databento's available ohlcv-1m data. "
-                "Use an earlier replay date. "
-                f"Raw error: {err}"
-            )
-        return None, err
-
-
 def build_databento_mbp1_trade_log(
     topbook_df,
     imbalance_open=0.62,
@@ -10453,7 +10328,6 @@ def build_databento_mbp1_trade_log(
     trailing_stop_pct=3.00,
     max_day_loss_pct=2.50,
     max_trades=2,
-    halt_on_dd=False,
 ):
     """
     Databento MBP-1 historical replay trade log — runner-aware version.
@@ -10463,10 +10337,6 @@ def build_databento_mbp1_trade_log(
     several times within seconds at the market open. This version first compresses
     the top-of-book stream into 1-minute decision bars, then uses MBP-1 pressure as
     confirmation of a VWAP/trend setup instead of as a standalone scalping signal.
-
-    halt_on_dd: if True, permanently halt all trading after the DD guard fires (old behaviour).
-                if False (default), use an extended cooldown instead so the system can
-                re-enter later in the day when a real trend develops.
     """
     try:
         d = topbook_df.copy()
@@ -10528,121 +10398,67 @@ def build_databento_mbp1_trade_log(
             b['size_proxy'] = (d['_bid_sz'] + d['_ask_sz']).resample(freq).sum().reindex(b.index).replace(0, np.nan).fillna(1.0)
             return b.dropna(subset=['price'])
 
-        bar_freq_used = '1min'
         bars = _make_replay_bars('1min')
         if len(bars) < 10:
-            bar_freq_used = '5s'
             bars = _make_replay_bars('5s')
         if len(bars) < 10:
-            bar_freq_used = '1s'
             bars = _make_replay_bars('1s')
         if len(bars) < 3:
             return pd.DataFrame(), pd.Series(dtype=float)
 
-        # Open noise skip by BAR COUNT, not wall-clock time.
-        # Timestamp-based cutoffs fail when data covers only a few seconds (1s bar fallback).
-        # Rule: skip the first N bars regardless of their wall-clock span:
-        #   1min bars → skip first 5 (= 5 minutes of session data)
-        #   5s   bars → skip first 60 (= 5 minutes)
-        #   1s   bars → skip first 300 (= 5 minutes)
-        _skip_map = {'1min': 5, '5s': 60, '1s': 300}
-        skip_n = _skip_map.get(bar_freq_used, 5)
-        # Never skip more than 1/3 of available bars (short pulls might have < 15 bars total)
-        skip_n = min(skip_n, max(3, len(bars) // 3))
-        skip_n = max(skip_n, 3)  # always skip at least 3 bars
+        # Avoid the first few noisy opening minutes only when the replay window is long enough.
+        # If the user pulled only a short window / limited records, a fixed 10-minute skip can
+        # remove the whole usable sample and produce "no triggers" for every stock.
+        first_ts = bars.index.min()
+        last_ts = bars.index.max()
+        span_minutes = max(0.0, (last_ts - first_ts).total_seconds() / 60.0)
+        if span_minutes >= 45:
+            open_noise_cutoff = first_ts + pd.Timedelta(minutes=10)
+        elif span_minutes >= 15:
+            open_noise_cutoff = first_ts + pd.Timedelta(minutes=3)
+        else:
+            open_noise_cutoff = first_ts
+        after_open_noise = bars.index >= open_noise_cutoff
 
-        after_open_noise = pd.Series(False, index=bars.index, dtype=bool)
-        if len(bars) > skip_n:
-            after_open_noise.iloc[skip_n:] = True
-
-        # Session VWAP and common indicators (used by both modes).
+        # Session VWAP and trend filters.
         bars['vwap'] = (bars['price'] * bars['size_proxy']).cumsum() / (bars['size_proxy'].cumsum() + 1e-9)
         bars['ema_fast'] = bars['price'].ewm(span=5, adjust=False).mean()
         bars['ema_slow'] = bars['price'].ewm(span=15, adjust=False).mean()
         bars['imb_smooth'] = bars['imbalance'].rolling(max(2, int(confirm_records)), min_periods=1).mean()
         bars['vwap_slope'] = bars['vwap'].diff(3).fillna(0)
         bars['mom_5'] = bars['price'].pct_change(5).fillna(0)
-        bars['mom_10'] = bars['price'].pct_change(10).fillna(0)
         bars['spread_pct'] = (bars['spread'] / bars['price'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
         spread_cap = max(float(bars['spread_pct'].quantile(0.90)), 0.0010)
 
-        # Auto-detect full-day ohlcv-1m vs short-window mbp-1 mode.
-        # 150+ bars strongly implies a full trading session from ohlcv-1m.
-        _full_day = len(bars) >= 150
-
-        if _full_day:
-            # ── ohlcv-1m FULL-DAY TREND MODE ────────────────────────────────────────
-            # Imbalance proxy: ohlcv close-location is noisier than real MBP-1 bid/ask.
-            _eff_imb = min(float(imbalance_open) * 0.85, 0.54)
-            trend_ok = (
-                (bars['ema_fast'] >= bars['ema_slow']) &   # EMA crossover: trend is active
-                (bars['price'] > bars['ema_slow']) &         # price above medium-term EMA
-                (bars['mom_5'] >= -0.005)                    # not in an active 5-min selloff
-            )
-
-            # ── Consecutive-bar confirmation ─────────────────────────────────────────
-            # Require 2+ consecutive bars satisfying trend_ok before entry.
-            # This blocks the "enter on bar-1 of an EMA crossover at a local top" pattern
-            # that caused RGTI -4.97% on a +4-5% day: the EMA crossed at the peak of the
-            # morning spike, stock reversed immediately, stop fired before trend established.
-            _trend_int = trend_ok.astype(int)
-            _noncum = (~trend_ok).astype(int).cumsum()
-            bars['_confirmed'] = _trend_int.groupby(_noncum).cumsum().clip(upper=10)
-
-            # ── Anti-chase range-position filter ────────────────────────────────────
-            # Don't enter when price is in the top 15 % of its recent 30-bar range.
-            # Volatile small-caps (RGTI, MSTR, ASTS) spike 10-20 % in minutes; buying
-            # at the top of a spike means a small reversal triggers the stop.
-            _h30 = bars['price'].rolling(30, min_periods=5).max().fillna(bars['price'])
-            _l30 = bars['price'].rolling(30, min_periods=5).min().fillna(bars['price'])
-            bars['_range_pos'] = ((bars['price'] - _l30) / (_h30 - _l30 + 1e-9)).clip(0, 1)
-            not_at_top = bars['_range_pos'] <= 0.85
-
-            # Exit on EMA bearish cross, sharp 10-bar reversal, or pressure + EMA break.
-            close_cond = (
-                (bars['ema_fast'] < bars['ema_slow']) |
-                (bars['mom_10'] < -0.020) |
-                ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['ema_slow']))
-            )
-        else:
-            # ── mbp-1 SHORT-WINDOW MODE (original logic) ────────────────────────────
-            _eff_imb = float(imbalance_open)
-            trend_ok = (
-                (bars['price'] > bars['vwap']) &
-                (bars['ema_fast'] >= bars['ema_slow']) &
-                (bars['vwap_slope'] >= 0) &
-                (bars['mom_5'] >= -0.002)
-            )
-            bars['_confirmed'] = pd.Series(1, index=bars.index)   # no consecutive req for mbp-1
-            not_at_top = pd.Series(True, index=bars.index)        # no range filter for mbp-1
-            close_cond = (
-                ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
-                (bars['mom_5'] < -0.012) |
-                ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
-            )
-
-        pressure_ok = bars['imb_smooth'] >= _eff_imb
+        # MBP-1 is confirmation only. The main idea is trend + VWAP + healthy pressure.
+        trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['vwap_slope'] >= 0) & (bars['mom_5'] >= -0.002)
+        pressure_ok = bars['imb_smooth'] >= float(imbalance_open)
         spread_ok = bars['spread_pct'] <= spread_cap
-        open_cond = after_open_noise & (bars['_confirmed'] >= 2) & not_at_top & pressure_ok & spread_ok
+        open_cond = after_open_noise & trend_ok & pressure_ok & spread_ok
 
-        # Adaptive fallback: when primary filter has zero hits, relax pressure.
-        # Keep the consecutive-bar requirement even in fallback (just use >=1 if _full_day).
+        # Adaptive fallback: when the A+ filter is too strict for the selected window,
+        # use a runner-confirmation rule instead of returning zero trades for every stock.
+        # This still avoids raw tick scalping: it requires VWAP/trend support and some
+        # bid pressure, but it does not demand the very high default pressure threshold.
         if int(open_cond.sum()) == 0:
-            soft_pressure = max(0.48, _eff_imb - 0.12)
-            if _full_day:
-                relaxed_trend_ok = (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.008)
-                open_cond = after_open_noise & (bars['_confirmed'] >= 1) & relaxed_trend_ok & (bars['imb_smooth'] >= soft_pressure) & spread_ok
-            else:
-                relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.004)
-                open_cond = after_open_noise & relaxed_trend_ok & (bars['imb_smooth'] >= soft_pressure) & spread_ok
+            soft_pressure = max(0.52, float(imbalance_open) - 0.18)
+            relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.004)
+            relaxed_pressure_ok = bars['imb_smooth'] >= soft_pressure
+            open_cond = after_open_noise & relaxed_trend_ok & relaxed_pressure_ok & spread_ok
 
-        # Last-resort: any bar with intact trend structure and no pressure requirement.
+        # Last-resort trend participation for short historical pulls. If the record limit only
+        # returns a small slice of the session, pressure may not reach the threshold even when
+        # price is trending cleanly. Use a very small number of entries, still with risk guards.
         if int(open_cond.sum()) == 0 and len(bars) >= 6:
-            if _full_day:
-                trend_participation = (bars['ema_fast'] >= bars['ema_slow']) & (bars['price'] > bars['ema_slow'])
-            else:
-                trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= 0)
+            trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= 0)
             open_cond = after_open_noise & trend_participation & spread_ok
+
+        # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
+        close_cond = (
+            ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
+            (bars['mom_5'] < -0.012) |
+            ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
+        )
 
         position = 0
         entry_price = 0.0
@@ -10683,14 +10499,7 @@ def build_databento_mbp1_trade_log(
                 })
                 shares = 0.0
                 position = 0
-                if halt_on_dd:
-                    # Hard stop: no more trades today (old behaviour, opt-in only)
-                    halted = True
-                else:
-                    # Extended cooldown: allow re-entry after 5× normal cooldown.
-                    # This lets the system catch a real trend later in the day
-                    # instead of sitting flat after a single opening-noise stop-out.
-                    cooldown = int(cooldown_records) * 5
+                halted = True
 
             if halted:
                 equity_vals.append(equity_now)
@@ -10713,16 +10522,7 @@ def build_databento_mbp1_trade_log(
                 pnl_pct = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
                 trail_dd_pct = ((px - high_since_entry) / high_since_entry * 100.0) if high_since_entry else 0.0
 
-                # Full-day mode: per-trade stop only fires if price is ALSO below the
-                # slow EMA. This prevents getting stopped out during normal intraday
-                # pullbacks while the trend structure is still intact.
-                # mbp-1 mode: fire on raw price drop (tight window, fast decisions).
-                _ema_s_now = float(row.get('ema_slow', 0))
-                if _full_day:
-                    stop_hit = (pnl_pct <= -abs(float(per_trade_stop_pct))) and (px < _ema_s_now)
-                else:
-                    stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
-
+                stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
                 trailing_hit = (bars_held >= max(5, int(min_hold_records))) and (trail_dd_pct <= -abs(float(trailing_stop_pct)))
                 signal_exit = (bars_held >= max(8, int(min_hold_records))) and bool(close_cond.loc[ts])
 
@@ -10772,9 +10572,9 @@ def build_databento_mbp1_trade_log(
         # still avoiding tick-by-tick scalping.
         if len(trades) == 0 and len(bars) >= 3:
             usable = bars.copy()
-            # Prefer a point after the opening-noise skip when possible.
+            # Prefer a point after the opening-noise cutoff when possible.
             try:
-                usable = usable.iloc[skip_n:]
+                usable = usable.loc[usable.index >= open_noise_cutoff]
             except Exception:
                 pass
             if len(usable) < 2:
@@ -11058,27 +10858,14 @@ try:
                 elif use_databento_mbp1:
                     st.info("Databento is enabled, but no live request is running. Click the button to pull one snapshot.")
 
-            with st.expander("🕒 Databento historical replay — ohlcv-1m or mbp-1", expanded=False):
+            with st.expander("🕒 Databento historical replay — today/yesterday MBP-1", expanded=False):
                 hist_c1, hist_c2, hist_c3 = st.columns(3)
                 with hist_c1:
                     use_db_history = st.checkbox("Enable Databento historical replay", value=False, key="mm_use_db_history")
                 with hist_c2:
                     hist_date = st.date_input("Replay date", value=_previous_business_date(datetime.today().date()), key="mm_db_hist_date")
                 with hist_c3:
-                    hist_schema = st.selectbox(
-                        "Schema",
-                        ["ohlcv-1m  (full day, recommended)", "mbp-1  (tick pressure, short window)"],
-                        index=0,
-                        key="mm_db_hist_schema",
-                        help=(
-                            "ohlcv-1m: exactly 390 bars/day, covers the full session, no record-limit issues. "
-                            "Imbalance is proxied from candle close location. Best for full-day trend replay.\n\n"
-                            "mbp-1: real bid/ask pressure at tick resolution. Best for short windows "
-                            "(1–2 h) with Max records ≥ 20,000. On volatile stocks like ASTS, "
-                            "even 50,000 records can cover only 1–2 hours."
-                        ),
-                    )
-                    _use_ohlcv = "ohlcv" in hist_schema
+                    hist_limit = st.number_input("Max records", min_value=100, max_value=10000, value=1500, step=500, key="mm_db_hist_limit")
 
                 hist_t1, hist_t2 = st.columns(2)
                 with hist_t1:
@@ -11086,89 +10873,27 @@ try:
                 with hist_t2:
                     hist_end_time = st.time_input("End time", value=datetime.strptime("16:00", "%H:%M").time(), key="mm_db_hist_end_time")
 
-                if not _use_ohlcv:
-                    st.caption(
-                        "mbp-1 mode — Max records controls how much of the session you get. "
-                        "On volatile stocks 20,000+ records still covers only 1–2 hours. "
-                        "Switch to **ohlcv-1m** for reliable full-day coverage."
-                    )
-                    _mbp1_limit_col, _ = st.columns([1, 2])
-                    with _mbp1_limit_col:
-                        hist_limit = st.number_input("Max records", min_value=100, max_value=50000, value=20000, step=1000, key="mm_db_hist_limit")
-                else:
-                    hist_limit = 0  # unused for ohlcv-1m
-                    st.caption("ℹ️ ohlcv-1m schema — pulls all available 1-min bars for the selected date/window (≤ 390 for a full US session). No record limit needed.")
-
                 hist_s1, hist_s2, hist_s3 = st.columns(3)
                 with hist_s1:
                     hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.62, 0.01, key="mm_db_hist_open_imb")
-                    if _use_ohlcv:
-                        st.caption(f"ohlcv-1m: effective threshold auto-scaled to {min(hist_open_imb*0.85, 0.54):.2f} (close-location proxy is noisier than real bid/ask)")
                 with hist_s2:
                     hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.45, 0.01, key="mm_db_hist_close_imb")
                 with hist_s3:
-                    if _use_ohlcv:
-                        hist_min_hold = st.number_input(
-                            "Min bars held", min_value=1, max_value=500, value=30, step=5,
-                            key="mm_db_hist_min_hold_ohlcv",
-                            help="ohlcv-1m: 30 bars = at least 30 minutes in trade before signal exits can fire."
-                        )
-                    else:
-                        hist_min_hold = st.number_input("Min bars held", min_value=1, max_value=500, value=10, step=1, key="mm_db_hist_min_hold_mbp1")
-
-                if _use_ohlcv:
-                    st.caption(
-                        "📏 **ohlcv-1m stop sizing**: volatile stocks (ASTS, MSTR…) swing 3–6 % intraday on big move days. "
-                        "A 2–4 % stop fires on normal noise and kills the trade before the real move. "
-                        "Defaults below are sized for a full-day trend. Raise them further for faster movers."
-                    )
+                    hist_min_hold = st.number_input("Min bars held", min_value=1, max_value=500, value=10, step=1, key="mm_db_hist_min_hold")
 
                 hist_r1, hist_r2, hist_r3, hist_r4 = st.columns(4)
                 with hist_r1:
                     hist_confirm_records = st.number_input("Confirm bars", min_value=3, max_value=500, value=10, step=1, key="mm_db_hist_confirm_records")
                 with hist_r2:
-                    if _use_ohlcv:
-                        hist_trade_stop = st.number_input(
-                            "Per-trade stop (%)", min_value=0.50, max_value=30.0, value=8.0, step=0.5,
-                            key="mm_db_hist_trade_stop_ohlcv",
-                            help="ohlcv-1m full day: use 7–12 %. Lower than intraday volatility = premature stop-out."
-                        )
-                    else:
-                        hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=2.50, step=0.25, key="mm_db_hist_trade_stop_mbp1")
+                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=1.00, step=0.05, key="mm_db_hist_trade_stop")
                 with hist_r3:
-                    if _use_ohlcv:
-                        hist_trail_stop = st.number_input(
-                            "Trailing stop (%)", min_value=0.50, max_value=30.0, value=12.0, step=0.5,
-                            key="mm_db_hist_trail_stop_ohlcv",
-                            help="ohlcv-1m: trail from session high with 10–15 % to let the trend run. 4 % is too tight for a full-day trend."
-                        )
-                    else:
-                        hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=4.00, step=0.25, key="mm_db_hist_trail_stop_mbp1")
+                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=2.00, step=0.05, key="mm_db_hist_trail_stop")
                 with hist_r4:
-                    if _use_ohlcv:
-                        hist_max_day_loss = st.number_input(
-                            "Max replay loss (%)", min_value=1.0, max_value=30.0, value=20.0, step=1.0,
-                            key="mm_db_hist_max_day_loss_ohlcv",
-                            help="ohlcv-1m: set to 20 % or higher so a single bad stop-out does not permanently block re-entry."
-                        )
-                    else:
-                        hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=5.0, step=0.25, key="mm_db_hist_max_day_loss_mbp1")
+                    hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=1.0, step=0.25, key="mm_db_hist_max_day_loss")
 
-                hist_r5, hist_r6, hist_r7 = st.columns(3)
+                hist_r5, _ = st.columns([1, 3])
                 with hist_r5:
                     hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=3, step=1, key="mm_db_hist_max_trades")
-                with hist_r6:
-                    if _use_ohlcv:
-                        hist_cooldown_records = st.number_input(
-                            "Cooldown bars after exit", min_value=1, max_value=200, value=5, step=1,
-                            key="mm_db_hist_cooldown_ohlcv",
-                            help="ohlcv-1m: 5 bars = 5 minutes. Short cooldown lets the system re-enter quickly on a trending day."
-                        )
-                    else:
-                        hist_cooldown_records = st.number_input("Cooldown bars after exit", min_value=3, max_value=200, value=25, step=5, key="mm_db_hist_cooldown_mbp1")
-                with hist_r7:
-                    hist_halt_on_dd = st.checkbox("Hard-stop after DD guard", value=False, key="mm_db_hist_halt_on_dd",
-                                                  help="OFF (default): extended cooldown, allows re-entry later. ON: permanently halt once DD guard fires.")
 
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if use_db_history and not db_api_key_hist:
@@ -11176,8 +10901,8 @@ try:
 
                 run_db_history = False
                 if use_db_history:
-                    _btn_label = "Pull Databento ohlcv-1m replay" if _use_ohlcv else "Pull Databento mbp-1 replay"
-                    run_db_history = st.button(_btn_label, key="mm_db_hist_pull_now")
+                    st.caption("Historical replay uses New York market time and converts to UTC for Databento. Default is now A+ only: no trade is better than forced bad trades. If today's data is not available yet, use the previous trading day.")
+                    run_db_history = st.button("Pull Databento historical MBP-1 replay", key="mm_db_hist_pull_now")
 
                 if use_db_history and run_db_history:
                     hist_start_dt = datetime.combine(hist_date, hist_start_time)
@@ -11185,19 +10910,10 @@ try:
                     if hist_end_dt <= hist_start_dt:
                         st.warning("End time must be after start time.")
                     else:
-                        _schema_label = "ohlcv-1m" if _use_ohlcv else "mbp-1"
-                        with st.spinner(f"Pulling {_schema_label} data for {TICKER}…"):
-                            if _use_ohlcv:
-                                hist_snapshot, hist_err = get_databento_ohlcv1m_history(
-                                    str(TICKER), str(db_api_key_hist), hist_start_dt, hist_end_dt
-                                )
-                            else:
-                                hist_snapshot, hist_err = get_databento_equs_mbp1_history(
-                                    str(TICKER), str(db_api_key_hist), hist_start_dt, hist_end_dt, int(hist_limit)
-                                )
-
+                        with st.spinner(f"Pulling historical EQUS.MINI MBP-1 for {TICKER}..."):
+                            hist_snapshot, hist_err = get_databento_equs_mbp1_history(str(TICKER), str(db_api_key_hist), hist_start_dt, hist_end_dt, int(hist_limit))
                         if hist_err:
-                            st.warning(f"Databento {_schema_label} not available: {hist_err}")
+                            st.warning(f"Databento historical MBP-1 not available: {hist_err}")
                         elif hist_snapshot:
                             hd1, hd2, hd3, hd4 = st.columns(4)
                             hd1.metric("Last Bid", f"${hist_snapshot['bid_px']:.4f}")
@@ -11207,37 +10923,9 @@ try:
 
                             hist_records = hist_snapshot.get("records", pd.DataFrame())
                             if isinstance(hist_records, pd.DataFrame) and not hist_records.empty:
-
-                                # ── Data coverage diagnostic ────────────────────────────────
-                                n_rec = len(hist_records)
-                                if _use_ohlcv:
-                                    n_bars_ohlcv = hist_snapshot.get("n_bars", n_rec)
-                                    st.caption(f"📊 {n_bars_ohlcv} × 1-min bars (ohlcv-1m) · Full session coverage ✅")
-                                else:
-                                    try:
-                                        _ts = hist_records['timestamp'] if 'timestamp' in hist_records.columns else None
-                                        if _ts is not None and len(_ts) > 1:
-                                            _span_m = max(0.0, (_ts.max() - _ts.min()).total_seconds()) / 60.0
-                                            if _span_m >= 10:
-                                                _bar_hint = "1-min bars ✅"
-                                            elif _span_m >= 50 / 60:
-                                                _bar_hint = "5s bars ⚠️ — increase Max records or switch to ohlcv-1m"
-                                            else:
-                                                _bar_hint = "1s bars 🔴 — way too few records; switch to ohlcv-1m"
-                                            st.caption(f"📊 {n_rec:,} mbp-1 records · {_span_m:.1f} min of data · {_bar_hint}")
-                                            if _span_m < 10:
-                                                st.warning(
-                                                    f"⚠️ Only **{_span_m:.1f} min** of data pulled from mbp-1. "
-                                                    f"On volatile stocks, even 50,000 records can cover < 2 hours. "
-                                                    f"**Switch Schema to ohlcv-1m** for guaranteed full-day 1-min bars."
-                                                )
-                                    except Exception:
-                                        st.caption(f"📊 {n_rec:,} mbp-1 records pulled")
-                                # ───────────────────────────────────────────────────────────
-
-                                show_raw_db_records = st.checkbox("Show raw records", value=False, key="mm_show_raw_db_records")
+                                show_raw_db_records = st.checkbox("Show raw Databento records", value=False, key="mm_show_raw_db_records")
                                 if show_raw_db_records:
-                                    st.subheader(f"Raw {_schema_label} records")
+                                    st.subheader("Historical MBP-1 top-of-book records")
                                     show_cols = [c for c in ["timestamp", "bid_px", "ask_px", "bid_sz", "ask_sz", "spread", "imbalance", "microprice"] if c in hist_records.columns]
                                     st.dataframe(hist_records[show_cols].tail(100), use_container_width=True, hide_index=True)
 
@@ -11246,17 +10934,16 @@ try:
                                     imbalance_open=float(hist_open_imb),
                                     imbalance_close=float(hist_close_imb),
                                     min_hold_records=int(hist_min_hold),
-                                    cooldown_records=int(hist_cooldown_records),
+                                    cooldown_records=25,
                                     confirm_records=int(hist_confirm_records),
                                     per_trade_stop_pct=float(hist_trade_stop),
                                     trailing_stop_pct=float(hist_trail_stop),
                                     max_day_loss_pct=float(hist_max_day_loss),
                                     max_trades=int(hist_max_trades),
-                                    halt_on_dd=bool(hist_halt_on_dd),
                                 )
-                                st.subheader(f"Historical {_schema_label} trade log")
+                                st.subheader("Databento historical MBP-1 trade log")
                                 if hist_trades.empty:
-                                    st.info("No trade triggers found for this replay window/settings.")
+                                    st.info("No historical MBP-1 trade triggers found for this replay window/settings.")
                                 else:
                                     for col in ["Buy Price", "Sell Price", "PnL (%)", "Cumulative Return (%)"]:
                                         if col in hist_trades.columns:
@@ -11267,11 +10954,11 @@ try:
                                     st.metric("Replay Strategy Return", f"{hist_ret:.2f}%")
                                     if st.checkbox("Show replay equity chart", value=False, key="mm_show_replay_equity_chart"):
                                         fig_hist = go.Figure()
-                                        fig_hist.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq.values, name=f"{_schema_label} replay equity"))
+                                        fig_hist.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq.values, name="MBP-1 replay equity"))
                                         fig_hist.update_layout(height=350, template='plotly_dark')
                                         st.plotly_chart(fig_hist, use_container_width=True)
                 elif use_db_history:
-                    st.info("Historical replay is enabled, but no request is running. Click the pull button above.")
+                    st.info("Historical replay is enabled, but no request is running. Click the button to pull today/yesterday records.")
 
             mm_c1, mm_c2, mm_c3 = st.columns(3)
             with mm_c1:
