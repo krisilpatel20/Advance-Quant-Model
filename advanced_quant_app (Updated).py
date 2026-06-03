@@ -10397,9 +10397,18 @@ def build_databento_mbp1_trade_log(
         if len(bars) < 10:
             return pd.DataFrame(), pd.Series(dtype=float)
 
-        # Avoid the first few noisy opening minutes. Your bad ASTS logs were all at 13:30 UTC.
+        # Avoid the first few noisy opening minutes only when the replay window is long enough.
+        # If the user pulled only a short window / limited records, a fixed 10-minute skip can
+        # remove the whole usable sample and produce "no triggers" for every stock.
         first_ts = bars.index.min()
-        open_noise_cutoff = first_ts + pd.Timedelta(minutes=10)
+        last_ts = bars.index.max()
+        span_minutes = max(0.0, (last_ts - first_ts).total_seconds() / 60.0)
+        if span_minutes >= 45:
+            open_noise_cutoff = first_ts + pd.Timedelta(minutes=10)
+        elif span_minutes >= 15:
+            open_noise_cutoff = first_ts + pd.Timedelta(minutes=3)
+        else:
+            open_noise_cutoff = first_ts
         after_open_noise = bars.index >= open_noise_cutoff
 
         # Session VWAP and trend filters.
@@ -10417,6 +10426,23 @@ def build_databento_mbp1_trade_log(
         pressure_ok = bars['imb_smooth'] >= float(imbalance_open)
         spread_ok = bars['spread_pct'] <= spread_cap
         open_cond = after_open_noise & trend_ok & pressure_ok & spread_ok
+
+        # Adaptive fallback: when the A+ filter is too strict for the selected window,
+        # use a runner-confirmation rule instead of returning zero trades for every stock.
+        # This still avoids raw tick scalping: it requires VWAP/trend support and some
+        # bid pressure, but it does not demand the very high default pressure threshold.
+        if int(open_cond.sum()) == 0:
+            soft_pressure = max(0.52, float(imbalance_open) - 0.18)
+            relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.004)
+            relaxed_pressure_ok = bars['imb_smooth'] >= soft_pressure
+            open_cond = after_open_noise & relaxed_trend_ok & relaxed_pressure_ok & spread_ok
+
+        # Last-resort trend participation for short historical pulls. If the record limit only
+        # returns a small slice of the session, pressure may not reach the threshold even when
+        # price is trending cleanly. Use a very small number of entries, still with risk guards.
+        if int(open_cond.sum()) == 0 and len(bars) >= 6:
+            trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= 0)
+            open_cond = after_open_noise & trend_participation & spread_ok
 
         # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
         close_cond = (
@@ -10799,25 +10825,25 @@ try:
 
                 hist_s1, hist_s2, hist_s3 = st.columns(3)
                 with hist_s1:
-                    hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.72, 0.01, key="mm_db_hist_open_imb")
+                    hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.62, 0.01, key="mm_db_hist_open_imb")
                 with hist_s2:
-                    hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.48, 0.01, key="mm_db_hist_close_imb")
+                    hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.45, 0.01, key="mm_db_hist_close_imb")
                 with hist_s3:
-                    hist_min_hold = st.number_input("Min records held", min_value=1, max_value=500, value=50, step=1, key="mm_db_hist_min_hold")
+                    hist_min_hold = st.number_input("Min bars held", min_value=1, max_value=500, value=10, step=1, key="mm_db_hist_min_hold")
 
                 hist_r1, hist_r2, hist_r3, hist_r4 = st.columns(4)
                 with hist_r1:
-                    hist_confirm_records = st.number_input("Confirm records", min_value=3, max_value=500, value=60, step=1, key="mm_db_hist_confirm_records")
+                    hist_confirm_records = st.number_input("Confirm bars", min_value=3, max_value=500, value=10, step=1, key="mm_db_hist_confirm_records")
                 with hist_r2:
-                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=0.35, step=0.05, key="mm_db_hist_trade_stop")
+                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=1.00, step=0.05, key="mm_db_hist_trade_stop")
                 with hist_r3:
-                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=0.65, step=0.05, key="mm_db_hist_trail_stop")
+                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=2.00, step=0.05, key="mm_db_hist_trail_stop")
                 with hist_r4:
                     hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=1.0, step=0.25, key="mm_db_hist_max_day_loss")
 
                 hist_r5, _ = st.columns([1, 3])
                 with hist_r5:
-                    hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=2, step=1, key="mm_db_hist_max_trades")
+                    hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=3, step=1, key="mm_db_hist_max_trades")
 
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if use_db_history and not db_api_key_hist:
