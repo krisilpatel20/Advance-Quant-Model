@@ -10103,26 +10103,44 @@ def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds:
     records = []
     topbooks = []
 
-    def _cb(msg):
-        try:
-            tb = _databento_record_to_topbook(msg)
-            if tb is not None:
-                tb["received_at"] = datetime.utcnow()
-                topbooks.append(tb)
-                records.append(tb.copy())
-        except Exception:
-            pass
-
     try:
+        import threading
+
         client = db.Live(key=str(api_key))
-        client.subscribe(dataset="EQUS.MINI", schema="mbp-1", symbols=[str(ticker).upper().strip()])
-        client.add_callback(_cb)
-        client.start()
-        client.block_for_close(timeout=int(timeout_seconds))
+        client.subscribe(
+            dataset="EQUS.MINI",
+            schema="mbp-1",
+            symbols=[str(ticker).upper().strip()],
+        )
+
+        stop_event = threading.Event()
+        errors = []
+
+        def _pull():
+            try:
+                for record in client:
+                    if stop_event.is_set() or len(topbooks) >= int(max_records):
+                        break
+                    tb = _databento_record_to_topbook(record)
+                    if tb is not None:
+                        tb["received_at"] = datetime.utcnow()
+                        topbooks.append(tb)
+                        records.append(tb.copy())
+            except Exception as inner_e:
+                errors.append(str(inner_e))
+
+        t = threading.Thread(target=_pull, daemon=True)
+        t.start()
+        t.join(timeout=float(timeout_seconds))
+        stop_event.set()
         try:
             client.stop()
         except Exception:
             pass
+
+        if errors and not topbooks:
+            return None, errors[-1]
+
     except Exception as e:
         try:
             client.stop()
