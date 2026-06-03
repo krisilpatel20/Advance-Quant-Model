@@ -1208,6 +1208,71 @@ def get_nasdaq100():
         return ["AAPL","MSFT","AMZN","GOOG","NVDA","META","TSLA","AVGO","PEP","COST"]
 
 
+
+
+def clean_overlapping_duplicate_trades(trades_df):
+    """
+    Display/log-cleaning only.
+
+    Some weekly/daily mapped trade logs can create duplicate rows with the exact
+    same entry timestamp after the date-mapping layer. One position should not be
+    shown as both closed and open from the same exact entry timestamp.
+
+    Rule:
+    - If duplicate Entry Date rows exist, keep the Open row when present.
+    - Otherwise keep the row with the longest holding span.
+    - This does not change signals, prices used by the backtest engine, equity
+      curve, or performance metrics.
+    """
+    try:
+        if trades_df is None or trades_df.empty or "Entry Date" not in trades_df.columns:
+            return trades_df
+        out = trades_df.copy()
+
+        def _entry_key(x):
+            try:
+                ts = pd.Timestamp(x)
+                if pd.isna(ts):
+                    return str(x)
+                # Use full timestamp precision available. Do not round.
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert(None)
+                return ts.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return str(x)
+
+        out["__entry_key__"] = out["Entry Date"].apply(_entry_key)
+        keep_idx = []
+        for _, g in out.groupby("__entry_key__", sort=False):
+            if len(g) == 1:
+                keep_idx.append(g.index[0])
+                continue
+
+            status = g["Status"].astype(str).str.lower() if "Status" in g.columns else pd.Series([""] * len(g), index=g.index)
+            open_rows = g[status.eq("open")]
+            if not open_rows.empty:
+                # If there is an open duplicate, keep the latest open representation.
+                keep_idx.append(open_rows.index[-1])
+                continue
+
+            def _duration(row):
+                try:
+                    a = pd.Timestamp(row.get("Entry Date"))
+                    b = pd.Timestamp(row.get("Exit Date"))
+                    if pd.isna(a) or pd.isna(b):
+                        return pd.Timedelta(0)
+                    return b - a
+                except Exception:
+                    return pd.Timedelta(0)
+
+            durations = g.apply(_duration, axis=1)
+            keep_idx.append(durations.idxmax())
+
+        out = out.loc[keep_idx].drop(columns=["__entry_key__"], errors="ignore")
+        return out
+    except Exception:
+        return trades_df
+
 def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
@@ -7658,6 +7723,8 @@ with tab7:
             # Show newest trades first by default
             if 'Entry Date' in trades_df.columns:
                 trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
+            # Remove impossible duplicate/overlapping trade-log rows created by weekly/date mapping.
+            trades_df = clean_overlapping_duplicate_trades(trades_df)
             # Format dates
             trades_df = apply_trade_log_timestamp_display(trades_df)
             
