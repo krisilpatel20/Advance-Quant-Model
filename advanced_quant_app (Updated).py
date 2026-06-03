@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import json
 import smtplib
+import os
 from email.message import EmailMessage
 import os
 
