@@ -10301,15 +10301,15 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
 
 def build_databento_mbp1_trade_log(
     topbook_df,
-    imbalance_open=0.65,
-    imbalance_close=0.45,
-    min_hold_records=5,
-    cooldown_records=25,
-    confirm_records=20,
-    per_trade_stop_pct=0.75,
-    trailing_stop_pct=1.25,
-    max_day_loss_pct=3.0,
-    max_trades=8,
+    imbalance_open=0.72,
+    imbalance_close=0.48,
+    min_hold_records=50,
+    cooldown_records=150,
+    confirm_records=60,
+    per_trade_stop_pct=0.35,
+    trailing_stop_pct=0.65,
+    max_day_loss_pct=1.0,
+    max_trades=2,
 ):
     """
     Safer historical MBP-1 replay trade log.
@@ -10351,13 +10351,25 @@ def build_databento_mbp1_trade_log(
         imb = pd.to_numeric(d['imbalance'], errors='coerce').fillna(0.5).clip(0, 1)
         d['_imb_smooth'] = imb.rolling(confirm_records, min_periods=max(3, confirm_records // 2)).mean().fillna(imb)
 
-        # Small trend filter so we do not buy every temporary bid-size flicker.
-        ema_fast = d['_px'].ewm(span=max(5, confirm_records), adjust=False).mean()
-        ema_slow = d['_px'].ewm(span=max(10, confirm_records * 3), adjust=False).mean()
-        trend_ok = (d['_px'] >= ema_fast) | (ema_fast >= ema_slow)
+        # A+ setup filter: MBP-1 alone is too noisy. Only allow a trade when
+        # book pressure, session VWAP, short trend, and spread quality all agree.
+        ema_fast = d['_px'].ewm(span=max(8, confirm_records), adjust=False).mean()
+        ema_slow = d['_px'].ewm(span=max(20, confirm_records * 3), adjust=False).mean()
 
-        open_cond = (d['_imb_smooth'] >= float(imbalance_open)) & (imb >= max(0.50, float(imbalance_open) - 0.05)) & spread_ok & trend_ok
-        close_cond = (d['_imb_smooth'] <= float(imbalance_close)) | (~spread_ok & (imb < 0.50))
+        # Session VWAP proxy using the top-of-book midpoint and available displayed size.
+        size_proxy = (pd.to_numeric(d.get('bid_sz', 0), errors='coerce').fillna(0) +
+                      pd.to_numeric(d.get('ask_sz', 0), errors='coerce').fillna(0)).replace(0, np.nan)
+        if size_proxy.isna().all():
+            size_proxy = pd.Series(1.0, index=d.index)
+        session_vwap = (d['_px'] * size_proxy.fillna(1.0)).cumsum() / (size_proxy.fillna(1.0).cumsum() + 1e-9)
+        vwap_slope = session_vwap.diff(max(5, confirm_records // 3)).fillna(0)
+        price_mom = d['_px'].pct_change(max(5, confirm_records // 2)).fillna(0)
+
+        trend_ok = (d['_px'] > session_vwap) & (ema_fast >= ema_slow) & (vwap_slope > 0) & (price_mom > 0)
+        pressure_ok = (d['_imb_smooth'] >= float(imbalance_open)) & (imb >= max(0.55, float(imbalance_open) - 0.04))
+
+        open_cond = pressure_ok & spread_ok & trend_ok
+        close_cond = (d['_imb_smooth'] <= float(imbalance_close)) | (~spread_ok & (imb < 0.50)) | (d['_px'] < session_vwap) | (ema_fast < ema_slow)
 
         position = 0
         entry_price = 0.0
@@ -10738,25 +10750,25 @@ try:
 
                 hist_s1, hist_s2, hist_s3 = st.columns(3)
                 with hist_s1:
-                    hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.68, 0.01, key="mm_db_hist_open_imb")
+                    hist_open_imb = st.slider("Open if bid pressure ≥", 0.50, 0.90, 0.72, 0.01, key="mm_db_hist_open_imb")
                 with hist_s2:
-                    hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.42, 0.01, key="mm_db_hist_close_imb")
+                    hist_close_imb = st.slider("Close if bid pressure ≤", 0.10, 0.70, 0.48, 0.01, key="mm_db_hist_close_imb")
                 with hist_s3:
-                    hist_min_hold = st.number_input("Min records held", min_value=1, max_value=250, value=25, step=1, key="mm_db_hist_min_hold")
+                    hist_min_hold = st.number_input("Min records held", min_value=1, max_value=500, value=50, step=1, key="mm_db_hist_min_hold")
 
                 hist_r1, hist_r2, hist_r3, hist_r4 = st.columns(4)
                 with hist_r1:
-                    hist_confirm_records = st.number_input("Confirm records", min_value=3, max_value=250, value=30, step=1, key="mm_db_hist_confirm_records")
+                    hist_confirm_records = st.number_input("Confirm records", min_value=3, max_value=500, value=60, step=1, key="mm_db_hist_confirm_records")
                 with hist_r2:
-                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=0.75, step=0.05, key="mm_db_hist_trade_stop")
+                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=0.35, step=0.05, key="mm_db_hist_trade_stop")
                 with hist_r3:
-                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=1.25, step=0.05, key="mm_db_hist_trail_stop")
+                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=0.65, step=0.05, key="mm_db_hist_trail_stop")
                 with hist_r4:
-                    hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.50, max_value=20.0, value=3.0, step=0.50, key="mm_db_hist_max_day_loss")
+                    hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=1.0, step=0.25, key="mm_db_hist_max_day_loss")
 
                 hist_r5, _ = st.columns([1, 3])
                 with hist_r5:
-                    hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=8, step=1, key="mm_db_hist_max_trades")
+                    hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=2, step=1, key="mm_db_hist_max_trades")
 
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if use_db_history and not db_api_key_hist:
@@ -10764,7 +10776,7 @@ try:
 
                 run_db_history = False
                 if use_db_history:
-                    st.caption("Historical replay uses New York market time and converts to UTC for Databento. If today's data is not available yet, use the previous trading day.")
+                    st.caption("Historical replay uses New York market time and converts to UTC for Databento. Default is now A+ only: no trade is better than forced bad trades. If today's data is not available yet, use the previous trading day.")
                     run_db_history = st.button("Pull Databento historical MBP-1 replay", key="mm_db_hist_pull_now")
 
                 if use_db_history and run_db_history:
