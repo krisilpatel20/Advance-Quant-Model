@@ -10791,8 +10791,8 @@ def build_databento_mbp1_trade_log(
 
         # Session VWAP and trend filters.
         bars['vwap'] = (bars['price'] * bars['size_proxy']).cumsum() / (bars['size_proxy'].cumsum() + 1e-9)
-        bars['ema_fast'] = bars['price'].ewm(span=5, adjust=False).mean()
-        bars['ema_slow'] = bars['price'].ewm(span=15, adjust=False).mean()
+        bars['ema_fast'] = bars['price'].ewm(span=3, adjust=False).mean()
+        bars['ema_slow'] = bars['price'].ewm(span=8, adjust=False).mean()
         bars['imb_smooth'] = bars['imbalance'].rolling(max(2, int(confirm_records)), min_periods=1).mean()
         bars['vwap_slope'] = bars['vwap'].diff(3).fillna(0)
         bars['mom_5'] = bars['price'].pct_change(5).fillna(0)
@@ -10825,7 +10825,7 @@ def build_databento_mbp1_trade_log(
         # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
         close_cond = (
             ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
-            (bars['mom_5'] < -0.012) |
+            (bars['mom_5'] < -0.004) |
             ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
         )
 
@@ -11254,15 +11254,15 @@ try:
                 with hist_r1:
                     hist_confirm_records = st.number_input("Confirm bars", min_value=3, max_value=500, value=10, step=1, key="mm_db_hist_confirm_records")
                 with hist_r2:
-                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=1.00, step=0.05, key="mm_db_hist_trade_stop")
+                    hist_trade_stop = st.number_input("Per-trade stop (%)", min_value=0.10, max_value=10.0, value=0.50, step=0.05, key="mm_db_hist_trade_stop")
                 with hist_r3:
-                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=2.00, step=0.05, key="mm_db_hist_trail_stop")
+                    hist_trail_stop = st.number_input("Trailing stop (%)", min_value=0.10, max_value=10.0, value=0.75, step=0.05, key="mm_db_hist_trail_stop")
                 with hist_r4:
                     hist_max_day_loss = st.number_input("Max replay loss (%)", min_value=0.25, max_value=20.0, value=1.0, step=0.25, key="mm_db_hist_max_day_loss")
 
                 hist_r5, _ = st.columns([1, 3])
                 with hist_r5:
-                    hist_max_trades = st.number_input("Max trades", min_value=1, max_value=100, value=3, step=1, key="mm_db_hist_max_trades")
+                    hist_max_trades = st.number_input("Max trades", min_value=1, max_value=1000, value=100, step=1, key="mm_db_hist_max_trades")
 
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if use_db_history and not db_api_key_hist:
