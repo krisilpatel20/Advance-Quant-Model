@@ -11940,7 +11940,78 @@ try:
                 with b3:
                     backfill_limit = st.number_input("Backfill max records", min_value=500, max_value=3000, value=3000, step=500, key="mm_live_backfill_limit")
 
-                pull_live_now = st.button("Pull / update Databento MBP-1 session", key="mm_full_db_live_pull") or bool(live_auto_update)
+                # Manual pull runs only when clicked. Auto mode is handled by a Streamlit fragment below
+                # so it does not need a full browser/page refresh and does not force the app back to tab 1.
+                pull_live_now = st.button("Pull / update Databento MBP-1 session", key="mm_full_db_live_pull")
+
+                if bool(live_auto_update):
+                    if not db_api_key:
+                        st.warning("Auto-update needs DATABENTO_API_KEY in secrets or the password box above.")
+                    elif hasattr(st, "fragment"):
+                        @st.fragment(run_every=f"{int(live_refresh_sec)}s")
+                        def _mm_databento_live_auto_fragment():
+                            st.markdown("#### Auto Databento MBP-1 live session")
+                            st.caption(f"Auto-pulling {str(TICKER).upper()} every {int(live_refresh_sec)} seconds without full-page refresh.")
+                            try:
+                                snap_auto, err_auto = get_databento_equs_mbp1_snapshot(
+                                    str(TICKER),
+                                    str(db_api_key),
+                                    timeout_seconds=int(db_timeout),
+                                    max_records=int(db_max_records),
+                                )
+                                if err_auto:
+                                    st.warning(f"Live auto-pull not available right now: {err_auto}")
+                                elif snap_auto:
+                                    recs_new_auto = snap_auto.get("records", pd.DataFrame())
+                                    if isinstance(recs_new_auto, pd.DataFrame) and not recs_new_auto.empty:
+                                        old_recs_auto = st.session_state.get(live_buffer_key, pd.DataFrame())
+                                        st.session_state[live_buffer_key] = _merge_mbp1_session_records(
+                                            old_recs_auto,
+                                            recs_new_auto,
+                                            max_records=int(live_session_max_records),
+                                        )
+
+                                    a1, a2, a3, a4, a5 = st.columns(5)
+                                    a1.metric("Best Bid", f"${snap_auto.get('bid_px', np.nan):.4f}")
+                                    a2.metric("Best Ask", f"${snap_auto.get('ask_px', np.nan):.4f}")
+                                    a3.metric("Spread", f"${snap_auto.get('spread', np.nan):.4f}")
+                                    a4.metric("Bid Pressure", f"{float(snap_auto.get('imbalance', 0))*100:.1f}%")
+                                    a5.metric("Microprice", f"${snap_auto.get('microprice', np.nan):.4f}" if pd.notna(snap_auto.get('microprice', np.nan)) else "N/A")
+                            except Exception as e:
+                                st.warning(f"Live auto-pull failed: {e}")
+
+                            recs_auto = st.session_state.get(live_buffer_key, pd.DataFrame())
+                            if isinstance(recs_auto, pd.DataFrame) and not recs_auto.empty:
+                                try:
+                                    live_log_auto, live_summary_auto = build_databento_live_trade_log(
+                                        recs_auto,
+                                        open_pressure=float(st.session_state.get("mm_live_open_pressure", 0.62)),
+                                        close_pressure=float(st.session_state.get("mm_live_close_pressure", 0.45)),
+                                        min_hold_records=int(st.session_state.get("mm_live_min_hold_records", 20)),
+                                        min_hold_seconds=int(st.session_state.get("mm_live_min_hold_seconds", 60)),
+                                        cooldown_seconds=int(st.session_state.get("mm_live_cooldown_seconds", 120)),
+                                        stop_loss_pct=float(st.session_state.get("mm_live_stop_pct", 0.30)) / 100.0,
+                                        take_profit_pct=float(st.session_state.get("mm_live_target_pct", 0.50)) / 100.0,
+                                    )
+                                    if isinstance(live_summary_auto, dict) and live_summary_auto:
+                                        s1, s2, s3, s4, s5 = st.columns(5)
+                                        s1.metric("Live Strategy Return", f"{live_summary_auto.get('strategy_return_pct', 0):.2f}%")
+                                        s2.metric("Live Buy & Hold", f"{live_summary_auto.get('buy_hold_return_pct', 0):.2f}%")
+                                        s3.metric("Live Trades", f"{int(live_summary_auto.get('trade_count', 0))}")
+                                        s4.metric("Records Used", f"{int(live_summary_auto.get('records_used', 0)):,}")
+                                        s5.metric("Buffer Span", f"{str(live_summary_auto.get('first_time_utc', ''))[:19]} → {str(live_summary_auto.get('last_time_utc', ''))[:19]}")
+                                    if isinstance(live_log_auto, pd.DataFrame) and not live_log_auto.empty:
+                                        st.dataframe(live_log_auto, use_container_width=True)
+                                    else:
+                                        st.info("No live MBP-1 trade trigger yet in the current session buffer/settings.")
+                                except Exception as e:
+                                    st.warning(f"Could not build auto live trade log: {e}")
+                            else:
+                                st.info("Auto mode is running, but no MBP-1 records have been collected yet.")
+
+                        _mm_databento_live_auto_fragment()
+                    else:
+                        st.warning("Your Streamlit version does not support partial auto-refresh fragments. Upgrade Streamlit to use auto live refresh without full-app reload.")
 
                 if pull_live_now:
                     if not db_api_key:
@@ -12048,8 +12119,8 @@ try:
 
                 if bool(live_auto_update):
                     st.info(
-                        "Auto-update is in safe mode: full-page browser refresh is disabled so the app will not jump back to the first tab. "
-                        "Click the live pull button to collect the next MBP-1 slice. A true non-blocking live stream needs a separate background service/component, not a full Streamlit rerun."
+                        "Auto-update is ON. It uses Streamlit fragment refresh when available, so it updates the Databento live block without a full browser/page reload. "
+                        "Keep this tab open while collecting live records."
                     )
 
             # ---------- DATABENTO HISTORICAL REPLAY ----------
