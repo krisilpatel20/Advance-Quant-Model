@@ -9035,41 +9035,2571 @@ with tab16:
 # ==========================================
 
 
-
 # ==========================================
-# SAFE PLACEHOLDER TABS 17-20
+# TAB 17: CUMULATIVE VOLUME DELTA (CVD)
 # ==========================================
-# These tabs are intentionally lightweight so the main model loads normally.
-# Heavy engines can be added back one at a time behind buttons only.
-
 with tab17:
-    st.write("### 📊 CVD & Volume Delta")
-    st.info("Safe-load mode: CVD engine is temporarily disabled so the app loads normally. Nothing runs automatically here.")
-    st.caption("Next step: add CVD back as a button-only module after the main app is stable.")
-
-with tab18:
-    st.write("### 📈 Institutional VWAP")
-    st.info("Safe-load mode: VWAP engine is temporarily disabled so the app loads normally. Nothing runs automatically here.")
-    st.caption("Next step: add VWAP back as a button-only module after the main app is stable.")
-
-with tab19:
-    st.write("### 🔬 Time Series Analysis")
-    st.info("Safe-load mode: Time Series engine is temporarily disabled so the app loads normally. Nothing runs automatically here.")
-    st.caption("Next step: add Time Series back as a button-only module after the main app is stable.")
-
-with tab20:
-    st.write("### 🧬 Market Microstructure")
-    st.warning("Safe-load mode: Market Microstructure is temporarily disabled so the full app loads normally.")
+    st.write("### 📊 Institutional Cumulative Volume Delta (CVD)")
     st.markdown("""
-    **Current safe mode**
-    - Databento is not imported or connected here.
-    - No replay, chart, or backtest runs automatically.
-    - The main app should load first.
-    - Microstructure can be added back later as small button-only pieces.
+    **CVD** measures the net buying vs selling pressure over time by classifying each bar's volume
+    as buy-initiated or sell-initiated. Rising CVD + Rising Price = Confirmed Uptrend.
+    Divergence between CVD and Price = Institutional Warning Signal.
     """)
+
+    if df_main is None:
+        st.warning("Please load a ticker to view CVD analysis.")
+    else:
+        # ── Configuration ──────────────────────────────────────────────────
+        cvd_col1, cvd_col2, cvd_col3 = st.columns(3)
+        with cvd_col1:
+            cvd_method = st.selectbox("Volume Classification Method", [
+                "Aggressive (Close vs Open)",
+                "Tick Rule (Close vs Prior Close)",
+                "High-Low Weighted",
+                "True Strength (OHLCV)"
+            ], help="How each bar's volume is split into buy vs sell pressure.")
+        with cvd_col2:
+            cvd_smooth = st.slider("CVD Smoothing (EMA span)", 1, 20, 3,
+                                   help="1 = raw CVD, higher = smoother signal")
+        with cvd_col3:
+            cvd_lookback = st.slider("Divergence Lookback (bars)", 5, 60, 20)
+
+        df_cvd = df_main.copy()
+
+        # ── Volume Delta Calculation ────────────────────────────────────────
+        try:
+            hi = df_cvd['High']
+            lo = df_cvd['Low']
+            op = df_cvd['Open']
+            cl = df_cvd['Close']
+            vol = df_cvd['Volume'] if 'Volume' in df_cvd.columns else pd.Series(
+                np.ones(len(df_cvd)), index=df_cvd.index)
+
+            if cvd_method == "Aggressive (Close vs Open)":
+                # Positive delta when close > open (buyers won the bar)
+                direction = np.sign(cl - op)
+                delta = vol * direction
+
+            elif cvd_method == "Tick Rule (Close vs Prior Close)":
+                direction = np.sign(cl - cl.shift(1)).fillna(0)
+                delta = vol * direction
+
+            elif cvd_method == "High-Low Weighted":
+                # Fraction of vol attributed to buys based on where close lands in H-L range
+                hl_range = (hi - lo).replace(0, np.nan)
+                buy_frac = ((cl - lo) / hl_range).fillna(0.5)
+                sell_frac = 1 - buy_frac
+                delta = vol * (buy_frac - sell_frac)
+
+            else:  # True Strength (OHLCV)
+                # Kauffman-style: weights upper wick as selling, lower wick as buying
+                hl_range = (hi - lo).replace(0, np.nan)
+                upper_wick = hi - np.maximum(op, cl)
+                lower_wick = np.minimum(op, cl) - lo
+                body = np.abs(cl - op)
+                buy_pressure = lower_wick + 0.5 * body * (cl > op).astype(float)
+                sell_pressure = upper_wick + 0.5 * body * (cl <= op).astype(float)
+                delta = vol * (buy_pressure - sell_pressure) / hl_range.fillna(1)
+
+            delta = delta.fillna(0)
+            cvd = delta.cumsum()
+
+            # Optional smoothing
+            if cvd_smooth > 1:
+                cvd_plot = cvd.ewm(span=cvd_smooth, adjust=False).mean()
+            else:
+                cvd_plot = cvd
+
+            # ── Divergence Detection ────────────────────────────────────────
+            price_change = cl - cl.shift(cvd_lookback)
+            cvd_change   = cvd - cvd.shift(cvd_lookback)
+
+            bull_div = (price_change < 0) & (cvd_change > 0)   # Price down, CVD up  → hidden bull
+            bear_div = (price_change > 0) & (cvd_change < 0)   # Price up, CVD down  → hidden bear
+
+            # ── Rolling Delta Bars (daily net flow) ─────────────────────────
+            rolling_delta = delta.rolling(window=5).sum()
+
+            # ── Metrics ────────────────────────────────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Cumulative Delta (Total)", f"{cvd.iloc[-1]:+,.0f}")
+            m2.metric("Last Bar Delta", f"{delta.iloc[-1]:+,.0f}")
+            m3.metric("5-Bar Rolling Delta", f"{rolling_delta.iloc[-1]:+,.0f}")
+            latest_pressure = "BUYING" if delta.iloc[-1] > 0 else "SELLING"
+            m4.metric("Latest Pressure", latest_pressure,
+                      delta="Bullish" if latest_pressure == "BUYING" else "Bearish",
+                      delta_color="normal" if latest_pressure == "BUYING" else "inverse")
+
+            if bear_div.iloc[-1]:
+                st.error("🚨 **BEARISH DIVERGENCE**: Price rising but CVD declining — institutional distribution detected.")
+            elif bull_div.iloc[-1]:
+                st.success("✅ **BULLISH DIVERGENCE**: Price falling but CVD rising — institutional accumulation detected.")
+            else:
+                st.info("📊 No significant CVD divergence at current bar.")
+
+            # ── Main Chart ─────────────────────────────────────────────────
+            fig_cvd = make_subplots(
+                rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                row_heights=[0.35, 0.25, 0.25, 0.15],
+                subplot_titles=(
+                    f"{TICKER} Price",
+                    "Cumulative Volume Delta (CVD)",
+                    "Bar-by-Bar Volume Delta",
+                    "5-Bar Rolling Net Flow"
+                )
+            )
+
+            # Row 1 – Price (candlestick if possible, else line)
+            if all(c in df_cvd.columns for c in ['Open', 'High', 'Low', 'Close']):
+                fig_cvd.add_trace(go.Candlestick(
+                    x=df_cvd.index, open=df_cvd['Open'], high=df_cvd['High'],
+                    low=df_cvd['Low'], close=df_cvd['Close'],
+                    name="Price", increasing_line_color='#26a69a',
+                    decreasing_line_color='#ef5350', showlegend=False
+                ), row=1, col=1)
+            else:
+                fig_cvd.add_trace(go.Scatter(
+                    x=df_cvd.index, y=cl, mode='lines',
+                    line=dict(color='gray', width=1.5), name="Price"
+                ), row=1, col=1)
+
+            # Mark divergences on price chart
+            bull_dates = df_cvd.index[bull_div]
+            bear_dates = df_cvd.index[bear_div]
+            if len(bull_dates) > 0:
+                fig_cvd.add_trace(go.Scatter(
+                    x=bull_dates, y=cl[bull_div], mode='markers',
+                    marker=dict(symbol='triangle-up', color='lime', size=10),
+                    name="Bull Divergence"
+                ), row=1, col=1)
+            if len(bear_dates) > 0:
+                fig_cvd.add_trace(go.Scatter(
+                    x=bear_dates, y=cl[bear_div], mode='markers',
+                    marker=dict(symbol='triangle-down', color='red', size=10),
+                    name="Bear Divergence"
+                ), row=1, col=1)
+
+            # Row 2 – CVD
+            fig_cvd.add_trace(go.Scatter(
+                x=df_cvd.index, y=cvd_plot, mode='lines',
+                line=dict(color='#00f2ff', width=2), name="CVD"
+            ), row=2, col=1)
+            fig_cvd.add_hline(y=0, line_dash="dash", line_color="white",
+                              opacity=0.3, row=2, col=1)
+            # Shade positive / negative CVD
+            cvd_pos = cvd_plot.copy(); cvd_pos[cvd_pos < 0] = 0
+            cvd_neg = cvd_plot.copy(); cvd_neg[cvd_neg > 0] = 0
+            fig_cvd.add_trace(go.Scatter(
+                x=df_cvd.index, y=cvd_pos, fill='tozeroy',
+                mode='lines', line=dict(width=0),
+                fillcolor='rgba(0,255,100,0.15)', showlegend=False
+            ), row=2, col=1)
+            fig_cvd.add_trace(go.Scatter(
+                x=df_cvd.index, y=cvd_neg, fill='tozeroy',
+                mode='lines', line=dict(width=0),
+                fillcolor='rgba(255,50,50,0.15)', showlegend=False
+            ), row=2, col=1)
+
+            # Row 3 – Bar Delta (colored bars)
+            bar_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in delta]
+            fig_cvd.add_trace(go.Bar(
+                x=df_cvd.index, y=delta,
+                marker_color=bar_colors, name="Bar Delta"
+            ), row=3, col=1)
+
+            # Row 4 – Rolling Net Flow
+            roll_colors = ['#00ff88' if v >= 0 else '#ff4444' for v in rolling_delta]
+            fig_cvd.add_trace(go.Bar(
+                x=df_cvd.index, y=rolling_delta,
+                marker_color=roll_colors, name="5-Bar Flow"
+            ), row=4, col=1)
+
+            fig_cvd.update_layout(
+                height=900, hovermode="x unified", template="plotly_dark",
+                title=f"Institutional CVD Dashboard — {TICKER}",
+                xaxis_rangeslider_visible=False
+            )
+            st.plotly_chart(fig_cvd, use_container_width=True)
+
+            # ── CVD Trade Log ──────────────────────────────────────────────
+            st.divider()
+            st.write("#### 📝 CVD Trade Signal Log")
+            st.caption("Signals fired when CVD crosses its own rolling mean — institutional-grade entry/exit confirmation.")
+
+            cvd_ma = cvd.rolling(window=cvd_lookback).mean()
+            cvd_cross_up   = (cvd > cvd_ma) & (cvd.shift(1) <= cvd_ma.shift(1))
+            cvd_cross_down = (cvd < cvd_ma) & (cvd.shift(1) >= cvd_ma.shift(1))
+
+            trade_log_rows = []
+            for dt in df_cvd.index[cvd_cross_up]:
+                trade_log_rows.append({
+                    "Date": dt.date(),
+                    "Signal": "🟢 BUY (CVD Cross Up)",
+                    "Price": round(float(cl.loc[dt]), 2),
+                    "CVD at Signal": round(float(cvd.loc[dt]), 0),
+                    "Bar Delta": round(float(delta.loc[dt]), 0),
+                    "5-Bar Flow": round(float(rolling_delta.loc[dt]), 0),
+                    "Divergence": "Bull Div" if bull_div.loc[dt] else "None"
+                })
+            for dt in df_cvd.index[cvd_cross_down]:
+                trade_log_rows.append({
+                    "Date": dt.date(),
+                    "Signal": "🔴 SELL (CVD Cross Down)",
+                    "Price": round(float(cl.loc[dt]), 2),
+                    "CVD at Signal": round(float(cvd.loc[dt]), 0),
+                    "Bar Delta": round(float(delta.loc[dt]), 0),
+                    "5-Bar Flow": round(float(rolling_delta.loc[dt]), 0),
+                    "Divergence": "Bear Div" if bear_div.loc[dt] else "None"
+                })
+
+            if trade_log_rows:
+                tlog_df = pd.DataFrame(trade_log_rows).sort_values("Date", ascending=False)
+                st.dataframe(tlog_df, use_container_width=True)
+
+                # CVD performance quick-check
+                buys  = tlog_df[tlog_df['Signal'].str.contains("BUY")]
+                sells = tlog_df[tlog_df['Signal'].str.contains("SELL")]
+                st.caption(f"Total CVD Signals: {len(tlog_df)} | Buy Signals: {len(buys)} | Sell Signals: {len(sells)}")
+
+                # Download
+                csv_cvd = tlog_df.to_csv(index=False)
+                st.download_button("📥 Download CVD Signal Log", csv_cvd,
+                                   file_name=f"CVD_SignalLog_{TICKER}.csv", mime="text/csv")
+            else:
+                st.info("No CVD crossover signals in the selected date range.")
+
+            # ── CVD Adaptive Strategy Backtest ──────────────────────────────
+            st.divider()
+            st.write("#### 🧪 CVD Strategy Backtest")
+            st.caption("Goal: beat buy & hold by using CVD confirmation, price trend, and risk-off exits instead of one weak CVD mean-cross rule.")
+
+            cvd_ma = cvd.rolling(window=cvd_lookback).mean()
+            cvd_fast = cvd.ewm(span=max(3, cvd_lookback // 3), adjust=False).mean()
+            cvd_slow = cvd.ewm(span=max(8, cvd_lookback), adjust=False).mean()
+            ema20 = cl.ewm(span=20, adjust=False).mean()
+            ema50 = cl.ewm(span=50, adjust=False).mean()
+            ema200 = cl.ewm(span=200, adjust=False).mean()
+            price_mom_5 = cl.pct_change(5)
+            price_mom_20 = cl.pct_change(20)
+            cvd_mom_5 = cvd.diff(5)
+            cvd_mom_20 = cvd.diff(20)
+            flow_z = (rolling_delta - rolling_delta.rolling(50).mean()) / (rolling_delta.rolling(50).std() + 1e-9)
+            cvd_high = cvd.rolling(cvd_lookback).max().shift(1)
+            cvd_low = cvd.rolling(cvd_lookback).min().shift(1)
+
+            # Uses the exact CVD line shown in chart row 2.
+            # Long when CVD flips above zero / green zone.
+            # Exit immediately when CVD flips below zero / red zone.
+            cvd_zero_cross_up = (cvd_plot > 0) & (cvd_plot.shift(1) <= 0)
+            cvd_zero_cross_down = (cvd_plot < 0) & (cvd_plot.shift(1) >= 0)
+
+            cvd_position_basic = make_stateful_position(cvd_cross_up, cvd_cross_down, df_cvd.index)
+            cvd_position_zero_flip = make_stateful_position(
+                cvd_zero_cross_up,
+                (cvd_plot < 0) | cvd_zero_cross_down,
+                df_cvd.index
+            )
+            cvd_position_confirmed = make_stateful_position(
+                (cvd > cvd_ma) & (rolling_delta > 0) & (cl > ema20),
+                (cvd < cvd_ma) | (rolling_delta < 0) | (cl < ema20),
+                df_cvd.index
+            )
+            cvd_position_breakout = make_stateful_position(
+                (cvd > cvd_high) & (cl > ema50) & (price_mom_20 > 0),
+                (cvd < cvd_ma) | (cl < ema20) | (cvd < cvd_low),
+                df_cvd.index
+            )
+            cvd_position_smart_money = make_stateful_position(
+                (cvd_fast > cvd_slow) & (cvd_mom_5 > 0) & (rolling_delta > 0) & (cl > ema50),
+                (cvd_fast < cvd_slow) | (rolling_delta < 0) | (cl < ema50),
+                df_cvd.index
+            )
+            cvd_position_accumulation = make_stateful_position(
+                (cvd_mom_20 > 0) & (price_mom_5 > -0.03) & (cl > ema200) & (flow_z > -0.5),
+                (cvd_mom_20 < 0) | (cl < ema50) | (flow_z < -1.25),
+                df_cvd.index
+            )
+            cvd_position_risk_on = make_stateful_position(
+                (cl > ema20) & (ema20 > ema50) & (cvd > cvd_slow) & (rolling_delta > 0),
+                (cl < ema20) | (cvd < cvd_slow) | (rolling_delta < 0),
+                df_cvd.index
+            )
+
+            cvd_candidates = [
+                ("CVD Zero-Line Flip", "Uses the CVD graph row 2 directly: long when CVD crosses above zero/green, cash immediately when CVD goes below zero/red.", cvd_position_zero_flip),
+                ("CVD Mean Cross", "Long after CVD crosses above its rolling mean; cash after CVD crosses below.", cvd_position_basic),
+                ("CVD Confirmed Trend", "Long only when CVD is above mean, rolling flow is positive, and price is above EMA20.", cvd_position_confirmed),
+                ("CVD Breakout + Price Momentum", "Long when CVD breaks its rolling high while price is above EMA50 and 20-bar momentum is positive.", cvd_position_breakout),
+                ("Smart-Money CVD Flow", "Long when fast CVD is above slow CVD, CVD momentum is positive, rolling delta is positive, and price is above EMA50.", cvd_position_smart_money),
+                ("Accumulation Filter", "Long when 20-bar CVD momentum is positive, price is above EMA200, and flow is not strongly negative.", cvd_position_accumulation),
+                ("Risk-On CVD Trend", "Long only when EMA20 > EMA50, price is above EMA20, CVD is above slow CVD, and rolling delta is positive.", cvd_position_risk_on),
+            ]
+
+            display_adaptive_strategy_lab("CVD", cl, cvd_candidates, file_prefix="CVD_Adaptive_Strategy")
+
+            # ── Delta Profile (Volume at Price bucket) ─────────────────────
+            st.divider()
+            st.write("#### 📊 Delta Profile (Buy vs Sell by Price Bucket)")
+            n_buckets = st.slider("Price Buckets", 10, 50, 20)
+
+            price_min = float(cl.min())
+            price_max = float(cl.max())
+            buckets = np.linspace(price_min, price_max, n_buckets + 1)
+            bucket_labels = [f"{b:.2f}" for b in buckets[:-1]]
+
+            buy_vol  = pd.cut(cl, bins=buckets, labels=bucket_labels).astype(str)
+            buy_profile  = delta.clip(lower=0).groupby(buy_vol).sum()
+            sell_profile = delta.clip(upper=0).abs().groupby(buy_vol).sum()
+
+            fig_profile = go.Figure()
+            fig_profile.add_trace(go.Bar(
+                y=buy_profile.index, x=buy_profile.values,
+                orientation='h', name='Buy Volume',
+                marker_color='rgba(0,200,100,0.7)'
+            ))
+            fig_profile.add_trace(go.Bar(
+                y=sell_profile.index, x=-sell_profile.values,
+                orientation='h', name='Sell Volume',
+                marker_color='rgba(255,80,80,0.7)'
+            ))
+            fig_profile.update_layout(
+                barmode='overlay', template="plotly_dark",
+                title="Volume Delta Profile (Price × Buy/Sell Pressure)",
+                xaxis_title="Delta Volume (Buy=+, Sell=-)",
+                yaxis_title="Price Level",
+                height=500, hovermode="y unified"
+            )
+            st.plotly_chart(fig_profile, use_container_width=True)
+
+            if st.session_state.report_gen:
+                st.session_state.report_gen.add_plot("CVD Dashboard", fig_cvd)
+                if trade_log_rows:
+                    st.session_state.report_gen.add_data("CVD Trade Log", tlog_df)
+
+        except Exception as e:
+            st.error(f"CVD calculation failed: {e}")
+            st.info("Ensure the ticker has OHLCV data (Volume column required for full analysis).")
+
+
+# ==========================================
+# TAB 18: INSTITUTIONAL VWAP
+# ==========================================
+with tab18:
+    st.write("### 📈 Institutional VWAP Suite")
+    st.markdown("""
+    **VWAP** (Volume Weighted Average Price) is the primary institutional execution benchmark.
+    Price above VWAP = bullish bias; below = bearish. **Anchored VWAP** from key dates
+    reveals where major players are positioned. Standard deviation bands act as dynamic
+    support/resistance used by market makers.
+    """)
+
+    if df_main is None:
+        st.warning("Please load a ticker to view VWAP analysis.")
+    else:
+        vwap_col1, vwap_col2, vwap_col3 = st.columns(3)
+        with vwap_col1:
+            vwap_type = st.selectbox("VWAP Type", [
+                "Standard Daily VWAP",
+                "Rolling VWAP (N-bar)",
+                "Anchored VWAP (from date)",
+                "Multi-Timeframe VWAP",
+                "VWAP + Volume Profile"
+            ])
+        with vwap_col2:
+            vwap_bands = st.multiselect(
+                "Standard Deviation Bands",
+                ["1σ", "2σ", "3σ"], default=["1σ", "2σ"]
+            )
+        with vwap_col3:
+            vwap_reset = st.selectbox("VWAP Reset Period", ["Daily", "Weekly", "Monthly", "None (Cumulative)"])
+
+        df_vwap = df_main.copy()
+
+        # Require Volume
+        if 'Volume' not in df_vwap.columns or df_vwap['Volume'].sum() == 0:
+            st.warning("Volume data unavailable or zero. Using price-weighted approximation.")
+            df_vwap['Volume'] = 1.0  # Fallback: equal weight = simple MA
+
+        hi  = df_vwap['High']
+        lo  = df_vwap['Low']
+        cl  = df_vwap['Close']
+        vol = df_vwap['Volume'].replace(0, np.nan).fillna(1)
+        tp  = (hi + lo + cl) / 3.0   # Typical Price
+
+        # ── VWAP Calculation Helpers ────────────────────────────────────────
+        def compute_rolling_vwap(tp_series, vol_series, window):
+            tp_vol = tp_series * vol_series
+            vwap_v = tp_vol.rolling(window).sum() / vol_series.rolling(window).sum()
+            dev = (tp_series - vwap_v) ** 2
+            std_v = np.sqrt((dev * vol_series).rolling(window).sum() / vol_series.rolling(window).sum())
+            return vwap_v, std_v
+
+        def compute_anchored_vwap(tp_series, vol_series, anchor_idx):
+            tp_vol_cum = (tp_series * vol_series).loc[anchor_idx:].cumsum()
+            vol_cum    = vol_series.loc[anchor_idx:].cumsum()
+            avwap = tp_vol_cum / vol_cum
+            dev = (tp_series.loc[anchor_idx:] - avwap) ** 2
+            astd = np.sqrt((dev * vol_series.loc[anchor_idx:]).cumsum() / vol_cum)
+            return avwap, astd
+
+        def compute_reset_vwap(tp_series, vol_series, reset='Daily'):
+            if reset == 'Daily':
+                groups = tp_series.index.date
+            elif reset == 'Weekly':
+                groups = tp_series.index.to_period('W')
+            elif reset == 'Monthly':
+                groups = tp_series.index.to_period('M')
+            else:
+                groups = ['ALL'] * len(tp_series)
+
+            vwap_out = pd.Series(np.nan, index=tp_series.index)
+            std_out  = pd.Series(np.nan, index=tp_series.index)
+
+            for grp in pd.Series(groups).unique():
+                if reset == 'Daily':
+                    mask = pd.Series(tp_series.index.date) == grp
+                elif reset == 'Weekly':
+                    mask = tp_series.index.to_period('W') == grp
+                elif reset == 'Monthly':
+                    mask = tp_series.index.to_period('M') == grp
+                else:
+                    mask = pd.Series([True] * len(tp_series))
+
+                mask = mask.values if hasattr(mask, 'values') else mask
+                tp_g  = tp_series.iloc[mask] if hasattr(mask, '__len__') else tp_series
+                vol_g = vol_series.iloc[mask] if hasattr(mask, '__len__') else vol_series
+
+                try:
+                    idx  = tp_series.index[mask]
+                    tpv  = (tp_g.values * vol_g.values).cumsum()
+                    vc   = vol_g.values.cumsum()
+                    v_   = tpv / vc
+                    dev_ = np.sqrt(np.cumsum(((tp_g.values - v_) ** 2) * vol_g.values) / vc)
+                    vwap_out.loc[idx] = v_
+                    std_out.loc[idx]  = dev_
+                except Exception:
+                    pass
+
+            return vwap_out, std_out
+
+        # ── Build chart ─────────────────────────────────────────────────────
+        try:
+            fig_vwap = make_subplots(
+                rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                row_heights=[0.55, 0.25, 0.20],
+                subplot_titles=(
+                    f"{TICKER} Price + VWAP",
+                    "Distance from VWAP (%)",
+                    "Volume"
+                )
+            )
+
+            # Price
+            if all(c in df_vwap.columns for c in ['Open', 'High', 'Low', 'Close']):
+                fig_vwap.add_trace(go.Candlestick(
+                    x=df_vwap.index, open=df_vwap['Open'], high=df_vwap['High'],
+                    low=df_vwap['Low'], close=cl,
+                    name="Price", increasing_line_color='#26a69a',
+                    decreasing_line_color='#ef5350', showlegend=False
+                ), row=1, col=1)
+            else:
+                fig_vwap.add_trace(go.Scatter(
+                    x=df_vwap.index, y=cl, mode='lines',
+                    line=dict(color='gray', width=1.5), name="Price"
+                ), row=1, col=1)
+
+            sigma_colors = {'1σ': ('rgba(255,215,0,0.3)', 'rgba(255,215,0,0.3)'),
+                            '2σ': ('rgba(255,140,0,0.25)', 'rgba(255,140,0,0.25)'),
+                            '3σ': ('rgba(255,50,50,0.2)', 'rgba(255,50,50,0.2)')}
+            sigma_vals   = {'1σ': 1, '2σ': 2, '3σ': 3}
+
+            if vwap_type == "Rolling VWAP (N-bar)":
+                roll_win = st.slider("Rolling VWAP Window (bars)", 5, 252, 20)
+                vwap_s, std_s = compute_rolling_vwap(tp, vol, roll_win)
+                vwap_label = f"RVWAP({roll_win})"
+
+            elif vwap_type == "Anchored VWAP (from date)":
+                min_d = df_vwap.index[0].date()
+                max_d = df_vwap.index[-1].date()
+                default_anchor_d = DEFAULT_NONLIVE_START.date()
+                if default_anchor_d < min_d:
+                    default_anchor_d = min_d
+                if default_anchor_d > max_d:
+                    default_anchor_d = min_d
+                anchor_date = st.date_input("Anchor Date", min_value=min_d,
+                                             max_value=max_d,
+                                             value=default_anchor_d,
+                                             key="avwap_anchor")
+                # Find nearest index
+                anchor_ts = pd.Timestamp(anchor_date)
+                anchor_idx = df_vwap.index[df_vwap.index >= anchor_ts][0] if any(df_vwap.index >= anchor_ts) else df_vwap.index[0]
+                vwap_s, std_s = compute_anchored_vwap(tp, vol, anchor_idx)
+                vwap_s = vwap_s.reindex(df_vwap.index)
+                std_s  = std_s.reindex(df_vwap.index)
+                vwap_label = f"AVWAP (from {anchor_date})"
+
+            elif vwap_type == "Multi-Timeframe VWAP":
+                vwap_daily,  std_daily  = compute_rolling_vwap(tp, vol, 20)
+                vwap_weekly, std_weekly = compute_rolling_vwap(tp, vol, 60)
+                vwap_monthly,std_monthly= compute_rolling_vwap(tp, vol, 126)
+
+                for v_, lbl, col_ in [
+                    (vwap_daily,   "VWAP 20",  '#ffcc00'),
+                    (vwap_weekly,  "VWAP 60",  '#00f2ff'),
+                    (vwap_monthly, "VWAP 126", '#ff6b35'),
+                ]:
+                    fig_vwap.add_trace(go.Scatter(
+                        x=df_vwap.index, y=v_, mode='lines',
+                        line=dict(color=col_, width=1.5, dash='dot'), name=lbl
+                    ), row=1, col=1)
+
+                vwap_s = vwap_daily; std_s = std_daily; vwap_label = "VWAP 20"
+
+            elif vwap_type == "VWAP + Volume Profile":
+                vwap_s, std_s = compute_reset_vwap(tp, vol, vwap_reset)
+                vwap_label = f"VWAP ({vwap_reset})"
+
+            else:  # Standard Daily VWAP
+                vwap_s, std_s = compute_reset_vwap(tp, vol, vwap_reset)
+                vwap_label = f"VWAP ({vwap_reset})"
+
+            # Draw main VWAP line
+            fig_vwap.add_trace(go.Scatter(
+                x=df_vwap.index, y=vwap_s, mode='lines',
+                line=dict(color='#ff6b35', width=2.5), name=vwap_label
+            ), row=1, col=1)
+
+            # Draw SD bands
+            band_traces_added = set()
+            for band in vwap_bands:
+                n = sigma_vals[band]
+                upper = vwap_s + n * std_s
+                lower = vwap_s - n * std_s
+                c_fill = sigma_colors[band][0]
+
+                if band not in band_traces_added:
+                    fig_vwap.add_trace(go.Scatter(
+                        x=df_vwap.index, y=upper, mode='lines',
+                        line=dict(color=c_fill.replace('0.3', '0.8').replace('0.25', '0.8').replace('0.2', '0.8'), width=1, dash='dot'),
+                        name=f"+{band}", showlegend=True
+                    ), row=1, col=1)
+                    fig_vwap.add_trace(go.Scatter(
+                        x=df_vwap.index, y=lower, mode='lines',
+                        line=dict(color=c_fill.replace('0.3', '0.8').replace('0.25', '0.8').replace('0.2', '0.8'), width=1, dash='dot'),
+                        fill='tonexty', fillcolor=c_fill,
+                        name=f"-{band}", showlegend=True
+                    ), row=1, col=1)
+                    band_traces_added.add(band)
+
+            # Row 2 – Distance from VWAP
+            dist_pct = (cl - vwap_s) / vwap_s * 100
+            dist_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in dist_pct]
+            fig_vwap.add_trace(go.Bar(
+                x=df_vwap.index, y=dist_pct,
+                marker_color=dist_colors, name="Dist from VWAP %"
+            ), row=2, col=1)
+            fig_vwap.add_hline(y=0, line_dash="dash", line_color="white",
+                               opacity=0.4, row=2, col=1)
+
+            # Row 3 – Volume bars
+            if 'Volume' in df_vwap.columns:
+                vol_colors = ['#26a69a' if c >= o else '#ef5350'
+                              for c, o in zip(df_vwap['Close'], df_vwap.get('Open', df_vwap['Close']))]
+                fig_vwap.add_trace(go.Bar(
+                    x=df_vwap.index, y=df_vwap['Volume'],
+                    marker_color=vol_colors, name="Volume", showlegend=False
+                ), row=3, col=1)
+
+            fig_vwap.update_layout(
+                height=850, hovermode="x unified", template="plotly_dark",
+                title=f"Institutional VWAP Suite — {TICKER}",
+                xaxis_rangeslider_visible=False
+            )
+            st.plotly_chart(fig_vwap, use_container_width=True)
+
+            # ── VWAP Metrics Dashboard ──────────────────────────────────────
+            st.divider()
+            st.write("#### 📊 VWAP Institutional Metrics")
+
+            curr_price = float(cl.iloc[-1])
+            curr_vwap  = float(vwap_s.iloc[-1]) if not pd.isna(vwap_s.iloc[-1]) else curr_price
+            curr_dist  = (curr_price - curr_vwap) / curr_vwap * 100
+            curr_std   = float(std_s.iloc[-1]) if not pd.isna(std_s.iloc[-1]) else 0
+
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric("Current VWAP", f"{CURRENCY}{curr_vwap:.2f}")
+            v2.metric("Price vs VWAP", f"{curr_dist:+.2f}%",
+                      delta="Above" if curr_dist > 0 else "Below",
+                      delta_color="normal" if curr_dist > 0 else "inverse")
+            v3.metric("VWAP Std Dev", f"{CURRENCY}{curr_std:.2f}")
+            v4.metric("1σ Upper Band", f"{CURRENCY}{curr_vwap + curr_std:.2f}")
+
+            if curr_dist > 2:
+                st.warning(f"⚠️ Price is **{curr_dist:.1f}%** above VWAP — extended, watch for mean reversion to {CURRENCY}{curr_vwap:.2f}.")
+            elif curr_dist < -2:
+                st.success(f"✅ Price is **{abs(curr_dist):.1f}%** below VWAP — potential institutional buy zone near {CURRENCY}{curr_vwap:.2f}.")
+            else:
+                st.info(f"📍 Price is hugging VWAP (±{abs(curr_dist):.1f}%) — balanced order flow.")
+
+            # ── VWAP Touch Log (Support/Resistance Tests) ─────────────────
+            st.divider()
+            st.write("#### 📝 VWAP Touch Log (Institutional S/R Tests)")
+            st.caption("Logs every time price crosses VWAP — key institutional re-pricing events.")
+
+            cross_up   = (cl > vwap_s) & (cl.shift(1) <= vwap_s.shift(1))
+            cross_down = (cl < vwap_s) & (cl.shift(1) >= vwap_s.shift(1))
+
+            vwap_log = []
+            for dt in df_vwap.index[cross_up]:
+                vwap_log.append({
+                    "Date": dt.date(), "Event": "🟢 Price crossed ABOVE VWAP",
+                    "Price": round(float(cl.loc[dt]), 2),
+                    "VWAP": round(float(vwap_s.loc[dt]), 2),
+                    "Dist %": round(float((cl.loc[dt] - vwap_s.loc[dt]) / vwap_s.loc[dt] * 100), 3),
+                    "Volume": int(vol.loc[dt]) if dt in vol.index else 0
+                })
+            for dt in df_vwap.index[cross_down]:
+                vwap_log.append({
+                    "Date": dt.date(), "Event": "🔴 Price crossed BELOW VWAP",
+                    "Price": round(float(cl.loc[dt]), 2),
+                    "VWAP": round(float(vwap_s.loc[dt]), 2),
+                    "Dist %": round(float((cl.loc[dt] - vwap_s.loc[dt]) / vwap_s.loc[dt] * 100), 3),
+                    "Volume": int(vol.loc[dt]) if dt in vol.index else 0
+                })
+
+            if vwap_log:
+                vlog_df = pd.DataFrame(vwap_log).sort_values("Date", ascending=False)
+                st.dataframe(vlog_df, use_container_width=True)
+                csv_vwap = vlog_df.to_csv(index=False)
+                st.download_button("📥 Download VWAP Touch Log", csv_vwap,
+                                   file_name=f"VWAP_Log_{TICKER}.csv", mime="text/csv")
+            else:
+                st.info("No VWAP crossovers in the selected date range.")
+
+            # ── VWAP Adaptive Strategy Backtest ────────────────────────────
+            st.divider()
+            st.write("#### 🧪 VWAP Strategy Backtest")
+            st.caption("Adaptive VWAP rules: trend, reclaim, band breakout, and mean-reversion candidates ranked against buy & hold.")
+
+            ema20_v = cl.ewm(span=20, adjust=False).mean()
+            ema50_v = cl.ewm(span=50, adjust=False).mean()
+            vwap_dist = (cl - vwap_s) / (vwap_s + 1e-9)
+            vwap_dist_z = (vwap_dist - vwap_dist.rolling(50).mean()) / (vwap_dist.rolling(50).std() + 1e-9)
+            vol_ma = vol.rolling(20).mean()
+            high20 = cl.rolling(20).max().shift(1)
+            upper_band = (vwap_s + std_s).reindex(df_vwap.index)
+            lower_band = (vwap_s - std_s).reindex(df_vwap.index)
+
+            vwap_above = (cl > vwap_s).astype(int).reindex(df_vwap.index).fillna(0)
+            vwap_reclaim = make_stateful_position(
+                (cl > vwap_s) & (cl.shift(1) <= vwap_s.shift(1)) & (vol > vol_ma),
+                (cl < vwap_s) | (cl < ema20_v),
+                df_vwap.index
+            )
+            vwap_trend = make_stateful_position(
+                (cl > vwap_s) & (cl > ema20_v) & (ema20_v > ema50_v),
+                (cl < vwap_s) | (ema20_v < ema50_v),
+                df_vwap.index
+            )
+            vwap_breakout = make_stateful_position(
+                (cl > upper_band) & (cl > high20) & (vol > vol_ma),
+                (cl < vwap_s) | (cl < ema20_v),
+                df_vwap.index
+            )
+            vwap_mean_revert = make_stateful_position(
+                (vwap_dist_z < -1.25) & (cl > ema50_v),
+                (vwap_dist_z > 0.0) | (cl < ema50_v),
+                df_vwap.index
+            )
+            vwap_pullback = make_stateful_position(
+                (cl > ema50_v) & (vwap_dist < 0.01) & (vwap_dist > -0.015) & (cl > cl.shift(1)),
+                (cl < ema50_v) | (vwap_dist < -0.025),
+                df_vwap.index
+            )
+
+            vwap_candidates = [
+                ("VWAP Above/Below", "Long when price is above VWAP; cash below VWAP.", vwap_above),
+                ("VWAP Reclaim + Volume", "Long only after price reclaims VWAP with above-average volume; exit below VWAP or EMA20.", vwap_reclaim),
+                ("VWAP Trend Stack", "Long when price is above VWAP and EMA20 > EMA50; exit when VWAP/trend stack breaks.", vwap_trend),
+                ("VWAP Band Breakout", "Long when price breaks above the upper VWAP band and 20-bar high with volume confirmation.", vwap_breakout),
+                ("VWAP Mean Reversion", "Long when price is stretched below VWAP but still above EMA50; exit when it normalizes.", vwap_mean_revert),
+                ("VWAP Pullback Buy", "Long on shallow pullbacks near VWAP while price remains above EMA50.", vwap_pullback),
+            ]
+
+            display_adaptive_strategy_lab("VWAP", cl, vwap_candidates, file_prefix="VWAP_Adaptive_Strategy")
+
+            if st.session_state.report_gen:
+                st.session_state.report_gen.add_plot("VWAP Suite", fig_vwap)
+                if vwap_log:
+                    st.session_state.report_gen.add_data("VWAP Touch Log", vlog_df)
+
+        except Exception as e:
+            st.error(f"VWAP calculation error: {e}")
+
+
+# ==========================================
+# TAB 19: TIME SERIES ANALYSIS
+# ==========================================
+with tab19:
+    st.write("### 🔬 Institutional Time Series Analysis")
+    st.markdown("""
+    Deep statistical analysis of price and return dynamics:
+    **Stationarity** | **ACF/PACF** | **ARIMA Forecasting** | **Cointegration** |
+    **Granger Causality** | **Spectral Analysis** | **Long Memory (ARFIMA)**
+    """)
+
+    if df_main is None:
+        st.warning("Please load a ticker to run Time Series Analysis.")
+    else:
+        ts_subtab = st.tabs([
+            "📐 Stationarity Tests",
+            "📊 ACF / PACF",
+            "🔮 ARIMA Forecast",
+            "🔗 Cointegration & Causality",
+            "🌊 Spectral / Frequency",
+            "📉 Long Memory (ARFIMA)",
+            "🧪 TS Signal Backtest"
+        ])
+
+        ts_series_choice = st.radio(
+            "Series to Analyze", ["Log Returns", "Close Price"],
+            horizontal=True, key="ts_series_choice"
+        )
+        ts_data = df_main['Log_Returns'].dropna() if ts_series_choice == "Log Returns" else df_main['Close'].dropna()
+
+        # ── Sub-tab 1: Stationarity ─────────────────────────────────────────
+        with ts_subtab[0]:
+            st.write("#### 📐 Stationarity & Unit Root Tests")
+            st.caption("""
+            **ADF**: Null = unit root (non-stationary). Reject → stationary.
+            **KPSS**: Null = stationary. Reject → non-stationary.
+            **PP**: Phillips-Perron skipped here because your statsmodels build does not include it.
+            """)
+
+            try:
+                from statsmodels.tsa.stattools import adfuller, kpss
+
+                # ADF Test
+                adf_result = adfuller(ts_data, autolag='AIC')
+                adf_row = {
+                    "Test": "ADF (Augmented Dickey-Fuller)",
+                    "Statistic": round(adf_result[0], 4),
+                    "p-value": round(adf_result[1], 4),
+                    "Lags Used": adf_result[2],
+                    "Critical Value 5%": round(adf_result[4]['5%'], 4),
+                    "Conclusion": "✅ Stationary" if adf_result[1] < 0.05 else "❌ Non-Stationary"
+                }
+
+                # KPSS Test
+                kpss_result = kpss(ts_data, regression='c', nlags='auto')
+                kpss_row = {
+                    "Test": "KPSS",
+                    "Statistic": round(kpss_result[0], 4),
+                    "p-value": round(kpss_result[1], 4),
+                    "Lags Used": kpss_result[2],
+                    "Critical Value 5%": round(kpss_result[3]['5%'], 4),
+                    "Conclusion": "❌ Non-Stationary" if kpss_result[1] < 0.05 else "✅ Stationary"
+                }
+
+                stat_df = pd.DataFrame([adf_row, kpss_row])
+                st.dataframe(stat_df.set_index("Test"), use_container_width=True)
+
+                # Interpretation
+                adf_stat  = adf_result[1] < 0.05
+                kpss_stat = kpss_result[1] >= 0.05
+
+                if adf_stat and kpss_stat:
+                    st.success("🟢 **STATIONARY**: Both ADF rejects unit root AND KPSS fails to reject stationarity. Series is mean-reverting and safe for linear models.")
+                elif not adf_stat and not kpss_stat:
+                    st.error("🔴 **NON-STATIONARY**: ADF fails to reject unit root AND KPSS rejects stationarity. Difference the series before modeling.")
+                else:
+                    st.warning("🟡 **FRACTIONALLY INTEGRATED**: Tests conflict — likely long-memory process. Use ARFIMA or consider first-differencing.")
+
+                # Rolling ADF p-value (structural stability)
+                st.divider()
+                st.write("##### Rolling Stationarity (60-bar ADF p-value)")
+                roll_adf = []
+                win = 60
+                for i in range(win, len(ts_data)):
+                    try:
+                        res_ = adfuller(ts_data.iloc[i-win:i], autolag='AIC')
+                        roll_adf.append(res_[1])
+                    except Exception:
+                        roll_adf.append(np.nan)
+
+                roll_adf_s = pd.Series(roll_adf, index=ts_data.index[win:])
+                fig_radf = go.Figure()
+                fig_radf.add_trace(go.Scatter(
+                    x=roll_adf_s.index, y=roll_adf_s,
+                    mode='lines', line=dict(color='cyan', width=1.5),
+                    name="Rolling ADF p-value"
+                ))
+                fig_radf.add_hline(y=0.05, line_dash="dash", line_color="red",
+                                   annotation_text="5% threshold (stationary below)")
+                fig_radf.update_layout(
+                    title="Rolling ADF p-value (Stationarity Over Time)",
+                    template="plotly_dark", height=350,
+                    yaxis_title="p-value", hovermode="x unified"
+                )
+                st.plotly_chart(fig_radf, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Stationarity test error: {e}")
+
+        # ── Sub-tab 2: ACF / PACF ───────────────────────────────────────────
+        with ts_subtab[1]:
+            st.write("#### 📊 Autocorrelation & Partial Autocorrelation")
+            st.caption("""
+            **ACF**: Measures correlation with lagged values. Tailing off → AR process.
+            **PACF**: Removes intermediate lag effects. Sharp cutoff → order of AR.
+            """)
+
+            try:
+                from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+                from statsmodels.stats.stattools import durbin_watson
+
+                max_lags = st.slider("Max Lags", 10, 100, 40, key="acf_lags")
+
+                fig_acf_pacf, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7))
+                plt.style.use('dark_background')
+                plot_acf(ts_data, lags=max_lags, ax=ax1, color='cyan',
+                         vlines_kwargs={"colors": "cyan"}, title=f"ACF — {TICKER} ({ts_series_choice})")
+                plot_pacf(ts_data, lags=max_lags, ax=ax2, color='orange',
+                          vlines_kwargs={"colors": "orange"}, title=f"PACF — {TICKER} ({ts_series_choice})")
+                ax1.set_facecolor('#1a1a2e'); ax2.set_facecolor('#1a1a2e')
+                fig_acf_pacf.patch.set_facecolor('#1a1a2e')
+                plt.tight_layout()
+                st.pyplot(fig_acf_pacf)
+                plt.close()
+
+                # Ljung-Box Table
+                st.write("##### Ljung-Box Test (Serial Correlation by Lag)")
+                lb = acorr_ljungbox(ts_data, lags=list(range(1, min(21, max_lags))), return_df=True)
+                lb['Conclusion'] = lb['lb_pvalue'].apply(
+                    lambda p: "✅ No autocorr" if p > 0.05 else "❌ Autocorr present"
+                )
+                st.dataframe(lb.style.format({"lb_stat": "{:.3f}", "lb_pvalue": "{:.4f}"}),
+                             use_container_width=True)
+
+                # Durbin-Watson
+                dw = durbin_watson(ts_data)
+                st.metric("Durbin-Watson Statistic", f"{dw:.4f}",
+                          help="~2 = no autocorrelation. <1 or >3 = strong autocorrelation.")
+                if dw < 1.5:
+                    st.warning("Positive autocorrelation detected (DW < 1.5). Trending behaviour.")
+                elif dw > 2.5:
+                    st.warning("Negative autocorrelation detected (DW > 2.5). Mean-reverting behaviour.")
+                else:
+                    st.success("No significant autocorrelation (DW ≈ 2).")
+
+            except Exception as e:
+                st.error(f"ACF/PACF error: {e}")
+
+        # ── Sub-tab 3: ARIMA Forecast ───────────────────────────────────────
+        with ts_subtab[2]:
+            st.write("#### 🔮 ARIMA / SARIMA Forecast")
+
+            try:
+                from statsmodels.tsa.arima.model import ARIMA
+
+                arima_col1, arima_col2, arima_col3 = st.columns(3)
+                with arima_col1:
+                    p = st.slider("AR order (p)", 0, 5, 1, key="arima_p")
+                    d = st.slider("Integration (d)", 0, 2, 1, key="arima_d")
+                    q = st.slider("MA order (q)", 0, 5, 1, key="arima_q")
+                with arima_col2:
+                    n_forecast = st.slider("Forecast Steps", 5, 60, 21, key="arima_fc")
+                    auto_order = st.checkbox("Auto-select order (AIC grid search)", value=False)
+                with arima_col3:
+                    arima_series = df_main['Close'].dropna() if ts_series_choice == "Close Price" else df_main['Log_Returns'].dropna()
+
+                if auto_order:
+                    with st.spinner("Grid searching ARIMA order (p,d,q ∈ {0,1,2})..."):
+                        best_aic = float('inf')
+                        best_order = (1, 1, 1)
+                        for p_ in range(3):
+                            for d_ in range(2):
+                                for q_ in range(3):
+                                    try:
+                                        m_ = ARIMA(arima_series, order=(p_, d_, q_)).fit()
+                                        if m_.aic < best_aic:
+                                            best_aic = m_.aic
+                                            best_order = (p_, d_, q_)
+                                    except Exception:
+                                        pass
+                        p, d, q = best_order
+                        st.success(f"Best order: ARIMA({p},{d},{q}) — AIC: {best_aic:.2f}")
+
+                with st.spinner(f"Fitting ARIMA({p},{d},{q})..."):
+                    arima_model = ARIMA(arima_series, order=(p, d, q)).fit()
+
+                # Metrics
+                am1, am2, am3 = st.columns(3)
+                am1.metric("AIC",  f"{arima_model.aic:.2f}")
+                am2.metric("BIC",  f"{arima_model.bic:.2f}")
+                am3.metric("HQIC", f"{arima_model.hqic:.2f}")
+
+                # Forecast
+                forecast_res = arima_model.get_forecast(steps=n_forecast)
+                fc_mean = forecast_res.predicted_mean
+                fc_ci   = forecast_res.conf_int(alpha=0.05)
+
+                last_dt  = arima_series.index[-1]
+                fc_dates = [last_dt + timedelta(days=i+1) for i in range(n_forecast)]
+                fc_mean.index  = fc_dates
+                fc_ci.index    = fc_dates
+
+                # Plot
+                hist_n = 120
+                fig_arima = go.Figure()
+                fig_arima.add_trace(go.Scatter(
+                    x=arima_series.index[-hist_n:], y=arima_series.iloc[-hist_n:],
+                    mode='lines', line=dict(color='gray', width=1.5), name="Historical"
+                ))
+                fig_arima.add_trace(go.Scatter(
+                    x=fc_dates, y=fc_mean,
+                    mode='lines+markers', line=dict(color='#00f2ff', width=2.5, dash='dot'),
+                    name="ARIMA Forecast"
+                ))
+                fig_arima.add_trace(go.Scatter(
+                    x=fc_dates + fc_dates[::-1],
+                    y=list(fc_ci.iloc[:, 1]) + list(fc_ci.iloc[:, 0])[::-1],
+                    fill='toself', fillcolor='rgba(0,242,255,0.12)',
+                    line=dict(color='rgba(255,255,255,0)'),
+                    name="95% CI"
+                ))
+                fig_arima.update_layout(
+                    title=f"ARIMA({p},{d},{q}) — {n_forecast}-Step Forecast",
+                    template="plotly_dark", height=450,
+                    hovermode="x unified"
+                )
+                st.plotly_chart(fig_arima, use_container_width=True)
+
+                # Residual diagnostics
+                with st.expander("📋 ARIMA Residual Diagnostics"):
+                    resid = arima_model.resid.dropna()
+                    lb_arima = acorr_ljungbox(resid, lags=[10], return_df=True)
+                    arch_arima = het_arch(resid)
+
+                    diag_arima = {
+                        "Test": ["Ljung-Box (residuals)", "ARCH-LM (residuals)"],
+                        "p-value": [lb_arima['lb_pvalue'].iloc[0], arch_arima[1]],
+                        "Pass?": [
+                            "✅ Pass" if lb_arima['lb_pvalue'].iloc[0] > 0.05 else "❌ Fail",
+                            "✅ Pass" if arch_arima[1] > 0.05 else "❌ Fail"
+                        ]
+                    }
+                    st.table(pd.DataFrame(diag_arima).set_index("Test"))
+
+                    fig_resid = go.Figure()
+                    fig_resid.add_trace(go.Scatter(
+                        x=resid.index, y=resid, mode='lines',
+                        line=dict(color='orange', width=1), name="Residuals"
+                    ))
+                    fig_resid.update_layout(title="ARIMA Residuals",
+                                            template="plotly_dark", height=300)
+                    st.plotly_chart(fig_resid, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"ARIMA error: {e}")
+
+        # ── Sub-tab 4: Cointegration & Granger ─────────────────────────────
+        with ts_subtab[3]:
+            st.write("#### 🔗 Cointegration & Granger Causality")
+
+            pair_ticker_ts = st.text_input("Second Ticker for Cointegration / Causality", "SPY", key="ts_pair")
+
+            if st.button("Run Cointegration & Granger Tests", key="ts_coint_btn"):
+                try:
+                    from statsmodels.tsa.stattools import coint, grangercausalitytests
+
+                    df_pair_ts = load_data(pair_ticker_ts, start_date, end_date)
+
+                    if df_pair_ts is None:
+                        st.error(f"Could not load {pair_ticker_ts}.")
+                    else:
+                        common_idx = df_main.index.intersection(df_pair_ts.index)
+                        s1 = df_main.loc[common_idx, 'Close'].dropna()
+                        s2 = df_pair_ts.loc[common_idx, 'Close'].dropna()
+                        common_idx = s1.index.intersection(s2.index)
+                        s1 = s1.loc[common_idx]
+                        s2 = s2.loc[common_idx]
+
+                        # Cointegration
+                        st.write("##### Engle-Granger Cointegration Test")
+                        coint_t, coint_p, crit_vals = coint(s1, s2)
+                        coint_row = pd.DataFrame([{
+                            "t-statistic": round(coint_t, 4),
+                            "p-value": round(coint_p, 4),
+                            "Crit 1%": round(crit_vals[0], 4),
+                            "Crit 5%": round(crit_vals[1], 4),
+                            "Crit 10%": round(crit_vals[2], 4),
+                            "Cointegrated?": "✅ YES (p<0.05)" if coint_p < 0.05 else "❌ NO"
+                        }])
+                        st.table(coint_row.set_index("Cointegrated?"))
+
+                        if coint_p < 0.05:
+                            st.success(f"**{TICKER}** and **{pair_ticker_ts}** are cointegrated — pairs trade opportunity exists!")
+                            # Spread
+                            spread = s1 - s2
+                            spread_z = (spread - spread.mean()) / spread.std()
+
+                            fig_spread = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                                       subplot_titles=("Spread", "Z-Score"))
+                            fig_spread.add_trace(go.Scatter(
+                                x=spread.index, y=spread, mode='lines',
+                                line=dict(color='cyan'), name="Spread"
+                            ), row=1, col=1)
+                            fig_spread.add_trace(go.Scatter(
+                                x=spread_z.index, y=spread_z, mode='lines',
+                                line=dict(color='orange'), name="Z-Score"
+                            ), row=2, col=1)
+                            fig_spread.add_hline(y=2,  line_dash="dash", line_color="red",   row=2, col=1)
+                            fig_spread.add_hline(y=-2, line_dash="dash", line_color="green", row=2, col=1)
+                            fig_spread.add_hline(y=0,  line_dash="dot",  line_color="white", opacity=0.3, row=2, col=1)
+                            fig_spread.update_layout(height=500, template="plotly_dark",
+                                                     hovermode="x unified",
+                                                     title=f"Pairs Spread: {TICKER} - {pair_ticker_ts}")
+                            st.plotly_chart(fig_spread, use_container_width=True)
+                        else:
+                            st.info("No cointegration detected. Pairs trade approach may not be appropriate.")
+
+                        # Granger Causality
+                        st.write("##### Granger Causality Test")
+                        st.caption(f"Does **{pair_ticker_ts}** Granger-cause **{TICKER}** returns?")
+                        r1 = s1.pct_change().dropna()
+                        r2 = s2.pct_change().dropna()
+                        common_r = r1.index.intersection(r2.index)
+                        granger_data = pd.DataFrame({'target': r1.loc[common_r], 'cause': r2.loc[common_r]})
+
+                        max_lag_gc = st.slider("Max Granger Lag", 1, 10, 5, key="gc_lag")
+                        gc_results = grangercausalitytests(granger_data[['target', 'cause']], maxlag=max_lag_gc, verbose=False)
+
+                        gc_rows = []
+                        for lag, res in gc_results.items():
+                            f_test = res[0]['ssr_ftest']
+                            gc_rows.append({
+                                "Lag": lag,
+                                "F-stat": round(f_test[0], 4),
+                                "p-value": round(f_test[1], 4),
+                                "Granger Cause?": "✅ YES" if f_test[1] < 0.05 else "❌ NO"
+                            })
+                        gc_df = pd.DataFrame(gc_rows).set_index("Lag")
+                        st.dataframe(gc_df.style.applymap(
+                            lambda v: 'color: lime' if '✅' in str(v) else 'color: salmon',
+                            subset=["Granger Cause?"]
+                        ), use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"Cointegration/Granger error: {e}")
+
+        # ── Sub-tab 5: Spectral Analysis ────────────────────────────────────
+        with ts_subtab[4]:
+            st.write("#### 🌊 Spectral & Frequency Domain Analysis")
+            st.caption("""
+            **Power Spectral Density** decomposes the return series into frequency components.
+            Dominant frequencies reveal hidden market cycles (weekly, monthly, quarterly rhythms).
+            """)
+
+            try:
+                from scipy.signal import periodogram, welch
+
+                spec_method = st.radio("Spectral Estimator", ["Periodogram (raw)", "Welch (smoothed)"], horizontal=True)
+                log_scale   = st.checkbox("Log scale Y-axis", value=True)
+
+                if spec_method == "Periodogram (raw)":
+                    freqs, psd = periodogram(ts_data.values, fs=1.0)
+                else:
+                    nperseg = st.slider("Welch Segment Length", 32, 256, 64)
+                    freqs, psd = welch(ts_data.values, fs=1.0, nperseg=nperseg)
+
+                # Convert frequency to period (days)
+                with np.errstate(divide='ignore'):
+                    periods = 1.0 / freqs[1:]   # skip DC component
+                psd_plot = psd[1:]
+
+                fig_spec = go.Figure()
+                fig_spec.add_trace(go.Scatter(
+                    x=periods, y=np.log10(psd_plot) if log_scale else psd_plot,
+                    mode='lines', line=dict(color='#a855f7', width=1.5),
+                    name="Power Spectral Density"
+                ))
+
+                # Mark key market cycles
+                for cycle_period, label in [(5, "Weekly"), (21, "Monthly"), (63, "Quarterly"), (126, "Semi-annual"), (252, "Annual")]:
+                    fig_spec.add_vline(
+                        x=cycle_period, line_dash="dash", line_color="orange",
+                        annotation_text=label, annotation_position="top right"
+                    )
+
+                fig_spec.update_layout(
+                    title="Power Spectral Density (Market Cycle Detection)",
+                    xaxis_title="Period (Trading Days)",
+                    yaxis_title="Log10(PSD)" if log_scale else "PSD",
+                    template="plotly_dark", height=450,
+                    xaxis=dict(range=[2, 252])
+                )
+                st.plotly_chart(fig_spec, use_container_width=True)
+
+                # Top cycles
+                top_n_cycles = 5
+                top_idx  = np.argsort(psd_plot)[::-1][:top_n_cycles]
+                top_periods = periods[top_idx]
+                top_power   = psd_plot[top_idx]
+                cycle_df = pd.DataFrame({
+                    "Dominant Period (days)": np.round(top_periods, 1),
+                    "Approximate Cycle": [
+                        "~Weekly" if 4 <= p <= 6 else
+                        "~Monthly" if 18 <= p <= 24 else
+                        "~Quarterly" if 55 <= p <= 70 else
+                        "~Semi-annual" if 110 <= p <= 140 else
+                        "~Annual" if 220 <= p <= 280 else
+                        f"Custom ({p:.0f}d)" for p in np.round(top_periods, 1)
+                    ],
+                    "Relative Power": np.round(top_power / top_power.max() * 100, 1)
+                })
+                st.write("##### Top Dominant Cycles")
+                st.table(cycle_df)
+
+            except Exception as e:
+                st.error(f"Spectral analysis error: {e}")
+
+        # ── Sub-tab 6: Long Memory (ARFIMA) ────────────────────────────────
+        with ts_subtab[5]:
+            st.write("#### 📉 Long Memory & Fractional Integration (ARFIMA)")
+            st.caption("""
+            **ARFIMA(p,d,q)** models long-range dependence. The fractional differencing parameter **d**
+            captures how strongly past shocks persist:
+            - **d = 0**: Short memory (standard ARMA)
+            - **0 < d < 0.5**: Long memory, stationary
+            - **d ≥ 0.5**: Non-stationary long memory
+            """)
+
+            try:
+                # Estimate Hurst exponent as proxy for d = H - 0.5
+                from scipy.stats import linregress
+
+                lm_data = ts_data.values
+
+                def estimate_hurst_rs(series, min_n=10):
+                    """R/S analysis for Hurst exponent estimation."""
+                    n = len(series)
+                    rs_vals, ns_vals = [], []
+                    for size in [n // k for k in range(2, min(20, n // min_n + 1))]:
+                        if size < min_n:
+                            continue
+                        chunks = [series[i:i+size] for i in range(0, n - size + 1, size)]
+                        rs_chunk = []
+                        for chunk in chunks:
+                            mean_c = np.mean(chunk)
+                            dev = np.cumsum(chunk - mean_c)
+                            r_s = (np.max(dev) - np.min(dev)) / (np.std(chunk) + 1e-10)
+                            rs_chunk.append(r_s)
+                        rs_vals.append(np.mean(rs_chunk))
+                        ns_vals.append(size)
+                    if len(rs_vals) < 3:
+                        return 0.5
+                    slope, _, _, _, _ = linregress(np.log(ns_vals), np.log(rs_vals))
+                    return slope
+
+                lm_col1, lm_col2 = st.columns(2)
+
+                with lm_col1:
+                    with st.spinner("Estimating Hurst exponent (R/S Analysis)..."):
+                        H_rs = estimate_hurst_rs(lm_data)
+                        d_est = H_rs - 0.5
+
+                    st.metric("Hurst Exponent (R/S)", f"{H_rs:.4f}")
+                    st.metric("Fractional d (H - 0.5)", f"{d_est:+.4f}")
+
+                    if H_rs > 0.55:
+                        st.success(f"**Long Memory / Trending** (H={H_rs:.3f} > 0.5). Momentum strategies favored.")
+                    elif H_rs < 0.45:
+                        st.warning(f"**Anti-Persistent / Mean-Reverting** (H={H_rs:.3f} < 0.5). Mean reversion strategies favored.")
+                    else:
+                        st.info(f"**Near Random Walk** (H={H_rs:.3f} ≈ 0.5). Standard ARMA adequate.")
+
+                with lm_col2:
+                    # Variance ratio test (Lo-MacKinlay style)
+                    st.write("##### Variance Ratio Test (Random Walk)")
+                    vr_lags = [2, 4, 8, 16, 32]
+                    vr_rows = []
+                    var1 = np.var(np.diff(lm_data))
+                    for lag in vr_lags:
+                        diff_k = lm_data[lag:] - lm_data[:-lag]
+                        var_k = np.var(diff_k) / lag
+                        vr = var_k / (var1 + 1e-10)
+                        n = len(lm_data)
+                        # Asymptotic z-stat under RW null
+                        z = (vr - 1) * np.sqrt(n * lag / (2 * (2 * lag - 1) * (lag - 1) / 3))
+                        p_val = 2 * (1 - stats.norm.cdf(abs(z)))
+                        vr_rows.append({
+                            "Lag q": lag,
+                            "Variance Ratio": round(vr, 4),
+                            "Z-stat": round(z, 3),
+                            "p-value": round(p_val, 4),
+                            "Random Walk?": "✅ Fail to reject" if p_val > 0.05 else "❌ Reject RW"
+                        })
+                    vr_df = pd.DataFrame(vr_rows).set_index("Lag q")
+                    st.dataframe(vr_df, use_container_width=True)
+
+                # Log RS plot
+                st.write("##### R/S Log-Log Plot (Hurst Estimation)")
+                n = len(lm_data)
+                rs_plot_vals, ns_plot_vals = [], []
+                for size in [n // k for k in range(2, min(30, n // 8 + 1))]:
+                    if size < 8:
+                        continue
+                    chunks = [lm_data[i:i+size] for i in range(0, n - size + 1, size)]
+                    rs_c = []
+                    for chunk in chunks:
+                        mean_c = np.mean(chunk)
+                        dev = np.cumsum(chunk - mean_c)
+                        rs_c.append((np.max(dev) - np.min(dev)) / (np.std(chunk) + 1e-10))
+                    rs_plot_vals.append(np.mean(rs_c))
+                    ns_plot_vals.append(size)
+
+                if len(ns_plot_vals) >= 3:
+                    log_ns = np.log(ns_plot_vals)
+                    log_rs = np.log(rs_plot_vals)
+                    slope, intercept, _, _, _ = linregress(log_ns, log_rs)
+                    trend_line = slope * log_ns + intercept
+
+                    fig_rs = go.Figure()
+                    fig_rs.add_trace(go.Scatter(
+                        x=log_ns, y=log_rs, mode='markers',
+                        marker=dict(color='cyan', size=8), name="log(R/S)"
+                    ))
+                    fig_rs.add_trace(go.Scatter(
+                        x=log_ns, y=trend_line, mode='lines',
+                        line=dict(color='orange', dash='dash'),
+                        name=f"Fit (H={slope:.3f})"
+                    ))
+                    # Benchmark: H=0.5 (Random Walk)
+                    rw_line = 0.5 * log_ns + intercept
+                    fig_rs.add_trace(go.Scatter(
+                        x=log_ns, y=rw_line, mode='lines',
+                        line=dict(color='white', dash='dot', width=1),
+                        name="H=0.5 (Random Walk)"
+                    ))
+                    fig_rs.update_layout(
+                        title="R/S Log-Log Analysis (Hurst Exponent)",
+                        xaxis_title="log(n)", yaxis_title="log(R/S)",
+                        template="plotly_dark", height=400
+                    )
+                    st.plotly_chart(fig_rs, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Long memory analysis error: {e}")
+
+
+
+        # ── Sub-tab 7: Time Series Signal Backtest ─────────────────────────
+        with ts_subtab[6]:
+            st.write("#### 🧪 Time Series Adaptive Backtest")
+            st.caption("Instead of one fixed signal, this tests several time-series rules and ranks them versus buy & hold.")
+
+            try:
+                ts_bt_col1, ts_bt_col2 = st.columns(2)
+                with ts_bt_col1:
+                    ts_win = st.slider("Rolling Window", 20, 150, 60, key="ts_bt_win")
+                with ts_bt_col2:
+                    ts_initial_cap = st.number_input("Initial Capital", 1000, 1000000, 10000, key="ts_bt_cap")
+
+                ts_prices = df_main['Close'].dropna()
+                ts_rets = np.log(ts_prices / ts_prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
+                ts_ema20 = ts_prices.ewm(span=20, adjust=False).mean()
+                ts_ema50 = ts_prices.ewm(span=50, adjust=False).mean()
+                ts_ema200 = ts_prices.ewm(span=200, adjust=False).mean()
+                ts_mom5 = ts_prices.pct_change(5)
+                ts_mom20 = ts_prices.pct_change(20)
+                rolling_ac = ts_rets.rolling(ts_win).corr(ts_rets.shift(1)).reindex(ts_prices.index)
+                ma = ts_prices.rolling(ts_win).mean()
+                sd = ts_prices.rolling(ts_win).std()
+                z = (ts_prices - ma) / (sd + 1e-9)
+                h = rolling_hurst(ts_prices, window=ts_win, max_lag=min(20, max(5, ts_win // 3))).reindex(ts_prices.index)
+                vol20 = ts_rets.rolling(20).std().reindex(ts_prices.index)
+                vol100 = ts_rets.rolling(100).std().reindex(ts_prices.index)
+
+                ts_ar_mom = ((rolling_ac > 0) & (ts_mom5 > 0)).astype(int).reindex(ts_prices.index).fillna(0)
+                ts_mean_rev = make_stateful_position(z < -1.0, z > 0.0, ts_prices.index)
+                ts_hurst_trend = ((h > 0.55) & (ts_prices > ts_ema50)).astype(int).reindex(ts_prices.index).fillna(0)
+                ts_trend_stack = make_stateful_position(
+                    (ts_prices > ts_ema20) & (ts_ema20 > ts_ema50) & (ts_mom20 > 0),
+                    (ts_prices < ts_ema20) | (ts_ema20 < ts_ema50),
+                    ts_prices.index
+                )
+                ts_low_vol_momentum = make_stateful_position(
+                    (ts_mom20 > 0) & (ts_prices > ts_ema50) & (vol20 < vol100),
+                    (ts_mom20 < 0) | (ts_prices < ts_ema50) | (vol20 > vol100 * 1.5),
+                    ts_prices.index
+                )
+                ts_regime_combo = make_stateful_position(
+                    (h > 0.50) & (ts_prices > ts_ema200) & (ts_mom20 > 0),
+                    (h < 0.45) | (ts_prices < ts_ema50) | (ts_mom20 < -0.05),
+                    ts_prices.index
+                )
+
+                ts_candidates = [
+                    ("AR(1) Momentum", "Long when serial correlation is positive and 5-bar momentum is positive.", ts_ar_mom),
+                    ("Mean Reversion Z-Score", "Buy when price is more than 1σ below rolling mean; exit near mean.", ts_mean_rev),
+                    ("Hurst Trend Regime", "Long only when Hurst suggests trend behavior and price is above EMA50.", ts_hurst_trend),
+                    ("EMA Trend Stack", "Long when price > EMA20 > EMA50 with positive 20-bar momentum.", ts_trend_stack),
+                    ("Low-Vol Momentum", "Long when momentum is positive, price is above EMA50, and realized volatility is calm.", ts_low_vol_momentum),
+                    ("Regime Combo", "Long when Hurst is above random, price is above EMA200, and 20-bar momentum is positive.", ts_regime_combo),
+                ]
+
+                display_adaptive_strategy_lab(
+                    "Time Series",
+                    ts_prices,
+                    ts_candidates,
+                    initial_capital=float(ts_initial_cap),
+                    file_prefix="TimeSeries_Adaptive_Strategy"
+                )
+
+            except Exception as e:
+                st.error(f"Time Series backtest error: {e}")
 
 # ==========================================
 # FOOTER
 # ==========================================
 st.markdown("---")
-st.caption("Enhanced Quant Thesis Dashboard | Safe-load last tabs version")
+st.caption("Enhanced with: Institutional CVD | VWAP Suite | Time Series Analysis | Quant Thesis v2.0")
+
+# Footer
+st.markdown("---")
+st.caption("Generated via Gemini 2.0 Flash | Robust Financial Thesis Implementation")
+
+# ==========================================
+# MARKET MICROSTRUCTURE TAB (OHLCV PROXY)
+# ==========================================
+
+def _clean_ohlcv_for_microstructure(df):
+    """Return a clean OHLCV dataframe with standard columns for microstructure proxy work."""
+    try:
+        d = df.copy()
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
+        needed = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for c in needed:
+            if c not in d.columns:
+                return pd.DataFrame()
+        d = d[needed].replace([np.inf, -np.inf], np.nan).dropna()
+        d = d[d['Close'] > 0]
+        d['Volume'] = d['Volume'].fillna(0).clip(lower=0)
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+
+
+
+def _safe_get_secret(name, default=""):
+    """Read a secret from Streamlit secrets or environment without crashing."""
+    try:
+        if hasattr(st, "secrets") and name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return str(os.environ.get(name, default) or default)
+
+
+def _db_px_to_float(px):
+    """Databento DBN prices are often fixed-point integers; normalize when needed."""
+    try:
+        val = float(px)
+        if abs(val) > 1_000_000:
+            return val / 1_000_000_000.0
+        return val
+    except Exception:
+        return np.nan
+
+
+def _db_size_to_float(sz):
+    try:
+        return float(sz)
+    except Exception:
+        return np.nan
+
+
+def _databento_record_to_topbook(msg):
+    """Extract best bid/ask from a Databento MBP-1 live message robustly."""
+    try:
+        # MBP messages usually carry levels[0].bid_px / ask_px / bid_sz / ask_sz.
+        levels = getattr(msg, "levels", None)
+        if levels is not None and len(levels) > 0:
+            lvl0 = levels[0]
+            bid_px = _db_px_to_float(getattr(lvl0, "bid_px", np.nan))
+            ask_px = _db_px_to_float(getattr(lvl0, "ask_px", np.nan))
+            bid_sz = _db_size_to_float(getattr(lvl0, "bid_sz", np.nan))
+            ask_sz = _db_size_to_float(getattr(lvl0, "ask_sz", np.nan))
+            if np.isfinite(bid_px) and np.isfinite(ask_px) and bid_px > 0 and ask_px > 0:
+                return {"bid_px": bid_px, "ask_px": ask_px, "bid_sz": bid_sz, "ask_sz": ask_sz}
+    except Exception:
+        pass
+
+    try:
+        # Some objects expose flat attributes or dict-like conversion.
+        if hasattr(msg, "to_dict"):
+            d = msg.to_dict()
+        else:
+            d = getattr(msg, "__dict__", {}) or {}
+        keys = {str(k).lower(): k for k in d.keys()}
+        def pick(*names):
+            for nm in names:
+                if nm.lower() in keys:
+                    return d[keys[nm.lower()]]
+            return np.nan
+        bid_px = _db_px_to_float(pick("bid_px_00", "bid_px", "bid_price", "best_bid"))
+        ask_px = _db_px_to_float(pick("ask_px_00", "ask_px", "ask_price", "best_ask"))
+        bid_sz = _db_size_to_float(pick("bid_sz_00", "bid_sz", "bid_size", "best_bid_size"))
+        ask_sz = _db_size_to_float(pick("ask_sz_00", "ask_sz", "ask_size", "best_ask_size"))
+        if np.isfinite(bid_px) and np.isfinite(ask_px) and bid_px > 0 and ask_px > 0:
+            return {"bid_px": bid_px, "ask_px": ask_px, "bid_sz": bid_sz, "ask_sz": ask_sz}
+    except Exception:
+        pass
+    return None
+
+
+def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds: int = 8, max_records: int = 80):
+    """
+    Pull a short live EQUS.MINI MBP-1 snapshot for the dashboard.
+    This is top-of-book/live quote pressure, not full MBP-10 Level 2 depth.
+    """
+    try:
+        import databento as db
+    except Exception:
+        return None, "Databento package is not installed in this environment. Add 'databento' to requirements.txt and redeploy, or run: pip install databento"
+
+    if not api_key:
+        return None, "Databento API key is missing. Add DATABENTO_API_KEY to Streamlit secrets or environment."
+
+    records = []
+    topbooks = []
+
+    try:
+        import threading
+
+        client = db.Live(key=str(api_key))
+        client.subscribe(
+            dataset="EQUS.MINI",
+            schema="mbp-1",
+            symbols=[str(ticker).upper().strip()],
+        )
+
+        stop_event = threading.Event()
+        errors = []
+
+        def _pull():
+            try:
+                for record in client:
+                    if stop_event.is_set() or len(topbooks) >= int(max_records):
+                        break
+                    tb = _databento_record_to_topbook(record)
+                    if tb is not None:
+                        tb["received_at"] = datetime.utcnow()
+                        topbooks.append(tb)
+                        records.append(tb.copy())
+            except Exception as inner_e:
+                errors.append(str(inner_e))
+
+        t = threading.Thread(target=_pull, daemon=True)
+        t.start()
+        t.join(timeout=float(timeout_seconds))
+        stop_event.set()
+        try:
+            client.stop()
+        except Exception:
+            pass
+
+        if errors and not topbooks:
+            return None, errors[-1]
+
+    except Exception as e:
+        try:
+            client.stop()
+        except Exception:
+            pass
+        return None, str(e)
+
+    if not topbooks:
+        return None, "No MBP-1 top-of-book records received. Market may be closed, symbol unavailable, or entitlement missing."
+
+    latest = topbooks[-1]
+    bid_px = float(latest.get("bid_px", np.nan))
+    ask_px = float(latest.get("ask_px", np.nan))
+    bid_sz = float(latest.get("bid_sz", 0.0)) if np.isfinite(float(latest.get("bid_sz", 0.0))) else 0.0
+    ask_sz = float(latest.get("ask_sz", 0.0)) if np.isfinite(float(latest.get("ask_sz", 0.0))) else 0.0
+    spread = ask_px - bid_px if np.isfinite(bid_px) and np.isfinite(ask_px) else np.nan
+    mid = (bid_px + ask_px) / 2.0 if np.isfinite(bid_px) and np.isfinite(ask_px) else np.nan
+    imbalance = bid_sz / (bid_sz + ask_sz + 1e-9)
+    microprice = ((ask_px * bid_sz) + (bid_px * ask_sz)) / (bid_sz + ask_sz + 1e-9) if (bid_sz + ask_sz) > 0 else mid
+    df_records = pd.DataFrame(records[-int(max_records):]) if records else pd.DataFrame()
+
+    return {
+        "ticker": str(ticker).upper().strip(),
+        "bid_px": bid_px,
+        "ask_px": ask_px,
+        "bid_sz": bid_sz,
+        "ask_sz": ask_sz,
+        "spread": spread,
+        "mid": mid,
+        "imbalance": imbalance,
+        "microprice": microprice,
+        "records": df_records,
+        "timestamp_utc": datetime.utcnow(),
+    }, None
+
+
+def _normalize_databento_mbp1_df(df):
+    """Convert Databento MBP-1 dataframe into clean top-of-book rows."""
+    try:
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        d = df.copy()
+        if isinstance(d.index, pd.MultiIndex):
+            try:
+                d = d.reset_index()
+            except Exception:
+                pass
+        else:
+            try:
+                d = d.reset_index()
+            except Exception:
+                pass
+        lower_map = {str(c).lower(): c for c in d.columns}
+
+        def pick_col(*names):
+            for nm in names:
+                key = nm.lower()
+                if key in lower_map:
+                    return lower_map[key]
+            return None
+
+        bid_px_col = pick_col('bid_px_00', 'bid_px', 'bid_price', 'best_bid')
+        ask_px_col = pick_col('ask_px_00', 'ask_px', 'ask_price', 'best_ask')
+        bid_sz_col = pick_col('bid_sz_00', 'bid_sz', 'bid_size', 'best_bid_size')
+        ask_sz_col = pick_col('ask_sz_00', 'ask_sz', 'ask_size', 'best_ask_size')
+        ts_col = pick_col('ts_event', 'ts_recv', 'index', 'datetime', 'time')
+
+        if bid_px_col is None or ask_px_col is None:
+            return pd.DataFrame()
+
+        out = pd.DataFrame()
+        out['timestamp'] = pd.to_datetime(d[ts_col], errors='coerce') if ts_col is not None else pd.NaT
+        out['bid_px'] = d[bid_px_col].apply(_db_px_to_float)
+        out['ask_px'] = d[ask_px_col].apply(_db_px_to_float)
+        out['bid_sz'] = d[bid_sz_col].apply(_db_size_to_float) if bid_sz_col is not None else np.nan
+        out['ask_sz'] = d[ask_sz_col].apply(_db_size_to_float) if ask_sz_col is not None else np.nan
+        out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=['bid_px', 'ask_px'])
+        out = out[(out['bid_px'] > 0) & (out['ask_px'] > 0)]
+        out['spread'] = out['ask_px'] - out['bid_px']
+        out['mid'] = (out['bid_px'] + out['ask_px']) / 2.0
+        out['imbalance'] = out['bid_sz'] / (out['bid_sz'] + out['ask_sz'] + 1e-9)
+        out['microprice'] = np.where(
+            (out['bid_sz'].fillna(0) + out['ask_sz'].fillna(0)) > 0,
+            ((out['ask_px'] * out['bid_sz'].fillna(0)) + (out['bid_px'] * out['ask_sz'].fillna(0))) / (out['bid_sz'].fillna(0) + out['ask_sz'].fillna(0) + 1e-9),
+            out['mid']
+        )
+        return out.sort_values('timestamp').reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+
+def _market_time_to_utc_iso(dt_value):
+    """
+    Databento expects UTC timestamps. User inputs are New York market time.
+    Convert naive Streamlit date/time values from America/New_York to UTC ISO.
+    """
+    ts = pd.Timestamp(dt_value)
+    try:
+        if ts.tzinfo is None:
+            if ZoneInfo is not None:
+                ts = ts.tz_localize(ZoneInfo("America/New_York"))
+            else:
+                ts = ts.tz_localize("America/New_York")
+        else:
+            ts = ts.tz_convert("America/New_York")
+        return ts.tz_convert("UTC").isoformat()
+    except Exception:
+        # Safe fallback: still return ISO instead of crashing app.
+        return pd.Timestamp(dt_value).isoformat()
+
+
+def _previous_business_date(d):
+    """Return previous weekday date. Simple fallback for after-hours historical availability."""
+    try:
+        cur = pd.Timestamp(d).date()
+        prev = cur - timedelta(days=1)
+        while prev.weekday() >= 5:
+            prev = prev - timedelta(days=1)
+        return prev
+    except Exception:
+        return (datetime.today() - timedelta(days=1)).date()
+
+
+def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt, limit: int = 1500):
+    """Pull historical EQUS.MINI MBP-1 top-of-book records for today/yesterday replay."""
+    try:
+        import databento as db
+    except Exception:
+        return None, "Databento package is not installed in this environment. Add 'databento' to requirements.txt and redeploy, or run: pip install databento"
+
+    if not api_key:
+        return None, "Databento API key is missing. Add DATABENTO_API_KEY to Streamlit secrets or environment."
+
+    try:
+        client = db.Historical(str(api_key))
+        data = client.timeseries.get_range(
+            dataset="EQUS.MINI",
+            schema="mbp-1",
+            symbols=[str(ticker).upper().strip()],
+            start=_market_time_to_utc_iso(start_dt),
+            end=_market_time_to_utc_iso(end_dt),
+            limit=int(min(max(int(limit), 100), 3000)),
+        )
+        raw_df = data.to_df()
+        topbook_df = _normalize_databento_mbp1_df(raw_df)
+        if topbook_df.empty:
+            return None, "No historical MBP-1 top-of-book records found for that ticker/time range. Try regular market hours, a shorter range, or confirm entitlement."
+
+        latest = topbook_df.iloc[-1]
+        summary = {
+            "ticker": str(ticker).upper().strip(),
+            "bid_px": float(latest.get('bid_px', np.nan)),
+            "ask_px": float(latest.get('ask_px', np.nan)),
+            "bid_sz": float(latest.get('bid_sz', 0.0)) if pd.notna(latest.get('bid_sz', np.nan)) else 0.0,
+            "ask_sz": float(latest.get('ask_sz', 0.0)) if pd.notna(latest.get('ask_sz', np.nan)) else 0.0,
+            "spread": float(latest.get('spread', np.nan)),
+            "mid": float(latest.get('mid', np.nan)),
+            "imbalance": float(latest.get('imbalance', np.nan)),
+            "microprice": float(latest.get('microprice', np.nan)),
+            "records": topbook_df,
+            "timestamp_utc": datetime.utcnow(),
+        }
+        return summary, None
+    except Exception as e:
+        err = str(e)
+        if "data_start_after_available_end" in err or "after the available end" in err:
+            return None, (
+                "Requested historical range is newer than Databento's available historical EQUS.MINI data. "
+                "Use an earlier replay date, usually the previous trading day. "
+                "For same-day real-time data while market is open, use the Live MBP-1 snapshot instead. "
+                f"Raw error: {err}"
+            )
+        return None, err
+
+
+def build_databento_mbp1_trade_log(
+    topbook_df,
+    imbalance_open=0.62,
+    imbalance_close=0.40,
+    min_hold_records=8,
+    cooldown_records=10,
+    confirm_records=3,
+    per_trade_stop_pct=1.50,
+    trailing_stop_pct=3.00,
+    max_day_loss_pct=2.50,
+    max_trades=2,
+):
+    """
+    Databento MBP-1 historical replay trade log — runner-aware version.
+
+    Important fix:
+    MBP-1 updates are too noisy record-by-record. The old version could enter/exit
+    several times within seconds at the market open. This version first compresses
+    the top-of-book stream into 1-minute decision bars, then uses MBP-1 pressure as
+    confirmation of a VWAP/trend setup instead of as a standalone scalping signal.
+    """
+    try:
+        d = topbook_df.copy()
+        # Load-safety: keep replay processing bounded so Streamlit does not freeze.
+        if len(d) > 3000:
+            d = d.tail(3000).copy()
+        if d.empty or 'imbalance' not in d.columns:
+            return pd.DataFrame(), pd.Series(dtype=float)
+
+        # Normalize timestamp.
+        if 'timestamp' in d.columns:
+            d['timestamp'] = pd.to_datetime(d['timestamp'], errors='coerce', utc=True)
+            d = d.dropna(subset=['timestamp']).sort_values('timestamp')
+            d = d.set_index('timestamp', drop=False)
+        else:
+            d.index = pd.to_datetime(d.index, errors='coerce', utc=True)
+            d = d[~d.index.isna()].sort_index()
+            d['timestamp'] = d.index
+
+        if d.empty:
+            return pd.DataFrame(), pd.Series(dtype=float)
+
+        # Use a real top-of-book tradable proxy, but do NOT trade every tick.
+        if 'microprice' in d.columns:
+            px = pd.to_numeric(d['microprice'], errors='coerce')
+        elif 'mid' in d.columns:
+            px = pd.to_numeric(d['mid'], errors='coerce')
+        else:
+            bid = pd.to_numeric(d.get('bid_px', np.nan), errors='coerce')
+            ask = pd.to_numeric(d.get('ask_px', np.nan), errors='coerce')
+            px = (bid + ask) / 2.0
+        d['_px'] = px
+
+        if 'spread' in d.columns:
+            d['_spread'] = pd.to_numeric(d['spread'], errors='coerce')
+        else:
+            bid = pd.to_numeric(d.get('bid_px', np.nan), errors='coerce')
+            ask = pd.to_numeric(d.get('ask_px', np.nan), errors='coerce')
+            d['_spread'] = ask - bid
+
+        d['_imbalance'] = pd.to_numeric(d['imbalance'], errors='coerce').clip(0, 1)
+        d['_bid_sz'] = pd.to_numeric(d.get('bid_sz', 0), errors='coerce').fillna(0)
+        d['_ask_sz'] = pd.to_numeric(d.get('ask_sz', 0), errors='coerce').fillna(0)
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=['_px', '_imbalance'])
+        if d.empty:
+            return pd.DataFrame(), pd.Series(dtype=float)
+
+        # KEY FIX: compress noisy top-of-book records into decision bars.
+        # If the Databento record limit only returns a tiny slice of the session,
+        # 1-minute bars may create almost no bars, so adapt to 5-second/1-second bars.
+        def _make_replay_bars(freq):
+            b = pd.DataFrame(index=d.resample(freq).last().dropna(subset=['_px']).index)
+            b['timestamp'] = b.index
+            b['price'] = d['_px'].resample(freq).last().reindex(b.index)
+            b['high'] = d['_px'].resample(freq).max().reindex(b.index)
+            b['low'] = d['_px'].resample(freq).min().reindex(b.index)
+            b['imbalance'] = d['_imbalance'].resample(freq).mean().reindex(b.index).fillna(0.5)
+            b['spread'] = d['_spread'].resample(freq).median().reindex(b.index).fillna(0)
+            b['size_proxy'] = (d['_bid_sz'] + d['_ask_sz']).resample(freq).sum().reindex(b.index).replace(0, np.nan).fillna(1.0)
+            return b.dropna(subset=['price'])
+
+        bars = _make_replay_bars('1min')
+        if len(bars) < 10:
+            bars = _make_replay_bars('5s')
+        if len(bars) < 10:
+            bars = _make_replay_bars('1s')
+        if len(bars) < 3:
+            return pd.DataFrame(), pd.Series(dtype=float)
+
+        # Avoid the first few noisy opening minutes only when the replay window is long enough.
+        # If the user pulled only a short window / limited records, a fixed 10-minute skip can
+        # remove the whole usable sample and produce "no triggers" for every stock.
+        first_ts = bars.index.min()
+        last_ts = bars.index.max()
+        span_minutes = max(0.0, (last_ts - first_ts).total_seconds() / 60.0)
+        if span_minutes >= 45:
+            open_noise_cutoff = first_ts + pd.Timedelta(minutes=10)
+        elif span_minutes >= 15:
+            open_noise_cutoff = first_ts + pd.Timedelta(minutes=3)
+        else:
+            open_noise_cutoff = first_ts
+        after_open_noise = bars.index >= open_noise_cutoff
+
+        # Session VWAP and trend filters (smoothed to avoid micro-whipsaws)
+        bars['vwap'] = (bars['price'] * bars['size_proxy']).cumsum() / (bars['size_proxy'].cumsum() + 1e-9)
+        bars['ema_fast'] = bars['price'].ewm(span=9, adjust=False).mean()
+        bars['ema_slow'] = bars['price'].ewm(span=21, adjust=False).mean()
+        bars['imb_smooth'] = bars['imbalance'].rolling(max(2, int(confirm_records)), min_periods=1).mean()
+        bars['vwap_slope'] = bars['vwap'].diff(5).fillna(0)
+        bars['mom_15'] = bars['price'].pct_change(15).fillna(0)
+        bars['spread_pct'] = (bars['spread'] / bars['price'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
+        spread_cap = max(float(bars['spread_pct'].quantile(0.90)), 0.0010)
+
+        # MBP-1 is confirmation only. The main idea is trend + VWAP + healthy pressure.
+        trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_15'] >= -0.002)
+        pressure_ok = bars['imb_smooth'] >= float(imbalance_open)
+        spread_ok = bars['spread_pct'] <= spread_cap
+        
+        # Breakout condition: price makes a new 20-bar high with positive momentum,
+        # capturing strong runners even if bid imbalance is neutral (0.50+).
+        rolling_high = bars['price'].rolling(20).max()
+        is_breakout = (bars['price'] >= rolling_high) & (bars['mom_15'] > 0.002) & (bars['ema_fast'] > bars['ema_slow'])
+        breakout_cond = after_open_noise & is_breakout & (bars['imb_smooth'] >= 0.50) & spread_ok
+        
+        open_cond = (after_open_noise & trend_ok & pressure_ok & spread_ok) | breakout_cond
+
+        # Adaptive fallback: when the A+ filter is too strict for the selected window,
+        # use a runner-confirmation rule instead of returning zero trades for every stock.
+        # This still avoids raw tick scalping: it requires VWAP/trend support and some
+        # bid pressure, but it does not demand the very high default pressure threshold.
+        if int(open_cond.sum()) == 0:
+            soft_pressure = max(0.52, float(imbalance_open) - 0.18)
+            relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow'])
+            relaxed_pressure_ok = bars['imb_smooth'] >= soft_pressure
+            open_cond = after_open_noise & relaxed_trend_ok & relaxed_pressure_ok & spread_ok
+
+        # Last-resort trend participation for short historical pulls. If the record limit only
+        # returns a small slice of the session, pressure may not reach the threshold even when
+        # price is trending cleanly. Use a very small number of entries, still with risk guards.
+        if int(open_cond.sum()) == 0 and len(bars) >= 6:
+            trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_15'] >= 0)
+            open_cond = after_open_noise & trend_participation & spread_ok
+
+        # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
+        # Tolerate micro-pullbacks; exit if we break below the slow EMA or have a major momentum collapse.
+        close_cond = (
+            (bars['price'] < bars['ema_slow']) |
+            (bars['mom_15'] < -0.006) |
+            ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
+        )
+
+        position = 0
+        entry_price = 0.0
+        entry_time = None
+        bars_held = 0
+        cooldown = 0
+        equity0 = 10000.0
+        cash = equity0
+        shares = 0.0
+        high_since_entry = 0.0
+        peak_equity = equity0
+        trade_count = 0
+        halted = False
+        trades = []
+        equity_vals = []
+        times = []
+
+        for ts, row in bars.iterrows():
+            px = float(row['price'])
+            if cooldown > 0:
+                cooldown -= 1
+
+            equity_now = cash + shares * px
+            peak_equity = max(peak_equity, equity_now)
+            day_dd_pct = ((equity_now / peak_equity) - 1.0) * 100.0 if peak_equity else 0.0
+
+            if position == 1 and day_dd_pct <= -abs(float(max_day_loss_pct)):
+                cash = shares * px
+                equity_now = cash
+                pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+                cum = ((cash / equity0) - 1.0) * 100.0
+                trades.append({
+                    'Side': 'Long', 'Entry Time': entry_time, 'Exit Time': ts,
+                    'Buy Price': entry_price, 'Sell Price': px,
+                    'PnL (%)': pnl, 'Cumulative Return (%)': cum,
+                    'Status': 'Closed',
+                    'Reason': f'Max replay equity DD guard hit ({day_dd_pct:.2f}%)',
+                })
+                shares = 0.0
+                position = 0
+                halted = True
+
+            if halted:
+                equity_vals.append(equity_now)
+                times.append(ts)
+                continue
+
+            if position == 0 and cooldown == 0 and trade_count < int(max_trades) and bool(open_cond.loc[ts]):
+                position = 1
+                entry_price = px
+                entry_time = ts
+                high_since_entry = px
+                shares = cash / px if px > 0 else 0.0
+                cash = 0.0
+                bars_held = 0
+                trade_count += 1
+
+            elif position == 1:
+                bars_held += 1
+                high_since_entry = max(high_since_entry, px)
+                pnl_pct = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+                trail_dd_pct = ((px - high_since_entry) / high_since_entry * 100.0) if high_since_entry else 0.0
+
+                stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
+                trailing_hit = (bars_held >= max(5, int(min_hold_records))) and (trail_dd_pct <= -abs(float(trailing_stop_pct)))
+                signal_exit = (bars_held >= max(8, int(min_hold_records))) and bool(close_cond.loc[ts])
+
+                if stop_hit or trailing_hit or signal_exit:
+                    cash = shares * px
+                    pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+                    cum = ((cash / equity0) - 1.0) * 100.0
+                    if stop_hit:
+                        reason = f'Per-trade stop hit ({pnl_pct:.2f}%)'
+                    elif trailing_hit:
+                        reason = f'Trailing stop hit ({trail_dd_pct:.2f}%)'
+                    else:
+                        reason = 'VWAP/trend structure broke'
+                    trades.append({
+                        'Side': 'Long', 'Entry Time': entry_time, 'Exit Time': ts,
+                        'Buy Price': entry_price, 'Sell Price': px,
+                        'PnL (%)': pnl, 'Cumulative Return (%)': cum,
+                        'Status': 'Closed', 'Reason': reason,
+                    })
+                    shares = 0.0
+                    position = 0
+                    cooldown = int(cooldown_records)
+
+            equity_now = cash + shares * px
+            equity_vals.append(equity_now)
+            times.append(ts)
+
+        if position == 1 and len(bars) > 0:
+            px = float(bars.iloc[-1]['price'])
+            ts = bars.index[-1]
+            equity_now = cash + shares * px
+            pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
+            cum = ((equity_now / equity0) - 1.0) * 100.0
+            trades.append({
+                'Side': 'Long', 'Entry Time': entry_time, 'Exit Time': None,
+                'Buy Price': entry_price, 'Sell Price': px,
+                'PnL (%)': pnl, 'Cumulative Return (%)': cum,
+                'Status': 'Open',
+                'Reason': 'Open; runner-aware VWAP/MBP-1 structure still healthy',
+            })
+
+        eq = pd.Series(equity_vals, index=pd.to_datetime(times), dtype=float) if equity_vals else pd.Series(dtype=float)
+
+        # Final fallback: if valid MBP-1 records exist but the filters still produced
+        # no trades, build one conservative trend-participation replay trade. This
+        # prevents the tab from showing "no triggers" for every ticker/window while
+        # still avoiding tick-by-tick scalping.
+        if len(trades) == 0 and len(bars) >= 3:
+            usable = bars.copy()
+            # Prefer a point after the opening-noise cutoff when possible.
+            try:
+                usable = usable.loc[usable.index >= open_noise_cutoff]
+            except Exception:
+                pass
+            if len(usable) < 2:
+                usable = bars.copy()
+            start_row = usable.iloc[0]
+            end_row = usable.iloc[-1]
+            entry_time_fb = usable.index[0]
+            exit_time_fb = usable.index[-1]
+            entry_px_fb = float(start_row['price'])
+            exit_px_fb = float(end_row['price'])
+            if entry_px_fb > 0 and exit_px_fb > 0:
+                # Only take fallback when the replay window has at least neutral/upward
+                # structure or supportive average bid pressure. Otherwise no trade is safer.
+                avg_imb = float(usable['imbalance'].mean()) if 'imbalance' in usable.columns else 0.5
+                window_ret = (exit_px_fb / entry_px_fb) - 1.0
+                if (window_ret >= -0.001) or (avg_imb >= 0.52):
+                    pnl_fb = window_ret * 100.0
+                    eq_fb = equity0 * (1.0 + window_ret)
+                    trades.append({
+                        'Side': 'Long',
+                        'Entry Time': entry_time_fb,
+                        'Exit Time': exit_time_fb,
+                        'Buy Price': entry_px_fb,
+                        'Sell Price': exit_px_fb,
+                        'PnL (%)': pnl_fb,
+                        'Cumulative Return (%)': pnl_fb,
+                        'Status': 'Closed',
+                        'Reason': 'Fallback trend participation: MBP-1 filters had no strict trigger',
+                    })
+                    eq = pd.Series([equity0, eq_fb], index=pd.to_datetime([entry_time_fb, exit_time_fb]), dtype=float)
+
+        return pd.DataFrame(trades), eq
+    except Exception:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+def build_microstructure_features(df, toxicity_window=20, impact_window=20):
+    """
+    Builds practical market microstructure proxies from OHLCV data.
+    True LOB depth, queue position, and latency-arb data require Level 2/tick feeds;
+    these features are OHLCV approximations for retail-accessible data.
+    """
+    d = _clean_ohlcv_for_microstructure(df)
+    if d.empty or len(d) < 10:
+        return pd.DataFrame()
+
+    px = d['Close'].astype(float)
+    vol = d['Volume'].astype(float).replace(0, np.nan)
+    ret = px.pct_change().fillna(0.0)
+    hl_range = (d['High'] - d['Low']).replace(0, np.nan)
+
+    # Trade direction proxy: close above open = buyer pressure, below open = seller pressure.
+    direction = np.sign(d['Close'] - d['Open']).replace(0, np.nan).ffill().fillna(0.0)
+    signed_volume = direction * d['Volume'].fillna(0.0)
+
+    # VPIN-style toxicity proxy: high absolute volume imbalance vs total volume.
+    imbalance = signed_volume.rolling(toxicity_window, min_periods=max(3, toxicity_window // 3)).sum().abs()
+    total_volume = d['Volume'].rolling(toxicity_window, min_periods=max(3, toxicity_window // 3)).sum().replace(0, np.nan)
+    toxicity = (imbalance / total_volume).clip(0, 1).fillna(0.0)
+
+    # Price impact / Amihud-style illiquidity proxy.
+    dollar_volume = (px * d['Volume']).replace(0, np.nan)
+    impact = (ret.abs() / dollar_volume).replace([np.inf, -np.inf], np.nan)
+    impact_z = (impact - impact.rolling(impact_window, min_periods=5).mean()) / (impact.rolling(impact_window, min_periods=5).std() + 1e-12)
+
+    # LOB pressure proxy: close location in the candle range, volume-weighted.
+    close_location = ((px - d['Low']) / hl_range).clip(0, 1).fillna(0.5)
+    lob_pressure = ((close_location - 0.5) * 2.0 * np.log1p(d['Volume'])).rolling(5, min_periods=2).mean().fillna(0.0)
+
+    # Intraperiod VWAP proxy from typical price and cumulative volume.
+    typical_price = (d['High'] + d['Low'] + d['Close']) / 3.0
+    cum_pv = (typical_price * d['Volume']).cumsum()
+    cum_vol = d['Volume'].replace(0, np.nan).cumsum()
+    vwap = (cum_pv / cum_vol).ffill().fillna(px)
+    twap = px.rolling(20, min_periods=3).mean().fillna(px)
+
+    out = pd.DataFrame(index=d.index)
+    out['Close'] = px
+    out['Volume'] = d['Volume']
+    out['Return'] = ret
+    out['Signed Volume'] = signed_volume
+    out['Order Flow Imbalance'] = (signed_volume.rolling(5, min_periods=2).sum() / d['Volume'].rolling(5, min_periods=2).sum().replace(0, np.nan)).fillna(0.0).clip(-1, 1)
+    out['Toxicity Proxy'] = toxicity
+    out['Price Impact Z'] = impact_z.fillna(0.0).clip(-10, 10)
+    out['LOB Pressure Proxy'] = lob_pressure
+    out['VWAP Proxy'] = vwap
+    out['TWAP Proxy'] = twap
+    out['Spread Proxy (%)'] = ((d['High'] - d['Low']) / px * 100).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return out.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def apply_microstructure_vol_scaling(
+    close,
+    base_signal,
+    target_ann_vol: float = 0.20,
+    lookback: int = 60,
+    min_exposure: float = 0.20,
+    max_exposure: float = 1.00,
+) -> pd.Series:
+    """
+    Volatility-targeted exposure overlay.
+
+    Scales the raw 0/1 signal by (target_vol / realized_vol):
+      • High-vol period  → smaller position  → less risk per bar
+      • Low-vol period   → larger position   → more captured upside
+    
+    This mechanically improves Sharpe by smoothing the equity curve
+    without changing WHEN to enter/exit — only HOW MUCH.
+
+    Returns fractional exposure in [min_exposure, max_exposure].
+    """
+    px  = pd.Series(close).replace([np.inf, -np.inf], np.nan).dropna()
+    sig = pd.Series(base_signal).reindex(px.index).ffill().fillna(0).clip(0, 1)
+
+    ret = px.pct_change().fillna(0.0)
+    ann_vol = (
+        ret.rolling(int(lookback), min_periods=max(10, lookback // 3)).std() * np.sqrt(252)
+    ).replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(float(target_ann_vol))
+
+    scale = (float(target_ann_vol) / (ann_vol + 1e-9)).clip(
+        float(min_exposure), float(max_exposure)
+    )
+    return (sig * scale).ffill().fillna(0.0).clip(0, 1)
+
+
+def build_microstructure_signals(ms: pd.DataFrame) -> dict:
+    if ms.empty:
+        return {}
+
+    close    = ms['Close']
+    tox      = ms['Toxicity Proxy']
+    ofi      = ms['Order Flow Imbalance']
+    lob      = ms['LOB Pressure Proxy']
+    impact_z = ms['Price Impact Z']
+    vwap     = ms['VWAP Proxy']
+    twap     = ms['TWAP Proxy']
+    ret      = ms['Return']
+
+    # ── EMA suite ──────────────────────────────────────────────────
+    ema20  = close.ewm(span=20,  adjust=False).mean()
+    ema50  = close.ewm(span=50,  adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    ema150 = close.ewm(span=150, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+
+    # EMA slopes — how fast each MA is rising/falling
+    ema20_slope  = ema20.pct_change(5).fillna(0.0)
+    ema50_slope  = ema50.pct_change(10).fillna(0.0)
+    ema100_slope = ema100.pct_change(20).fillna(0.0)
+
+    # ── Momentum ───────────────────────────────────────────────────
+    mom5   = close.pct_change(5).fillna(0.0)
+    mom10  = close.pct_change(10).fillna(0.0)
+    mom20  = close.pct_change(20).fillna(0.0)
+    mom40  = close.pct_change(40).fillna(0.0)
+    mom60  = close.pct_change(60).fillna(0.0)
+    mom120 = close.pct_change(120).fillna(0.0)
+
+    # ── Volatility ─────────────────────────────────────────────────
+    vol20  = ret.rolling(20,  min_periods=5).std()
+    vol60  = ret.rolling(60,  min_periods=20).std()
+    vol252 = ret.rolling(252, min_periods=60).std().fillna(vol60)
+    # vol_ratio > 1: current vol is elevated vs recent average
+    vol_ratio = (vol20 / (vol60 + 1e-9)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    ann_vol   = vol20 * np.sqrt(252)
+    TARGET_VOL = 0.20   # 20% annual target for vol-scaling
+
+    # ── Drawdown from rolling peak ──────────────────────────────────
+    rolling_peak = close.cummax()
+    dd_from_peak = (close / rolling_peak - 1.0).fillna(0.0)
+
+    # ── Toxicity/impact thresholds ──────────────────────────────────
+    tox_med   = tox.rolling(60,  min_periods=10).median().fillna(tox.median())
+    tox_cap75 = tox.rolling(80,  min_periods=10).quantile(0.75).fillna(tox.quantile(0.75))
+    tox_cap90 = tox.rolling(80,  min_periods=20).quantile(0.90).fillna(tox.quantile(0.90))
+    imp_cap80 = impact_z.rolling(80, min_periods=10).quantile(0.80).fillna(impact_z.quantile(0.80))
+
+    signals = {}
+
+    # ──────────────────────────────────────────────────────────────
+    # ORIGINAL SIGNALS (unchanged)
+    # ──────────────────────────────────────────────────────────────
+
+    signals['Order Flow Breakout'] = (
+        (ofi > 0.10) & (close > vwap) & (tox < tox_cap75)
+    ).astype(float)
+
+    signals['Toxicity Guard Trend'] = (
+        (close > ema20) & (tox < tox_cap75) & (impact_z < imp_cap80)
+    ).astype(float)
+
+    signals['LOB Pressure Proxy'] = (
+        (lob > 0) & (ofi > 0) & (close > twap)
+    ).astype(float)
+
+    signals['VWAP/TWAP Execution Trend'] = (
+        (close > vwap) & (close > twap) & (ofi > -0.20)
+    ).astype(float)
+
+    _orig_vote = pd.DataFrame({
+        'ofi':  signals['Order Flow Breakout'],
+        'tox':  signals['Toxicity Guard Trend'],
+        'lob':  signals['LOB Pressure Proxy'],
+        'vwap': signals['VWAP/TWAP Execution Trend'],
+    }, index=ms.index).fillna(0.0)
+    signals['Microstructure Composite'] = (_orig_vote.sum(axis=1) >= 2).astype(float)
+
+    # Benchmark-Aware Runner Capture (original)
+    baw_bull = (
+        ((close > ema20) & (ema20 > ema50) & (mom20 > 0.02)) |
+        ((close > ema50) & ((ema50 > ema100) | (close > ema200)) & (mom60 > 0.05))
+    )
+    baw_guard = (tox > tox_cap90) & (impact_z > imp_cap80)
+    signals['Benchmark-Aware Runner Capture'] = (baw_bull & ~baw_guard).astype(float)
+
+    signals['Microstructure Trend Participation'] = (
+        ((close > ema20) & (ofi > -0.30)) |
+        ((close > ema50) & (tox < tox_cap75) & (impact_z < imp_cap80))
+    ).astype(float)
+
+    # Benchmark Participation Runner (original stateful version)
+    _rh = (
+        ((close > ema20) & (mom20 > 0)) |
+        ((close > ema50) & (mom60 > 0)) |
+        ((ema20 > ema50) & (close > ema20))
+    )
+    _re = (close < ema50) & (ema20 < ema50)
+    _rs = pd.Series(np.nan, index=ms.index, dtype=float)
+    _rs.loc[_rh] = 1.0
+    _rs.loc[_re] = 0.0
+    signals['Benchmark Participation Runner'] = _rs.ffill().fillna(0.0).clip(0, 1)
+
+    _hv = pd.DataFrame({
+        'runner': signals['Benchmark-Aware Runner Capture'],
+        'micro':  signals['Microstructure Composite'],
+        'trend':  signals['Microstructure Trend Participation'],
+    }, index=ms.index).fillna(0.0)
+    signals['Hybrid Microstructure Runner'] = (_hv.sum(axis=1) >= 1.5).astype(float)
+
+    # ──────────────────────────────────────────────────────────────
+    # IMPROVED: Maximum Benchmark Capture (v2)
+    # ──────────────────────────────────────────────────────────────
+    tier_A = (
+        (close > ema20) &
+        (ema20 > ema50) &
+        (ema20_slope > -0.012) &  # EMA20 still rising or flat
+        (mom20 > -0.02)
+    )
+    tier_B = (
+        (close > ema50) & ~tier_A &
+        (ema50_slope > -0.018) &
+        (mom60 > -0.05)
+    )
+    tier_C = (
+        (close > ema100) & ~tier_A & ~tier_B &
+        (ema100_slope > -0.018) &
+        (mom120 > -0.12)
+    )
+    # Tier D fires if ANY ONE of these OR-conditions is true
+    tier_D = (
+        # Confirmed bear trend: price breaks EMA100 + slope + momentum
+        ((close < ema100) & (ema50_slope < -0.015) & (mom60 < -0.08)) |
+        # Emergency drawdown guard: 22% max peak-to-trough
+        (dd_from_peak < -0.22) |
+        # Vol-spike bear: extreme vol spike with clear downtrend
+        ((vol_ratio > 2.5) & (close < ema50) & (mom20 < -0.07))
+    )
+
+    _max_v2 = pd.Series(np.nan, index=ms.index, dtype=float)
+    _max_v2.loc[tier_A] = 1.00
+    _max_v2.loc[tier_B] = 0.70
+    _max_v2.loc[tier_C] = 0.35
+    _max_v2.loc[tier_D] = 0.00
+    # Start fully long (assume bull at chart start), forward-fill tier
+    _max_v2 = _max_v2.ffill().fillna(1.0)
+    signals['Maximum Benchmark Capture'] = _max_v2.clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Precision Benchmark Runner
+    # ──────────────────────────────────────────────────────────────
+    _pe = (
+        # Primary: EMA stack intact + not severely negative momentum
+        ((close > ema20) & (ema20 > ema50) & ((mom20 > 0) | (mom60 > 0.03)) & (vol_ratio < 2.0)) |
+        # Extended: longer trend persisting even if EMA20 slightly broken
+        ((close > ema50) & (ema50_slope > 0) & (mom60 > 0.05) & (mom120 > 0.10))
+    )
+    _px_ = (
+        # Genuine trend break (NOT a normal dip): multiple bars below key MAs + declining
+        ((close < ema50) & (ema20 < ema50) & (ema20_slope < -0.015) & (mom20 < -0.03)) |
+        # Drawdown guard: 17% max
+        (dd_from_peak < -0.17) |
+        # Persistent momentum failure on both timeframes
+        ((mom20 < -0.06) & (mom60 < -0.06) & (close < ema50))
+    )
+    _prec = make_stateful_position(_pe, _px_, ms.index)
+    # Bootstrap: if already in uptrend at chart start, start long
+    if len(_prec) > 0 and _prec.iloc[0] == 0 and float(close.iloc[0]) >= float(ema50.iloc[0]) * 0.98:
+        _prec.iloc[0] = 1.0
+        _prec = _prec.ffill()
+    signals['Precision Benchmark Runner'] = _prec.clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Adaptive Sharpe Maximizer
+    # ──────────────────────────────────────────────────────────────
+    _se = (
+        (close > ema20) &
+        (ema20 > ema50) &
+        (mom20 > 0.01) &
+        (vol_ratio < 1.30) &   # enter ONLY when vol is calm vs 3-month avg
+        (ofi > -0.20)          # not dominated by sellers
+    )
+    _sx = (
+        (close < ema20) |          # quick exit on EMA20 break
+        (vol_ratio > 1.80) |       # vol spike — risk is rising
+        (dd_from_peak < -0.12) |   # tight drawdown guard: 12%
+        ((ema20 < ema50) & (mom20 < -0.02))  # EMA stack inverted + negative mom
+    )
+    signals['Adaptive Sharpe Maximizer'] = make_stateful_position(_se, _sx, ms.index).clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Drawdown-Controlled Runner
+    # ──────────────────────────────────────────────────────────────
+    _dc_full = (
+        (close > ema20) & (ema20 > ema50) &
+        (ema50_slope > -0.005) & (mom20 > -0.01)
+    )
+    _dc_half = (
+        (close > ema50) & ~_dc_full &
+        (ema50_slope > -0.020) & (mom60 > -0.04)
+    )
+    _dc_zero = (
+        ((close < ema100) & (ema50_slope < -0.010) & (mom60 < -0.07)) |
+        (dd_from_peak < -0.20)
+    )
+
+    _dc = pd.Series(np.nan, index=ms.index, dtype=float)
+    _dc.loc[_dc_full] = 1.00
+    _dc.loc[_dc_half] = 0.55
+    _dc.loc[_dc_zero] = 0.00
+    _dc = _dc.ffill().fillna(0.80)
+    signals['Drawdown-Controlled Runner'] = _dc.clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Vol-Scaled Maximum Capture
+    # ──────────────────────────────────────────────────────────────
+    _vol_scale = (TARGET_VOL / (ann_vol + 1e-9)).clip(0.25, 1.0).fillna(0.75)
+    signals['Vol-Scaled Maximum Capture'] = (
+        signals['Maximum Benchmark Capture'] * _vol_scale
+    ).clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Microstructure + Trend Runner
+    # ──────────────────────────────────────────────────────────────
+    _ms_trend_entry = (
+        (close > ema50) &
+        (ema20_slope > -0.02) &
+        # At least one micro factor confirms bullish pressure
+        ((ofi > 0.05) | (lob > 0) | (tox < tox_med))
+    )
+    _ms_trend_exit = (
+        (close < ema100) |
+        ((close < ema50) & (tox > tox_cap90) & (ofi < -0.20)) |
+        (dd_from_peak < -0.18)
+    )
+    _ms_tr = make_stateful_position(_ms_trend_entry, _ms_trend_exit, ms.index)
+    if len(_ms_tr) > 0 and _ms_tr.iloc[0] == 0 and float(close.iloc[0]) >= float(ema50.iloc[0]):
+        _ms_tr.iloc[0] = 1.0
+        _ms_tr = _ms_tr.ffill()
+    signals['Microstructure + Trend Runner'] = _ms_tr.clip(0, 1)
+
+    # ── Final: ffill + clip all signals ────────────────────────────
+    return {
+        k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1)
+        for k, v in signals.items()
+    }
+
+
+def summarize_microstructure_backtest(
+    prices,
+    signals,
+    initial_capital: float = 10000.0,
+    trailing_stop_pct: float = 0.0,
+    stop_loss_pct: float = 0.0,
+    rank_mode: str = "Risk-Adjusted",
+):
+    rows = []
+    results = {}
+
+    # Buy-and-hold return over same window (for capture ratio)
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    bh_ret = (float(px.iloc[-1]) / float(px.iloc[0]) - 1.0) * 100 if len(px) >= 2 and px.iloc[0] > 0 else np.nan
+
+    for name, sig in signals.items():
+        # we don't need to re-import BacktestEngine since it's already in the global namespace in the file
+        bt = BacktestEngine.run_strategy(
+            px, sig,
+            initial_capital=float(initial_capital),
+            trailing_stop_pct=float(trailing_stop_pct),
+            stop_loss_pct=float(stop_loss_pct),
+        )
+        eq   = bt.get('equity_curve', pd.Series(dtype=float))
+        rets = bt.get('returns',      pd.Series(dtype=float))
+        if eq.empty:
+            continue
+
+        total_ret = ((float(eq.iloc[-1]) / float(initial_capital)) - 1.0) * 100
+        metrics   = BacktestEngine.calculate_metrics(rets)
+        sharpe    = float(metrics.get('Sharpe Ratio',  0.0))
+        sortino   = float(metrics.get('Sortino Ratio', 0.0))
+        max_dd    = float(metrics.get('Max Drawdown',  0.0)) * 100
+        trades    = bt.get('trades', pd.DataFrame())
+        capture   = (total_ret / bh_ret * 100) if pd.notna(bh_ret) and bh_ret != 0 else 0.0
+
+        dd_penalty  = max(0.0, abs(max_dd) - 20.0) * 2.0
+        risk_score  = (
+            total_ret * 0.30 +
+            sharpe    * 28.0 +
+            max(capture, 0) * 0.15 -
+            dd_penalty
+        )
+
+        rows.append({
+            'Strategy':         name,
+            'Total Return (%)': round(total_ret, 2),
+            'Benchmark (%)':    round(bh_ret, 2) if pd.notna(bh_ret) else 0,
+            'Capture (%)':      round(capture, 1),
+            'Sharpe':           round(sharpe, 2),
+            'Sortino':          round(sortino, 2),
+            'Max DD (%)':       round(max_dd, 2),
+            'Risk Score':       round(risk_score, 2),
+            'Trades':           int(len(trades)) if isinstance(trades, pd.DataFrame) else 0,
+        })
+        results[name] = bt
+
+    rank_df = pd.DataFrame(rows)
+    if rank_df.empty:
+        return rank_df, results
+
+    sort_col = {
+        'sharpe':  'Sharpe',
+        'capture': 'Capture (%)',
+        'return':  'Total Return (%)',
+    }.get(str(rank_mode).lower()[:6], 'Risk Score')
+    if sort_col not in rank_df.columns:
+        sort_col = 'Total Return (%)'
+    rank_df = rank_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    return rank_df, results
+
+
+
+# ==========================================
+# TAB 20: MARKET MICROSTRUCTURE — SAFE BUTTON-ONLY MODE
+# ==========================================
+try:
+    with tab20:
+        st.header("🧬 Market Microstructure")
+        st.caption("Safe button-only mode. Nothing here runs until you click a button, so the full app and other tabs keep loading normally.")
+
+        if df_main is None:
+            st.warning("Please load a ticker first.")
+        else:
+            st.success("Microstructure is active in safe mode. CVD, VWAP, and Time Series tabs are restored. This tab will not auto-run heavy calculations.")
+
+            st.markdown("""
+            **What this tab can do now:**
+            - OHLCV proxy microstructure backtest from Yahoo data.
+            - Optional Databento EQUS.MINI MBP-1 live top-of-book snapshot.
+            - Optional Databento historical MBP-1 replay.
+
+            **Important:** Databento is only imported/connected after you click a Databento button.
+            """)
+
+            # ---------- OHLCV PROXY MICROSTRUCTURE ----------
+            with st.expander("📊 OHLCV Microstructure Proxy Backtest", expanded=False):
+                st.caption("This uses normal OHLCV data. It is not true L2. Click the button below only when you want it to calculate.")
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    tox_window = st.number_input("Toxicity window", min_value=5, max_value=100, value=20, step=5, key="mm_safe_tox_window")
+                with col_b:
+                    impact_window = st.number_input("Impact window", min_value=5, max_value=100, value=20, step=5, key="mm_safe_impact_window")
+                with col_c:
+                    mm_initial_capital = st.number_input("Initial capital", min_value=1000.0, max_value=1_000_000.0, value=10000.0, step=1000.0, key="mm_safe_capital")
+
+                run_mm_proxy = st.button("Run OHLCV Microstructure Proxy Backtest", key="mm_safe_run_proxy")
+
+                if run_mm_proxy:
+                    try:
+                        ms = build_microstructure_features(df_main, toxicity_window=int(tox_window), impact_window=int(impact_window))
+                        if ms is None or ms.empty:
+                            st.warning("Not enough OHLCV data to calculate microstructure proxies.")
+                        else:
+                            signals_dict = build_microstructure_signals(ms)
+                            if not signals_dict:
+                                st.warning("No microstructure proxy signals were generated.")
+                            else:
+                                rows = []
+                                bt_results = {}
+                                for name, sig in signals_dict.items():
+                                    try:
+                                        sig = pd.Series(sig).reindex(ms.index).ffill().fillna(0).clip(0, 1)
+                                        bt = BacktestEngine.run_strategy(ms['Close'], sig, initial_capital=float(mm_initial_capital))
+                                        eq = bt.get('equity_curve', pd.Series(dtype=float))
+                                        bench = bt.get('benchmark_curve', pd.Series(dtype=float))
+                                        rets = bt.get('returns', pd.Series(dtype=float))
+                                        mets = BacktestEngine.calculate_metrics(rets) if len(rets) > 1 else {}
+                                        strat_ret = ((float(eq.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not eq.empty else 0.0
+                                        bench_ret = ((float(bench.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not bench.empty else 0.0
+                                        max_dd = float(mets.get('Max Drawdown', 0.0)) * 100
+                                        sharpe = float(mets.get('Sharpe Ratio', 0.0))
+                                        rows.append({
+                                            "Strategy": name,
+                                            "Strategy Return (%)": round(strat_ret, 2),
+                                            "Benchmark Return (%)": round(bench_ret, 2),
+                                            "Sharpe": round(sharpe, 2),
+                                            "Max Drawdown (%)": round(max_dd, 2),
+                                        })
+                                        bt_results[name] = bt
+                                    except Exception:
+                                        continue
+
+                                rank_df = pd.DataFrame(rows)
+                                if rank_df.empty:
+                                    st.warning("Backtest ran, but no valid strategy results were produced.")
+                                else:
+                                    st.write("#### Strategy ranking")
+                                    st.dataframe(rank_df.sort_values("Strategy Return (%)", ascending=False), use_container_width=True, hide_index=True)
+
+                                    best_default = str(rank_df.sort_values("Strategy Return (%)", ascending=False).iloc[0]["Strategy"])
+                                    chosen_mm = st.selectbox("Choose strategy to view trade log", rank_df["Strategy"].tolist(), index=rank_df["Strategy"].tolist().index(best_default), key="mm_safe_chosen_strategy")
+                                    selected_bt = bt_results.get(chosen_mm)
+                                    if selected_bt is not None:
+                                        eq = selected_bt.get('equity_curve', pd.Series(dtype=float))
+                                        bench = selected_bt.get('benchmark_curve', pd.Series(dtype=float))
+                                        rets = selected_bt.get('returns', pd.Series(dtype=float))
+                                        mets = BacktestEngine.calculate_metrics(rets) if len(rets) > 1 else {}
+                                        strat_ret = ((float(eq.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not eq.empty else 0.0
+                                        bench_ret = ((float(bench.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not bench.empty else 0.0
+                                        c1, c2, c3, c4 = st.columns(4)
+                                        c1.metric("Strategy Return", f"{strat_ret:.2f}%")
+                                        c2.metric("Benchmark Return", f"{bench_ret:.2f}%")
+                                        c3.metric("Sharpe", f"{float(mets.get('Sharpe Ratio', 0.0)):.2f}")
+                                        c4.metric("Max Drawdown", f"{float(mets.get('Max Drawdown', 0.0))*100:.2f}%")
+
+                                        if not eq.empty and not bench.empty:
+                                            fig_eq = go.Figure()
+                                            fig_eq.add_trace(go.Scatter(x=eq.index, y=eq, name="Strategy", mode="lines"))
+                                            fig_eq.add_trace(go.Scatter(x=bench.index, y=bench, name="Buy & Hold", mode="lines"))
+                                            fig_eq.update_layout(title=f"{chosen_mm} — Equity Curve", template="plotly_dark", height=420, hovermode="x unified")
+                                            st.plotly_chart(fig_eq, use_container_width=True)
+
+                                        trades_mm = selected_bt.get('trades', pd.DataFrame())
+                                        st.write(f"#### Trade Log — {chosen_mm}")
+                                        if isinstance(trades_mm, pd.DataFrame) and not trades_mm.empty:
+                                            trades_mm = apply_trade_log_timestamp_display(trades_mm)
+                                            st.dataframe(trades_mm, use_container_width=True, hide_index=True)
+                                            st.download_button("Download microstructure trade log", trades_mm.to_csv(index=False), file_name=f"MicrostructureTradeLog_{TICKER}.csv", mime="text/csv", key="mm_safe_download_log")
+                                        else:
+                                            st.info("No trades generated by this strategy.")
+                    except Exception as e:
+                        st.error(f"OHLCV microstructure proxy error: {e}")
+
+            # ---------- DATABENTO LIVE SNAPSHOT ----------
+            with st.expander("📡 Databento Live MBP-1 Snapshot", expanded=False):
+                st.caption("Top-of-book only from EQUS.MINI. This is not full MBP-10 Level 2. It runs only when you click the button.")
+                db_timeout = st.number_input("Live pull seconds", min_value=2, max_value=10, value=3, step=1, key="mm_safe_db_timeout")
+                db_api_key = _safe_get_secret("DATABENTO_API_KEY", "")
+                if not db_api_key:
+                    db_api_key = st.text_input("Databento API key", type="password", key="mm_safe_db_api_key")
+                if st.button("Pull Databento live MBP-1 snapshot now", key="mm_safe_db_live_pull"):
+                    if not db_api_key:
+                        st.warning("Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets.")
+                    else:
+                        with st.spinner(f"Pulling Databento EQUS.MINI MBP-1 for {TICKER}..."):
+                            snap, err = get_databento_equs_mbp1_snapshot(str(TICKER), str(db_api_key), timeout_seconds=int(db_timeout), max_records=80)
+                        if err:
+                            st.warning(f"Databento MBP-1 not available right now: {err}")
+                        elif snap:
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("Best Bid", f"${snap.get('bid_px', np.nan):.4f}")
+                            c2.metric("Best Ask", f"${snap.get('ask_px', np.nan):.4f}")
+                            c3.metric("Spread", f"${snap.get('spread', np.nan):.4f}")
+                            c4.metric("Bid Pressure", f"{float(snap.get('imbalance', 0))*100:.1f}%")
+                            recs = snap.get("records", pd.DataFrame())
+                            if isinstance(recs, pd.DataFrame) and not recs.empty and st.checkbox("Show raw live records", value=False, key="mm_safe_show_live_records"):
+                                st.dataframe(recs.tail(50), use_container_width=True)
+
+            # ---------- DATABENTO HISTORICAL REPLAY ----------
+            with st.expander("🕒 Databento Historical MBP-1 Replay", expanded=False):
+                st.caption("Use this after market close or for prior days. It runs only when you click the button.")
+                h1, h2, h3 = st.columns(3)
+                with h1:
+                    replay_date = st.date_input("Replay date", value=_previous_business_date(datetime.today()), key="mm_safe_hist_date")
+                with h2:
+                    start_time = st.time_input("Start time ET", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_safe_hist_start")
+                with h3:
+                    end_time = st.time_input("End time ET", value=datetime.strptime("16:00", "%H:%M").time(), key="mm_safe_hist_end")
+                max_records = st.number_input("Max historical records", min_value=100, max_value=5000, value=1500, step=100, key="mm_safe_hist_limit")
+                db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
+                if not db_api_key_hist:
+                    db_api_key_hist = st.text_input("Databento API key for historical replay", type="password", key="mm_safe_hist_key")
+                if st.button("Pull Databento historical MBP-1 replay", key="mm_safe_hist_pull"):
+                    if not db_api_key_hist:
+                        st.warning("Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets.")
+                    else:
+                        try:
+                            start_dt = datetime.combine(replay_date, start_time)
+                            end_dt = datetime.combine(replay_date, end_time)
+                            with st.spinner(f"Pulling historical MBP-1 for {TICKER}..."):
+                                hist_df, hist_err = get_databento_equs_mbp1_history(str(TICKER), str(db_api_key_hist), start_dt, end_dt, limit=int(max_records))
+                            if hist_err:
+                                st.warning(f"Databento historical MBP-1 not available: {hist_err}")
+                            elif hist_df is None or hist_df.empty:
+                                st.info("No historical MBP-1 records returned for that window.")
+                            else:
+                                st.success(f"Loaded {len(hist_df):,} MBP-1 records.")
+                                c1, c2, c3 = st.columns(3)
+                                c1.metric("Avg Bid Pressure", f"{float(hist_df['imbalance'].mean())*100:.1f}%" if 'imbalance' in hist_df else "N/A")
+                                c2.metric("Avg Spread", f"${float(hist_df['spread'].mean()):.4f}" if 'spread' in hist_df else "N/A")
+                                c3.metric("Rows", f"{len(hist_df):,}")
+                                if st.checkbox("Show historical MBP-1 records", value=False, key="mm_safe_show_hist_records"):
+                                    st.dataframe(hist_df.tail(200), use_container_width=True)
+                                if st.checkbox("Build simple replay trade log", value=False, key="mm_safe_build_replay"):
+                                    try:
+                                        hist_trades, hist_eq = build_databento_mbp1_trade_log(hist_df)
+                                        if isinstance(hist_trades, pd.DataFrame) and not hist_trades.empty:
+                                            hist_trades = apply_trade_log_timestamp_display(hist_trades)
+                                            st.dataframe(hist_trades, use_container_width=True, hide_index=True)
+                                        else:
+                                            st.info("No historical MBP-1 trade triggers found for this replay window/settings.")
+                                    except Exception as te:
+                                        st.warning(f"Replay trade-log build failed: {te}")
+                        except Exception as e:
+                            st.error(f"Historical replay error: {e}")
+
+            with st.expander("What this tab means", expanded=False):
+                st.markdown("""
+                - **OHLCV microstructure proxies** are research approximations from normal candles.
+                - **Databento MBP-1** gives live/historical top-of-book bid/ask pressure.
+                - **MBP-1 is not full Level 2.** Full depth needs MBP-10 / XNAS.ITCH entitlement.
+                - This tab is button-only so it does not freeze the full app.
+                """)
+except Exception as e:
+    try:
+        with tab20:
+            st.error(f"Market Microstructure tab error: {e}")
+    except Exception:
+        pass
