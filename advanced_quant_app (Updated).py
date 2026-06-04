@@ -10977,108 +10977,118 @@ try:
                     st.info("Databento historical replay is OFF. Turn it on and click the button when needed.")
 
             st.divider()
-            st.subheader("OHLCV Microstructure Proxy Backtest")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                mm_toxicity_guard = st.slider("Toxicity guard", 0.5, 8.0, 3.0, 0.25, key="mm2_toxicity_guard")
-            with c2:
-                mm_min_hold = st.number_input("Minimum hold bars", min_value=1, max_value=100, value=3, step=1, key="mm2_min_hold")
-            with c3:
-                mm_stop = st.slider("Stop loss %", 0.0, 20.0, 8.0, 0.25, key="mm2_stop") / 100.0
-            with c4:
-                mm_trail = st.slider("Trailing stop %", 0.0, 30.0, 15.0, 0.25, key="mm2_trail") / 100.0
-            c5, c6 = st.columns(2)
-            with c5:
-                mm_rank_by = st.selectbox("Auto-select by", ["Risk-Adjusted", "Return Only"], index=0, key="mm2_rank_by")
-            with c6:
-                mm_manual = st.checkbox("Manually select microstructure strategy", value=False, key="mm2_manual")
-
-            feat = mm_compute_microstructure_features(df_main)
-            if feat.empty or len(feat) < 20:
-                st.warning("Not enough OHLCV data for microstructure proxy signals.")
+            run_mm_ohlcv = st.checkbox(
+                "Run OHLCV Microstructure Proxy Backtest",
+                value=False,
+                key="mm2_run_ohlcv",
+                help="Keeps the app fast. Turn this on only when you want the heavy microstructure charts/backtest to run."
+            )
+            if not run_mm_ohlcv:
+                st.info("OHLCV microstructure backtest is OFF so the app loads faster. Turn it on to run this tab.")
             else:
-                latest = feat.iloc[-1]
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Toxicity Proxy", f"{latest['Toxicity']:.2f}")
-                m2.metric("OFI Z", f"{latest['OFI Z']:.2f}")
-                m3.metric("LOB Pressure Proxy", f"{latest['LOB Pressure Proxy']:.2f}")
-                m4.metric("Spread Proxy", f"{latest['Spread Proxy']*100:.2f}%")
+                st.divider()
+                st.subheader("OHLCV Microstructure Proxy Backtest")
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    mm_toxicity_guard = st.slider("Toxicity guard", 0.5, 8.0, 3.0, 0.25, key="mm2_toxicity_guard")
+                with c2:
+                    mm_min_hold = st.number_input("Minimum hold bars", min_value=1, max_value=100, value=3, step=1, key="mm2_min_hold")
+                with c3:
+                    mm_stop = st.slider("Stop loss %", 0.0, 20.0, 8.0, 0.25, key="mm2_stop") / 100.0
+                with c4:
+                    mm_trail = st.slider("Trailing stop %", 0.0, 30.0, 15.0, 0.25, key="mm2_trail") / 100.0
+                c5, c6 = st.columns(2)
+                with c5:
+                    mm_rank_by = st.selectbox("Auto-select by", ["Risk-Adjusted", "Return Only"], index=0, key="mm2_rank_by")
+                with c6:
+                    mm_manual = st.checkbox("Manually select microstructure strategy", value=False, key="mm2_manual")
 
-                fig_ms = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, subplot_titles=("Price / VWAP", "Order Flow / CVD", "Toxicity / Pressure"))
-                fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["Close"], mode="lines", name="Close"), row=1, col=1)
-                fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["VWAP"], mode="lines", name="VWAP"), row=1, col=1)
-                fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["CVD"], mode="lines", name="CVD"), row=2, col=1)
-                fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["OFI Z"], mode="lines", name="OFI Z"), row=2, col=1)
-                fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["Toxicity"], mode="lines", name="Toxicity"), row=3, col=1)
-                fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["LOB Pressure Proxy"], mode="lines", name="LOB Pressure Proxy"), row=3, col=1)
-                fig_ms.update_layout(height=750, template="plotly_dark", hovermode="x unified")
-                st.plotly_chart(fig_ms, use_container_width=True)
-
-                strategies = mm_build_microstructure_strategies(feat, toxicity_guard=float(mm_toxicity_guard), min_hold_bars=int(mm_min_hold))
-                rank_df, bt_results = mm_summarize_backtests(feat["Close"], strategies, stop_loss_pct=float(mm_stop), trailing_stop_pct=float(mm_trail), rank_by=mm_rank_by)
-                if rank_df.empty:
-                    st.warning("No microstructure strategy results generated.")
+                feat = mm_compute_microstructure_features(df_main)
+                if feat.empty or len(feat) < 20:
+                    st.warning("Not enough OHLCV data for microstructure proxy signals.")
                 else:
-                    st.subheader("Microstructure Strategy Ranking")
-                    st.dataframe(rank_df, use_container_width=True)
-                    names = rank_df["Strategy"].tolist()
-                    if mm_manual:
-                        chosen = st.selectbox("Choose Microstructure Strategy", names, index=0, key="mm2_chosen")
+                    latest = feat.iloc[-1]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Toxicity Proxy", f"{latest['Toxicity']:.2f}")
+                    m2.metric("OFI Z", f"{latest['OFI Z']:.2f}")
+                    m3.metric("LOB Pressure Proxy", f"{latest['LOB Pressure Proxy']:.2f}")
+                    m4.metric("Spread Proxy", f"{latest['Spread Proxy']*100:.2f}%")
+
+                    fig_ms = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, subplot_titles=("Price / VWAP", "Order Flow / CVD", "Toxicity / Pressure"))
+                    fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["Close"], mode="lines", name="Close"), row=1, col=1)
+                    fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["VWAP"], mode="lines", name="VWAP"), row=1, col=1)
+                    fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["CVD"], mode="lines", name="CVD"), row=2, col=1)
+                    fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["OFI Z"], mode="lines", name="OFI Z"), row=2, col=1)
+                    fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["Toxicity"], mode="lines", name="Toxicity"), row=3, col=1)
+                    fig_ms.add_trace(go.Scatter(x=feat.index, y=feat["LOB Pressure Proxy"], mode="lines", name="LOB Pressure Proxy"), row=3, col=1)
+                    fig_ms.update_layout(height=750, template="plotly_dark", hovermode="x unified")
+                    st.plotly_chart(fig_ms, use_container_width=True)
+
+                    strategies = mm_build_microstructure_strategies(feat, toxicity_guard=float(mm_toxicity_guard), min_hold_bars=int(mm_min_hold))
+                    rank_df, bt_results = mm_summarize_backtests(feat["Close"], strategies, stop_loss_pct=float(mm_stop), trailing_stop_pct=float(mm_trail), rank_by=mm_rank_by)
+                    if rank_df.empty:
+                        st.warning("No microstructure strategy results generated.")
                     else:
-                        chosen = names[0]
-                        st.caption(f"Auto-selected strategy: **{chosen}**")
-
-                    bt = bt_results.get(chosen, {})
-                    eq = bt.get("equity_curve", pd.Series(dtype=float))
-                    bench = bt.get("benchmark_curve", pd.Series(dtype=float))
-                    rets = bt.get("returns", pd.Series(dtype=float))
-                    trades = bt.get("trades", pd.DataFrame())
-                    if not eq.empty:
-                        strat_ret = ((eq.iloc[-1] / eq.iloc[0]) - 1.0) * 100 if eq.iloc[0] else 0.0
-                        bench_ret = ((bench.iloc[-1] / bench.iloc[0]) - 1.0) * 100 if not bench.empty and bench.iloc[0] else 0.0
-                        metrics = BacktestEngine.calculate_metrics(rets) if len(rets) > 1 else {}
-                        s1, s2, s3, s4 = st.columns(4)
-                        s1.metric("Strategy Return", f"{strat_ret:.2f}%")
-                        s2.metric("Benchmark Return", f"{bench_ret:.2f}%")
-                        s3.metric("Sharpe", f"{float(metrics.get('Sharpe Ratio', 0.0)):.2f}")
-                        s4.metric("Max Drawdown", f"{float(metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-
-                        fig_eq = go.Figure()
-                        fig_eq.add_trace(go.Scatter(x=eq.index, y=eq, mode="lines", name="Strategy Equity"))
-                        if not bench.empty:
-                            fig_eq.add_trace(go.Scatter(x=bench.index, y=bench, mode="lines", name="Buy & Hold"))
-                        fig_eq.update_layout(title=f"Market Microstructure Strategy — {chosen}", template="plotly_dark", hovermode="x unified", height=500)
-                        st.plotly_chart(fig_eq, use_container_width=True)
-
-                        st.subheader("Microstructure Trade Log")
-                        if trades.empty:
-                            st.info("No closed/open trades generated by this strategy in the selected date range.")
+                        st.subheader("Microstructure Strategy Ranking")
+                        st.dataframe(rank_df, use_container_width=True)
+                        names = rank_df["Strategy"].tolist()
+                        if mm_manual:
+                            chosen = st.selectbox("Choose Microstructure Strategy", names, index=0, key="mm2_chosen")
                         else:
-                            try:
-                                trades = clean_overlapping_duplicate_trades(trades)
-                            except Exception:
-                                pass
-                            try:
-                                trades = apply_trade_log_timestamp_display(trades)
-                            except Exception:
-                                pass
-                            st.dataframe(trades.sort_values("Entry Date", ascending=False), use_container_width=True)
-                            st.download_button(
-                                "Download Microstructure Trade Log CSV",
-                                trades.to_csv(index=False),
-                                file_name=f"MicrostructureTradeLog_{TICKER}_{chosen.replace(' ', '_')}.csv",
-                                mime="text/csv",
-                                key="mm2_download_trade_log",
-                            )
+                            chosen = names[0]
+                            st.caption(f"Auto-selected strategy: **{chosen}**")
 
-                with st.expander("What each microstructure proxy means"):
-                    st.markdown("""
-- **Order Flow Toxicity Proxy:** OHLCV-based proxy for noisy/dangerous flow. It is not true VPIN or full order book toxicity.
-- **LOB Pressure Proxy:** Approximation from candle direction/range/volume. True LOB pressure needs Level 2/Level 3 data.
-- **Price Impact Z:** Amihud-style return per volume. High values mean price moves more for the same volume.
-- **VWAP/TWAP Execution Trend:** Price participation relative to VWAP/TWAP style benchmarks.
-- **Databento MBP-1:** Real top-of-book bid/ask pressure. It is better than Yahoo bid/ask, but still not full MBP-10 Level 2.
-                    """)
+                        bt = bt_results.get(chosen, {})
+                        eq = bt.get("equity_curve", pd.Series(dtype=float))
+                        bench = bt.get("benchmark_curve", pd.Series(dtype=float))
+                        rets = bt.get("returns", pd.Series(dtype=float))
+                        trades = bt.get("trades", pd.DataFrame())
+                        if not eq.empty:
+                            strat_ret = ((eq.iloc[-1] / eq.iloc[0]) - 1.0) * 100 if eq.iloc[0] else 0.0
+                            bench_ret = ((bench.iloc[-1] / bench.iloc[0]) - 1.0) * 100 if not bench.empty and bench.iloc[0] else 0.0
+                            metrics = BacktestEngine.calculate_metrics(rets) if len(rets) > 1 else {}
+                            s1, s2, s3, s4 = st.columns(4)
+                            s1.metric("Strategy Return", f"{strat_ret:.2f}%")
+                            s2.metric("Benchmark Return", f"{bench_ret:.2f}%")
+                            s3.metric("Sharpe", f"{float(metrics.get('Sharpe Ratio', 0.0)):.2f}")
+                            s4.metric("Max Drawdown", f"{float(metrics.get('Max Drawdown', 0.0))*100:.2f}%")
+
+                            fig_eq = go.Figure()
+                            fig_eq.add_trace(go.Scatter(x=eq.index, y=eq, mode="lines", name="Strategy Equity"))
+                            if not bench.empty:
+                                fig_eq.add_trace(go.Scatter(x=bench.index, y=bench, mode="lines", name="Buy & Hold"))
+                            fig_eq.update_layout(title=f"Market Microstructure Strategy — {chosen}", template="plotly_dark", hovermode="x unified", height=500)
+                            st.plotly_chart(fig_eq, use_container_width=True)
+
+                            st.subheader("Microstructure Trade Log")
+                            if trades.empty:
+                                st.info("No closed/open trades generated by this strategy in the selected date range.")
+                            else:
+                                try:
+                                    trades = clean_overlapping_duplicate_trades(trades)
+                                except Exception:
+                                    pass
+                                try:
+                                    trades = apply_trade_log_timestamp_display(trades)
+                                except Exception:
+                                    pass
+                                st.dataframe(trades.sort_values("Entry Date", ascending=False), use_container_width=True)
+                                st.download_button(
+                                    "Download Microstructure Trade Log CSV",
+                                    trades.to_csv(index=False),
+                                    file_name=f"MicrostructureTradeLog_{TICKER}_{chosen.replace(' ', '_')}.csv",
+                                    mime="text/csv",
+                                    key="mm2_download_trade_log",
+                                )
+
+                    with st.expander("What each microstructure proxy means"):
+                        st.markdown("""
+    - **Order Flow Toxicity Proxy:** OHLCV-based proxy for noisy/dangerous flow. It is not true VPIN or full order book toxicity.
+    - **LOB Pressure Proxy:** Approximation from candle direction/range/volume. True LOB pressure needs Level 2/Level 3 data.
+    - **Price Impact Z:** Amihud-style return per volume. High values mean price moves more for the same volume.
+    - **VWAP/TWAP Execution Trend:** Price participation relative to VWAP/TWAP style benchmarks.
+    - **Databento MBP-1:** Real top-of-book bid/ask pressure. It is better than Yahoo bid/ask, but still not full MBP-10 Level 2.
+                        """)
 except Exception as e:
     try:
         with tab20:
