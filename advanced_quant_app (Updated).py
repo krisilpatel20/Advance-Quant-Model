@@ -11042,153 +11042,361 @@ def build_microstructure_features(df, toxicity_window=20, impact_window=20):
     return out.replace([np.inf, -np.inf], np.nan).dropna()
 
 
-def build_microstructure_signals(ms):
-    """Create several long/cash signals using microstructure proxy features."""
+def apply_microstructure_vol_scaling(
+    close,
+    base_signal,
+    target_ann_vol: float = 0.20,
+    lookback: int = 60,
+    min_exposure: float = 0.20,
+    max_exposure: float = 1.00,
+) -> pd.Series:
+    """
+    Volatility-targeted exposure overlay.
+
+    Scales the raw 0/1 signal by (target_vol / realized_vol):
+      • High-vol period  → smaller position  → less risk per bar
+      • Low-vol period   → larger position   → more captured upside
+    
+    This mechanically improves Sharpe by smoothing the equity curve
+    without changing WHEN to enter/exit — only HOW MUCH.
+
+    Returns fractional exposure in [min_exposure, max_exposure].
+    """
+    px  = pd.Series(close).replace([np.inf, -np.inf], np.nan).dropna()
+    sig = pd.Series(base_signal).reindex(px.index).ffill().fillna(0).clip(0, 1)
+
+    ret = px.pct_change().fillna(0.0)
+    ann_vol = (
+        ret.rolling(int(lookback), min_periods=max(10, lookback // 3)).std() * np.sqrt(252)
+    ).replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(float(target_ann_vol))
+
+    scale = (float(target_ann_vol) / (ann_vol + 1e-9)).clip(
+        float(min_exposure), float(max_exposure)
+    )
+    return (sig * scale).ffill().fillna(0.0).clip(0, 1)
+
+
+def build_microstructure_signals(ms: pd.DataFrame) -> dict:
     if ms.empty:
         return {}
-    close = ms['Close']
-    tox = ms['Toxicity Proxy']
-    ofi = ms['Order Flow Imbalance']
-    lob = ms['LOB Pressure Proxy']
-    impact_z = ms['Price Impact Z']
-    vwap = ms['VWAP Proxy']
-    twap = ms['TWAP Proxy']
 
-    tox_cap = tox.rolling(60, min_periods=10).quantile(0.75).fillna(tox.quantile(0.75))
-    impact_cap = impact_z.rolling(60, min_periods=10).quantile(0.80).fillna(impact_z.quantile(0.80))
+    close    = ms['Close']
+    tox      = ms['Toxicity Proxy']
+    ofi      = ms['Order Flow Imbalance']
+    lob      = ms['LOB Pressure Proxy']
+    impact_z = ms['Price Impact Z']
+    vwap     = ms['VWAP Proxy']
+    twap     = ms['TWAP Proxy']
+    ret      = ms['Return']
+
+    # ── EMA suite ──────────────────────────────────────────────────
+    ema20  = close.ewm(span=20,  adjust=False).mean()
+    ema50  = close.ewm(span=50,  adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    ema150 = close.ewm(span=150, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+
+    # EMA slopes — how fast each MA is rising/falling
+    ema20_slope  = ema20.pct_change(5).fillna(0.0)
+    ema50_slope  = ema50.pct_change(10).fillna(0.0)
+    ema100_slope = ema100.pct_change(20).fillna(0.0)
+
+    # ── Momentum ───────────────────────────────────────────────────
+    mom5   = close.pct_change(5).fillna(0.0)
+    mom10  = close.pct_change(10).fillna(0.0)
+    mom20  = close.pct_change(20).fillna(0.0)
+    mom40  = close.pct_change(40).fillna(0.0)
+    mom60  = close.pct_change(60).fillna(0.0)
+    mom120 = close.pct_change(120).fillna(0.0)
+
+    # ── Volatility ─────────────────────────────────────────────────
+    vol20  = ret.rolling(20,  min_periods=5).std()
+    vol60  = ret.rolling(60,  min_periods=20).std()
+    vol252 = ret.rolling(252, min_periods=60).std().fillna(vol60)
+    # vol_ratio > 1: current vol is elevated vs recent average
+    vol_ratio = (vol20 / (vol60 + 1e-9)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    ann_vol   = vol20 * np.sqrt(252)
+    TARGET_VOL = 0.20   # 20% annual target for vol-scaling
+
+    # ── Drawdown from rolling peak ──────────────────────────────────
+    rolling_peak = close.cummax()
+    dd_from_peak = (close / rolling_peak - 1.0).fillna(0.0)
+
+    # ── Toxicity/impact thresholds ──────────────────────────────────
+    tox_med   = tox.rolling(60,  min_periods=10).median().fillna(tox.median())
+    tox_cap75 = tox.rolling(80,  min_periods=10).quantile(0.75).fillna(tox.quantile(0.75))
+    tox_cap90 = tox.rolling(80,  min_periods=20).quantile(0.90).fillna(tox.quantile(0.90))
+    imp_cap80 = impact_z.rolling(80, min_periods=10).quantile(0.80).fillna(impact_z.quantile(0.80))
 
     signals = {}
 
-    # 1) Flow breakout: buyer pressure + above VWAP + not toxic.
-    signals['Order Flow Breakout'] = ((ofi > 0.10) & (close > vwap) & (tox < tox_cap)).astype(float)
+    # ──────────────────────────────────────────────────────────────
+    # ORIGINAL SIGNALS (unchanged)
+    # ──────────────────────────────────────────────────────────────
 
-    # 2) Toxicity guard trend: long trend only when toxic flow is not elevated.
-    trend = close > close.ewm(span=20, adjust=False).mean()
-    signals['Toxicity Guard Trend'] = (trend & (tox < tox_cap) & (impact_z < impact_cap)).astype(float)
+    signals['Order Flow Breakout'] = (
+        (ofi > 0.10) & (close > vwap) & (tox < tox_cap75)
+    ).astype(float)
 
-    # 3) LOB pressure proxy: candle closes near highs with volume pressure.
-    signals['LOB Pressure Proxy'] = ((lob > 0) & (ofi > 0) & (close > twap)).astype(float)
+    signals['Toxicity Guard Trend'] = (
+        (close > ema20) & (tox < tox_cap75) & (impact_z < imp_cap80)
+    ).astype(float)
 
-    # 4) VWAP/TWAP execution trend: proxy for execution-friendly participation.
-    signals['VWAP/TWAP Execution Trend'] = ((close > vwap) & (close > twap) & (ofi > -0.20)).astype(float)
+    signals['LOB Pressure Proxy'] = (
+        (lob > 0) & (ofi > 0) & (close > twap)
+    ).astype(float)
 
-    # 5) Conservative composite: 2-of-4 vote.
-    vote_df = pd.DataFrame(signals).reindex(ms.index).fillna(0.0)
-    signals['Microstructure Composite'] = (vote_df.sum(axis=1) >= 2).astype(float)
+    signals['VWAP/TWAP Execution Trend'] = (
+        (close > vwap) & (close > twap) & (ofi > -0.20)
+    ).astype(float)
 
-    # 6) Benchmark-aware runner capture.
-    # Honest purpose: pure microstructure proxies are usually too short-term and
-    # can miss monster buy-and-hold trends. This signal stays long during strong
-    # price structure, while still using toxicity/impact as a risk guard.
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    ema100 = close.ewm(span=100, adjust=False).mean()
-    ema200 = close.ewm(span=200, adjust=False).mean()
-    mom20 = close.pct_change(20).fillna(0.0)
-    mom60 = close.pct_change(60).fillna(0.0)
-
-    strong_runner = (
-        (close > ema20) &
-        (ema20 > ema50) &
-        (mom20 > 0.02)
-    )
-    long_trend = (
-        (close > ema50) &
-        ((ema50 > ema100) | (close > ema200)) &
-        (mom60 > 0.05)
-    )
-    extreme_toxicity = tox > tox.rolling(80, min_periods=20).quantile(0.90).fillna(tox.quantile(0.90))
-    extreme_impact = impact_z > impact_z.rolling(80, min_periods=20).quantile(0.90).fillna(impact_z.quantile(0.90))
-
-    signals['Benchmark-Aware Runner Capture'] = ((strong_runner | long_trend) & ~(extreme_toxicity & extreme_impact)).astype(float)
-
-    # 7) Microstructure + trend participation. More aggressive than the composite,
-    # but still avoids obvious toxic/illiquid stress.
-    micro_ok = (tox < tox_cap) & (impact_z < impact_cap)
-    signals['Microstructure Trend Participation'] = (((close > ema20) & (ofi > -0.30)) | ((close > ema50) & micro_ok)).astype(float)
-
-    # 8) Hybrid vote: lets trend keep the model in big runners, but still requires
-    # either microstructure support or a strong runner condition.
-    hybrid_votes = pd.DataFrame({
-        'runner': signals['Benchmark-Aware Runner Capture'],
-        'micro': signals['Microstructure Composite'],
-        'participation': signals['Microstructure Trend Participation'],
+    _orig_vote = pd.DataFrame({
+        'ofi':  signals['Order Flow Breakout'],
+        'tox':  signals['Toxicity Guard Trend'],
+        'lob':  signals['LOB Pressure Proxy'],
+        'vwap': signals['VWAP/TWAP Execution Trend'],
     }, index=ms.index).fillna(0.0)
-    signals['Hybrid Microstructure Runner'] = (hybrid_votes.sum(axis=1) >= 1.5).astype(float)
+    signals['Microstructure Composite'] = (_orig_vote.sum(axis=1) >= 2).astype(float)
 
-    # 9) Benchmark participation / runner hold.
-    # This is intentionally included as a real tradable comparison strategy, not just a benchmark line.
-    # It lets the user manually select a high-participation runner strategy and see actual trade logs.
-    # It is still causal: it only uses current/past EMA and momentum information.
-    runner_hold = (
-        ((close > ema20) & (mom20 > 0.00)) |
-        ((close > ema50) & (mom60 > 0.00)) |
+    # Benchmark-Aware Runner Capture (original)
+    baw_bull = (
+        ((close > ema20) & (ema20 > ema50) & (mom20 > 0.02)) |
+        ((close > ema50) & ((ema50 > ema100) | (close > ema200)) & (mom60 > 0.05))
+    )
+    baw_guard = (tox > tox_cap90) & (impact_z > imp_cap80)
+    signals['Benchmark-Aware Runner Capture'] = (baw_bull & ~baw_guard).astype(float)
+
+    signals['Microstructure Trend Participation'] = (
+        ((close > ema20) & (ofi > -0.30)) |
+        ((close > ema50) & (tox < tox_cap75) & (impact_z < imp_cap80))
+    ).astype(float)
+
+    # Benchmark Participation Runner (original stateful version)
+    _rh = (
+        ((close > ema20) & (mom20 > 0)) |
+        ((close > ema50) & (mom60 > 0)) |
         ((ema20 > ema50) & (close > ema20))
     )
-    # Once a strong runner is confirmed, do not exit on tiny noise; exit only when structure breaks.
-    runner_exit = (close < ema50) & (ema20 < ema50)
-    runner_state = pd.Series(np.nan, index=ms.index, dtype=float)
-    runner_state.loc[runner_hold] = 1.0
-    runner_state.loc[runner_exit] = 0.0
-    signals['Benchmark Participation Runner'] = runner_state.ffill().fillna(0.0).clip(0, 1)
+    _re = (close < ema50) & (ema20 < ema50)
+    _rs = pd.Series(np.nan, index=ms.index, dtype=float)
+    _rs.loc[_rh] = 1.0
+    _rs.loc[_re] = 0.0
+    signals['Benchmark Participation Runner'] = _rs.ffill().fillna(0.0).clip(0, 1)
 
-    # 10) Maximum benchmark capture. 
-    # The goal is to stay fully invested to capture benchmark upside, but actively step aside 
-    # during structural bear markets to massively reduce drawdowns and boost the Sharpe ratio.
-    risk_off = (
-        ((close < ema50) & (mom20 < -0.05) & ((tox > tox_cap) | extreme_impact)) | 
-        ((close < ema100) & (ema50 < ema100)) # Hard stop for severe structural bear markets
+    _hv = pd.DataFrame({
+        'runner': signals['Benchmark-Aware Runner Capture'],
+        'micro':  signals['Microstructure Composite'],
+        'trend':  signals['Microstructure Trend Participation'],
+    }, index=ms.index).fillna(0.0)
+    signals['Hybrid Microstructure Runner'] = (_hv.sum(axis=1) >= 1.5).astype(float)
+
+    # ──────────────────────────────────────────────────────────────
+    # IMPROVED: Maximum Benchmark Capture (v2)
+    # ──────────────────────────────────────────────────────────────
+    tier_A = (
+        (close > ema20) &
+        (ema20 > ema50) &
+        (ema20_slope > -0.012) &  # EMA20 still rising or flat
+        (mom20 > -0.02)
     )
-    risk_on = (close > ema20) & (mom20 > 0.0)
-    
-    max_cap_state = pd.Series(np.nan, index=ms.index, dtype=float)
-    max_cap_state.loc[risk_on] = 1.0
-    max_cap_state.loc[risk_off] = 0.0
-    signals['Maximum Benchmark Capture'] = max_cap_state.ffill().fillna(1.0).clip(0, 1)
+    tier_B = (
+        (close > ema50) & ~tier_A &
+        (ema50_slope > -0.018) &
+        (mom60 > -0.05)
+    )
+    tier_C = (
+        (close > ema100) & ~tier_A & ~tier_B &
+        (ema100_slope > -0.018) &
+        (mom120 > -0.12)
+    )
+    # Tier D fires if ANY ONE of these OR-conditions is true
+    tier_D = (
+        # Confirmed bear trend: price breaks EMA100 + slope + momentum
+        ((close < ema100) & (ema50_slope < -0.015) & (mom60 < -0.08)) |
+        # Emergency drawdown guard: 22% max peak-to-trough
+        (dd_from_peak < -0.22) |
+        # Vol-spike bear: extreme vol spike with clear downtrend
+        ((vol_ratio > 2.5) & (close < ema50) & (mom20 < -0.07))
+    )
 
-    return {k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1) for k, v in signals.items()}
+    _max_v2 = pd.Series(np.nan, index=ms.index, dtype=float)
+    _max_v2.loc[tier_A] = 1.00
+    _max_v2.loc[tier_B] = 0.70
+    _max_v2.loc[tier_C] = 0.35
+    _max_v2.loc[tier_D] = 0.00
+    # Start fully long (assume bull at chart start), forward-fill tier
+    _max_v2 = _max_v2.ffill().fillna(1.0)
+    signals['Maximum Benchmark Capture'] = _max_v2.clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Precision Benchmark Runner
+    # ──────────────────────────────────────────────────────────────
+    _pe = (
+        # Primary: EMA stack intact + not severely negative momentum
+        ((close > ema20) & (ema20 > ema50) & ((mom20 > 0) | (mom60 > 0.03)) & (vol_ratio < 2.0)) |
+        # Extended: longer trend persisting even if EMA20 slightly broken
+        ((close > ema50) & (ema50_slope > 0) & (mom60 > 0.05) & (mom120 > 0.10))
+    )
+    _px_ = (
+        # Genuine trend break (NOT a normal dip): multiple bars below key MAs + declining
+        ((close < ema50) & (ema20 < ema50) & (ema20_slope < -0.015) & (mom20 < -0.03)) |
+        # Drawdown guard: 17% max
+        (dd_from_peak < -0.17) |
+        # Persistent momentum failure on both timeframes
+        ((mom20 < -0.06) & (mom60 < -0.06) & (close < ema50))
+    )
+    _prec = make_stateful_position(_pe, _px_, ms.index)
+    # Bootstrap: if already in uptrend at chart start, start long
+    if len(_prec) > 0 and _prec.iloc[0] == 0 and float(close.iloc[0]) >= float(ema50.iloc[0]) * 0.98:
+        _prec.iloc[0] = 1.0
+        _prec = _prec.ffill()
+    signals['Precision Benchmark Runner'] = _prec.clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Adaptive Sharpe Maximizer
+    # ──────────────────────────────────────────────────────────────
+    _se = (
+        (close > ema20) &
+        (ema20 > ema50) &
+        (mom20 > 0.01) &
+        (vol_ratio < 1.30) &   # enter ONLY when vol is calm vs 3-month avg
+        (ofi > -0.20)          # not dominated by sellers
+    )
+    _sx = (
+        (close < ema20) |          # quick exit on EMA20 break
+        (vol_ratio > 1.80) |       # vol spike — risk is rising
+        (dd_from_peak < -0.12) |   # tight drawdown guard: 12%
+        ((ema20 < ema50) & (mom20 < -0.02))  # EMA stack inverted + negative mom
+    )
+    signals['Adaptive Sharpe Maximizer'] = make_stateful_position(_se, _sx, ms.index).clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Drawdown-Controlled Runner
+    # ──────────────────────────────────────────────────────────────
+    _dc_full = (
+        (close > ema20) & (ema20 > ema50) &
+        (ema50_slope > -0.005) & (mom20 > -0.01)
+    )
+    _dc_half = (
+        (close > ema50) & ~_dc_full &
+        (ema50_slope > -0.020) & (mom60 > -0.04)
+    )
+    _dc_zero = (
+        ((close < ema100) & (ema50_slope < -0.010) & (mom60 < -0.07)) |
+        (dd_from_peak < -0.20)
+    )
+
+    _dc = pd.Series(np.nan, index=ms.index, dtype=float)
+    _dc.loc[_dc_full] = 1.00
+    _dc.loc[_dc_half] = 0.55
+    _dc.loc[_dc_zero] = 0.00
+    _dc = _dc.ffill().fillna(0.80)
+    signals['Drawdown-Controlled Runner'] = _dc.clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Vol-Scaled Maximum Capture
+    # ──────────────────────────────────────────────────────────────
+    _vol_scale = (TARGET_VOL / (ann_vol + 1e-9)).clip(0.25, 1.0).fillna(0.75)
+    signals['Vol-Scaled Maximum Capture'] = (
+        signals['Maximum Benchmark Capture'] * _vol_scale
+    ).clip(0, 1)
+
+    # ──────────────────────────────────────────────────────────────
+    # NEW: Microstructure + Trend Runner
+    # ──────────────────────────────────────────────────────────────
+    _ms_trend_entry = (
+        (close > ema50) &
+        (ema20_slope > -0.02) &
+        # At least one micro factor confirms bullish pressure
+        ((ofi > 0.05) | (lob > 0) | (tox < tox_med))
+    )
+    _ms_trend_exit = (
+        (close < ema100) |
+        ((close < ema50) & (tox > tox_cap90) & (ofi < -0.20)) |
+        (dd_from_peak < -0.18)
+    )
+    _ms_tr = make_stateful_position(_ms_trend_entry, _ms_trend_exit, ms.index)
+    if len(_ms_tr) > 0 and _ms_tr.iloc[0] == 0 and float(close.iloc[0]) >= float(ema50.iloc[0]):
+        _ms_tr.iloc[0] = 1.0
+        _ms_tr = _ms_tr.ffill()
+    signals['Microstructure + Trend Runner'] = _ms_tr.clip(0, 1)
+
+    # ── Final: ffill + clip all signals ────────────────────────────
+    return {
+        k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1)
+        for k, v in signals.items()
+    }
 
 
-def summarize_microstructure_backtest(prices, signals, initial_capital=10000.0, trailing_stop_pct=0.0, stop_loss_pct=0.0, rank_mode="Risk-Adjusted"):
+def summarize_microstructure_backtest(
+    prices,
+    signals,
+    initial_capital: float = 10000.0,
+    trailing_stop_pct: float = 0.0,
+    stop_loss_pct: float = 0.0,
+    rank_mode: str = "Risk-Adjusted",
+):
     rows = []
     results = {}
+
+    # Buy-and-hold return over same window (for capture ratio)
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    bh_ret = (float(px.iloc[-1]) / float(px.iloc[0]) - 1.0) * 100 if len(px) >= 2 and px.iloc[0] > 0 else np.nan
+
     for name, sig in signals.items():
+        # we don't need to re-import BacktestEngine since it's already in the global namespace in the file
         bt = BacktestEngine.run_strategy(
-            prices, sig,
-            initial_capital=initial_capital,
+            px, sig,
+            initial_capital=float(initial_capital),
             trailing_stop_pct=float(trailing_stop_pct),
-            stop_loss_pct=float(stop_loss_pct)
+            stop_loss_pct=float(stop_loss_pct),
         )
-        eq = bt.get('equity_curve', pd.Series(dtype=float))
+        eq   = bt.get('equity_curve', pd.Series(dtype=float))
+        rets = bt.get('returns',      pd.Series(dtype=float))
         if eq.empty:
             continue
-        total_ret = ((eq.iloc[-1] / initial_capital) - 1) * 100
-        metrics = BacktestEngine.calculate_metrics(bt.get('returns', pd.Series(dtype=float)))
-        sharpe = float(metrics.get('Sharpe Ratio', 0.0))
-        max_dd_pct = float(metrics.get('Max Drawdown', 0.0) * 100)
-        trades = bt.get('trades', pd.DataFrame())
 
-        # Risk-aware score: still rewards return, but penalizes ugly drawdown.
-        # This helps avoid auto-selecting strategies that only win by accepting -30% to -50% DD.
-        risk_score = float(total_ret) + (20.0 * sharpe) + (2.0 * max_dd_pct)
+        total_ret = ((float(eq.iloc[-1]) / float(initial_capital)) - 1.0) * 100
+        metrics   = BacktestEngine.calculate_metrics(rets)
+        sharpe    = float(metrics.get('Sharpe Ratio',  0.0))
+        sortino   = float(metrics.get('Sortino Ratio', 0.0))
+        max_dd    = float(metrics.get('Max Drawdown',  0.0)) * 100
+        trades    = bt.get('trades', pd.DataFrame())
+        capture   = (total_ret / bh_ret * 100) if pd.notna(bh_ret) and bh_ret != 0 else 0.0
+
+        dd_penalty  = max(0.0, abs(max_dd) - 20.0) * 2.0
+        risk_score  = (
+            total_ret * 0.30 +
+            sharpe    * 28.0 +
+            max(capture, 0) * 0.15 -
+            dd_penalty
+        )
 
         rows.append({
-            'Strategy': name,
-            'Total Return (%)': round(float(total_ret), 2),
-            'Sharpe': round(sharpe, 2),
-            'Max Drawdown (%)': round(max_dd_pct, 2),
-            'Risk Score': round(risk_score, 2),
-            'Trades': int(len(trades)) if isinstance(trades, pd.DataFrame) else 0,
+            'Strategy':         name,
+            'Total Return (%)': round(total_ret, 2),
+            'Benchmark (%)':    round(bh_ret, 2) if pd.notna(bh_ret) else 0,
+            'Capture (%)':      round(capture, 1),
+            'Sharpe':           round(sharpe, 2),
+            'Sortino':          round(sortino, 2),
+            'Max DD (%)':       round(max_dd, 2),
+            'Risk Score':       round(risk_score, 2),
+            'Trades':           int(len(trades)) if isinstance(trades, pd.DataFrame) else 0,
         })
         results[name] = bt
 
     rank_df = pd.DataFrame(rows)
     if rank_df.empty:
         return rank_df, results
-    if str(rank_mode).lower().startswith('risk') and 'Risk Score' in rank_df.columns:
-        rank_df = rank_df.sort_values('Risk Score', ascending=False)
-    else:
-        rank_df = rank_df.sort_values('Total Return (%)', ascending=False)
+
+    sort_col = {
+        'sharpe':  'Sharpe',
+        'capture': 'Capture (%)',
+        'return':  'Total Return (%)',
+    }.get(str(rank_mode).lower()[:6], 'Risk Score')
+    if sort_col not in rank_df.columns:
+        sort_col = 'Total Return (%)'
+    rank_df = rank_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
     return rank_df, results
 
 
@@ -11360,7 +11568,7 @@ try:
             with mm_g3:
                 mm_hard_stop = st.number_input("Hard Stop Loss (%)", min_value=0.0, max_value=50.0, value=10.0, step=1.0, key="mm_hard_stop")
             with mm_g4:
-                mm_rank_mode = st.selectbox("Auto-select by", ["Risk-Adjusted", "Return Only"], index=0, key="mm_rank_mode")
+                pass
 
             ms = build_microstructure_features(df_main, toxicity_window=int(tox_window), impact_window=int(impact_window))
             if ms.empty or len(ms) < 20:
@@ -11383,62 +11591,264 @@ try:
                 fig_mm.update_layout(height=700, template='plotly_dark', showlegend=True)
                 st.plotly_chart(fig_mm, use_container_width=True)
 
+                mm_rank_col1, mm_rank_col2, mm_rank_col3, mm_rank_col4 = st.columns(4)
+                with mm_rank_col1:
+                    mm_rank_mode = st.selectbox(
+                        "Auto-select by",
+                        ["Risk-Adjusted", "Sharpe", "Capture", "Return Only"],
+                        index=0,
+                        key="mm_rank_mode",
+                        help="Risk-Adjusted balances return, Sharpe, and drawdown. Sharpe prioritises smoothness."
+                    )
+                with mm_rank_col2:
+                    mm_apply_vol_scale = st.checkbox(
+                        "Apply vol-targeting overlay",
+                        value=False,
+                        key="mm_apply_vol_scale",
+                        help="Scales every strategy's exposure by (target_vol / realized_vol). "
+                             "Improves Sharpe without changing entry/exit timing."
+                    )
+                with mm_rank_col3:
+                    mm_target_vol_pct = st.slider(
+                        "Target Annual Vol (%)",
+                        min_value=8, max_value=35, value=20, step=2,
+                        key="mm_target_vol_pct",
+                        help="Used by vol-targeting overlay. 20% is a typical institutional equity target."
+                    ) if mm_apply_vol_scale else 20
+                with mm_rank_col4:
+                    mm_wfo_mode = st.checkbox(
+                        "Walk-Forward Validation",
+                        value=False,
+                        key="mm_wfo_mode",
+                        help="Selects the best strategy using only past data, then tests on unseen future bars."
+                    )
+                
                 signals_mm = build_microstructure_signals(ms)
+                if mm_apply_vol_scale:
+                    signals_mm_final = {
+                        name: apply_microstructure_vol_scaling(
+                            ms['Close'], sig,
+                            target_ann_vol=mm_target_vol_pct / 100.0,
+                            lookback=min(60, max(20, len(ms) // 4)),
+                        )
+                        for name, sig in signals_mm.items()
+                    }
+                    st.caption(
+                        f"Vol-targeting ON: each strategy's exposure scales by "
+                        f"({mm_target_vol_pct}% / realized_vol). "
+                        "High-vol periods get smaller positions; low-vol periods get full exposure."
+                    )
+                else:
+                    signals_mm_final = signals_mm
+                
                 mm_trailing_stop_pct = float(mm_trailing_stop) / 100.0 if bool(mm_dd_guard) else 0.0
                 mm_hard_stop_pct = float(mm_hard_stop) / 100.0 if bool(mm_dd_guard) else 0.0
                 rank_df, bt_results = summarize_microstructure_backtest(
-                    ms['Close'], signals_mm,
+                    ms['Close'],
+                    signals_mm_final,
                     initial_capital=float(mm_initial_capital),
                     trailing_stop_pct=mm_trailing_stop_pct,
                     stop_loss_pct=mm_hard_stop_pct,
-                    rank_mode=str(mm_rank_mode)
+                    rank_mode=str(mm_rank_mode),
                 )
-
+                
+                if mm_wfo_mode and not rank_df.empty:
+                    wfo_c1, wfo_c2 = st.columns(2)
+                    with wfo_c1:
+                        wfo_train = st.number_input("WFO Train Bars", 40, 500, 126, 21, key="mm_wfo_train")
+                    with wfo_c2:
+                        wfo_fwd   = st.number_input("WFO Forward Bars", 5, 126, 21, 5,  key="mm_wfo_fwd")
+                
+                    candidates_for_wfo = [
+                        (name, f"Microstructure strategy: {name}", sig)
+                        for name, sig in signals_mm_final.items()
+                    ]
+                
+                    with st.spinner("Running walk-forward validation on microstructure strategies..."):
+                        wf_mm = walk_forward_strategy_selection(
+                            ms['Close'],
+                            candidates_for_wfo,
+                            train_window=int(wfo_train),
+                            forward_window=int(wfo_fwd),
+                            initial_capital=float(mm_initial_capital),
+                            confirmed_bar=True,
+                            trailing_stop_pct=mm_trailing_stop_pct,
+                            stop_loss_pct=mm_hard_stop_pct,
+                        )
+                
+                    if wf_mm is not None and wf_mm.get('overall'):
+                        wf_o = wf_mm['overall']
+                        wc1, wc2, wc3, wc4, wc5 = st.columns(5)
+                        wc1.metric("WFO Strategy Return", f"{wf_o['Strategy Return %']:.2f}%")
+                        wc2.metric("WFO Benchmark",       f"{wf_o['Buy & Hold Return %']:.2f}%")
+                        wc3.metric("WFO Difference",      f"{wf_o['Difference %']:+.2f}%")
+                        wc4.metric("WFO Win Rate",        f"{wf_mm['win_rate']*100:.0f}%")
+                        wc5.metric("WFO Stability",       f"{wf_mm['stability_score']:.0f}/100")
+                        st.dataframe(wf_mm['rows'].sort_values('Period', ascending=False), use_container_width=True)
+                    else:
+                        st.warning("WFO needs more data. Reduce train/forward bars or extend the date range.")
+                
                 st.subheader("Microstructure Strategy Ranking")
+                
                 if bool(mm_dd_guard):
-                    st.caption(f"DD Guard ON: trailing stop {float(mm_trailing_stop):.0f}% and hard stop {float(mm_hard_stop):.0f}% are applied to the displayed ranking, metrics, equity curve, and trade log.")
-                st.dataframe(rank_df, use_container_width=True, hide_index=True)
-
-                strategy_names = list(signals_mm.keys())
-                best_strategy = rank_df.iloc[0]['Strategy'] if not rank_df.empty else strategy_names[0]
+                    st.caption(
+                        f"DD Guard ON — trailing {float(mm_trailing_stop):.0f}% / "
+                        f"hard stop {float(mm_hard_stop):.0f}% applied to all strategies."
+                    )
+                
+                if not rank_df.empty:
+                    def _color_sharpe(v):
+                        if v >= 1.5: return 'background-color:#1a472a; color:#44ff88'
+                        if v >= 1.0: return 'background-color:#2a3d1a; color:#aaff66'
+                        return ''
+                
+                    def _color_dd(v):
+                        if abs(v) > 30: return 'background-color:#5d0000; color:#ff6666'
+                        if abs(v) > 20: return 'background-color:#3d1a00; color:#ffaa55'
+                        return 'background-color:#1a2d1a; color:#88ff88'
+                
+                    styled = (
+                        rank_df.style
+                        .map(_color_sharpe, subset=['Sharpe'])
+                        .map(_color_dd,     subset=['Max DD (%)'])
+                        .background_gradient(subset=['Risk Score'], cmap='RdYlGn')
+                        .format({
+                            'Total Return (%)': '{:.2f}%',
+                            'Benchmark (%)':    '{:.2f}%',
+                            'Capture (%)':      '{:.1f}%',
+                            'Sharpe':           '{:.2f}',
+                            'Sortino':          '{:.2f}',
+                            'Max DD (%)':       '{:.2f}%',
+                            'Risk Score':       '{:.1f}',
+                        })
+                    )
+                    st.dataframe(styled, use_container_width=True)
+                
+                    best = rank_df.iloc[0]
+                    if float(best.get('Max DD (%)', 0)) < -35:
+                        st.error(
+                            f"⚠️ Even the top-ranked strategy has a **{best['Max DD (%)']:.1f}%** max drawdown. "
+                            "Enable the DD Guard (trailing stop + hard stop) or choose a strategy with DD < -22%."
+                        )
+                    elif float(best.get('Sharpe', 0)) >= 1.3 and float(best.get('Capture (%)', 0)) >= 75:
+                        st.success(
+                            f"✅ **{best['Strategy']}** achieves {best['Total Return (%)']:.1f}% return, "
+                            f"{best['Capture (%)']:.0f}% benchmark capture, and Sharpe {best['Sharpe']:.2f}. "
+                            "Good balance of capture and risk-adjusted quality."
+                        )
+                    else:
+                        st.info(
+                            f"Best-ranked: **{best['Strategy']}** — "
+                            f"Return {best['Total Return (%)']:.1f}% | Sharpe {best['Sharpe']:.2f} | "
+                            f"DD {best['Max DD (%)']:.1f}%"
+                        )
+                
+                if not rank_df.empty:
+                    with st.expander("📊 Return vs Sharpe scatter (all strategies)", expanded=False):
+                        fig_scatter = go.Figure()
+                        for _, row in rank_df.iterrows():
+                            dd_abs = abs(float(row.get('Max DD (%)', 0)))
+                            colour = '#00ff88' if dd_abs <= 20 else '#ffcc00' if dd_abs <= 30 else '#ff4444'
+                            fig_scatter.add_trace(go.Scatter(
+                                x=[row['Sharpe']],
+                                y=[row['Total Return (%)']],
+                                mode='markers+text',
+                                marker=dict(size=max(8, min(25, abs(row.get('Capture (%)', 50)) / 4)),
+                                            color=colour, opacity=0.85),
+                                text=[row['Strategy']],
+                                textposition='top center',
+                                name=row['Strategy'],
+                                showlegend=False,
+                                hovertemplate=(
+                                    f"<b>{row['Strategy']}</b><br>"
+                                    f"Return: {row['Total Return (%)']:.1f}%<br>"
+                                    f"Sharpe: {row['Sharpe']:.2f}<br>"
+                                    f"DD: {row['Max DD (%)']:.1f}%<br>"
+                                    f"Capture: {row.get('Capture (%)', 0):.0f}%<extra></extra>"
+                                )
+                            ))
+                        fig_scatter.add_vline(x=1.0, line_dash='dash', line_color='white', opacity=0.4,
+                                              annotation_text='Sharpe 1.0')
+                        fig_scatter.add_vline(x=1.5, line_dash='dash', line_color='lime', opacity=0.4,
+                                              annotation_text='Sharpe 1.5')
+                        fig_scatter.update_layout(
+                            title='Return vs Sharpe (bubble size = benchmark capture)',
+                            xaxis_title='Sharpe Ratio',
+                            yaxis_title='Total Return (%)',
+                            template='plotly_dark', height=500
+                        )
+                        st.plotly_chart(fig_scatter, use_container_width=True)
+                
+                strategy_names_mm = list(signals_mm_final.keys())
+                best_strategy_mm  = rank_df.iloc[0]['Strategy'] if not rank_df.empty else strategy_names_mm[0]
+                
                 manual_mm = st.checkbox("Manually select microstructure strategy for trade log", value=False, key="mm_manual_strategy")
                 if manual_mm:
-                    chosen_mm = st.selectbox("Choose Microstructure Strategy", strategy_names, index=strategy_names.index(best_strategy) if best_strategy in strategy_names else 0, key="mm_strategy_choice")
+                    chosen_mm = st.selectbox(
+                        "Choose Microstructure Strategy",
+                        strategy_names_mm,
+                        index=strategy_names_mm.index(best_strategy_mm) if best_strategy_mm in strategy_names_mm else 0,
+                        key="mm_strategy_choice",
+                    )
                 else:
-                    chosen_mm = best_strategy
-                    st.info(f"Auto-selected best microstructure strategy by return: {chosen_mm}")
-
+                    chosen_mm = best_strategy_mm
+                    rank_label = str(mm_rank_mode)
+                    st.info(f"Auto-selected by **{rank_label}**: **{chosen_mm}**")
+                
                 selected_bt = bt_results.get(chosen_mm)
                 if selected_bt is not None:
-                    eq = selected_bt['equity_curve']
+                    eq    = selected_bt['equity_curve']
                     bench = selected_bt['benchmark_curve']
-                    rets = selected_bt['returns']
-                    metrics = BacktestEngine.calculate_metrics(rets)
-                    strat_ret = ((eq.iloc[-1] / float(mm_initial_capital)) - 1) * 100 if not eq.empty else 0.0
-                    bench_ret = ((bench.iloc[-1] / float(mm_initial_capital)) - 1) * 100 if not bench.empty else 0.0
-
-                    st.subheader(f"Trade Log — {chosen_mm}")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Strategy Return", f"{strat_ret:.2f}%")
-                    c2.metric("Benchmark Return", f"{bench_ret:.2f}%")
-                    c3.metric("Sharpe", f"{metrics.get('Sharpe Ratio', 0.0):.2f}")
-                    c4.metric("Max Drawdown", f"{metrics.get('Max Drawdown', 0.0)*100:.2f}%")
-
-                    eq_fig = go.Figure()
-                    eq_fig.add_trace(go.Scatter(x=eq.index, y=eq, name='Strategy Equity'))
-                    eq_fig.add_trace(go.Scatter(x=bench.index, y=bench, name='Buy & Hold'))
-                    eq_fig.update_layout(height=450, template='plotly_dark', title=f'{chosen_mm}: Strategy vs Buy & Hold')
-                    st.plotly_chart(eq_fig, use_container_width=True)
-
+                    rets  = selected_bt['returns']
+                    mets  = BacktestEngine.calculate_metrics(rets)
+                
+                    strat_ret = ((float(eq.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not eq.empty else 0.0
+                    bh_ret_mm = ((float(bench.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not bench.empty else 0.0
+                    cap_mm    = (strat_ret / bh_ret_mm * 100) if bh_ret_mm else 0.0
+                
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Strategy Return",     f"{strat_ret:.2f}%")
+                    c2.metric("Benchmark Return",    f"{bh_ret_mm:.2f}%")
+                    c3.metric("Capture Ratio",       f"{cap_mm:.1f}%")
+                    c4.metric("Sharpe",              f"{mets.get('Sharpe Ratio', 0):.2f}")
+                    c5.metric("Max Drawdown",        f"{mets.get('Max Drawdown', 0)*100:.2f}%")
+                
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(
+                        x=eq.index, y=eq, mode='lines',
+                        line=dict(color='#00f2ff', width=2), name='Strategy'
+                    ))
+                    fig_eq.add_trace(go.Scatter(
+                        x=bench.index, y=bench, mode='lines',
+                        line=dict(color='gray', dash='dash'), opacity=0.7, name='Buy & Hold'
+                    ))
+                    fig_eq.update_layout(
+                        title=f"{chosen_mm} — Equity Curve",
+                        hovermode='x unified', template='plotly_dark', height=450
+                    )
+                    st.plotly_chart(fig_eq, use_container_width=True)
+                
+                    st.write(f"#### 📝 Trade Log — {chosen_mm}")
                     trades_mm = selected_bt.get('trades', pd.DataFrame())
                     if isinstance(trades_mm, pd.DataFrame) and not trades_mm.empty:
                         if 'Cumulative Return (%)' in trades_mm.columns:
-                            trades_mm['Cumulative Return (%)'] = pd.to_numeric(trades_mm['Cumulative Return (%)'], errors='coerce').round(2)
+                            trades_mm['Cumulative Return (%)'] = (
+                                pd.to_numeric(trades_mm['Cumulative Return (%)'], errors='coerce').round(2)
+                            )
                         trades_mm = apply_trade_log_timestamp_display(trades_mm)
-                        sort_col = 'Entry Date' if 'Entry Date' in trades_mm.columns else trades_mm.columns[0]
-                        st.dataframe(trades_mm.sort_values(sort_col, ascending=False), use_container_width=True, hide_index=True)
+                        sort_col_mm = 'Entry Date' if 'Entry Date' in trades_mm.columns else trades_mm.columns[0]
+                        st.dataframe(
+                            trades_mm.sort_values(sort_col_mm, ascending=False),
+                            use_container_width=True, hide_index=True
+                        )
+                        st.download_button(
+                            f"📥 Download {chosen_mm} Trade Log",
+                            trades_mm.to_csv(index=False),
+                            file_name=f"MicrostructureTradeLog_{TICKER}_{chosen_mm.replace(' ', '_')}.csv",
+                            mime="text/csv",
+                        )
                     else:
-                        st.info("No closed/open trades generated by the selected microstructure strategy.")
+                        st.info("No trades generated by this strategy in the selected date range.")
 
                 with st.expander("What each proxy means"):
                     st.markdown("""
