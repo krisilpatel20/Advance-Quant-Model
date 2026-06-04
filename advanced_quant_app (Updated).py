@@ -11132,12 +11132,19 @@ def build_microstructure_signals(ms):
     runner_state.loc[runner_exit] = 0.0
     signals['Benchmark Participation Runner'] = runner_state.ffill().fillna(0.0).clip(0, 1)
 
-    # 10) Maximum benchmark capture. This is basically long exposure with a light trend brake.
-    # Use this when the goal is to get closest to buy-and-hold while still having a basic exit rule.
-    max_capture = pd.Series(1.0, index=ms.index, dtype=float)
-    risk_break = (close < ema100) & (mom60 < -0.10) & (tox > tox_cap)
-    max_capture.loc[risk_break] = 0.0
-    signals['Maximum Benchmark Capture'] = max_capture.ffill().fillna(1.0).clip(0, 1)
+    # 10) Maximum benchmark capture. 
+    # The goal is to stay fully invested to capture benchmark upside, but actively step aside 
+    # during structural bear markets to massively reduce drawdowns and boost the Sharpe ratio.
+    risk_off = (
+        ((close < ema50) & (mom20 < -0.05) & ((tox > tox_cap) | extreme_impact)) | 
+        ((close < ema100) & (ema50 < ema100)) # Hard stop for severe structural bear markets
+    )
+    risk_on = (close > ema20) & (mom20 > 0.0)
+    
+    max_cap_state = pd.Series(np.nan, index=ms.index, dtype=float)
+    max_cap_state.loc[risk_on] = 1.0
+    max_cap_state.loc[risk_off] = 0.0
+    signals['Maximum Benchmark Capture'] = max_cap_state.ffill().fillna(1.0).clip(0, 1)
 
     return {k: pd.Series(v, index=ms.index).ffill().fillna(0).clip(0, 1) for k, v in signals.items()}
 
