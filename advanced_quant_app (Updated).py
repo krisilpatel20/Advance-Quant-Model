@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -10551,21 +10552,27 @@ def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds:
     }, None
 
 
-def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressure=0.45, min_hold_records=3, stop_loss_pct=0.003, take_profit_pct=0.005):
+def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressure=0.45, min_hold_records=3, min_hold_seconds=60, cooldown_seconds=60, stop_loss_pct=0.003, take_profit_pct=0.005):
     """
-    Build a tiny live MBP-1 trade/event log from the short live snapshot records.
-    This is button-only/display-only and does not affect any main strategy/backtest.
+    Build a live MBP-1 session trade log from all collected top-of-book records.
+
+    Important:
+    - This uses every record collected in the current Databento pull.
+    - It cannot reconstruct earlier live trades from before the app started collecting;
+      use Historical Replay for today's full session after/when historical data is available.
+    - Adds Buy & Hold Return and Cumulative Return so the live log is comparable.
     """
     try:
         if records_df is None or not isinstance(records_df, pd.DataFrame) or records_df.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), {}
 
         df = records_df.copy()
-        if "received_at" not in df.columns:
-            return pd.DataFrame()
+        ts_col = "received_at" if "received_at" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
+        if ts_col is None:
+            return pd.DataFrame(), {}
 
-        df["received_at"] = pd.to_datetime(df["received_at"], errors="coerce", utc=True)
-        df = df.dropna(subset=["received_at"]).sort_values("received_at")
+        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+        df = df.dropna(subset=[ts_col]).sort_values(ts_col)
         for col in ["bid_px", "ask_px", "bid_sz", "ask_sz"]:
             if col not in df.columns:
                 df[col] = np.nan
@@ -10573,18 +10580,22 @@ def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressur
         df = df.dropna(subset=["bid_px", "ask_px"])
         df = df[(df["bid_px"] > 0) & (df["ask_px"] > 0) & (df["ask_px"] >= df["bid_px"])]
         if df.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), {}
 
         df["mid"] = (df["bid_px"] + df["ask_px"]) / 2.0
         df["spread"] = df["ask_px"] - df["bid_px"]
-        df["bid_pressure"] = df["bid_sz"] / (df["bid_sz"] + df["ask_sz"] + 1e-9)
+        df["bid_pressure"] = df["bid_sz"].fillna(0) / (df["bid_sz"].fillna(0) + df["ask_sz"].fillna(0) + 1e-9)
         df["microprice"] = np.where(
-            (df["bid_sz"] + df["ask_sz"]) > 0,
-            ((df["ask_px"] * df["bid_sz"]) + (df["bid_px"] * df["ask_sz"])) / (df["bid_sz"] + df["ask_sz"] + 1e-9),
+            (df["bid_sz"].fillna(0) + df["ask_sz"].fillna(0)) > 0,
+            ((df["ask_px"] * df["bid_sz"].fillna(0)) + (df["bid_px"] * df["ask_sz"].fillna(0))) / (df["bid_sz"].fillna(0) + df["ask_sz"].fillna(0) + 1e-9),
             df["mid"]
         )
-        df["pressure_smooth"] = df["bid_pressure"].rolling(3, min_periods=1).mean()
+        df["pressure_smooth"] = df["bid_pressure"].rolling(5, min_periods=1).mean()
         df["micro_slope"] = df["microprice"].diff().fillna(0.0)
+
+        first_px = float(df["microprice"].iloc[0]) if pd.notna(df["microprice"].iloc[0]) else float(df["mid"].iloc[0])
+        last_px = float(df["microprice"].iloc[-1]) if pd.notna(df["microprice"].iloc[-1]) else float(df["mid"].iloc[-1])
+        buy_hold_return = ((last_px / first_px) - 1.0) * 100.0 if first_px > 0 else 0.0
 
         trades = []
         in_pos = False
@@ -10592,16 +10603,29 @@ def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressur
         entry_pressure = np.nan
         bars_held = 0
         peak_price = np.nan
+        equity = 1.0
+        last_exit_time = None
+        min_hold_seconds = max(0, int(min_hold_seconds))
+        cooldown_seconds = max(0, int(cooldown_seconds))
 
         for _, row in df.iterrows():
-            t = row["received_at"]
+            t = row[ts_col]
             price = float(row["microprice"] if pd.notna(row["microprice"]) else row["mid"])
             pressure = float(row["pressure_smooth"])
             spread = float(row["spread"])
             slope = float(row["micro_slope"])
 
+            if not np.isfinite(price) or price <= 0:
+                continue
+
             if not in_pos:
-                if pressure >= float(open_pressure) and slope >= 0 and np.isfinite(price):
+                if last_exit_time is not None:
+                    try:
+                        if (t - last_exit_time).total_seconds() < cooldown_seconds:
+                            continue
+                    except Exception:
+                        pass
+                if pressure >= float(open_pressure) and slope >= 0:
                     in_pos = True
                     entry_time = t
                     entry_price = price
@@ -10614,15 +10638,23 @@ def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressur
             peak_price = max(float(peak_price), price) if np.isfinite(peak_price) else price
             pnl_pct = ((price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
             exit_reason = None
-            if bars_held >= int(min_hold_records):
-                if pressure <= float(close_pressure):
-                    exit_reason = f"Bid pressure faded to {pressure:.2f}"
+            try:
+                held_seconds = (t - entry_time).total_seconds() if entry_time is not None else 0.0
+            except Exception:
+                held_seconds = 0.0
+            can_exit = (bars_held >= int(min_hold_records)) and (held_seconds >= float(min_hold_seconds))
+            if can_exit:
+                if take_profit_pct and pnl_pct >= abs(float(take_profit_pct)) * 100.0:
+                    exit_reason = f"Live target hit ({pnl_pct:.2f}%)"
                 elif stop_loss_pct and pnl_pct <= -abs(float(stop_loss_pct)) * 100.0:
                     exit_reason = f"Live stop hit ({pnl_pct:.2f}%)"
-                elif take_profit_pct and pnl_pct >= abs(float(take_profit_pct)) * 100.0:
-                    exit_reason = f"Live target hit ({pnl_pct:.2f}%)"
+                elif pressure <= float(close_pressure):
+                    exit_reason = f"Bid pressure faded to {pressure:.2f}"
 
             if exit_reason:
+                trade_mult = price / entry_price if entry_price else 1.0
+                equity *= trade_mult
+                cumulative_return_pct = (equity - 1.0) * 100.0
                 trades.append({
                     "Side": "Long",
                     "Entry Time": entry_time,
@@ -10630,12 +10662,17 @@ def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressur
                     "Buy Price": round(float(entry_price), 4),
                     "Sell Price": round(float(price), 4),
                     "PnL (%)": round(float(pnl_pct), 3),
+                    "Cumulative Return (%)": round(float(cumulative_return_pct), 3),
+                    "Buy & Hold Return (%)": round(float(buy_hold_return), 3),
                     "Entry Bid Pressure": round(float(entry_pressure) * 100.0, 1),
                     "Exit Bid Pressure": round(float(pressure) * 100.0, 1),
                     "Spread": round(float(spread), 4),
+                    "Records Held": int(bars_held),
+                    "Seconds Held": round(float(held_seconds), 1),
                     "Status": "Closed",
                     "Reason": exit_reason,
                 })
+                last_exit_time = t
                 in_pos = False
                 entry_price = entry_time = None
                 entry_pressure = np.nan
@@ -10644,8 +10681,15 @@ def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressur
 
         if in_pos and entry_price is not None:
             last = df.iloc[-1]
+            last_time = last[ts_col]
             last_price = float(last["microprice"] if pd.notna(last["microprice"]) else last["mid"])
             pnl_pct = ((last_price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
+            try:
+                open_held_seconds = (last_time - entry_time).total_seconds() if entry_time is not None else 0.0
+            except Exception:
+                open_held_seconds = 0.0
+            open_equity = equity * (last_price / entry_price if entry_price else 1.0)
+            cumulative_return_pct = (open_equity - 1.0) * 100.0
             trades.append({
                 "Side": "Long",
                 "Entry Time": entry_time,
@@ -10653,14 +10697,33 @@ def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressur
                 "Buy Price": round(float(entry_price), 4),
                 "Sell Price": round(float(last_price), 4),
                 "PnL (%)": round(float(pnl_pct), 3),
+                "Cumulative Return (%)": round(float(cumulative_return_pct), 3),
+                "Buy & Hold Return (%)": round(float(buy_hold_return), 3),
                 "Entry Bid Pressure": round(float(entry_pressure) * 100.0, 1),
                 "Exit Bid Pressure": round(float(last["pressure_smooth"]) * 100.0, 1),
                 "Spread": round(float(last["spread"]), 4),
+                "Records Held": int(bars_held),
+                "Seconds Held": round(float(open_held_seconds), 1),
                 "Status": "Open",
-                "Reason": "Live snapshot still supports open position",
+                "Reason": "Open; latest live record still marks position to market",
             })
 
         log = pd.DataFrame(trades)
+        final_return = 0.0
+        if not log.empty and "Cumulative Return (%)" in log.columns:
+            final_return = float(log["Cumulative Return (%)"].iloc[-1])
+
+        summary = {
+            "records_used": int(len(df)),
+            "first_time_utc": df[ts_col].iloc[0],
+            "last_time_utc": df[ts_col].iloc[-1],
+            "first_price": round(float(first_px), 4),
+            "last_price": round(float(last_px), 4),
+            "strategy_return_pct": round(float(final_return), 3),
+            "buy_hold_return_pct": round(float(buy_hold_return), 3),
+            "trade_count": int(len(log)),
+        }
+
         if not log.empty:
             # Convert UTC received timestamps into Central Time for display.
             for col in ["Entry Time", "Exit Time"]:
@@ -10676,10 +10739,9 @@ def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressur
                         except Exception:
                             return v
                     log[col] = log[col].apply(_fmt)
-        return log
+        return log, summary
     except Exception:
-        return pd.DataFrame()
-
+        return pd.DataFrame(), {}
 
 def _normalize_databento_mbp1_df(df):
     """Convert Databento MBP-1 dataframe into clean top-of-book rows."""
@@ -11709,15 +11771,33 @@ try:
             # ---------- DATABENTO LIVE SNAPSHOT ----------
             with st.expander("📡 Databento Live MBP-1 Snapshot", expanded=False):
                 st.caption("Top-of-book only from EQUS.MINI. This is not full MBP-10 Level 2. It runs only when you click the button.")
-                d1, d2 = st.columns(2)
+                d1, d2, d3, d4 = st.columns(4)
                 with d1:
-                    db_timeout = st.number_input("Live pull seconds", min_value=2, max_value=15, value=3, step=1, key="mm_full_db_timeout")
+                    db_timeout = st.number_input("Live pull seconds", min_value=2, max_value=300, value=10, step=1, key="mm_full_db_timeout")
                 with d2:
-                    db_max_records = st.number_input("Max live records", min_value=10, max_value=500, value=80, step=10, key="mm_full_db_live_records")
+                    db_max_records = st.number_input("Max records per pull", min_value=10, max_value=10000, value=1500, step=100, key="mm_full_db_live_records")
+                with d3:
+                    live_auto_update = st.checkbox("Auto-update live", value=False, key="mm_live_auto_update")
+                with d4:
+                    live_refresh_sec = st.number_input("Refresh every seconds", min_value=5, max_value=300, value=30, step=5, key="mm_live_refresh_seconds")
+
+                d5, d6 = st.columns(2)
+                with d5:
+                    live_session_max_records = st.number_input("Session buffer max records", min_value=500, max_value=50000, value=20000, step=500, key="mm_live_session_max_records")
+                with d6:
+                    reset_live_buffer = st.button("Reset live session buffer", key="mm_live_reset_buffer")
+
+                live_buffer_key = f"mm_live_buffer_{str(TICKER).upper()}"
+                if reset_live_buffer:
+                    st.session_state[live_buffer_key] = pd.DataFrame()
+
                 db_api_key = _safe_get_secret("DATABENTO_API_KEY", "")
                 if not db_api_key:
                     db_api_key = st.text_input("Databento API key", type="password", key="mm_full_db_api_key")
-                if st.button("Pull Databento live MBP-1 snapshot now", key="mm_full_db_live_pull"):
+
+                pull_live_now = st.button("Pull Databento live MBP-1 now", key="mm_full_db_live_pull") or bool(live_auto_update)
+
+                if pull_live_now:
                     if not db_api_key:
                         st.warning("Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets.")
                     else:
@@ -11732,43 +11812,83 @@ try:
                             c3.metric("Spread", f"${snap.get('spread', np.nan):.4f}")
                             c4.metric("Bid Pressure", f"{float(snap.get('imbalance', 0))*100:.1f}%")
                             c5.metric("Microprice", f"${snap.get('microprice', np.nan):.4f}" if pd.notna(snap.get('microprice', np.nan)) else "N/A")
-                            recs = snap.get("records", pd.DataFrame())
-                            if isinstance(recs, pd.DataFrame) and not recs.empty:
-                                st.markdown("#### Live MBP-1 trade log")
-                                lt1, lt2, lt3, lt4, lt5 = st.columns(5)
-                                with lt1:
-                                    live_open_pressure = st.slider("Live open pressure", 0.50, 0.95, 0.62, 0.01, key="mm_live_open_pressure")
-                                with lt2:
-                                    live_close_pressure = st.slider("Live close pressure", 0.05, 0.70, 0.45, 0.01, key="mm_live_close_pressure")
-                                with lt3:
-                                    live_min_hold = st.number_input("Min live records held", 1, 50, 3, 1, key="mm_live_min_hold_records")
-                                with lt4:
-                                    live_stop_pct = st.number_input("Live stop %", 0.05, 5.0, 0.30, 0.05, key="mm_live_stop_pct")
-                                with lt5:
-                                    live_target_pct = st.number_input("Live target %", 0.05, 5.0, 0.50, 0.05, key="mm_live_target_pct")
-
-                                live_log = build_databento_live_trade_log(
-                                    recs,
-                                    open_pressure=float(live_open_pressure),
-                                    close_pressure=float(live_close_pressure),
-                                    min_hold_records=int(live_min_hold),
-                                    stop_loss_pct=float(live_stop_pct) / 100.0,
-                                    take_profit_pct=float(live_target_pct) / 100.0,
-                                )
-                                if isinstance(live_log, pd.DataFrame) and not live_log.empty:
-                                    st.dataframe(live_log, use_container_width=True)
-                                    st.download_button(
-                                        "Download live MBP-1 trade log CSV",
-                                        live_log.to_csv(index=False).encode("utf-8"),
-                                        file_name=f"{str(TICKER).upper()}_databento_live_mbp1_trade_log.csv",
-                                        mime="text/csv",
-                                        key="mm_live_trade_log_download",
-                                    )
+                            recs_new = snap.get("records", pd.DataFrame())
+                            if isinstance(recs_new, pd.DataFrame) and not recs_new.empty:
+                                old_recs = st.session_state.get(live_buffer_key, pd.DataFrame())
+                                if isinstance(old_recs, pd.DataFrame) and not old_recs.empty:
+                                    combined = pd.concat([old_recs, recs_new], ignore_index=True)
                                 else:
-                                    st.info("No live MBP-1 trade trigger found in this short snapshot. Increase pull seconds/records or loosen live open/close pressure.")
+                                    combined = recs_new.copy()
+                                dedup_cols = [c for c in ["received_at", "bid_px", "ask_px", "bid_sz", "ask_sz"] if c in combined.columns]
+                                if dedup_cols:
+                                    combined = combined.drop_duplicates(subset=dedup_cols, keep="last")
+                                if "received_at" in combined.columns:
+                                    combined["received_at"] = pd.to_datetime(combined["received_at"], errors="coerce", utc=True)
+                                    combined = combined.dropna(subset=["received_at"]).sort_values("received_at")
+                                combined = combined.tail(int(live_session_max_records)).reset_index(drop=True)
+                                st.session_state[live_buffer_key] = combined
 
-                            if isinstance(recs, pd.DataFrame) and not recs.empty and st.checkbox("Show raw live records", value=False, key="mm_full_show_live_records"):
-                                st.dataframe(recs.tail(100), use_container_width=True)
+                recs = st.session_state.get(live_buffer_key, pd.DataFrame())
+                if isinstance(recs, pd.DataFrame) and not recs.empty:
+                    st.markdown("#### Live MBP-1 session trade log")
+                    st.caption("Uses all live records collected in this app session. It cannot include records before the app started collecting; use Historical Replay for from-market-open reconstruction.")
+                    lt1, lt2, lt3, lt4, lt5 = st.columns(5)
+                    with lt1:
+                        live_open_pressure = st.slider("Live open pressure", 0.50, 0.95, 0.62, 0.01, key="mm_live_open_pressure")
+                    with lt2:
+                        live_close_pressure = st.slider("Live close pressure", 0.05, 0.70, 0.45, 0.01, key="mm_live_close_pressure")
+                    with lt3:
+                        live_min_hold_seconds = st.number_input("Minimum hold seconds", 10, 3600, 60, 10, key="mm_live_min_hold_seconds")
+                    with lt4:
+                        live_stop_pct = st.number_input("Live stop %", 0.05, 5.0, 0.30, 0.05, key="mm_live_stop_pct")
+                    with lt5:
+                        live_target_pct = st.number_input("Live target %", 0.05, 5.0, 0.50, 0.05, key="mm_live_target_pct")
+
+                    lt6, lt7 = st.columns(2)
+                    with lt6:
+                        live_min_records = st.number_input("Minimum records held", 1, 500, 20, 5, key="mm_live_min_hold_records")
+                    with lt7:
+                        live_cooldown_seconds = st.number_input("Cooldown after exit seconds", 0, 3600, 120, 10, key="mm_live_cooldown_seconds")
+
+                    live_log, live_summary = build_databento_live_trade_log(
+                        recs,
+                        open_pressure=float(live_open_pressure),
+                        close_pressure=float(live_close_pressure),
+                        min_hold_records=int(live_min_records),
+                        min_hold_seconds=int(live_min_hold_seconds),
+                        cooldown_seconds=int(live_cooldown_seconds),
+                        stop_loss_pct=float(live_stop_pct) / 100.0,
+                        take_profit_pct=float(live_target_pct) / 100.0,
+                    )
+                    if isinstance(live_summary, dict) and live_summary:
+                        sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+                        sm1.metric("Live Strategy Return", f"{live_summary.get('strategy_return_pct', 0):.2f}%")
+                        sm2.metric("Live Buy & Hold", f"{live_summary.get('buy_hold_return_pct', 0):.2f}%")
+                        sm3.metric("Live Trades", f"{int(live_summary.get('trade_count', 0))}")
+                        sm4.metric("Records Used", f"{int(live_summary.get('records_used', 0)):,}")
+                        sm5.metric("Buffer Span", f"{str(live_summary.get('first_time_utc', ''))[:19]} → {str(live_summary.get('last_time_utc', ''))[:19]}")
+                    if isinstance(live_log, pd.DataFrame) and not live_log.empty:
+                        st.dataframe(live_log, use_container_width=True)
+                        st.download_button(
+                            "Download live MBP-1 trade log CSV",
+                            live_log.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{str(TICKER).upper()}_databento_live_mbp1_session_trade_log.csv",
+                            mime="text/csv",
+                            key="mm_live_trade_log_download",
+                        )
+                    else:
+                        st.info("No live MBP-1 trade trigger found yet in this session buffer. Auto-update can keep collecting; for earlier records from market open, use Historical Replay.")
+
+                    if st.checkbox("Show raw live session records", value=False, key="mm_full_show_live_records"):
+                        st.dataframe(recs.tail(300), use_container_width=True)
+                else:
+                    st.info("No live MBP-1 records collected yet. Click pull now or enable auto-update during market hours.")
+
+                if bool(live_auto_update):
+                    components.html(
+                        f"<script>setTimeout(function(){{window.parent.location.reload();}}, {int(live_refresh_sec) * 1000});</script>",
+                        height=0,
+                    )
 
             # ---------- DATABENTO HISTORICAL REPLAY ----------
             with st.expander("🕒 Databento Historical MBP-1 Replay", expanded=False):
