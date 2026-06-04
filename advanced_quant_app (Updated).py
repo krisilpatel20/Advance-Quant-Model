@@ -11407,156 +11407,240 @@ def summarize_microstructure_backtest(
 
 
 # ==========================================
-# TAB 20: MARKET MICROSTRUCTURE — SAFE BUTTON-ONLY MODE
+# TAB 20: MARKET MICROSTRUCTURE — FULL BUTTON-ONLY MODE
 # ==========================================
 try:
     with tab20:
         st.header("🧬 Market Microstructure")
-        st.caption("Safe button-only mode. Nothing here runs until you click a button, so the full app and other tabs keep loading normally.")
+        st.caption("Full microstructure tab restored. Nothing heavy runs until you click a button, so the full app loads normally.")
 
         if df_main is None:
             st.warning("Please load a ticker first.")
         else:
-            st.success("Microstructure is active in safe mode. CVD, VWAP, and Time Series tabs are restored. This tab will not auto-run heavy calculations.")
+            st.success("Market Microstructure is active. OHLCV proxy strategies + Databento live/historical tools are available in button-only mode.")
 
             st.markdown("""
-            **What this tab can do now:**
-            - OHLCV proxy microstructure backtest from Yahoo data.
-            - Optional Databento EQUS.MINI MBP-1 live top-of-book snapshot.
-            - Optional Databento historical MBP-1 replay.
-
-            **Important:** Databento is only imported/connected after you click a Databento button.
+            **Included here:**
+            - OHLCV proxy microstructure features: order-flow imbalance, toxicity, price impact, LOB pressure proxy, VWAP/TWAP.
+            - Full strategy set: breakout, toxicity guard, LOB pressure, VWAP/TWAP, composite, benchmark-capture runners, drawdown-controlled runner, vol-scaled runner, Sharpe maximizer.
+            - Strategy ranking, manual strategy selector, equity curve, feature chart, trade log download.
+            - Databento EQUS.MINI MBP-1 live snapshot and historical replay.
             """)
 
             # ---------- OHLCV PROXY MICROSTRUCTURE ----------
-            with st.expander("📊 OHLCV Microstructure Proxy Backtest", expanded=False):
-                st.caption("This uses normal OHLCV data. It is not true L2. Click the button below only when you want it to calculate.")
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    tox_window = st.number_input("Toxicity window", min_value=5, max_value=100, value=20, step=5, key="mm_safe_tox_window")
-                with col_b:
-                    impact_window = st.number_input("Impact window", min_value=5, max_value=100, value=20, step=5, key="mm_safe_impact_window")
-                with col_c:
-                    mm_initial_capital = st.number_input("Initial capital", min_value=1000.0, max_value=1_000_000.0, value=10000.0, step=1000.0, key="mm_safe_capital")
+            with st.expander("📊 OHLCV Microstructure Proxy Backtest + Strategy Lab", expanded=True):
+                st.caption("Uses normal OHLCV candles. This is not true L2, but it gives usable microstructure-style proxies without blocking the app.")
 
-                run_mm_proxy = st.button("Run OHLCV Microstructure Proxy Backtest", key="mm_safe_run_proxy")
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    tox_window = st.number_input("Toxicity window", min_value=5, max_value=150, value=20, step=5, key="mm_full_tox_window")
+                    mm_initial_capital = st.number_input("Initial capital", min_value=1000.0, max_value=1_000_000.0, value=10000.0, step=1000.0, key="mm_full_capital")
+                with c2:
+                    impact_window = st.number_input("Impact window", min_value=5, max_value=150, value=20, step=5, key="mm_full_impact_window")
+                    mm_rank_mode = st.selectbox("Auto-select by", ["Risk-Adjusted", "Return Only"], index=0, key="mm_full_rank_mode")
+                with c3:
+                    enable_mm_dd_guard = st.checkbox("Enable Microstructure DD Guard", value=False, key="mm_full_enable_dd_guard")
+                    mm_trailing_stop = st.number_input("Trailing DD Stop (%)", min_value=0.0, max_value=50.0, value=18.0, step=0.5, key="mm_full_trailing_stop")
+                with c4:
+                    mm_stop_loss = st.number_input("Hard Stop Loss (%)", min_value=0.0, max_value=50.0, value=10.0, step=0.5, key="mm_full_stop_loss")
+                    show_feature_chart = st.checkbox("Show feature chart after run", value=True, key="mm_full_show_feature_chart")
+
+                run_mm_proxy = st.button("Run full OHLCV Microstructure Strategy Lab", key="mm_full_run_proxy")
 
                 if run_mm_proxy:
                     try:
-                        ms = build_microstructure_features(df_main, toxicity_window=int(tox_window), impact_window=int(impact_window))
-                        if ms is None or ms.empty:
-                            st.warning("Not enough OHLCV data to calculate microstructure proxies.")
-                        else:
-                            signals_dict = build_microstructure_signals(ms)
-                            if not signals_dict:
-                                st.warning("No microstructure proxy signals were generated.")
+                        with st.spinner("Running microstructure proxy strategies..."):
+                            ms = build_microstructure_features(df_main, toxicity_window=int(tox_window), impact_window=int(impact_window))
+                            if ms is None or ms.empty:
+                                st.session_state["mm_full_last_error"] = "Not enough OHLCV data to calculate microstructure proxies."
+                                st.session_state.pop("mm_full_results", None)
                             else:
-                                rows = []
-                                bt_results = {}
-                                for name, sig in signals_dict.items():
-                                    try:
-                                        sig = pd.Series(sig).reindex(ms.index).ffill().fillna(0).clip(0, 1)
-                                        bt = BacktestEngine.run_strategy(ms['Close'], sig, initial_capital=float(mm_initial_capital))
-                                        eq = bt.get('equity_curve', pd.Series(dtype=float))
-                                        bench = bt.get('benchmark_curve', pd.Series(dtype=float))
-                                        rets = bt.get('returns', pd.Series(dtype=float))
-                                        mets = BacktestEngine.calculate_metrics(rets) if len(rets) > 1 else {}
-                                        strat_ret = ((float(eq.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not eq.empty else 0.0
-                                        bench_ret = ((float(bench.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not bench.empty else 0.0
-                                        max_dd = float(mets.get('Max Drawdown', 0.0)) * 100
-                                        sharpe = float(mets.get('Sharpe Ratio', 0.0))
-                                        rows.append({
-                                            "Strategy": name,
-                                            "Strategy Return (%)": round(strat_ret, 2),
-                                            "Benchmark Return (%)": round(bench_ret, 2),
-                                            "Sharpe": round(sharpe, 2),
-                                            "Max Drawdown (%)": round(max_dd, 2),
-                                        })
-                                        bt_results[name] = bt
-                                    except Exception:
-                                        continue
-
-                                rank_df = pd.DataFrame(rows)
-                                if rank_df.empty:
-                                    st.warning("Backtest ran, but no valid strategy results were produced.")
+                                signals_dict = build_microstructure_signals(ms)
+                                if not signals_dict:
+                                    st.session_state["mm_full_last_error"] = "No microstructure proxy signals were generated."
+                                    st.session_state.pop("mm_full_results", None)
                                 else:
-                                    st.write("#### Strategy ranking")
-                                    st.dataframe(rank_df.sort_values("Strategy Return (%)", ascending=False), use_container_width=True, hide_index=True)
-
-                                    best_default = str(rank_df.sort_values("Strategy Return (%)", ascending=False).iloc[0]["Strategy"])
-                                    chosen_mm = st.selectbox("Choose strategy to view trade log", rank_df["Strategy"].tolist(), index=rank_df["Strategy"].tolist().index(best_default), key="mm_safe_chosen_strategy")
-                                    selected_bt = bt_results.get(chosen_mm)
-                                    if selected_bt is not None:
-                                        eq = selected_bt.get('equity_curve', pd.Series(dtype=float))
-                                        bench = selected_bt.get('benchmark_curve', pd.Series(dtype=float))
-                                        rets = selected_bt.get('returns', pd.Series(dtype=float))
-                                        mets = BacktestEngine.calculate_metrics(rets) if len(rets) > 1 else {}
-                                        strat_ret = ((float(eq.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not eq.empty else 0.0
-                                        bench_ret = ((float(bench.iloc[-1]) / float(mm_initial_capital)) - 1) * 100 if not bench.empty else 0.0
-                                        c1, c2, c3, c4 = st.columns(4)
-                                        c1.metric("Strategy Return", f"{strat_ret:.2f}%")
-                                        c2.metric("Benchmark Return", f"{bench_ret:.2f}%")
-                                        c3.metric("Sharpe", f"{float(mets.get('Sharpe Ratio', 0.0)):.2f}")
-                                        c4.metric("Max Drawdown", f"{float(mets.get('Max Drawdown', 0.0))*100:.2f}%")
-
-                                        if not eq.empty and not bench.empty:
-                                            fig_eq = go.Figure()
-                                            fig_eq.add_trace(go.Scatter(x=eq.index, y=eq, name="Strategy", mode="lines"))
-                                            fig_eq.add_trace(go.Scatter(x=bench.index, y=bench, name="Buy & Hold", mode="lines"))
-                                            fig_eq.update_layout(title=f"{chosen_mm} — Equity Curve", template="plotly_dark", height=420, hovermode="x unified")
-                                            st.plotly_chart(fig_eq, use_container_width=True)
-
-                                        trades_mm = selected_bt.get('trades', pd.DataFrame())
-                                        st.write(f"#### Trade Log — {chosen_mm}")
-                                        if isinstance(trades_mm, pd.DataFrame) and not trades_mm.empty:
-                                            trades_mm = apply_trade_log_timestamp_display(trades_mm)
-                                            st.dataframe(trades_mm, use_container_width=True, hide_index=True)
-                                            st.download_button("Download microstructure trade log", trades_mm.to_csv(index=False), file_name=f"MicrostructureTradeLog_{TICKER}.csv", mime="text/csv", key="mm_safe_download_log")
-                                        else:
-                                            st.info("No trades generated by this strategy.")
+                                    trailing = float(mm_trailing_stop) / 100.0 if enable_mm_dd_guard else 0.0
+                                    hard_stop = float(mm_stop_loss) / 100.0 if enable_mm_dd_guard else 0.0
+                                    rank_df, bt_results = summarize_microstructure_backtest(
+                                        ms["Close"],
+                                        signals_dict,
+                                        initial_capital=float(mm_initial_capital),
+                                        trailing_stop_pct=float(trailing),
+                                        stop_loss_pct=float(hard_stop),
+                                        rank_mode=str(mm_rank_mode),
+                                    )
+                                    st.session_state["mm_full_results"] = {
+                                        "features": ms,
+                                        "signals": signals_dict,
+                                        "ranking": rank_df,
+                                        "backtests": bt_results,
+                                        "capital": float(mm_initial_capital),
+                                        "ticker": str(TICKER),
+                                        "rank_mode": str(mm_rank_mode),
+                                        "dd_guard": bool(enable_mm_dd_guard),
+                                        "trailing": float(mm_trailing_stop),
+                                        "stop": float(mm_stop_loss),
+                                    }
+                                    st.session_state.pop("mm_full_last_error", None)
                     except Exception as e:
-                        st.error(f"OHLCV microstructure proxy error: {e}")
+                        st.session_state["mm_full_last_error"] = f"OHLCV microstructure proxy error: {e}"
+                        st.session_state.pop("mm_full_results", None)
+
+                if st.session_state.get("mm_full_last_error"):
+                    st.warning(st.session_state.get("mm_full_last_error"))
+
+                mm_pack = st.session_state.get("mm_full_results")
+                if mm_pack:
+                    rank_df = mm_pack.get("ranking", pd.DataFrame())
+                    bt_results = mm_pack.get("backtests", {})
+                    ms = mm_pack.get("features", pd.DataFrame())
+                    signals_dict = mm_pack.get("signals", {})
+                    cap = float(mm_pack.get("capital", 10000.0))
+
+                    if isinstance(rank_df, pd.DataFrame) and not rank_df.empty:
+                        st.write("#### Strategy ranking")
+                        st.dataframe(rank_df, use_container_width=True, hide_index=True)
+
+                        all_strats = rank_df["Strategy"].astype(str).tolist()
+                        default_idx = 0
+                        if "Risk Score" in rank_df.columns and str(mm_pack.get("rank_mode", "")).lower().startswith("risk"):
+                            default_name = str(rank_df.sort_values("Risk Score", ascending=False).iloc[0]["Strategy"])
+                        elif "Total Return (%)" in rank_df.columns:
+                            default_name = str(rank_df.sort_values("Total Return (%)", ascending=False).iloc[0]["Strategy"])
+                        else:
+                            default_name = all_strats[0]
+                        if default_name in all_strats:
+                            default_idx = all_strats.index(default_name)
+
+                        chosen_mm = st.selectbox("Choose any microstructure strategy to view", all_strats, index=default_idx, key="mm_full_chosen_strategy")
+                        selected_bt = bt_results.get(chosen_mm)
+
+                        if selected_bt is not None:
+                            eq = selected_bt.get('equity_curve', pd.Series(dtype=float))
+                            bench = selected_bt.get('benchmark_curve', pd.Series(dtype=float))
+                            rets = selected_bt.get('returns', pd.Series(dtype=float))
+                            trades_mm = selected_bt.get('trades', pd.DataFrame())
+                            mets = BacktestEngine.calculate_metrics(rets) if len(rets) > 1 else {}
+                            strat_ret = ((float(eq.iloc[-1]) / cap) - 1) * 100 if isinstance(eq, pd.Series) and not eq.empty else 0.0
+                            bench_ret = ((float(bench.iloc[-1]) / cap) - 1) * 100 if isinstance(bench, pd.Series) and not bench.empty else 0.0
+
+                            m1, m2, m3, m4, m5 = st.columns(5)
+                            m1.metric("Strategy Return", f"{strat_ret:.2f}%")
+                            m2.metric("Benchmark Return", f"{bench_ret:.2f}%")
+                            m3.metric("Sharpe", f"{float(mets.get('Sharpe Ratio', 0.0)):.2f}")
+                            m4.metric("Max Drawdown", f"{float(mets.get('Max Drawdown', 0.0))*100:.2f}%")
+                            m5.metric("Trades", f"{len(trades_mm) if isinstance(trades_mm, pd.DataFrame) else 0}")
+
+                            eq_col, sig_col = st.columns([2, 1])
+                            with eq_col:
+                                if isinstance(eq, pd.Series) and not eq.empty and isinstance(bench, pd.Series) and not bench.empty:
+                                    fig_eq = go.Figure()
+                                    fig_eq.add_trace(go.Scatter(x=eq.index, y=eq, name="Strategy", mode="lines"))
+                                    fig_eq.add_trace(go.Scatter(x=bench.index, y=bench, name="Buy & Hold", mode="lines"))
+                                    fig_eq.update_layout(title=f"{chosen_mm} — Equity Curve", template="plotly_dark", height=420, hovermode="x unified")
+                                    st.plotly_chart(fig_eq, use_container_width=True)
+                            with sig_col:
+                                sig_view = pd.Series(signals_dict.get(chosen_mm, pd.Series(dtype=float))).reindex(ms.index).ffill().fillna(0) if isinstance(ms, pd.DataFrame) and not ms.empty else pd.Series(dtype=float)
+                                latest_exposure = float(sig_view.iloc[-1]) if not sig_view.empty else 0.0
+                                st.metric("Latest exposure", f"{latest_exposure*100:.0f}%")
+                                st.caption("Exposure can be fractional for vol-scaled/drawdown-controlled strategies.")
+
+                            if show_feature_chart and isinstance(ms, pd.DataFrame) and not ms.empty:
+                                st.write("#### Microstructure feature chart")
+                                fig_feat = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                                                         subplot_titles=("Price + VWAP/TWAP", "Order Flow / LOB Pressure", "Toxicity", "Price Impact Z"))
+                                fig_feat.add_trace(go.Scatter(x=ms.index, y=ms['Close'], name="Close", mode="lines"), row=1, col=1)
+                                if 'VWAP Proxy' in ms:
+                                    fig_feat.add_trace(go.Scatter(x=ms.index, y=ms['VWAP Proxy'], name="VWAP proxy", mode="lines"), row=1, col=1)
+                                if 'TWAP Proxy' in ms:
+                                    fig_feat.add_trace(go.Scatter(x=ms.index, y=ms['TWAP Proxy'], name="TWAP proxy", mode="lines"), row=1, col=1)
+                                if 'Order Flow Imbalance' in ms:
+                                    fig_feat.add_trace(go.Scatter(x=ms.index, y=ms['Order Flow Imbalance'], name="OFI", mode="lines"), row=2, col=1)
+                                if 'LOB Pressure Proxy' in ms:
+                                    fig_feat.add_trace(go.Scatter(x=ms.index, y=ms['LOB Pressure Proxy'], name="LOB pressure", mode="lines"), row=2, col=1)
+                                if 'Toxicity Proxy' in ms:
+                                    fig_feat.add_trace(go.Scatter(x=ms.index, y=ms['Toxicity Proxy'], name="Toxicity", mode="lines"), row=3, col=1)
+                                if 'Price Impact Z' in ms:
+                                    fig_feat.add_trace(go.Scatter(x=ms.index, y=ms['Price Impact Z'], name="Impact Z", mode="lines"), row=4, col=1)
+                                fig_feat.update_layout(template="plotly_dark", height=760, hovermode="x unified", showlegend=True)
+                                st.plotly_chart(fig_feat, use_container_width=True)
+
+                            st.write(f"#### Trade Log — {chosen_mm}")
+                            if isinstance(trades_mm, pd.DataFrame) and not trades_mm.empty:
+                                trades_show = apply_trade_log_timestamp_display(trades_mm)
+                                trades_show = clean_overlapping_duplicate_trades(trades_show)
+                                st.dataframe(trades_show, use_container_width=True, hide_index=True)
+                                st.download_button(
+                                    "Download microstructure trade log",
+                                    trades_show.to_csv(index=False),
+                                    file_name=f"MicrostructureTradeLog_{TICKER}_{chosen_mm.replace(' ', '_')}.csv",
+                                    mime="text/csv",
+                                    key="mm_full_download_log",
+                                )
+                            else:
+                                st.info("No trades generated by this strategy.")
+
+                            with st.expander("Show raw feature table", expanded=False):
+                                if isinstance(ms, pd.DataFrame) and not ms.empty:
+                                    st.dataframe(ms.tail(300), use_container_width=True)
+                    else:
+                        st.warning("Microstructure run finished, but no valid ranking table was produced.")
 
             # ---------- DATABENTO LIVE SNAPSHOT ----------
             with st.expander("📡 Databento Live MBP-1 Snapshot", expanded=False):
                 st.caption("Top-of-book only from EQUS.MINI. This is not full MBP-10 Level 2. It runs only when you click the button.")
-                db_timeout = st.number_input("Live pull seconds", min_value=2, max_value=10, value=3, step=1, key="mm_safe_db_timeout")
+                d1, d2 = st.columns(2)
+                with d1:
+                    db_timeout = st.number_input("Live pull seconds", min_value=2, max_value=15, value=3, step=1, key="mm_full_db_timeout")
+                with d2:
+                    db_max_records = st.number_input("Max live records", min_value=10, max_value=500, value=80, step=10, key="mm_full_db_live_records")
                 db_api_key = _safe_get_secret("DATABENTO_API_KEY", "")
                 if not db_api_key:
-                    db_api_key = st.text_input("Databento API key", type="password", key="mm_safe_db_api_key")
-                if st.button("Pull Databento live MBP-1 snapshot now", key="mm_safe_db_live_pull"):
+                    db_api_key = st.text_input("Databento API key", type="password", key="mm_full_db_api_key")
+                if st.button("Pull Databento live MBP-1 snapshot now", key="mm_full_db_live_pull"):
                     if not db_api_key:
                         st.warning("Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets.")
                     else:
                         with st.spinner(f"Pulling Databento EQUS.MINI MBP-1 for {TICKER}..."):
-                            snap, err = get_databento_equs_mbp1_snapshot(str(TICKER), str(db_api_key), timeout_seconds=int(db_timeout), max_records=80)
+                            snap, err = get_databento_equs_mbp1_snapshot(str(TICKER), str(db_api_key), timeout_seconds=int(db_timeout), max_records=int(db_max_records))
                         if err:
                             st.warning(f"Databento MBP-1 not available right now: {err}")
                         elif snap:
-                            c1, c2, c3, c4 = st.columns(4)
+                            c1, c2, c3, c4, c5 = st.columns(5)
                             c1.metric("Best Bid", f"${snap.get('bid_px', np.nan):.4f}")
                             c2.metric("Best Ask", f"${snap.get('ask_px', np.nan):.4f}")
                             c3.metric("Spread", f"${snap.get('spread', np.nan):.4f}")
                             c4.metric("Bid Pressure", f"{float(snap.get('imbalance', 0))*100:.1f}%")
+                            c5.metric("Microprice", f"${snap.get('microprice', np.nan):.4f}" if pd.notna(snap.get('microprice', np.nan)) else "N/A")
                             recs = snap.get("records", pd.DataFrame())
-                            if isinstance(recs, pd.DataFrame) and not recs.empty and st.checkbox("Show raw live records", value=False, key="mm_safe_show_live_records"):
-                                st.dataframe(recs.tail(50), use_container_width=True)
+                            if isinstance(recs, pd.DataFrame) and not recs.empty and st.checkbox("Show raw live records", value=False, key="mm_full_show_live_records"):
+                                st.dataframe(recs.tail(100), use_container_width=True)
 
             # ---------- DATABENTO HISTORICAL REPLAY ----------
             with st.expander("🕒 Databento Historical MBP-1 Replay", expanded=False):
                 st.caption("Use this after market close or for prior days. It runs only when you click the button.")
                 h1, h2, h3 = st.columns(3)
                 with h1:
-                    replay_date = st.date_input("Replay date", value=_previous_business_date(datetime.today()), key="mm_safe_hist_date")
+                    replay_date = st.date_input("Replay date", value=_previous_business_date(datetime.today()), key="mm_full_hist_date")
                 with h2:
-                    start_time = st.time_input("Start time ET", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_safe_hist_start")
+                    start_time = st.time_input("Start time ET", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_full_hist_start")
                 with h3:
-                    end_time = st.time_input("End time ET", value=datetime.strptime("16:00", "%H:%M").time(), key="mm_safe_hist_end")
-                max_records = st.number_input("Max historical records", min_value=100, max_value=5000, value=1500, step=100, key="mm_safe_hist_limit")
+                    end_time = st.time_input("End time ET", value=datetime.strptime("16:00", "%H:%M").time(), key="mm_full_hist_end")
+
+                h4, h5, h6 = st.columns(3)
+                with h4:
+                    max_records = st.number_input("Max historical records", min_value=100, max_value=10000, value=1500, step=100, key="mm_full_hist_limit")
+                with h5:
+                    show_hist_records = st.checkbox("Show records after pull", value=False, key="mm_full_show_hist_records")
+                with h6:
+                    build_replay_log = st.checkbox("Build replay trade log", value=True, key="mm_full_build_replay")
+
                 db_api_key_hist = _safe_get_secret("DATABENTO_API_KEY", "")
                 if not db_api_key_hist:
-                    db_api_key_hist = st.text_input("Databento API key for historical replay", type="password", key="mm_safe_hist_key")
-                if st.button("Pull Databento historical MBP-1 replay", key="mm_safe_hist_pull"):
+                    db_api_key_hist = st.text_input("Databento API key for historical replay", type="password", key="mm_full_hist_key")
+
+                if st.button("Pull Databento historical MBP-1 replay", key="mm_full_hist_pull"):
                     if not db_api_key_hist:
                         st.warning("Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets.")
                     else:
@@ -11567,35 +11651,60 @@ try:
                                 hist_df, hist_err = get_databento_equs_mbp1_history(str(TICKER), str(db_api_key_hist), start_dt, end_dt, limit=int(max_records))
                             if hist_err:
                                 st.warning(f"Databento historical MBP-1 not available: {hist_err}")
+                                st.session_state.pop("mm_full_hist_df", None)
                             elif hist_df is None or hist_df.empty:
                                 st.info("No historical MBP-1 records returned for that window.")
+                                st.session_state.pop("mm_full_hist_df", None)
                             else:
+                                st.session_state["mm_full_hist_df"] = hist_df
                                 st.success(f"Loaded {len(hist_df):,} MBP-1 records.")
-                                c1, c2, c3 = st.columns(3)
-                                c1.metric("Avg Bid Pressure", f"{float(hist_df['imbalance'].mean())*100:.1f}%" if 'imbalance' in hist_df else "N/A")
-                                c2.metric("Avg Spread", f"${float(hist_df['spread'].mean()):.4f}" if 'spread' in hist_df else "N/A")
-                                c3.metric("Rows", f"{len(hist_df):,}")
-                                if st.checkbox("Show historical MBP-1 records", value=False, key="mm_safe_show_hist_records"):
-                                    st.dataframe(hist_df.tail(200), use_container_width=True)
-                                if st.checkbox("Build simple replay trade log", value=False, key="mm_safe_build_replay"):
-                                    try:
-                                        hist_trades, hist_eq = build_databento_mbp1_trade_log(hist_df)
-                                        if isinstance(hist_trades, pd.DataFrame) and not hist_trades.empty:
-                                            hist_trades = apply_trade_log_timestamp_display(hist_trades)
-                                            st.dataframe(hist_trades, use_container_width=True, hide_index=True)
-                                        else:
-                                            st.info("No historical MBP-1 trade triggers found for this replay window/settings.")
-                                    except Exception as te:
-                                        st.warning(f"Replay trade-log build failed: {te}")
                         except Exception as e:
                             st.error(f"Historical replay error: {e}")
+
+                hist_df = st.session_state.get("mm_full_hist_df")
+                if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Avg Bid Pressure", f"{float(hist_df['imbalance'].mean())*100:.1f}%" if 'imbalance' in hist_df else "N/A")
+                    c2.metric("Avg Spread", f"${float(hist_df['spread'].mean()):.4f}" if 'spread' in hist_df else "N/A")
+                    c3.metric("Rows", f"{len(hist_df):,}")
+                    c4.metric("Last Mid", f"${float(hist_df['mid'].dropna().iloc[-1]):.4f}" if 'mid' in hist_df and not hist_df['mid'].dropna().empty else "N/A")
+
+                    fig_hist = go.Figure()
+                    if 'mid' in hist_df:
+                        fig_hist.add_trace(go.Scatter(x=hist_df.index, y=hist_df['mid'], name="Mid", mode="lines"))
+                    if 'microprice' in hist_df:
+                        fig_hist.add_trace(go.Scatter(x=hist_df.index, y=hist_df['microprice'], name="Microprice", mode="lines"))
+                    if len(fig_hist.data) > 0:
+                        fig_hist.update_layout(title="Databento MBP-1 mid/microprice", template="plotly_dark", height=360, hovermode="x unified")
+                        st.plotly_chart(fig_hist, use_container_width=True)
+
+                    if show_hist_records:
+                        st.dataframe(hist_df.tail(300), use_container_width=True)
+
+                    if build_replay_log:
+                        try:
+                            hist_trades, hist_eq = build_databento_mbp1_trade_log(hist_df)
+                            if isinstance(hist_trades, pd.DataFrame) and not hist_trades.empty:
+                                st.write("#### Databento historical replay trade log")
+                                hist_trades = apply_trade_log_timestamp_display(hist_trades)
+                                st.dataframe(hist_trades, use_container_width=True, hide_index=True)
+                                if isinstance(hist_eq, pd.Series) and not hist_eq.empty:
+                                    st.metric("Replay Strategy Return", f"{((float(hist_eq.iloc[-1]) / float(hist_eq.iloc[0])) - 1) * 100:.2f}%")
+                                    fig_replay = go.Figure()
+                                    fig_replay.add_trace(go.Scatter(x=hist_eq.index, y=hist_eq, name="Replay equity", mode="lines"))
+                                    fig_replay.update_layout(title="Databento Replay Equity", template="plotly_dark", height=340, hovermode="x unified")
+                                    st.plotly_chart(fig_replay, use_container_width=True)
+                            else:
+                                st.info("No historical MBP-1 trade triggers found for this replay window/settings.")
+                        except Exception as te:
+                            st.warning(f"Replay trade-log build failed: {te}")
 
             with st.expander("What this tab means", expanded=False):
                 st.markdown("""
                 - **OHLCV microstructure proxies** are research approximations from normal candles.
                 - **Databento MBP-1** gives live/historical top-of-book bid/ask pressure.
                 - **MBP-1 is not full Level 2.** Full depth needs MBP-10 / XNAS.ITCH entitlement.
-                - This tab is button-only so it does not freeze the full app.
+                - The full tab is restored, but everything heavy is button-only so it does not freeze the full app.
                 """)
 except Exception as e:
     try:
