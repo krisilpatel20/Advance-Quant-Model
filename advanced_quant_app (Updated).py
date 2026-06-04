@@ -10551,6 +10551,136 @@ def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds:
     }, None
 
 
+def build_databento_live_trade_log(records_df, open_pressure=0.62, close_pressure=0.45, min_hold_records=3, stop_loss_pct=0.003, take_profit_pct=0.005):
+    """
+    Build a tiny live MBP-1 trade/event log from the short live snapshot records.
+    This is button-only/display-only and does not affect any main strategy/backtest.
+    """
+    try:
+        if records_df is None or not isinstance(records_df, pd.DataFrame) or records_df.empty:
+            return pd.DataFrame()
+
+        df = records_df.copy()
+        if "received_at" not in df.columns:
+            return pd.DataFrame()
+
+        df["received_at"] = pd.to_datetime(df["received_at"], errors="coerce", utc=True)
+        df = df.dropna(subset=["received_at"]).sort_values("received_at")
+        for col in ["bid_px", "ask_px", "bid_sz", "ask_sz"]:
+            if col not in df.columns:
+                df[col] = np.nan
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["bid_px", "ask_px"])
+        df = df[(df["bid_px"] > 0) & (df["ask_px"] > 0) & (df["ask_px"] >= df["bid_px"])]
+        if df.empty:
+            return pd.DataFrame()
+
+        df["mid"] = (df["bid_px"] + df["ask_px"]) / 2.0
+        df["spread"] = df["ask_px"] - df["bid_px"]
+        df["bid_pressure"] = df["bid_sz"] / (df["bid_sz"] + df["ask_sz"] + 1e-9)
+        df["microprice"] = np.where(
+            (df["bid_sz"] + df["ask_sz"]) > 0,
+            ((df["ask_px"] * df["bid_sz"]) + (df["bid_px"] * df["ask_sz"])) / (df["bid_sz"] + df["ask_sz"] + 1e-9),
+            df["mid"]
+        )
+        df["pressure_smooth"] = df["bid_pressure"].rolling(3, min_periods=1).mean()
+        df["micro_slope"] = df["microprice"].diff().fillna(0.0)
+
+        trades = []
+        in_pos = False
+        entry_price = entry_time = None
+        entry_pressure = np.nan
+        bars_held = 0
+        peak_price = np.nan
+
+        for _, row in df.iterrows():
+            t = row["received_at"]
+            price = float(row["microprice"] if pd.notna(row["microprice"]) else row["mid"])
+            pressure = float(row["pressure_smooth"])
+            spread = float(row["spread"])
+            slope = float(row["micro_slope"])
+
+            if not in_pos:
+                if pressure >= float(open_pressure) and slope >= 0 and np.isfinite(price):
+                    in_pos = True
+                    entry_time = t
+                    entry_price = price
+                    entry_pressure = pressure
+                    bars_held = 0
+                    peak_price = price
+                continue
+
+            bars_held += 1
+            peak_price = max(float(peak_price), price) if np.isfinite(peak_price) else price
+            pnl_pct = ((price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
+            exit_reason = None
+            if bars_held >= int(min_hold_records):
+                if pressure <= float(close_pressure):
+                    exit_reason = f"Bid pressure faded to {pressure:.2f}"
+                elif stop_loss_pct and pnl_pct <= -abs(float(stop_loss_pct)) * 100.0:
+                    exit_reason = f"Live stop hit ({pnl_pct:.2f}%)"
+                elif take_profit_pct and pnl_pct >= abs(float(take_profit_pct)) * 100.0:
+                    exit_reason = f"Live target hit ({pnl_pct:.2f}%)"
+
+            if exit_reason:
+                trades.append({
+                    "Side": "Long",
+                    "Entry Time": entry_time,
+                    "Exit Time": t,
+                    "Buy Price": round(float(entry_price), 4),
+                    "Sell Price": round(float(price), 4),
+                    "PnL (%)": round(float(pnl_pct), 3),
+                    "Entry Bid Pressure": round(float(entry_pressure) * 100.0, 1),
+                    "Exit Bid Pressure": round(float(pressure) * 100.0, 1),
+                    "Spread": round(float(spread), 4),
+                    "Status": "Closed",
+                    "Reason": exit_reason,
+                })
+                in_pos = False
+                entry_price = entry_time = None
+                entry_pressure = np.nan
+                bars_held = 0
+                peak_price = np.nan
+
+        if in_pos and entry_price is not None:
+            last = df.iloc[-1]
+            last_price = float(last["microprice"] if pd.notna(last["microprice"]) else last["mid"])
+            pnl_pct = ((last_price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
+            trades.append({
+                "Side": "Long",
+                "Entry Time": entry_time,
+                "Exit Time": "Open",
+                "Buy Price": round(float(entry_price), 4),
+                "Sell Price": round(float(last_price), 4),
+                "PnL (%)": round(float(pnl_pct), 3),
+                "Entry Bid Pressure": round(float(entry_pressure) * 100.0, 1),
+                "Exit Bid Pressure": round(float(last["pressure_smooth"]) * 100.0, 1),
+                "Spread": round(float(last["spread"]), 4),
+                "Status": "Open",
+                "Reason": "Live snapshot still supports open position",
+            })
+
+        log = pd.DataFrame(trades)
+        if not log.empty:
+            # Convert UTC received timestamps into Central Time for display.
+            for col in ["Entry Time", "Exit Time"]:
+                if col in log.columns:
+                    def _fmt(v):
+                        try:
+                            if str(v).strip().lower() == "open":
+                                return "Open"
+                            ts = pd.Timestamp(v)
+                            if ts.tzinfo is None:
+                                ts = ts.tz_localize("UTC")
+                            return ts.tz_convert("America/Chicago").strftime("%Y-%m-%d %H:%M:%S CT")
+                        except Exception:
+                            return v
+                    log[col] = log[col].apply(_fmt)
+        return log
+    except Exception:
+        return pd.DataFrame()
+
+
 def _normalize_databento_mbp1_df(df):
     """Convert Databento MBP-1 dataframe into clean top-of-book rows."""
     try:
@@ -10661,24 +10791,13 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
         )
         raw_df = data.to_df()
         topbook_df = _normalize_databento_mbp1_df(raw_df)
-        if topbook_df.empty:
+        if not isinstance(topbook_df, pd.DataFrame) or topbook_df.empty:
             return None, "No historical MBP-1 top-of-book records found for that ticker/time range. Try regular market hours, a shorter range, or confirm entitlement."
 
-        latest = topbook_df.iloc[-1]
-        summary = {
-            "ticker": str(ticker).upper().strip(),
-            "bid_px": float(latest.get('bid_px', np.nan)),
-            "ask_px": float(latest.get('ask_px', np.nan)),
-            "bid_sz": float(latest.get('bid_sz', 0.0)) if pd.notna(latest.get('bid_sz', np.nan)) else 0.0,
-            "ask_sz": float(latest.get('ask_sz', 0.0)) if pd.notna(latest.get('ask_sz', np.nan)) else 0.0,
-            "spread": float(latest.get('spread', np.nan)),
-            "mid": float(latest.get('mid', np.nan)),
-            "imbalance": float(latest.get('imbalance', np.nan)),
-            "microprice": float(latest.get('microprice', np.nan)),
-            "records": topbook_df,
-            "timestamp_utc": datetime.utcnow(),
-        }
-        return summary, None
+        # IMPORTANT: Historical replay expects a DataFrame, not a summary dict.
+        # Live snapshot returns a dict, but historical replay needs the full row stream
+        # so it can build charts, features, and trade logs.
+        return topbook_df, None
     except Exception as e:
         err = str(e)
         if "data_start_after_available_end" in err or "after the available end" in err:
@@ -11614,6 +11733,40 @@ try:
                             c4.metric("Bid Pressure", f"{float(snap.get('imbalance', 0))*100:.1f}%")
                             c5.metric("Microprice", f"${snap.get('microprice', np.nan):.4f}" if pd.notna(snap.get('microprice', np.nan)) else "N/A")
                             recs = snap.get("records", pd.DataFrame())
+                            if isinstance(recs, pd.DataFrame) and not recs.empty:
+                                st.markdown("#### Live MBP-1 trade log")
+                                lt1, lt2, lt3, lt4, lt5 = st.columns(5)
+                                with lt1:
+                                    live_open_pressure = st.slider("Live open pressure", 0.50, 0.95, 0.62, 0.01, key="mm_live_open_pressure")
+                                with lt2:
+                                    live_close_pressure = st.slider("Live close pressure", 0.05, 0.70, 0.45, 0.01, key="mm_live_close_pressure")
+                                with lt3:
+                                    live_min_hold = st.number_input("Min live records held", 1, 50, 3, 1, key="mm_live_min_hold_records")
+                                with lt4:
+                                    live_stop_pct = st.number_input("Live stop %", 0.05, 5.0, 0.30, 0.05, key="mm_live_stop_pct")
+                                with lt5:
+                                    live_target_pct = st.number_input("Live target %", 0.05, 5.0, 0.50, 0.05, key="mm_live_target_pct")
+
+                                live_log = build_databento_live_trade_log(
+                                    recs,
+                                    open_pressure=float(live_open_pressure),
+                                    close_pressure=float(live_close_pressure),
+                                    min_hold_records=int(live_min_hold),
+                                    stop_loss_pct=float(live_stop_pct) / 100.0,
+                                    take_profit_pct=float(live_target_pct) / 100.0,
+                                )
+                                if isinstance(live_log, pd.DataFrame) and not live_log.empty:
+                                    st.dataframe(live_log, use_container_width=True)
+                                    st.download_button(
+                                        "Download live MBP-1 trade log CSV",
+                                        live_log.to_csv(index=False).encode("utf-8"),
+                                        file_name=f"{str(TICKER).upper()}_databento_live_mbp1_trade_log.csv",
+                                        mime="text/csv",
+                                        key="mm_live_trade_log_download",
+                                    )
+                                else:
+                                    st.info("No live MBP-1 trade trigger found in this short snapshot. Increase pull seconds/records or loosen live open/close pressure.")
+
                             if isinstance(recs, pd.DataFrame) and not recs.empty and st.checkbox("Show raw live records", value=False, key="mm_full_show_live_records"):
                                 st.dataframe(recs.tail(100), use_container_width=True)
 
@@ -11652,7 +11805,16 @@ try:
                             if hist_err:
                                 st.warning(f"Databento historical MBP-1 not available: {hist_err}")
                                 st.session_state.pop("mm_full_hist_df", None)
-                            elif hist_df is None or hist_df.empty:
+                            elif isinstance(hist_df, dict) and isinstance(hist_df.get("records"), pd.DataFrame):
+                                # Backward compatibility if an older helper returns a live-style summary dict.
+                                hist_df = hist_df.get("records")
+                                if hist_df is None or hist_df.empty:
+                                    st.info("No historical MBP-1 records returned for that window.")
+                                    st.session_state.pop("mm_full_hist_df", None)
+                                else:
+                                    st.session_state["mm_full_hist_df"] = hist_df
+                                    st.success(f"Loaded {len(hist_df):,} MBP-1 records.")
+                            elif not isinstance(hist_df, pd.DataFrame) or hist_df.empty:
                                 st.info("No historical MBP-1 records returned for that window.")
                                 st.session_state.pop("mm_full_hist_df", None)
                             else:
