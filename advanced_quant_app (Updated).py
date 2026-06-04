@@ -10857,22 +10857,41 @@ def _normalize_databento_mbp1_df(df):
 
 def _market_time_to_utc_iso(dt_value):
     """
-    Databento expects UTC timestamps. User inputs are New York market time.
-    Convert naive Streamlit date/time values from America/New_York to UTC ISO.
+    Databento expects UTC timestamps. User inputs are Central Time (CT).
+    Convert naive Streamlit date/time values from America/Chicago to UTC ISO.
     """
     ts = pd.Timestamp(dt_value)
     try:
         if ts.tzinfo is None:
             if ZoneInfo is not None:
-                ts = ts.tz_localize(ZoneInfo("America/New_York"))
+                ts = ts.tz_localize(ZoneInfo("America/Chicago"))
             else:
-                ts = ts.tz_localize("America/New_York")
+                ts = ts.tz_localize("America/Chicago")
         else:
-            ts = ts.tz_convert("America/New_York")
+            ts = ts.tz_convert("America/Chicago")
         return ts.tz_convert("UTC").isoformat()
     except Exception:
-        # Safe fallback: still return ISO instead of crashing app.
         return pd.Timestamp(dt_value).isoformat()
+
+
+def _safe_databento_end_dt_ct(end_dt, buffer_minutes=5):
+    """
+    Databento EQUS.MINI historical data can lag live data by a few minutes.
+    Clamp requested historical end time to now minus a small buffer in CT so
+    same-day backfill does not fail with data_end_after_available_end.
+    """
+    try:
+        if ZoneInfo is not None:
+            now_ct = datetime.now(ZoneInfo("America/Chicago")).replace(tzinfo=None)
+        else:
+            now_ct = datetime.now()
+        safe_end = now_ct - timedelta(minutes=int(buffer_minutes))
+        end_ts = pd.Timestamp(end_dt).to_pydatetime()
+        if end_ts > safe_end:
+            return safe_end
+        return end_dt
+    except Exception:
+        return end_dt
 
 
 def _previous_business_date(d):
@@ -10899,12 +10918,13 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
 
     try:
         client = db.Historical(str(api_key))
+        safe_end_dt = _safe_databento_end_dt_ct(end_dt, buffer_minutes=5)
         data = client.timeseries.get_range(
             dataset="EQUS.MINI",
             schema="mbp-1",
             symbols=[str(ticker).upper().strip()],
             start=_market_time_to_utc_iso(start_dt),
-            end=_market_time_to_utc_iso(end_dt),
+            end=_market_time_to_utc_iso(safe_end_dt),
             limit=int(min(max(int(limit), 100), 3000)),
         )
         raw_df = data.to_df()
@@ -10918,10 +10938,17 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
         return topbook_df, None
     except Exception as e:
         err = str(e)
+        if "data_end_after_available_end" in err or "end in the query" in err:
+            return None, (
+                "Databento historical data is a few minutes behind live. "
+                "I now clamp same-day backfill to CT time minus a safety buffer, but Databento still says the requested end is too new. "
+                "Try again in a few minutes or lower the end time by 5–10 minutes. "
+                f"Raw error: {err}"
+            )
         if "data_start_after_available_end" in err or "after the available end" in err:
             return None, (
                 "Requested historical range is newer than Databento's available historical EQUS.MINI data. "
-                "Use an earlier replay date, usually the previous trading day. "
+                "Use an earlier replay date/time in CT, usually the previous trading day. "
                 "For same-day real-time data while market is open, use the Live MBP-1 snapshot instead. "
                 f"Raw error: {err}"
             )
@@ -11858,10 +11885,10 @@ try:
                         "Backfill today from market open",
                         value=True,
                         key="mm_live_backfill_from_open",
-                        help="Uses Databento Historical MBP-1 to rebuild today's session from 9:30 ET to now, then merges live records. This is how the live log can include trades from earlier this morning."
+                        help="Uses Databento Historical MBP-1 to rebuild today's session from 8:30 CT to now, then merges live records. This is how the live log can include trades from earlier this morning."
                     )
                 with b2:
-                    backfill_start_time = st.time_input("Backfill start time ET", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_live_backfill_start_time")
+                    backfill_start_time = st.time_input("Backfill start time CT", value=datetime.strptime("08:30", "%H:%M").time(), key="mm_live_backfill_start_time")
                 with b3:
                     backfill_limit = st.number_input("Backfill max records", min_value=500, max_value=3000, value=3000, step=500, key="mm_live_backfill_limit")
 
@@ -11876,11 +11903,11 @@ try:
                         if bool(backfill_from_open):
                             try:
                                 if ZoneInfo is not None:
-                                    now_et = datetime.now(ZoneInfo("America/New_York"))
+                                    now_ct = datetime.now(ZoneInfo("America/Chicago"))
                                 else:
-                                    now_et = datetime.now()
-                                hist_start = datetime.combine(now_et.date(), backfill_start_time)
-                                hist_end = now_et.replace(tzinfo=None)
+                                    now_ct = datetime.now()
+                                hist_start = datetime.combine(now_ct.date(), backfill_start_time)
+                                hist_end = _safe_databento_end_dt_ct(now_ct.replace(tzinfo=None), buffer_minutes=5)
                                 with st.spinner(f"Backfilling Databento EQUS.MINI MBP-1 for {TICKER} from market open..."):
                                     hist_recs, hist_err = get_databento_equs_mbp1_history(
                                         str(TICKER), str(db_api_key), hist_start, hist_end, limit=int(backfill_limit)
@@ -11984,9 +12011,9 @@ try:
                 with h1:
                     replay_date = st.date_input("Replay date", value=_previous_business_date(datetime.today()), key="mm_full_hist_date")
                 with h2:
-                    start_time = st.time_input("Start time ET", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_full_hist_start")
+                    start_time = st.time_input("Start time CT", value=datetime.strptime("08:30", "%H:%M").time(), key="mm_full_hist_start")
                 with h3:
-                    end_time = st.time_input("End time ET", value=datetime.strptime("16:00", "%H:%M").time(), key="mm_full_hist_end")
+                    end_time = st.time_input("End time CT", value=datetime.strptime("15:00", "%H:%M").time(), key="mm_full_hist_end")
 
                 h4, h5, h6 = st.columns(3)
                 with h4:
