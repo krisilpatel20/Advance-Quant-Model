@@ -10462,6 +10462,62 @@ def _databento_record_to_topbook(msg):
     return None
 
 
+
+
+def _prepare_mbp1_records_for_session_buffer(df):
+    """Normalize Databento MBP-1 rows so live + historical records can share one session buffer."""
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        out = df.copy()
+        # Historical replay uses timestamp; live snapshot uses received_at.
+        if "received_at" not in out.columns:
+            if "timestamp" in out.columns:
+                out["received_at"] = out["timestamp"]
+            elif isinstance(out.index, pd.DatetimeIndex):
+                out["received_at"] = out.index
+        if "received_at" in out.columns:
+            out["received_at"] = pd.to_datetime(out["received_at"], errors="coerce", utc=True)
+            out = out.dropna(subset=["received_at"])
+        # Keep only fields needed for the live/session trade log.
+        for c in ["bid_px", "ask_px", "bid_sz", "ask_sz"]:
+            if c not in out.columns:
+                out[c] = np.nan
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        out = out.dropna(subset=["bid_px", "ask_px"])
+        out = out[(out["bid_px"] > 0) & (out["ask_px"] > 0) & (out["ask_px"] >= out["bid_px"])]
+        keep = [c for c in ["received_at", "timestamp", "bid_px", "ask_px", "bid_sz", "ask_sz", "mid", "spread", "imbalance", "microprice"] if c in out.columns]
+        out = out[keep].copy()
+        if "received_at" in out.columns:
+            out = out.sort_values("received_at")
+        return out.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _merge_mbp1_session_records(old_df, new_df, max_records=20000):
+    """Append MBP-1 rows into Streamlit session buffer without duplicates."""
+    try:
+        old_clean = _prepare_mbp1_records_for_session_buffer(old_df)
+        new_clean = _prepare_mbp1_records_for_session_buffer(new_df)
+        if old_clean.empty and new_clean.empty:
+            return pd.DataFrame()
+        if old_clean.empty:
+            combined = new_clean.copy()
+        elif new_clean.empty:
+            combined = old_clean.copy()
+        else:
+            combined = pd.concat([old_clean, new_clean], ignore_index=True)
+        dedup_cols = [c for c in ["received_at", "bid_px", "ask_px", "bid_sz", "ask_sz"] if c in combined.columns]
+        if dedup_cols:
+            combined = combined.drop_duplicates(subset=dedup_cols, keep="last")
+        if "received_at" in combined.columns:
+            combined["received_at"] = pd.to_datetime(combined["received_at"], errors="coerce", utc=True)
+            combined = combined.dropna(subset=["received_at"]).sort_values("received_at")
+        return combined.tail(int(max_records)).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
 def get_databento_equs_mbp1_snapshot(ticker: str, api_key: str, timeout_seconds: int = 8, max_records: int = 80):
     """
     Pull a short live EQUS.MINI MBP-1 snapshot for the dashboard.
@@ -11795,16 +11851,56 @@ try:
                 if not db_api_key:
                     db_api_key = st.text_input("Databento API key", type="password", key="mm_full_db_api_key")
 
-                pull_live_now = st.button("Pull Databento live MBP-1 now", key="mm_full_db_live_pull") or bool(live_auto_update)
+                st.markdown("##### Session backfill")
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    backfill_from_open = st.checkbox(
+                        "Backfill today from market open",
+                        value=True,
+                        key="mm_live_backfill_from_open",
+                        help="Uses Databento Historical MBP-1 to rebuild today's session from 9:30 ET to now, then merges live records. This is how the live log can include trades from earlier this morning."
+                    )
+                with b2:
+                    backfill_start_time = st.time_input("Backfill start time ET", value=datetime.strptime("09:30", "%H:%M").time(), key="mm_live_backfill_start_time")
+                with b3:
+                    backfill_limit = st.number_input("Backfill max records", min_value=500, max_value=3000, value=3000, step=500, key="mm_live_backfill_limit")
+
+                pull_live_now = st.button("Pull / update Databento MBP-1 session", key="mm_full_db_live_pull") or bool(live_auto_update)
 
                 if pull_live_now:
                     if not db_api_key:
                         st.warning("Databento API key missing. Add DATABENTO_API_KEY to Streamlit secrets.")
                     else:
-                        with st.spinner(f"Pulling Databento EQUS.MINI MBP-1 for {TICKER}..."):
+                        # 1) Optional historical backfill from market open to now. This is required
+                        # if you want the live trade log to include trades before the app started running.
+                        if bool(backfill_from_open):
+                            try:
+                                if ZoneInfo is not None:
+                                    now_et = datetime.now(ZoneInfo("America/New_York"))
+                                else:
+                                    now_et = datetime.now()
+                                hist_start = datetime.combine(now_et.date(), backfill_start_time)
+                                hist_end = now_et.replace(tzinfo=None)
+                                with st.spinner(f"Backfilling Databento EQUS.MINI MBP-1 for {TICKER} from market open..."):
+                                    hist_recs, hist_err = get_databento_equs_mbp1_history(
+                                        str(TICKER), str(db_api_key), hist_start, hist_end, limit=int(backfill_limit)
+                                    )
+                                if hist_err:
+                                    st.info(f"Session backfill not available yet: {hist_err}")
+                                elif isinstance(hist_recs, pd.DataFrame) and not hist_recs.empty:
+                                    old_recs = st.session_state.get(live_buffer_key, pd.DataFrame())
+                                    st.session_state[live_buffer_key] = _merge_mbp1_session_records(
+                                        old_recs, hist_recs, max_records=int(live_session_max_records)
+                                    )
+                                    st.success(f"Backfilled {len(hist_recs):,} MBP-1 records into live session buffer.")
+                            except Exception as e:
+                                st.info(f"Session backfill skipped: {e}")
+
+                        # 2) Live slice now. This adds current top-of-book records to the same session buffer.
+                        with st.spinner(f"Pulling live Databento EQUS.MINI MBP-1 for {TICKER}..."):
                             snap, err = get_databento_equs_mbp1_snapshot(str(TICKER), str(db_api_key), timeout_seconds=int(db_timeout), max_records=int(db_max_records))
                         if err:
-                            st.warning(f"Databento MBP-1 not available right now: {err}")
+                            st.warning(f"Databento MBP-1 live slice not available right now: {err}")
                         elif snap:
                             c1, c2, c3, c4, c5 = st.columns(5)
                             c1.metric("Best Bid", f"${snap.get('bid_px', np.nan):.4f}")
@@ -11815,23 +11911,14 @@ try:
                             recs_new = snap.get("records", pd.DataFrame())
                             if isinstance(recs_new, pd.DataFrame) and not recs_new.empty:
                                 old_recs = st.session_state.get(live_buffer_key, pd.DataFrame())
-                                if isinstance(old_recs, pd.DataFrame) and not old_recs.empty:
-                                    combined = pd.concat([old_recs, recs_new], ignore_index=True)
-                                else:
-                                    combined = recs_new.copy()
-                                dedup_cols = [c for c in ["received_at", "bid_px", "ask_px", "bid_sz", "ask_sz"] if c in combined.columns]
-                                if dedup_cols:
-                                    combined = combined.drop_duplicates(subset=dedup_cols, keep="last")
-                                if "received_at" in combined.columns:
-                                    combined["received_at"] = pd.to_datetime(combined["received_at"], errors="coerce", utc=True)
-                                    combined = combined.dropna(subset=["received_at"]).sort_values("received_at")
-                                combined = combined.tail(int(live_session_max_records)).reset_index(drop=True)
-                                st.session_state[live_buffer_key] = combined
+                                st.session_state[live_buffer_key] = _merge_mbp1_session_records(
+                                    old_recs, recs_new, max_records=int(live_session_max_records)
+                                )
 
                 recs = st.session_state.get(live_buffer_key, pd.DataFrame())
                 if isinstance(recs, pd.DataFrame) and not recs.empty:
                     st.markdown("#### Live MBP-1 session trade log")
-                    st.caption("Uses all live records collected in this app session. It cannot include records before the app started collecting; use Historical Replay for from-market-open reconstruction.")
+                    st.caption("Uses the Databento session buffer. With backfill ON, it includes today from market open if historical MBP-1 is available; otherwise it uses records collected while the app is running.")
                     lt1, lt2, lt3, lt4, lt5 = st.columns(5)
                     with lt1:
                         live_open_pressure = st.slider("Live open pressure", 0.50, 0.95, 0.62, 0.01, key="mm_live_open_pressure")
@@ -11877,17 +11964,17 @@ try:
                             key="mm_live_trade_log_download",
                         )
                     else:
-                        st.info("No live MBP-1 trade trigger found yet in this session buffer. Auto-update can keep collecting; for earlier records from market open, use Historical Replay.")
+                        st.info("No MBP-1 trade trigger found yet in this session buffer/settings. Try backfill from market open, loosen pressure thresholds, or widen the replay window.")
 
                     if st.checkbox("Show raw live session records", value=False, key="mm_full_show_live_records"):
                         st.dataframe(recs.tail(300), use_container_width=True)
                 else:
-                    st.info("No live MBP-1 records collected yet. Click pull now or enable auto-update during market hours.")
+                    st.info("No MBP-1 session records collected yet. Click Pull / update Databento MBP-1 session. Turn Backfill ON to include today from market open when Databento historical data is available.")
 
                 if bool(live_auto_update):
-                    components.html(
-                        f"<script>setTimeout(function(){{window.parent.location.reload();}}, {int(live_refresh_sec) * 1000});</script>",
-                        height=0,
+                    st.info(
+                        "Auto-update is in safe mode: full-page browser refresh is disabled so the app will not jump back to the first tab. "
+                        "Click the live pull button to collect the next MBP-1 slice. A true non-blocking live stream needs a separate background service/component, not a full Streamlit rerun."
                     )
 
             # ---------- DATABENTO HISTORICAL REPLAY ----------
