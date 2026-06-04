@@ -10803,7 +10803,13 @@ def build_databento_mbp1_trade_log(
         trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['vwap_slope'] >= 0) & (bars['mom_5'] >= -0.002)
         pressure_ok = bars['imb_smooth'] >= float(imbalance_open)
         spread_ok = bars['spread_pct'] <= spread_cap
-        open_cond = after_open_noise & trend_ok & pressure_ok & spread_ok
+        
+        # Add a momentum breakout condition to capture huge trending days (e.g. 6% up) 
+        # even if bid imbalance isn't sitting at extreme levels (e.g. just neutral 0.50+).
+        trend_strong = (bars['price'] > bars['vwap']) & (bars['ema_fast'] > bars['ema_slow']) & (bars['mom_5'] > 0.004)
+        breakout_cond = after_open_noise & trend_strong & (bars['imb_smooth'] >= 0.50) & spread_ok
+        
+        open_cond = (after_open_noise & trend_ok & pressure_ok & spread_ok) | breakout_cond
 
         # Adaptive fallback: when the A+ filter is too strict for the selected window,
         # use a runner-confirmation rule instead of returning zero trades for every stock.
@@ -10823,9 +10829,10 @@ def build_databento_mbp1_trade_log(
             open_cond = after_open_noise & trend_participation & spread_ok
 
         # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
+        # Tolerate minor mom_5 pullbacks if we are still above ema_slow or vwap.
         close_cond = (
             ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
-            (bars['mom_5'] < -0.004) |
+            ((bars['mom_5'] < -0.004) & (bars['price'] < bars['ema_slow'])) |
             ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
         )
 
@@ -11303,7 +11310,7 @@ try:
                                     imbalance_open=float(hist_open_imb),
                                     imbalance_close=float(hist_close_imb),
                                     min_hold_records=int(hist_min_hold),
-                                    cooldown_records=25,
+                                    cooldown_records=3,
                                     confirm_records=int(hist_confirm_records),
                                     per_trade_stop_pct=float(hist_trade_stop),
                                     trailing_stop_pct=float(hist_trail_stop),
