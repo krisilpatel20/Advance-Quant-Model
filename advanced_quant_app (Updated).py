@@ -3283,7 +3283,7 @@ def risk_adjusted_candidate_score(score, benchmark_bias=0.15, activity_mode="Con
         trade_penalty = 5.0 if trades < 2 else 0.0
         return (0.55 * ret) + (0.35 * diff) - (0.25 * dd) - trade_penalty + (benchmark_bias * max(ret, 0))
 
-def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0):
+def walk_forward_strategy_selection(prices, candidates, train_window=126, forward_window=21, initial_capital=10000.0, confirmed_bar=True, trailing_stop_pct=0.0, stop_loss_pct=0.0, use_return_booster=False, return_booster_mode="Balanced"):
     """
     Walk-forward validation for adaptive strategy choosers.
     Chooses the best candidate using ONLY the trailing training window, then applies that candidate
