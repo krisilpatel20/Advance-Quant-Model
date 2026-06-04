@@ -10907,7 +10907,13 @@ def _previous_business_date(d):
 
 
 def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt, limit: int = 1500):
-    """Pull historical EQUS.MINI MBP-1 top-of-book records for today/yesterday replay."""
+    """Pull historical EQUS.MINI MBP-1 top-of-book records for CT replay/backfill.
+
+    Important fix:
+    Databento same-day historical data can lag live data. If Databento returns
+    data_end_after_available_end, this function parses the exact "available up to"
+    timestamp from the error and retries automatically using that available end.
+    """
     try:
         import databento as db
     except Exception:
@@ -10917,32 +10923,74 @@ def get_databento_equs_mbp1_history(ticker: str, api_key: str, start_dt, end_dt,
         return None, "Databento API key is missing. Add DATABENTO_API_KEY to Streamlit secrets or environment."
 
     try:
+        import re
         client = db.Historical(str(api_key))
-        safe_end_dt = _safe_databento_end_dt_ct(end_dt, buffer_minutes=5)
-        data = client.timeseries.get_range(
-            dataset="EQUS.MINI",
-            schema="mbp-1",
-            symbols=[str(ticker).upper().strip()],
-            start=_market_time_to_utc_iso(start_dt),
-            end=_market_time_to_utc_iso(safe_end_dt),
-            limit=int(min(max(int(limit), 100), 3000)),
-        )
-        raw_df = data.to_df()
-        topbook_df = _normalize_databento_mbp1_df(raw_df)
-        if not isinstance(topbook_df, pd.DataFrame) or topbook_df.empty:
-            return None, "No historical MBP-1 top-of-book records found for that ticker/time range. Try regular market hours, a shorter range, or confirm entitlement."
 
-        # IMPORTANT: Historical replay expects a DataFrame, not a summary dict.
-        # Live snapshot returns a dict, but historical replay needs the full row stream
-        # so it can build charts, features, and trade logs.
+        start_iso = _market_time_to_utc_iso(start_dt)
+        safe_end_dt = _safe_databento_end_dt_ct(end_dt, buffer_minutes=10)
+        end_iso = _market_time_to_utc_iso(safe_end_dt)
+        record_limit = int(min(max(int(limit), 100), 3000))
+        symbol = str(ticker).upper().strip()
+
+        def _pull(end_value):
+            data = client.timeseries.get_range(
+                dataset="EQUS.MINI",
+                schema="mbp-1",
+                symbols=[symbol],
+                start=start_iso,
+                end=end_value,
+                limit=record_limit,
+            )
+            raw_df = data.to_df()
+            return _normalize_databento_mbp1_df(raw_df)
+
+        try:
+            topbook_df = _pull(end_iso)
+        except Exception as e:
+            err = str(e)
+            # Example error text:
+            # The dataset EQUS.MINI has data available up to '2026-06-04 18:00:00+00:00'.
+            # The end in the query ('2026-06-04 18:01:30+00:00') is after the available range.
+            if "data_end_after_available_end" in err or "available up to" in err:
+                m = re.search(r"available up to '([^']+)'", err)
+                if not m:
+                    raise
+                available_end_utc = pd.Timestamp(m.group(1))
+                if available_end_utc.tzinfo is None:
+                    available_end_utc = available_end_utc.tz_localize("UTC")
+                else:
+                    available_end_utc = available_end_utc.tz_convert("UTC")
+
+                start_utc = pd.Timestamp(start_iso)
+                if start_utc.tzinfo is None:
+                    start_utc = start_utc.tz_localize("UTC")
+                else:
+                    start_utc = start_utc.tz_convert("UTC")
+
+                retry_end_utc = available_end_utc - pd.Timedelta(seconds=1)
+                if retry_end_utc <= start_utc:
+                    avail_ct = available_end_utc.tz_convert("America/Chicago").strftime("%Y-%m-%d %H:%M:%S CT")
+                    return None, (
+                        f"Databento historical EQUS.MINI is only available up to {avail_ct}, "
+                        "which is before/too close to your selected CT start time. "
+                        "Choose an earlier start time or try again later."
+                    )
+
+                topbook_df = _pull(retry_end_utc.isoformat())
+            else:
+                raise
+
+        if not isinstance(topbook_df, pd.DataFrame) or topbook_df.empty:
+            return None, "No historical MBP-1 top-of-book records found for that ticker/time range. Try regular market hours, a shorter CT range, or confirm entitlement."
+
         return topbook_df, None
     except Exception as e:
         err = str(e)
         if "data_end_after_available_end" in err or "end in the query" in err:
             return None, (
-                "Databento historical data is a few minutes behind live. "
-                "I now clamp same-day backfill to CT time minus a safety buffer, but Databento still says the requested end is too new. "
-                "Try again in a few minutes or lower the end time by 5–10 minutes. "
+                "Databento historical data is still behind live for this exact CT window. "
+                "The app tried to clamp/retry using the available end, but Databento still rejected the request. "
+                "Try an end time 10–15 minutes earlier in CT or try again in a few minutes. "
                 f"Raw error: {err}"
             )
         if "data_start_after_available_end" in err or "after the available end" in err:
