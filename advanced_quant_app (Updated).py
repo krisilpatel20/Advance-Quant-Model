@@ -1436,6 +1436,10 @@ class BacktestEngine:
 
         returns = prices.pct_change().fillna(0.0)
 
+        prices_arr = prices.values
+        signals_arr = signals.values
+        dates_arr = prices.index
+
         equity_vals = []
         trades = []
 
@@ -1472,9 +1476,10 @@ class BacktestEngine:
                 'Status': status_msg
             })
 
-        for date, price in prices.items():
-            price = float(price)
-            desired_signal = float(signals.loc[date])
+        for i in range(len(prices_arr)):
+            date = dates_arr[i]
+            price = float(prices_arr[i])
+            desired_signal = float(signals_arr[i])
 
             # Cooldown logic to prevent immediate re-entry after stop loss/trailing stop
             if cooldown_bars > 0:
