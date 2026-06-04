@@ -10789,25 +10789,26 @@ def build_databento_mbp1_trade_log(
             open_noise_cutoff = first_ts
         after_open_noise = bars.index >= open_noise_cutoff
 
-        # Session VWAP and trend filters.
+        # Session VWAP and trend filters (smoothed to avoid micro-whipsaws)
         bars['vwap'] = (bars['price'] * bars['size_proxy']).cumsum() / (bars['size_proxy'].cumsum() + 1e-9)
-        bars['ema_fast'] = bars['price'].ewm(span=3, adjust=False).mean()
-        bars['ema_slow'] = bars['price'].ewm(span=8, adjust=False).mean()
+        bars['ema_fast'] = bars['price'].ewm(span=9, adjust=False).mean()
+        bars['ema_slow'] = bars['price'].ewm(span=21, adjust=False).mean()
         bars['imb_smooth'] = bars['imbalance'].rolling(max(2, int(confirm_records)), min_periods=1).mean()
-        bars['vwap_slope'] = bars['vwap'].diff(3).fillna(0)
-        bars['mom_5'] = bars['price'].pct_change(5).fillna(0)
+        bars['vwap_slope'] = bars['vwap'].diff(5).fillna(0)
+        bars['mom_15'] = bars['price'].pct_change(15).fillna(0)
         bars['spread_pct'] = (bars['spread'] / bars['price'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
         spread_cap = max(float(bars['spread_pct'].quantile(0.90)), 0.0010)
 
         # MBP-1 is confirmation only. The main idea is trend + VWAP + healthy pressure.
-        trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['vwap_slope'] >= 0) & (bars['mom_5'] >= -0.002)
+        trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_15'] >= -0.002)
         pressure_ok = bars['imb_smooth'] >= float(imbalance_open)
         spread_ok = bars['spread_pct'] <= spread_cap
         
-        # Add a momentum breakout condition to capture huge trending days (e.g. 6% up) 
-        # even if bid imbalance isn't sitting at extreme levels (e.g. just neutral 0.50+).
-        trend_strong = (bars['price'] > bars['vwap']) & (bars['ema_fast'] > bars['ema_slow']) & (bars['mom_5'] > 0.004)
-        breakout_cond = after_open_noise & trend_strong & (bars['imb_smooth'] >= 0.50) & spread_ok
+        # Breakout condition: price makes a new 20-bar high with positive momentum,
+        # capturing strong runners even if bid imbalance is neutral (0.50+).
+        rolling_high = bars['price'].rolling(20).max()
+        is_breakout = (bars['price'] >= rolling_high) & (bars['mom_15'] > 0.002) & (bars['ema_fast'] > bars['ema_slow'])
+        breakout_cond = after_open_noise & is_breakout & (bars['imb_smooth'] >= 0.50) & spread_ok
         
         open_cond = (after_open_noise & trend_ok & pressure_ok & spread_ok) | breakout_cond
 
@@ -10817,7 +10818,7 @@ def build_databento_mbp1_trade_log(
         # bid pressure, but it does not demand the very high default pressure threshold.
         if int(open_cond.sum()) == 0:
             soft_pressure = max(0.52, float(imbalance_open) - 0.18)
-            relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= -0.004)
+            relaxed_trend_ok = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow'])
             relaxed_pressure_ok = bars['imb_smooth'] >= soft_pressure
             open_cond = after_open_noise & relaxed_trend_ok & relaxed_pressure_ok & spread_ok
 
@@ -10825,14 +10826,14 @@ def build_databento_mbp1_trade_log(
         # returns a small slice of the session, pressure may not reach the threshold even when
         # price is trending cleanly. Use a very small number of entries, still with risk guards.
         if int(open_cond.sum()) == 0 and len(bars) >= 6:
-            trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_5'] >= 0)
+            trend_participation = (bars['price'] > bars['vwap']) & (bars['ema_fast'] >= bars['ema_slow']) & (bars['mom_15'] >= 0)
             open_cond = after_open_noise & trend_participation & spread_ok
 
         # Do NOT exit just because imbalance flickers. Exit only on real price/trend damage.
-        # Tolerate minor mom_5 pullbacks if we are still above ema_slow or vwap.
+        # Tolerate micro-pullbacks; exit if we break below the slow EMA or have a major momentum collapse.
         close_cond = (
-            ((bars['price'] < bars['vwap']) & (bars['ema_fast'] < bars['ema_slow'])) |
-            ((bars['mom_5'] < -0.004) & (bars['price'] < bars['ema_slow'])) |
+            (bars['price'] < bars['ema_slow']) |
+            (bars['mom_15'] < -0.006) |
             ((bars['imb_smooth'] <= float(imbalance_close)) & (bars['price'] < bars['vwap']))
         )
 
