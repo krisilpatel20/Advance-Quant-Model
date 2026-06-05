@@ -9463,17 +9463,24 @@ def _intraday_clean_frame(source_df, today_only=True):
 
 def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False, direction_mode='Long Only'):
     """
-    Long-only intraday alpha engine.
+    Long-only auction-quality intraday engine.
 
-    Institutional-style structure for retail data:
-    1) Classify the day: Trend Up, Trend Down, Panic Bounce, Chop, Opening Drive.
-    2) Score separate long setups instead of using one yes/no rule:
-       - Green-day momentum continuation
-       - Red-day dip-bounce / reclaim pulse
-       - VWAP reclaim
-       - Opening-range breakout
-    3) Apply avoid filters: weak bounce, too extended, illiquid/low volume, bad candle close.
-    4) Emit long-only entry events. No short selling is generated here.
+    Important idea:
+    Institutions do NOT buy every dip. They wait for the auction to prove that
+    sellers are exhausted or buyers are in control. Since this app is long-only,
+    the correct answer on many red/downtrend days is NO TRADE.
+
+    Playbooks:
+    1) Trend-up continuation: only above VWAP, EMA stack, pullback/OR breakout.
+    2) Red-day reversal: only after capitulation + reclaim + higher-low/break-of-structure.
+    3) VWAP reclaim: only when reclaim holds and momentum confirms.
+
+    Hard avoids:
+    - waterfall / lower-low sequence
+    - below VWAP and below EMA21 on trend-down days
+    - weak bounce with no structure
+    - overextended chase
+    - low volume / bad candle close
     """
     close = d['Close'].astype(float)
     high = d['High'].astype(float) if 'High' in d.columns else close
@@ -9484,11 +9491,10 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     idx = close.index
     n = len(close)
     false = pd.Series(False, index=idx)
-    if n < 10:
-        features = pd.DataFrame({'Close': close, 'Final Entry': 0, 'Long Entry': 0, 'Short Entry': 0}, index=idx)
+    if n < 30:
+        features = pd.DataFrame({'Close': close, 'Final Entry': 0, 'Long Entry': 0, 'Short Entry': 0, 'Model Decision': 'Not enough bars'}, index=idx)
         return false, false, features
 
-    # Core intraday features
     ema5 = close.ewm(span=5, adjust=False).mean()
     ema9 = close.ewm(span=9, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
@@ -9498,7 +9504,7 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
 
     rng = (high - low).replace(0, np.nan)
     close_location = ((close - low) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.5)
-    candle_body = ((close - open_) / open_.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
+    body_pct = ((close - open_) / open_.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
     ret1 = close.pct_change().fillna(0)
     mom3 = close.pct_change(3).fillna(0)
     mom6 = close.pct_change(6).fillna(0)
@@ -9506,180 +9512,195 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
 
     vol_ma20 = vol.rolling(20, min_periods=5).mean()
     vol_ratio = (vol / vol_ma20).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    vol_impulse = vol_ratio > 1.15
 
     rolling_high = high.cummax()
     rolling_low = low.cummin()
     bounce_from_low = (close / rolling_low - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
-    pullback_from_high = (close / rolling_high - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
     distance_vwap = (close / vwap - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
     distance_ema21 = (close / ema21 - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # Opening range: first ~15 bars for 1m, still useful for 5m/other intervals.
+    bar_no = pd.Series(np.arange(n), index=idx)
     or_bars = min(max(5, int(n * 0.08)), 20)
     opening_high = pd.Series(high.iloc[:or_bars].max(), index=idx)
     opening_low = pd.Series(low.iloc[:or_bars].min(), index=idx)
+    opening_mid = (opening_high + opening_low) / 2.0
     above_opening_high = close > opening_high
-    below_opening_low = close < opening_low
+    above_opening_mid = close > opening_mid
 
-    # Day type classifier. This is simple, explainable, and fast.
-    trend_up_day = (session_move > 0.012) & (close > vwap) & (ema9 > ema21)
-    trend_down_day = (session_move < -0.012) & (close < vwap) & (ema9 < ema21)
-    panic_bounce_day = (session_move < -0.018) & (bounce_from_low > 0.003) & (close > ema5)
-    opening_drive_day = (above_opening_high & (session_move > 0.006)) | (below_opening_low & (session_move < -0.006))
-    chop_day = (session_move.abs() < 0.006) & (distance_vwap.abs() < 0.004)
+    # Structure: this is the part the old version was missing.
+    recent_low_8 = low.rolling(8, min_periods=3).min()
+    recent_high_8 = high.rolling(8, min_periods=3).max()
+    prior_high_5 = high.shift(1).rolling(5, min_periods=3).max()
+    prior_low_5 = low.shift(1).rolling(5, min_periods=3).min()
+    higher_low = low > prior_low_5
+    break_structure_up = close > prior_high_5
+    reclaim_fast = (close > ema9) & (close.shift(1) <= ema9.shift(1))
+    reclaim_vwap = (close > vwap) & (close.shift(1) <= vwap.shift(1))
+    hold_vwap = (close > vwap) & (low >= vwap * 0.998)
 
-    # Setup engines, all LONG ONLY.
-    green_momentum = (
-        (session_move > 0.004) &
-        (close > ema9) & (ema9 >= ema21) &
-        ((mom3 > 0.0007) | (mom6 > 0.0015)) &
-        (close_location > 0.48)
+    # Waterfall / distribution detection. Long-only model should usually stand aside here.
+    lower_low_sequence = (low <= low.shift(1)) & (low.shift(1) <= low.shift(2)) & (low.shift(2) <= low.shift(3))
+    lower_high_sequence = (high <= high.shift(1)) & (high.shift(1) <= high.shift(2))
+    below_stack = (close < vwap) & (close < ema9) & (ema9 < ema21)
+    trend_down_day = (session_move < -0.012) & below_stack
+    waterfall = (session_move < -0.018) & lower_low_sequence & (mom3 < 0)
+    distribution = trend_down_day & lower_high_sequence & (close_location < 0.55)
+
+    trend_up_day = (session_move > 0.010) & (close > vwap) & (ema9 > ema21)
+    chop_day = (session_move.abs() < 0.005) & (distance_vwap.abs() < 0.0035)
+
+    # Capitulation is not an entry. It only says: maybe wait for reversal confirmation.
+    large_down_bar = (body_pct < -0.004) | (ret1 < -0.004)
+    capitulation = ((low <= rolling_low.shift(1).fillna(low)) & (vol_impulse | large_down_bar)).rolling(8, min_periods=1).max().astype(bool)
+
+    # Red-day long only requires all three: panic happened, structure reclaimed, and seller pressure slowed.
+    red_reversal_confirmed = (
+        (session_move < -0.012) &
+        capitulation &
+        (bounce_from_low > 0.0065) &
+        (higher_low | break_structure_up) &
+        (close > ema9) &
+        (mom3 > 0.0012) &
+        (close_location > 0.60) &
+        (~waterfall) &
+        (~distribution)
     )
 
-    vwap_reclaim = (
-        (close > vwap) & (close.shift(1) <= vwap.shift(1)) &
-        (mom3 > -0.0005) &
-        (close_location > 0.52)
-    )
-
-    opening_range_breakout = (
-        above_opening_high &
-        (close.shift(1) <= opening_high.shift(1).fillna(opening_high)) &
-        (vol_ratio > 0.75) &
-        (close_location > 0.52)
-    )
-
-    # Red-day dip-bounce: your exact no-short-selling logic.
-    # The stock is down hard, forms an intraday low, then confirms a rebound.
-    red_dip_bounce = (
-        (session_move < -0.010) &
-        (bounce_from_low > 0.0025) &
-        (close > ema5) &
-        ((close > ema9) | (mom3 > 0.0010)) &
-        (close_location > 0.50)
-    )
-
+    # Very strong reclaim pulse: allowed even before VWAP, but only if price breaks structure.
     red_reclaim_pulse = (
-        (session_move < -0.006) &
-        (bounce_from_low > 0.0040) &
-        ((close > ema9) | (close > vwap)) &
-        (mom3 > 0) &
-        (vol_ratio > 0.60)
+        red_reversal_confirmed &
+        ((reclaim_fast | break_structure_up) | (close > ema21)) &
+        (vol_ratio > 0.75)
     )
 
-    # Avoid filters: these matter more than adding indicators.
-    too_extended_up = (distance_vwap > 0.030) | (distance_ema21 > 0.025)
-    weak_bounce = (session_move < -0.010) & (close < ema5) & (close_location < 0.45)
-    still_waterfalling = (session_move < -0.020) & (close <= rolling_low.shift(1).fillna(close)) & (mom3 < 0)
-    low_quality_volume = vol_ratio < 0.45
-    bad_close = close_location < 0.34
-    avoid = (too_extended_up | weak_bounce | still_waterfalling | low_quality_volume | bad_close).fillna(False)
-    if require_vwap:
-        # Conservative toggle: for momentum/reclaim setups, require reclaiming VWAP.
-        # Red dip-bounce can still work below VWAP, but it must be reclaiming EMA9 with good score.
-        avoid = avoid | ((green_momentum | vwap_reclaim | opening_range_breakout) & (close < vwap))
+    # Green-day continuation. This should be pullback/continuation, not chase.
+    pullback_hold = (trend_up_day & (low <= ema9 * 1.003) & (close > ema9) & (close_location > 0.58) & (mom3 > -0.0008))
+    opening_breakout_quality = (above_opening_high & (close.shift(1) <= opening_high.shift(1).fillna(opening_high)) & (close > vwap) & (vol_ratio > 1.0) & (close_location > 0.62))
+    green_momentum = (
+        (trend_up_day | above_opening_high) &
+        (close > vwap) & (ema5 >= ema9) & (ema9 >= ema21) &
+        ((pullback_hold) | (opening_breakout_quality) | ((mom3 > 0.0015) & (break_structure_up))) &
+        (distance_vwap < 0.018) &
+        (close_location > 0.56)
+    )
 
-    # Score from 0-100. Separate components keep it explainable.
+    # VWAP reclaim needs a hold/confirmation, not just touching VWAP.
+    vwap_reclaim_quality = (
+        reclaim_vwap &
+        (close > ema9) &
+        (mom3 > 0.0008) &
+        (close_location > 0.60) &
+        (vol_ratio > 0.85) &
+        (~waterfall)
+    )
+
+    setup_raw = (green_momentum | red_reclaim_pulse | vwap_reclaim_quality | opening_breakout_quality).fillna(False)
+
+    # Overextension and adverse-selection avoids.
+    too_extended_up = (distance_vwap > 0.020) | (distance_ema21 > 0.018)
+    low_quality_volume = vol_ratio < 0.55
+    bad_close = close_location < 0.50
+    first_minutes_filter = bar_no < max(10, min(20, int(n * 0.06)))
+    weak_red_bounce = (session_move < -0.010) & (close < ema9) & (~break_structure_up)
+    no_long_below_auction = trend_down_day & (close < opening_mid) & (~red_reversal_confirmed)
+    require_real_reclaim_on_red = (session_move < -0.012) & (~red_reversal_confirmed)
+
+    avoid = (
+        too_extended_up |
+        low_quality_volume |
+        bad_close |
+        first_minutes_filter |
+        weak_red_bounce |
+        no_long_below_auction |
+        require_real_reclaim_on_red |
+        waterfall |
+        distribution
+    ).fillna(False)
+
+    if require_vwap:
+        avoid = avoid | (close < vwap)
+
+    # Score: quality of auction, not quantity of triggers.
     momentum_score = pd.Series(0.0, index=idx)
     momentum_score += np.where(close > vwap, 18, 0)
-    momentum_score += np.where(ema5 > ema9, 12, 0)
+    momentum_score += np.where(ema5 >= ema9, 10, 0)
     momentum_score += np.where(ema9 >= ema21, 12, 0)
-    momentum_score += np.where(mom3 > 0.0010, 14, 0)
-    momentum_score += np.where(mom6 > 0.0020, 10, 0)
-    momentum_score += np.where(vol_ratio > 0.8, 10, 0)
-    momentum_score += np.where(close_location > 0.55, 10, 0)
-    momentum_score += np.where(above_opening_high, 8, 0)
-    momentum_score += np.where(trend_up_day, 6, 0)
+    momentum_score += np.where(above_opening_high, 10, 0)
+    momentum_score += np.where(break_structure_up, 16, 0)
+    momentum_score += np.where(mom3 > 0.0015, 12, 0)
+    momentum_score += np.where(vol_ratio > 1.0, 10, 0)
+    momentum_score += np.where(close_location > 0.62, 12, 0)
 
-    bounce_score = pd.Series(0.0, index=idx)
-    bounce_score += np.where(session_move < -0.010, 12, 0)
-    bounce_score += np.where(session_move < -0.025, 8, 0)
-    bounce_score += np.where(bounce_from_low > 0.0025, 18, 0)
-    bounce_score += np.where(bounce_from_low > 0.0060, 10, 0)
-    bounce_score += np.where(close > ema5, 12, 0)
-    bounce_score += np.where(close > ema9, 10, 0)
-    bounce_score += np.where(mom3 > 0.0008, 14, 0)
-    bounce_score += np.where(close_location > 0.55, 10, 0)
-    bounce_score += np.where(vol_ratio > 0.70, 8, 0)
-    bounce_score += np.where(panic_bounce_day, 8, 0)
+    reversal_score = pd.Series(0.0, index=idx)
+    reversal_score += np.where(session_move < -0.012, 8, 0)
+    reversal_score += np.where(capitulation, 16, 0)
+    reversal_score += np.where(bounce_from_low > 0.0065, 16, 0)
+    reversal_score += np.where(higher_low, 14, 0)
+    reversal_score += np.where(break_structure_up, 18, 0)
+    reversal_score += np.where(close > ema9, 10, 0)
+    reversal_score += np.where(mom3 > 0.0012, 10, 0)
+    reversal_score += np.where(close_location > 0.60, 8, 0)
 
-    reclaim_score = pd.Series(0.0, index=idx)
-    reclaim_score += np.where(vwap_reclaim, 30, 0)
-    reclaim_score += np.where(opening_range_breakout, 25, 0)
-    reclaim_score += np.where(close > ema21, 10, 0)
-    reclaim_score += np.where(mom3 > 0, 10, 0)
-    reclaim_score += np.where(vol_ratio > 0.75, 10, 0)
-    reclaim_score += np.where(close_location > 0.50, 8, 0)
-
-    alpha_score = pd.concat([momentum_score, bounce_score, reclaim_score], axis=1).max(axis=1).clip(0, 100)
+    alpha_score = pd.concat([momentum_score, reversal_score], axis=1).max(axis=1).clip(0, 100)
     risk_penalty = pd.Series(0.0, index=idx)
-    risk_penalty += np.where(too_extended_up, 18, 0)
-    risk_penalty += np.where(weak_bounce, 15, 0)
-    risk_penalty += np.where(still_waterfalling, 25, 0)
-    risk_penalty += np.where(low_quality_volume, 12, 0)
-    risk_penalty += np.where(bad_close, 10, 0)
+    risk_penalty += np.where(waterfall, 35, 0)
+    risk_penalty += np.where(distribution, 30, 0)
+    risk_penalty += np.where(too_extended_up, 20, 0)
+    risk_penalty += np.where(low_quality_volume, 14, 0)
+    risk_penalty += np.where(bad_close, 14, 0)
+    risk_penalty += np.where(weak_red_bounce, 24, 0)
+    risk_penalty += np.where(no_long_below_auction, 28, 0)
     trade_quality_score = (alpha_score - risk_penalty).clip(0, 100)
 
     sens = str(sensitivity).lower()
-    # RISK-FIRST thresholds. The old version traded too much and could stack
-    # small stop losses. This version intentionally skips mediocre setups.
     if sens == 'aggressive':
-        min_score = 64
+        min_score = 74
     elif sens == 'strict':
-        min_score = 82
+        min_score = 88
     else:
-        min_score = 72
+        min_score = 82
 
-    setup_raw = (green_momentum | red_dip_bounce | red_reclaim_pulse | vwap_reclaim | opening_range_breakout).fillna(False)
+    raw_long = setup_raw & (~avoid) & (trade_quality_score >= min_score)
 
-    # Extra confirmation: do not buy while the current candle is still weak.
-    bar_no = pd.Series(np.arange(n), index=idx)
-    two_bar_reclaim = (close > close.shift(1)) & (close.shift(1) >= close.shift(2))
-    one_bar_impulse = (ret1 > 0) & (close_location > 0.58)
-    quality_candle = (one_bar_impulse | two_bar_reclaim) & (close_location > 0.52)
+    # Structural risk gate: do not enter if the nearest logical swing stop is too far.
+    swing_stop = recent_low_8 * 0.999
+    structural_risk = ((close / swing_stop) - 1.0).replace([np.inf, -np.inf], np.nan).fillna(9.0)
+    raw_long = raw_long & (structural_risk <= 0.0065)
 
-    # On red days, a bounce is only allowed after price actually lifts away
-    # from the low and reclaims fast structure. This avoids buying waterfalls.
-    red_day_confirm = (
-        (session_move >= -0.010) |
-        ((bounce_from_low > 0.0045) & (close > ema9) & (mom3 > 0.0010) & (close_location > 0.58))
-    )
-
-    first_minutes_filter = bar_no < max(8, min(15, int(n * 0.05)))
-    lower_low_cluster = (low <= low.shift(1)) & (low.shift(1) <= low.shift(2)) & (mom3 < 0)
-    failed_reclaim = (session_move < -0.012) & (close < ema9) & (close < vwap) & (mom3 <= 0)
-    institutional_avoid = (first_minutes_filter | lower_low_cluster | failed_reclaim).fillna(False)
-
-    raw_long = setup_raw & (trade_quality_score >= min_score) & (~avoid) & (~institutional_avoid) & quality_candle & red_day_confirm
-
-    # Guard against chop: in chop, only permit a clean VWAP reclaim/opening breakout with enough score.
-    raw_long = raw_long & (~chop_day | vwap_reclaim | opening_range_breakout | (trade_quality_score >= min_score + 10))
-
-    # Debounce entries more aggressively so one bad regime cannot machine-gun the account.
-    long_entry = raw_long & ~raw_long.shift(1).fillna(False)
+    # Final debounce: this is an allocator, not a scalper clicking every bounce.
+    long_entry_base = raw_long & ~raw_long.shift(1).fillna(False)
     last_signal_i = -999
     cleaned = []
-    for i, val in enumerate(long_entry.fillna(False).values):
-        if val and (i - last_signal_i) >= 10:
+    for i, val in enumerate(long_entry_base.fillna(False).values):
+        if val and (i - last_signal_i) >= 35:
             cleaned.append(True)
             last_signal_i = i
         else:
             cleaned.append(False)
     long_entry = pd.Series(cleaned, index=idx)
-    short_entry = pd.Series(False, index=idx)  # hard long-only rule
+    short_entry = pd.Series(False, index=idx)
 
-    day_type = pd.Series('Chop / Wait', index=idx, dtype='object')
-    day_type.loc[trend_up_day] = 'Trend Up Day'
-    day_type.loc[trend_down_day] = 'Trend Down Day'
-    day_type.loc[panic_bounce_day] = 'Panic Bounce Day'
-    day_type.loc[opening_drive_day & trend_up_day] = 'Opening Drive Up'
+    day_type = pd.Series('No Edge / Wait', index=idx, dtype='object')
+    day_type.loc[chop_day] = 'Chop / Wait'
+    day_type.loc[trend_up_day] = 'Trend Up Auction'
+    day_type.loc[trend_down_day] = 'Trend Down Auction — Longs Disabled'
+    day_type.loc[red_reversal_confirmed] = 'Confirmed Red-Day Reversal'
+    day_type.loc[opening_breakout_quality] = 'Opening Drive Up'
 
     setup_name = pd.Series('None', index=idx, dtype='object')
-    setup_name.loc[green_momentum] = 'Green Momentum Long'
-    setup_name.loc[vwap_reclaim] = 'VWAP Reclaim Long'
-    setup_name.loc[opening_range_breakout] = 'Opening Range Breakout Long'
-    setup_name.loc[red_dip_bounce] = 'Red-Day Dip Bounce Long'
-    setup_name.loc[red_reclaim_pulse] = 'Red-Day Reclaim Pulse Long'
+    setup_name.loc[green_momentum] = 'Trend-Up Continuation Long'
+    setup_name.loc[vwap_reclaim_quality] = 'VWAP Reclaim Hold Long'
+    setup_name.loc[opening_breakout_quality] = 'Opening Range Breakout Long'
+    setup_name.loc[red_reclaim_pulse] = 'Confirmed Red-Day Reversal Long'
+
+    model_decision = pd.Series('WAIT — no proven long edge', index=idx, dtype='object')
+    model_decision.loc[waterfall] = 'NO TRADE — waterfall / lower lows'
+    model_decision.loc[distribution] = 'NO TRADE — distribution below VWAP/EMA'
+    model_decision.loc[weak_red_bounce] = 'NO TRADE — weak bounce, no structure'
+    model_decision.loc[too_extended_up] = 'NO TRADE — chase/overextended'
+    model_decision.loc[raw_long] = 'QUALIFIED SETUP — waiting debounce/execution'
+    model_decision.loc[long_entry] = 'ENTER LONG — auction confirmed'
 
     features = pd.DataFrame({
         'Close': close,
@@ -9690,29 +9711,30 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'EMA50': ema50,
         'Day Type': day_type,
         'Setup Name': setup_name,
+        'Model Decision': model_decision,
         'Session Move %': session_move * 100,
         'Bounce From Low %': bounce_from_low * 100,
-        'Pullback From High %': pullback_from_high * 100,
         'Distance VWAP %': distance_vwap * 100,
         'Mom3 %': mom3 * 100,
         'Mom6 %': mom6 * 100,
         'Vol Ratio': vol_ratio,
         'Close Location': close_location,
+        'Higher Low': higher_low.astype(int),
+        'Break Structure Up': break_structure_up.astype(int),
+        'Capitulation Seen': capitulation.astype(int),
+        'Waterfall': waterfall.astype(int),
+        'Distribution': distribution.astype(int),
         'Momentum Score': momentum_score.round(1),
-        'Bounce Score': bounce_score.round(1),
-        'Reclaim Score': reclaim_score.round(1),
+        'Reversal Score': reversal_score.round(1),
         'Risk Penalty': risk_penalty.round(1),
+        'Structural Risk %': (structural_risk * 100).round(3),
         'Trade Quality Score': trade_quality_score.round(1),
         'Min Score Used': min_score,
-        'Green Momentum': green_momentum.astype(int),
-        'Red Dip Bounce': red_dip_bounce.astype(int),
-        'Red Reclaim Pulse': red_reclaim_pulse.astype(int),
-        'VWAP Reclaim': vwap_reclaim.astype(int),
-        'Opening Breakout': opening_range_breakout.astype(int),
+        'Trend Continuation': green_momentum.astype(int),
+        'Confirmed Red Reversal': red_reclaim_pulse.astype(int),
+        'VWAP Reclaim Quality': vwap_reclaim_quality.astype(int),
+        'Opening Breakout': opening_breakout_quality.astype(int),
         'Avoid Filter': avoid.astype(int),
-        'Institutional Avoid': institutional_avoid.astype(int),
-        'Quality Candle': quality_candle.astype(int),
-        'Red Day Confirm': red_day_confirm.astype(int),
         'Long Entry': long_entry.astype(int),
         'Short Entry': short_entry.astype(int),
         'Final Entry': long_entry.astype(int),
@@ -9720,8 +9742,8 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     return long_entry.astype(bool), short_entry.astype(bool), features
 
 def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
-                          min_hold_bars=2, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
-                          let_winners_run=True, allow_shorts=False, cooldown_after_loss=10, max_consecutive_losses=2):
+                          min_hold_bars=3, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
+                          let_winners_run=True, allow_shorts=False, cooldown_after_loss=45, max_consecutive_losses=1):
     """Risk-first single-position intraday engine. Long-only by default.
 
     Capital protection upgrades:
@@ -10032,8 +10054,8 @@ except Exception as e:
 # ==========================================
 try:
     with tab21:
-        st.header('⚡ Risk-First Long-Only Intraday Capture')
-        st.caption('Fresh intraday candles only. Long-only. Risk-first: fewer trades, stronger confirmation, cooldown after stops, and automatic shutdown after repeated losses.')
+        st.header('⚡ Auction-Quality Long-Only Intraday Engine')
+        st.caption('Fresh intraday candles only. Long-only. This version waits for auction confirmation: no more buying every weak bounce.')
 
         c0a, c0b, c0c, c0d = st.columns(4)
         with c0a:
@@ -10047,18 +10069,18 @@ try:
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=1, key='safe_lc_sensitivity')
+            sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=2, key='safe_lc_sensitivity')
             direction_mode = 'Long Only'
             st.info('Direction mode: Long Only — no short selling.')
         with c2:
-            target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.60, step=0.05, key='safe_lc_target') / 100.0
-            stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.30, step=0.05, key='safe_lc_stop') / 100.0
+            target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.55, step=0.05, key='safe_lc_target') / 100.0
+            stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.25, step=0.05, key='safe_lc_stop') / 100.0
         with c3:
             let_winners_run = st.checkbox('Let winners run', value=True, key='safe_lc_runner')
-            trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.35, step=0.05, key='safe_lc_trail') / 100.0
+            trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.30, step=0.05, key='safe_lc_trail') / 100.0
         with c4:
-            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=45, step=5, key='safe_lc_maxhold')
-            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=3, step=1, key='safe_lc_maxtrades')
+            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=30, step=5, key='safe_lc_maxhold')
+            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=2, step=1, key='safe_lc_maxtrades')
 
         c5, c6 = st.columns(2)
         with c5:
@@ -10068,11 +10090,11 @@ try:
 
         c7, c8 = st.columns(2)
         with c7:
-            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=2, step=1, key='safe_lc_max_consec_losses')
+            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=1, step=1, key='safe_lc_max_consec_losses')
         with c8:
-            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=60, value=12, step=1, key='safe_lc_cooldown_loss')
+            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=90, value=45, step=1, key='safe_lc_cooldown_loss')
 
-        st.warning('Risk-first mode: if the setup quality is not good, the correct output is NO TRADE. This prevents machine-gun stop losses.')
+        st.warning('Auction-quality mode: institutions do not force trades. If the stock is in a trend-down auction below VWAP/EMA, this tab should say NO TRADE until higher-low + break-of-structure confirmation appears.')
         run_lc = st.button('Fetch TODAY intraday + Run Long-Only Engine', key='safe_lc_run')
 
         if run_lc:
@@ -10090,7 +10112,7 @@ try:
                     target_pct=float(target_pct),
                     stop_pct=float(stop_pct),
                     trail_pct=float(trail_pct),
-                    min_hold_bars=2,
+                    min_hold_bars=3,
                     max_hold_bars=int(max_hold),
                     max_trades=int(max_trades),
                     max_day_loss=float(max_day_loss),
@@ -10167,4 +10189,4 @@ except Exception as e:
     _safe_last_tab_error(tab21, 'Intraday Live Capture tab', e)
 
 st.markdown('---')
-st.caption('Generated via Quant Thesis Dashboard | Safe last-tabs rebuild')
+st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
