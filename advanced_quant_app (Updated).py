@@ -9621,26 +9621,46 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     trade_quality_score = (alpha_score - risk_penalty).clip(0, 100)
 
     sens = str(sensitivity).lower()
+    # RISK-FIRST thresholds. The old version traded too much and could stack
+    # small stop losses. This version intentionally skips mediocre setups.
     if sens == 'aggressive':
-        min_score = 54
-    elif sens == 'strict':
-        min_score = 74
-    else:
         min_score = 64
+    elif sens == 'strict':
+        min_score = 82
+    else:
+        min_score = 72
 
     setup_raw = (green_momentum | red_dip_bounce | red_reclaim_pulse | vwap_reclaim | opening_range_breakout).fillna(False)
-    raw_long = setup_raw & (trade_quality_score >= min_score) & (~avoid)
+
+    # Extra confirmation: do not buy while the current candle is still weak.
+    bar_no = pd.Series(np.arange(n), index=idx)
+    two_bar_reclaim = (close > close.shift(1)) & (close.shift(1) >= close.shift(2))
+    one_bar_impulse = (ret1 > 0) & (close_location > 0.58)
+    quality_candle = (one_bar_impulse | two_bar_reclaim) & (close_location > 0.52)
+
+    # On red days, a bounce is only allowed after price actually lifts away
+    # from the low and reclaims fast structure. This avoids buying waterfalls.
+    red_day_confirm = (
+        (session_move >= -0.010) |
+        ((bounce_from_low > 0.0045) & (close > ema9) & (mom3 > 0.0010) & (close_location > 0.58))
+    )
+
+    first_minutes_filter = bar_no < max(8, min(15, int(n * 0.05)))
+    lower_low_cluster = (low <= low.shift(1)) & (low.shift(1) <= low.shift(2)) & (mom3 < 0)
+    failed_reclaim = (session_move < -0.012) & (close < ema9) & (close < vwap) & (mom3 <= 0)
+    institutional_avoid = (first_minutes_filter | lower_low_cluster | failed_reclaim).fillna(False)
+
+    raw_long = setup_raw & (trade_quality_score >= min_score) & (~avoid) & (~institutional_avoid) & quality_candle & red_day_confirm
 
     # Guard against chop: in chop, only permit a clean VWAP reclaim/opening breakout with enough score.
-    raw_long = raw_long & (~chop_day | vwap_reclaim | opening_range_breakout | (trade_quality_score >= min_score + 8))
+    raw_long = raw_long & (~chop_day | vwap_reclaim | opening_range_breakout | (trade_quality_score >= min_score + 10))
 
-    # Debounce entries and add short cooldown after a signal so the log is not noisy.
+    # Debounce entries more aggressively so one bad regime cannot machine-gun the account.
     long_entry = raw_long & ~raw_long.shift(1).fillna(False)
-    cooldown = pd.Series(False, index=idx)
     last_signal_i = -999
     cleaned = []
     for i, val in enumerate(long_entry.fillna(False).values):
-        if val and (i - last_signal_i) >= 4:
+        if val and (i - last_signal_i) >= 10:
             cleaned.append(True)
             last_signal_i = i
         else:
@@ -9690,6 +9710,9 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'VWAP Reclaim': vwap_reclaim.astype(int),
         'Opening Breakout': opening_range_breakout.astype(int),
         'Avoid Filter': avoid.astype(int),
+        'Institutional Avoid': institutional_avoid.astype(int),
+        'Quality Candle': quality_candle.astype(int),
+        'Red Day Confirm': red_day_confirm.astype(int),
         'Long Entry': long_entry.astype(int),
         'Short Entry': short_entry.astype(int),
         'Final Entry': long_entry.astype(int),
@@ -9698,8 +9721,15 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
 
 def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
                           min_hold_bars=2, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
-                          let_winners_run=True, allow_shorts=True):
-    """Single-position bidirectional intraday engine with target + trailing runner exits."""
+                          let_winners_run=True, allow_shorts=False, cooldown_after_loss=10, max_consecutive_losses=2):
+    """Risk-first single-position intraday engine. Long-only by default.
+
+    Capital protection upgrades:
+    - no short selling unless explicitly allowed by caller
+    - cooldown after a losing trade
+    - disables engine after max consecutive losses
+    - disables engine at max session loss
+    """
     close = d['Close'].astype(float)
     high = d['High'].astype(float) if 'High' in d.columns else close
     low = d['Low'].astype(float) if 'Low' in d.columns else close
@@ -9719,6 +9749,9 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_
     bars_held = 0
     trades_today = 0
     disabled = False
+    disabled_reason = ''
+    cooldown_bars = 0
+    consecutive_losses = 0
     trades = []
     eq_vals = []
 
@@ -9731,6 +9764,9 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_
         px = float(close.iloc[i])
         hi = float(high.iloc[i])
         lo = float(low.iloc[i])
+
+        if cooldown_bars > 0:
+            cooldown_bars -= 1
 
         if in_pos:
             bars_held += 1
@@ -9787,16 +9823,26 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_
                     'Status': 'Closed',
                     'Reason': exit_reason,
                 })
+                if trade_ret < 0:
+                    consecutive_losses += 1
+                    cooldown_bars = int(cooldown_after_loss)
+                else:
+                    consecutive_losses = 0
+                    cooldown_bars = 2
                 in_pos = False
                 side = None
                 entry_price = 0.0
                 entry_time = None
                 bars_held = 0
                 best_price = 0.0
+                if consecutive_losses >= int(max_consecutive_losses):
+                    disabled = True
+                    disabled_reason = f'Max consecutive losses hit ({consecutive_losses})'
                 if (equity / initial - 1.0) <= -float(max_day_loss):
                     disabled = True
+                    disabled_reason = f'Max session loss guard hit ({max_day_loss*100:.2f}%)'
 
-        if (not in_pos) and (not disabled) and trades_today < int(max_trades):
+        if (not in_pos) and (not disabled) and cooldown_bars == 0 and trades_today < int(max_trades):
             go_long = bool(long_entry_signal.iloc[i])
             go_short = bool(short_entry_signal.iloc[i]) and bool(allow_shorts)
             if go_long or go_short:
@@ -9845,7 +9891,9 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_
         'Trades': len(trades_df),
         'Long Trades': longs,
         'Short Trades': shorts,
-        'Daily Guard Hit': disabled
+        'Daily Guard Hit': disabled,
+        'Disabled Reason': disabled_reason,
+        'Consecutive Losses': consecutive_losses
     }
 
 
@@ -9984,8 +10032,8 @@ except Exception as e:
 # ==========================================
 try:
     with tab21:
-        st.header('⚡ Long-Only Intraday Capture: Momentum + Dip Bounce')
-        st.caption('Fresh intraday candles only. Long-only: captures green-day momentum and red-day dip-bounce waves. No short selling, no puts, no inverse logic.')
+        st.header('⚡ Risk-First Long-Only Intraday Capture')
+        st.caption('Fresh intraday candles only. Long-only. Risk-first: fewer trades, stronger confirmation, cooldown after stops, and automatic shutdown after repeated losses.')
 
         c0a, c0b, c0c, c0d = st.columns(4)
         with c0a:
@@ -9999,25 +10047,32 @@ try:
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=0, key='safe_lc_sensitivity')
+            sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=1, key='safe_lc_sensitivity')
             direction_mode = 'Long Only'
             st.info('Direction mode: Long Only — no short selling.')
         with c2:
-            target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.75, step=0.05, key='safe_lc_target') / 100.0
-            stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.35, step=0.05, key='safe_lc_stop') / 100.0
+            target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.60, step=0.05, key='safe_lc_target') / 100.0
+            stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.30, step=0.05, key='safe_lc_stop') / 100.0
         with c3:
             let_winners_run = st.checkbox('Let winners run', value=True, key='safe_lc_runner')
-            trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.40, step=0.05, key='safe_lc_trail') / 100.0
+            trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.35, step=0.05, key='safe_lc_trail') / 100.0
         with c4:
-            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=60, step=5, key='safe_lc_maxhold')
-            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=10, step=1, key='safe_lc_maxtrades')
+            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=45, step=5, key='safe_lc_maxhold')
+            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=3, step=1, key='safe_lc_maxtrades')
 
         c5, c6 = st.columns(2)
         with c5:
             require_vwap = st.checkbox('Require VWAP side filter', value=False, key='safe_lc_req_vwap', help='Longs require above VWAP; shorts require below VWAP. OFF is more aggressive.')
         with c6:
-            max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.5, max_value=10.0, value=2.5, step=0.5, key='safe_lc_dayloss') / 100.0
+            max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.3, max_value=10.0, value=0.8, step=0.1, key='safe_lc_dayloss') / 100.0
 
+        c7, c8 = st.columns(2)
+        with c7:
+            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=2, step=1, key='safe_lc_max_consec_losses')
+        with c8:
+            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=60, value=12, step=1, key='safe_lc_cooldown_loss')
+
+        st.warning('Risk-first mode: if the setup quality is not good, the correct output is NO TRADE. This prevents machine-gun stop losses.')
         run_lc = st.button('Fetch TODAY intraday + Run Long-Only Engine', key='safe_lc_run')
 
         if run_lc:
@@ -10040,6 +10095,9 @@ try:
                     max_trades=int(max_trades),
                     max_day_loss=float(max_day_loss),
                     let_winners_run=bool(let_winners_run),
+                    allow_shorts=False,
+                    cooldown_after_loss=int(cooldown_after_loss),
+                    max_consecutive_losses=int(max_consec_losses),
                 )
                 st.session_state['safe_lc_pack'] = {
                     'd': d, 'long_entry': long_entry, 'short_entry': short_entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ,
@@ -10061,6 +10119,8 @@ try:
             m4.metric('Trades', str(int(summ.get('Trades', 0))))
             m5.metric('Long Trades', str(int(summ.get('Long Trades', 0))))
             m6.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
+            if summ.get('Daily Guard Hit'):
+                st.error(f"Trading disabled by risk guard: {summ.get('Disabled Reason', 'Guard hit')}")
 
             if isinstance(d, pd.DataFrame) and not d.empty:
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=(f'{TICKER} Intraday Setup', 'Equity Curve'))
