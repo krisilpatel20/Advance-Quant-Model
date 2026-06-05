@@ -1594,6 +1594,16 @@ class BacktestEngine:
 
 
 
+def safe_report_add(title, data):
+    """Safe report-export helper. Prevents AttributeError when report generator is disabled, skipped, or not initialized."""
+    try:
+        rg = st.session_state.get("report_gen", None)
+        if rg is not None and hasattr(rg, "add_data"):
+            rg.add_data(title, data)
+    except Exception:
+        pass
+
+
 def make_stateful_position(entry_cond, exit_cond, index):
     """
     Converts entry/exit booleans into a 0/1 long-only position series.
@@ -5047,10 +5057,295 @@ tabs = st.tabs([
 
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20, tab21 = tabs
 
+
+# ==========================================================
+# FAST WHOLE-APP MODE
+# ==========================================================
+# This is still the whole app file. Fast mode simply stops the heavy thesis
+# tabs from executing on startup and renders a lightweight intraday final tab.
+# Turn Fast intraday-only startup OFF in the sidebar to run the full dashboard.
+if fast_intraday_mode:
+    for _t, _name in zip(
+        [tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20],
+        ["Decision Summary", "GARCH", "Regime Switching", "Heston/Jump", "Kalman", "Macro", "Structural", "Backtest", "Vol Clustering", "Advanced Regime", "SML & Alpha", "Multi-Asset Scan", "FED", "Options", "Hurst", "Hot 10", "IV Scanner", "CVD", "VWAP", "Time Series", "Microstructure"]
+    ):
+        with _t:
+            st.info(f"{_name} is paused because Fast intraday-only startup is ON. Turn it OFF in the sidebar when you want the full thesis dashboard.")
+
+    def _fast_flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        return df
+
+    @st.cache_data(ttl=20, show_spinner=False)
+    def _fast_fetch_intraday(ticker: str, period: str, interval: str) -> pd.DataFrame:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, prepost=False)
+        df = _fast_flatten_yf_columns(df)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        needed = ["Open", "High", "Low", "Close", "Volume"]
+        df = df[[c for c in needed if c in df.columns]].dropna()
+        if df.empty:
+            return pd.DataFrame()
+        try:
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("America/New_York").tz_convert("America/Chicago")
+            else:
+                df.index = df.index.tz_convert("America/Chicago")
+        except Exception:
+            pass
+        return df
+
+    def _fast_add_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        typical = (out["High"] + out["Low"] + out["Close"]) / 3.0
+        vol = out["Volume"].replace(0, np.nan).fillna(1.0)
+        out["VWAP"] = (typical * vol).cumsum() / vol.cumsum()
+        out["EMA_FAST"] = out["Close"].ewm(span=5, adjust=False).mean()
+        out["EMA_SLOW"] = out["Close"].ewm(span=13, adjust=False).mean()
+        out["EMA_GUARD"] = out["Close"].ewm(span=21, adjust=False).mean()
+        out["VOL_AVG"] = out["Volume"].rolling(20, min_periods=5).mean()
+        out["VOL_RATIO"] = out["Volume"] / (out["VOL_AVG"] + 1e-9)
+        out["SESSION_OPEN"] = float(out["Open"].iloc[0])
+        out["SESSION_LOW"] = out["Low"].cummin()
+        out["SESSION_HIGH"] = out["High"].cummax()
+        out["FROM_OPEN_PCT"] = (out["Close"] / out["SESSION_OPEN"] - 1.0) * 100.0
+        out["BOUNCE_FROM_LOW_PCT"] = (out["Close"] / out["SESSION_LOW"] - 1.0) * 100.0
+        out["PULLBACK_FROM_HIGH_PCT"] = (out["Close"] / out["SESSION_HIGH"] - 1.0) * 100.0
+        out["MOM_1"] = out["Close"].pct_change(1) * 100.0
+        out["MOM_2"] = out["Close"].pct_change(2) * 100.0
+        out["MOM_3"] = out["Close"].pct_change(3) * 100.0
+        return out
+
+    def _fast_build_long_only_signals(df: pd.DataFrame, sensitivity: str, setup_mode: str, require_vwap: bool,
+                                      min_red_drop: float, bounce_confirm: float, min_vol_ratio: float) -> pd.DataFrame:
+        out = _fast_add_intraday_indicators(df)
+        if sensitivity == "Aggressive":
+            mom_req, ema_req = 0.05, False
+        elif sensitivity == "Balanced":
+            mom_req, ema_req = 0.12, True
+        else:
+            mom_req, ema_req = 0.22, True
+
+        vwap_ok = (out["Close"] >= out["VWAP"]) if require_vwap else pd.Series(True, index=out.index)
+        volume_ok = out["VOL_RATIO"].fillna(1.0) >= min_vol_ratio
+
+        green_momentum = (
+            (out["MOM_3"] >= mom_req) &
+            (out["Close"] > out["EMA_FAST"]) &
+            ((out["EMA_FAST"] > out["EMA_SLOW"]) if ema_req else True) &
+            vwap_ok & volume_ok
+        )
+
+        # Long-only red-day bounce: no short selling. Wait for panic/drop, then buy the reclaim bounce.
+        red_dip_bounce = (
+            (out["FROM_OPEN_PCT"] <= -abs(min_red_drop)) &
+            (out["BOUNCE_FROM_LOW_PCT"] >= bounce_confirm) &
+            ((out["MOM_1"] > 0) | (out["MOM_2"] > 0)) &
+            (out["Close"] > out["EMA_FAST"]) &
+            volume_ok
+        )
+
+        # Failed selloff reclaim: useful when stock falls hard, bounces, dips again, then bounces again.
+        reclaim_pulse = (
+            (out["FROM_OPEN_PCT"] <= -abs(min_red_drop) * 0.75) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_FAST"].shift(1)) &
+            (out["MOM_2"] > 0) &
+            volume_ok
+        )
+
+        if setup_mode == "Green-Day Momentum Only":
+            entry = green_momentum
+        elif setup_mode == "Red-Day Dip Bounce Only":
+            entry = red_dip_bounce | reclaim_pulse
+        else:
+            entry = green_momentum | red_dip_bounce | reclaim_pulse
+
+        # Avoid impossible repeated entries on every bar. Backtest also enforces one position at a time.
+        out["ENTRY_SIGNAL"] = entry.fillna(False)
+        out["SETUP"] = np.where(red_dip_bounce, "Red-Day Dip Bounce", np.where(reclaim_pulse, "Red-Day Reclaim Pulse", np.where(green_momentum, "Green Momentum", "")))
+        return out
+
+    def _fast_run_long_only_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
+                                     trail_pct: float, max_hold_bars: int, max_trades: int, cooldown_bars: int) -> pd.DataFrame:
+        trades = []
+        in_pos = False
+        entry_price = entry_time = entry_setup = None
+        stop_price = target_price = None
+        high_since = None
+        bars_held = 0
+        cooldown = 0
+
+        for i in range(len(df)):
+            row = df.iloc[i]
+            ts = df.index[i]
+            price = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+                exit_reason = None
+                exit_price = None
+
+                # Same-bar conservative rule: stop before target/trail.
+                if low <= stop_price:
+                    exit_reason = "Stop"
+                    exit_price = stop_price
+                elif runner_on and high >= target_price:
+                    trail_stop = high_since * (1.0 - trail_pct / 100.0)
+                    if low <= trail_stop:
+                        exit_reason = "Runner Trail"
+                        exit_price = trail_stop
+                elif (not runner_on) and high >= target_price:
+                    exit_reason = "Target"
+                    exit_price = target_price
+                elif bars_held >= max_hold_bars:
+                    exit_reason = "Max Hold"
+                    exit_price = price
+
+                if exit_reason is not None:
+                    pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+                    trades.append({
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_price, 4),
+                        "Sell Price": round(exit_price, 4),
+                        "PnL %": round(pnl_pct, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": bars_held,
+                    })
+                    in_pos = False
+                    cooldown = cooldown_bars
+                    if len(trades) >= max_trades:
+                        break
+                    continue
+
+            if (not in_pos) and cooldown == 0 and bool(row.get("ENTRY_SIGNAL", False)):
+                in_pos = True
+                entry_price = price
+                entry_time = ts
+                entry_setup = str(row.get("SETUP", "Long")) or "Long"
+                stop_price = entry_price * (1.0 - stop_pct / 100.0)
+                target_price = entry_price * (1.0 + target_pct / 100.0)
+                high_since = price
+                bars_held = 0
+
+        if in_pos:
+            last = df.iloc[-1]
+            exit_price = float(last["Close"])
+            pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+            trades.append({
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_price, 4),
+                "Sell Price": round(exit_price, 4),
+                "PnL %": round(pnl_pct, 3),
+                "Exit Reason": "Open",
+                "Bars Held": bars_held,
+            })
+        return pd.DataFrame(trades)
+
+    with tab21:
+        st.header("⚡ 0.5% Live Capture — FAST Long-Only Intraday")
+        st.caption("Whole app file, fast path. No short selling. Captures green-day momentum and red-day dip-bounce/reclaim waves.")
+
+        colA, colB, colC = st.columns(3)
+        with colA:
+            intraday_interval = st.selectbox("Intraday interval", ["1m", "2m", "5m", "15m", "30m", "60m"], index=2, key="fast_whole_interval")
+            intraday_period = st.selectbox("Data window", ["1d", "5d", "7d", "30d"], index=0, key="fast_whole_period")
+            setup_mode_fast = st.selectbox("Setup mode", ["Both Momentum + Dip Bounce", "Green-Day Momentum Only", "Red-Day Dip Bounce Only"], index=0, key="fast_whole_setup")
+        with colB:
+            sensitivity_fast = st.selectbox("Entry sensitivity", ["Aggressive", "Balanced", "Strict"], index=0, key="fast_whole_sens")
+            require_vwap_fast = st.checkbox("Require above VWAP for green momentum", value=False, key="fast_whole_vwap")
+            min_red_drop_fast = st.number_input("Red-day trigger: down from open %", 0.2, 15.0, 2.0, 0.1, key="fast_whole_red_drop")
+            bounce_confirm_fast = st.number_input("Bounce from intraday low %", 0.05, 5.0, 0.30, 0.05, key="fast_whole_bounce")
+            min_vol_ratio_fast = st.number_input("Min volume ratio", 0.1, 5.0, 0.8, 0.1, key="fast_whole_vol_ratio")
+        with colC:
+            target_fast = st.number_input("Base target %", 0.05, 5.0, 0.60, 0.05, key="fast_whole_target")
+            stop_fast = st.number_input("Hard stop %", 0.05, 3.0, 0.35, 0.05, key="fast_whole_stop")
+            runner_fast = st.checkbox("Let winners run after target", value=True, key="fast_whole_runner")
+            trail_fast = st.number_input("Runner trail %", 0.05, 3.0, 0.35, 0.05, key="fast_whole_trail")
+            max_hold_fast = st.number_input("Max hold bars", 2, 200, 30, 1, key="fast_whole_hold")
+            max_trades_fast = st.number_input("Max trades", 1, 100, 10, 1, key="fast_whole_max_trades")
+            cooldown_fast = st.number_input("Cooldown bars", 0, 50, 3, 1, key="fast_whole_cooldown")
+
+        run_fast = st.button("Fetch TODAY intraday + Run Long-Only Engine", type="primary", use_container_width=True, key="fast_whole_run")
+        if not run_fast:
+            st.info("Click the button above. Fast mode will only fetch intraday data for this final tab; the other heavy tabs stay paused.")
+        else:
+            with st.spinner(f"Fetching {TICKER} intraday data..."):
+                raw_fast = _fast_fetch_intraday(TICKER, intraday_period, intraday_interval)
+            if raw_fast.empty:
+                st.error("No intraday data returned. Try 5m interval or 5d window.")
+            else:
+                try:
+                    latest_date = raw_fast.index[-1].date()
+                    day_fast = raw_fast[raw_fast.index.date == latest_date].copy()
+                except Exception:
+                    day_fast = raw_fast.copy()
+                if len(day_fast) < 10:
+                    st.warning("Latest session has very few bars. Showing all fetched bars instead.")
+                    day_fast = raw_fast.copy()
+
+                signals_fast = _fast_build_long_only_signals(day_fast, sensitivity_fast, setup_mode_fast, require_vwap_fast, min_red_drop_fast, bounce_confirm_fast, min_vol_ratio_fast)
+                trades_fast = _fast_run_long_only_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast))
+
+                first_bar = signals_fast.index[0]
+                last_bar = signals_fast.index[-1]
+                open_price = float(signals_fast["Open"].iloc[0])
+                last_price = float(signals_fast["Close"].iloc[-1])
+                move_from_open = (last_price / open_price - 1.0) * 100.0
+                session_low = float(signals_fast["Low"].min())
+                session_high = float(signals_fast["High"].max())
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Bars used", f"{len(signals_fast)}")
+                m2.metric("Move from open", f"{move_from_open:.2f}%")
+                m3.metric("Session low", f"{session_low:.2f}")
+                m4.metric("Session high", f"{session_high:.2f}")
+                st.caption(f"Using latest session only: **{first_bar} → {last_bar} CT**")
+
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(x=signals_fast.index, open=signals_fast["Open"], high=signals_fast["High"], low=signals_fast["Low"], close=signals_fast["Close"], name="Price"))
+                fig.add_trace(go.Scatter(x=signals_fast.index, y=signals_fast["VWAP"], name="VWAP", mode="lines"))
+                fig.add_trace(go.Scatter(x=signals_fast.index, y=signals_fast["EMA_FAST"], name="EMA 5", mode="lines"))
+                entries = signals_fast[signals_fast["ENTRY_SIGNAL"]]
+                if not entries.empty:
+                    fig.add_trace(go.Scatter(x=entries.index, y=entries["Close"], name="Long entry signals", mode="markers", marker=dict(size=10, symbol="triangle-up")))
+                fig.update_layout(height=600, xaxis_rangeslider_visible=False, title=f"{TICKER} Long-Only Intraday Capture")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.subheader("Trade Log")
+                if trades_fast.empty:
+                    st.warning("0 trades. For CMG-type runners/dip-bounces, try Aggressive, lower bounce to 0.20–0.30, lower volume ratio to 0.6–0.8, or use 1m/5m.")
+                else:
+                    st.dataframe(trades_fast, use_container_width=True, hide_index=True)
+                    closed = trades_fast[trades_fast["Exit Reason"] != "Open"]
+                    if not closed.empty:
+                        win_rate = (closed["PnL %"] > 0).mean() * 100.0
+                        total_pnl = closed["PnL %"].sum()
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Closed trades", len(closed))
+                        c2.metric("Win rate", f"{win_rate:.1f}%")
+                        c3.metric("Sum of trade PnL", f"{total_pnl:.2f}%")
+
+                with st.expander("Diagnostics", expanded=False):
+                    st.dataframe(signals_fast[["Close", "VWAP", "EMA_FAST", "EMA_SLOW", "FROM_OPEN_PCT", "BOUNCE_FROM_LOW_PCT", "MOM_1", "MOM_2", "MOM_3", "VOL_RATIO", "ENTRY_SIGNAL", "SETUP"]].tail(80), use_container_width=True)
+
+    st.stop()
+
 if df_main is not None:
     # Initialize Report Generator
     st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
-    st.session_state.report_gen.add_data("Historical Data", df_main.tail(100))
+    safe_report_add("Historical Data", df_main.tail(100))
     
     # 6. UNIFIED DECISION ENGINE (Global Signals)
     # ==========================================
@@ -5234,7 +5529,7 @@ with tab1:
                 }).set_index("Param")
                 st.subheader("Model Parameters")
                 st.dataframe(params_df.style.format("{:.4f}"))
-                st.session_state.report_gen.add_data("GARCH Parameters", params_df)
+                safe_report_add("GARCH Parameters", params_df)
                 
                 st.markdown("### Analysis")
                 
@@ -5596,7 +5891,7 @@ with tab2:
             avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
             st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
     
-    st.session_state.report_gen.add_data("Regime Statistics", pd.DataFrame(regime_stats))
+    safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
     
     # ===== CURRENT STATE =====
     # Use .iloc[-1] to get the probabilities at the LAST time step
@@ -5867,7 +6162,7 @@ with tab3:
             )
             st.plotly_chart(fig, use_container_width=True)
             st.session_state.report_gen.add_plot("Merton Jump Diffusion", fig)
-            st.session_state.report_gen.add_data("Merton Metrics", {"Mean": final_mean, "Median": final_median})
+            safe_report_add("Merton Metrics", {"Mean": final_mean, "Median": final_median})
 
     elif sim_type == "Heston Stochastic Volatility":
         col1, col2 = st.columns([1, 3])
@@ -5979,7 +6274,7 @@ with tab3:
             )
             st.plotly_chart(fig_h, use_container_width=True)
             st.session_state.report_gen.add_plot("Heston Price Simulation", fig_h)
-            st.session_state.report_gen.add_data("Heston Metrics", {"Mean": final_mean, "Median": final_median})
+            safe_report_add("Heston Metrics", {"Mean": final_mean, "Median": final_median})
             
             # Volatility Plot (Optional, keep simple or upgrade too)
             st.write("**Stochastic Volatility Paths**")
@@ -6044,7 +6339,7 @@ with tab4:
                 fig_k.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_k, use_container_width=True)
                 st.session_state.report_gen.add_plot("Kalman Pairs Analysis", fig_k)
-                st.session_state.report_gen.add_data("Kalman Hedge Ratio", {"Beta": beta[-1]})
+                safe_report_add("Kalman Hedge Ratio", {"Beta": beta[-1]})
                 st.write(f"Current Hedge Ratio: **{beta[-1]:.4f}** (Long 1 {TICKER}, Short {beta[-1]:.4f} {PAIR_TICKER})")
             else:
                 st.error("Not enough overlapping data for pairs analysis.")
@@ -6100,7 +6395,7 @@ with tab4:
         current_price = prices[-1]
         diff_pct = (current_price - current_trend) / current_trend * 100
 
-        st.session_state.report_gen.add_data("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
+        safe_report_add("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
         
         # Display Current Values
         c1, c2, c3 = st.columns(3)
@@ -6162,7 +6457,7 @@ with tab5:
         fig_hm.update_layout(title="Asset Class Correlations", template="plotly_dark", width=600, height=600)
         st.plotly_chart(fig_hm, use_container_width=True)
         st.session_state.report_gen.add_plot("Macro Correlations", fig_hm)
-        st.session_state.report_gen.add_data("Correlation Matrix", corr_matrix)
+        safe_report_add("Correlation Matrix", corr_matrix)
         
         st.write(f"**Structural Thesis Check:**")
         oil_corr = corr_matrix.loc[TICKER, 'Crude Oil']
@@ -6175,7 +6470,7 @@ with tab5:
         else:
             st.warning(f"Low sensitivity to Energy prices ({oil_corr:.2f}).")
         
-        st.session_state.report_gen.add_data("Macro Sensitivity Thesis", {
+        safe_report_add("Macro Sensitivity Thesis", {
             "Oil Correlation": oil_corr,
             "Rate Correlation": rate_corr
         })
@@ -6202,7 +6497,7 @@ with tab6:
         fig_dec.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Structural Decomposition")
         st.plotly_chart(fig_dec, use_container_width=True)
         st.session_state.report_gen.add_plot("Structural Decomposition", fig_dec)
-        st.session_state.report_gen.add_data("Decomposition Period", {"Period": period})
+        safe_report_add("Decomposition Period", {"Period": period})
     else:
         st.warning("Insufficient data for decomposition with selected period.")
 
@@ -7777,7 +8072,7 @@ with tab7:
         fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
         st.plotly_chart(fig_bt, use_container_width=True)
         st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
-        st.session_state.report_gen.add_data("Backtest Metrics", strat_metrics)
+        safe_report_add("Backtest Metrics", strat_metrics)
         
         # Trade Log
         st.write("#### 📝 Trade Log")
@@ -7870,7 +8165,7 @@ with tab8:
     else:
         st.success("Stable: Volatility mean-reverts quickly.")
 
-    st.session_state.report_gen.add_data("Volatility Clustering Metrics", {
+    safe_report_add("Volatility Clustering Metrics", {
         "RV": rv, "BV": bv, "Jump Ratio": jump_res['jump_ratio'],
         "Branching Ratio": br, "Half-Life": hl
     })
@@ -8032,8 +8327,8 @@ with tab10:
                 fig_dyn.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_dyn, use_container_width=True)
                 st.session_state.report_gen.add_plot("SML Factor Dynamics", fig_dyn)
-                st.session_state.report_gen.add_data("SML Analysis Results", res_sml.tail(100))
-                st.session_state.report_gen.add_data("Current SML Metrics", last_row.to_dict())
+                safe_report_add("SML Analysis Results", res_sml.tail(100))
+                safe_report_add("Current SML Metrics", last_row.to_dict())
 
             else:
                 st.error(f"Could not load data for Benchmark: {bench_ticker}")
