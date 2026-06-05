@@ -1824,6 +1824,57 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
 
 
 
+def resample_to_closed_weekly_friday(prices):
+    """
+    Convert daily/raw closes to true closed weekly bars ending Friday.
+
+    pandas resample('W-FRI') can label a partial Mon-Thu week as the upcoming
+    Friday. For regime switching this feels laggy/incorrect because the displayed
+    weekly candle is not actually closed yet. This helper keeps the current week
+    only when the latest raw candle date has reached that Friday label.
+    """
+    try:
+        s = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+        if s.empty:
+            return s
+        s.index = pd.to_datetime(s.index)
+        wk = s.resample('W-FRI').last().dropna()
+        if wk.empty:
+            return wk
+        latest_raw_day = pd.Timestamp(s.index.max()).tz_localize(None).normalize() if getattr(pd.Timestamp(s.index.max()), 'tzinfo', None) is not None else pd.Timestamp(s.index.max()).normalize()
+        latest_week_label = pd.Timestamp(wk.index.max()).tz_localize(None).normalize() if getattr(pd.Timestamp(wk.index.max()), 'tzinfo', None) is not None else pd.Timestamp(wk.index.max()).normalize()
+        # If the latest weekly label is ahead of the latest real trading day, it is
+        # an incomplete week. Do not let it change the official weekly signal yet.
+        if latest_week_label > latest_raw_day:
+            wk = wk.iloc[:-1]
+        return wk.dropna()
+    except Exception:
+        try:
+            return pd.Series(prices).resample('W-FRI').last().dropna()
+        except Exception:
+            return pd.Series(dtype=float)
+
+
+def apply_confirmed_bar_execution_policy(signals, frequency="Daily", confirmed_bar=True, weekly_close_updates=True, fill_value=0.0):
+    """
+    Confirmed-bar signal policy.
+
+    Daily/intraday confirmed execution can still use prior-bar confirmation if desired.
+    Weekly signals are different: once the Friday weekly candle is closed, that
+    exact Friday bar is already confirmed. Shifting it one more weekly bar makes
+    the buy/sell change appear one week late.
+    """
+    s = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(fill_value).clip(0, 1)
+    if not bool(confirmed_bar):
+        return s
+    is_weekly = str(frequency or "").lower().startswith('week')
+    if is_weekly and bool(weekly_close_updates):
+        # No extra one-week delay. The signal is only built from the closed Friday
+        # weekly candle because resample_to_closed_weekly_friday removes partial weeks.
+        return s.ffill().fillna(fill_value).clip(0, 1)
+    return s.shift(1).ffill().fillna(fill_value).clip(0, 1)
+
+
 def _nearest_price_at_or_before(price_series, target_date):
     """Return last available raw market close at or before target_date."""
     try:
@@ -1854,7 +1905,7 @@ def _scan_one_regime_recent_trigger(ticker, start_date, end_date, frequency, n_r
             return []
 
         if str(frequency).lower().startswith('week'):
-            scan_prices = raw_prices.resample('W-FRI').last().dropna()
+            scan_prices = resample_to_closed_weekly_friday(raw_prices)
         else:
             scan_prices = raw_prices.copy()
         scan_returns = scan_prices.pct_change().dropna()
@@ -1872,8 +1923,9 @@ def _scan_one_regime_recent_trigger(ticker, start_date, end_date, frequency, n_r
             res_scan, scan_model_data.index, scan_prices.index, n_reg, str(signal_method),
             conviction=float(conviction), min_hold=int(min_hold)
         )
-        if bool(confirmed_bar):
-            sig_scan = sig_scan.shift(1).ffill().fillna(0).clip(0, 1)
+        sig_scan = apply_confirmed_bar_execution_policy(
+            sig_scan, frequency=str(frequency), confirmed_bar=bool(confirmed_bar), weekly_close_updates=True, fill_value=0.0
+        )
         sig_scan = sig_scan.reindex(scan_prices.index).ffill().fillna(0).clip(0, 1)
         if len(sig_scan) < 2:
             return []
@@ -6596,6 +6648,16 @@ with tab7:
         with col_sig3:
             confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
 
+        weekly_close_same_bar = True
+        if str(bt_freq) == "Weekly":
+            weekly_close_same_bar = st.checkbox(
+                "Weekly signal updates on Friday close",
+                value=True,
+                key="bt_weekly_same_close_signal",
+                help="When ON, the weekly Regime signal changes as soon as the Friday weekly candle is closed. It does not wait one extra week. Partial Mon-Thu weeks are ignored to avoid repainting."
+            )
+            st.caption("✅ Weekly regime fix ON: official weekly signals use only closed Friday bars, and buy/sell changes are allowed on that closed Friday bar instead of being delayed to the next week.")
+
         with st.expander("🧭 Regime WFO Settings", expanded=True):
             wf_c1, wf_c2, wf_c3, wf_c4, wf_c5 = st.columns(5)
             enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=False, key="bt_regime_enable_wfo")
@@ -6675,7 +6737,7 @@ with tab7:
             with st.spinner("Analyzing model complexity and performance..."):
                 comp_results = []
                 # Setup local data context
-                loc_prices = prices_bt.resample('W-FRI').last().dropna() if bt_freq == "Weekly" else prices_bt
+                loc_prices = resample_to_closed_weekly_friday(prices_bt) if bt_freq == "Weekly" else prices_bt
                 loc_returns = loc_prices.pct_change().dropna()
                 if bt_stability > 0:
                     loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
@@ -6702,8 +6764,10 @@ with tab7:
                             conviction=float(conviction),
                             min_hold=int(min_hold_period)
                         )
-                        if confirmed_regime_bar:
-                            sigs = sigs.shift(1).ffill().fillna(0).clip(0, 1)
+                        sigs = apply_confirmed_bar_execution_policy(
+                            sigs, frequency=str(bt_freq), confirmed_bar=bool(confirmed_regime_bar),
+                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                        )
 
                         # 3. Run Backtest
                         common_idx = loc_prices.index.intersection(sigs.index)
@@ -6759,8 +6823,13 @@ with tab7:
                 regime_live_hybrid_enabled = False
 
         if regime_model_freq == "Weekly":
-            # Resample Prices to Weekly (Last Close)
-            prices_bt_resampled = regime_source_prices.resample('W-FRI').last().dropna()
+            # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
+            prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
+            try:
+                if len(prices_bt_resampled):
+                    st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
+            except Exception:
+                pass
         else:
             prices_bt_resampled = regime_source_prices.dropna()
 
@@ -6826,8 +6895,10 @@ with tab7:
                         index=signals.index
                     ).clip(0, 1)
 
-                    if confirmed_regime_bar:
-                        signals = signals.shift(1).ffill().fillna(0).clip(0, 1)
+                    signals = apply_confirmed_bar_execution_policy(
+                        signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                        weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                    )
 
                     # --- Walk-forward validation / primary signal ---
                     if enable_regime_wfo:
@@ -6845,7 +6916,7 @@ with tab7:
                                 initial_capital=initial_cap,
                                 trailing_stop_pct=trailing_stop,
                                 stop_loss_pct=stop_loss,
-                                confirmed_bar=bool(confirmed_regime_bar),
+                                confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
                                 use_strong_runner_override=bool(use_regime_runner_override),
                                 activity_mode=str(regime_activity_mode),
                                 use_return_booster=bool(use_regime_return_booster),
@@ -6930,8 +7001,10 @@ with tab7:
                                         booster_full = benchmark_aware_trend_participation_signal(
                                             strat_prices, mode=str(regime_return_booster_mode)
                                         ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                        if bool(confirmed_regime_bar):
-                                            booster_full = booster_full.shift(1).ffill().fillna(0).clip(0, 1)
+                                        booster_full = apply_confirmed_bar_execution_policy(
+                                            booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                                        )
 
                                         mode_l = str(regime_return_booster_mode or "Balanced").lower()
                                         original_signals = signals.copy()
