@@ -9053,6 +9053,68 @@ def _safe_last_tab_error(tab_obj, tab_name, err):
         pass
 
 
+
+def _load_fresh_intraday_for_capture(ticker, interval='1m', period='1d', include_prepost=False):
+    """
+    Fetch fresh intraday data directly for the final Live Capture tab.
+    This intentionally does NOT use df_main/start_date, because df_main can be
+    daily historical data from 2024 when the rest of the dashboard is not in Live Mode.
+    """
+    try:
+        t = str(ticker).strip().upper()
+        if not t:
+            return pd.DataFrame(), "No ticker selected."
+
+        interval = str(interval).strip()
+        period = str(period).strip()
+
+        # yfinance limits: 1m normally supports about 7 days; period=1d is best for true today.
+        kwargs = dict(period=period, interval=interval, progress=False, auto_adjust=True, prepost=bool(include_prepost), threads=False)
+        d = yf.download(t, **kwargs)
+
+        if d is None or d.empty:
+            # Fallback to a slightly wider period in case market just opened / holiday edge.
+            fallback_period = '5d' if interval in {'1m', '2m', '5m', '15m', '30m'} else '1mo'
+            d = yf.download(t, period=fallback_period, interval=interval, progress=False, auto_adjust=True, prepost=bool(include_prepost), threads=False)
+
+        if d is None or d.empty:
+            return pd.DataFrame(), f"No fresh intraday data returned for {t}."
+
+        # Flatten multi-index columns if yfinance returns them.
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
+
+        keep = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in d.columns]
+        d = d[keep].copy()
+        if 'Close' not in d.columns:
+            return pd.DataFrame(), "Fresh intraday data loaded, but Close column is missing."
+
+        for c in ['Open', 'High', 'Low']:
+            if c not in d.columns:
+                d[c] = d['Close']
+        if 'Volume' not in d.columns:
+            d['Volume'] = 1.0
+
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
+        d = d[d['Close'] > 0]
+        if d.empty:
+            return pd.DataFrame(), "Fresh intraday data was empty after cleaning."
+
+        # Convert timezone-aware timestamps to Central Time for display/session filtering.
+        try:
+            idx = pd.DatetimeIndex(d.index)
+            if idx.tz is not None:
+                d.index = idx.tz_convert('America/Chicago')
+            else:
+                # Yahoo daily-like output may be naive. Keep as-is but do not convert date-only data.
+                d.index = idx
+        except Exception:
+            pass
+
+        return d, ""
+    except Exception as e:
+        return pd.DataFrame(), f"Fresh intraday fetch failed: {e}"
+
 def _intraday_clean_frame(source_df, today_only=True):
     """Prepare intraday OHLCV frame safely for the Live Capture tab."""
     try:
@@ -9400,55 +9462,68 @@ except Exception as e:
 try:
     with tab21:
         st.header('⚡ Intraday 0.5%+ Live Capture')
-        st.caption('Built for intraday entries and capturing more profit with runner trailing exits. Use 1m/5m/15m data in Live Mode for best results.')
+        st.caption('This final tab now pulls fresh intraday candles directly. It does NOT use the 2024 start-date/daily dataset from the main dashboard.')
 
-        if df_main is None or df_main.empty:
-            st.warning('Please load a ticker first.')
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                lc_today_only = st.checkbox('Today/session only', value=True, key='safe_lc_today_only')
-                sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=1, key='safe_lc_sensitivity')
-            with c2:
-                target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=3.00, value=0.75, step=0.05, key='safe_lc_target') / 100.0
-                stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=2.00, value=0.35, step=0.05, key='safe_lc_stop') / 100.0
-            with c3:
-                let_winners_run = st.checkbox('Let winners run', value=True, key='safe_lc_runner')
-                trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=2.00, value=0.40, step=0.05, key='safe_lc_trail') / 100.0
-            with c4:
-                max_hold = st.number_input('Max hold bars', min_value=5, max_value=200, value=45, step=5, key='safe_lc_maxhold')
-                max_trades = st.number_input('Max trades/day', min_value=1, max_value=50, value=10, step=1, key='safe_lc_maxtrades')
+        c0a, c0b, c0c, c0d = st.columns(4)
+        with c0a:
+            lc_interval = st.selectbox('Intraday interval', ['1m', '2m', '5m', '15m', '30m', '60m'], index=0, key='safe_lc_interval')
+        with c0b:
+            lc_period = st.selectbox('Data window', ['1d', '5d', '7d', '30d'], index=0, key='safe_lc_period')
+        with c0c:
+            include_prepost = st.checkbox('Include pre/after hours', value=False, key='safe_lc_prepost')
+        with c0d:
+            force_latest_session = st.checkbox('Latest session only', value=True, key='safe_lc_latest_session')
 
-            c5, c6 = st.columns(2)
-            with c5:
-                require_vwap = st.checkbox('Require price above VWAP', value=True, key='safe_lc_req_vwap')
-            with c6:
-                max_day_loss = st.number_input('Max day loss guard (%)', min_value=0.5, max_value=10.0, value=2.5, step=0.5, key='safe_lc_dayloss') / 100.0
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=0, key='safe_lc_sensitivity')
+        with c2:
+            target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.75, step=0.05, key='safe_lc_target') / 100.0
+            stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.35, step=0.05, key='safe_lc_stop') / 100.0
+        with c3:
+            let_winners_run = st.checkbox('Let winners run', value=True, key='safe_lc_runner')
+            trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.40, step=0.05, key='safe_lc_trail') / 100.0
+        with c4:
+            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=60, step=5, key='safe_lc_maxhold')
+            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=10, step=1, key='safe_lc_maxtrades')
 
-            run_lc = st.button('Run Intraday Capture Engine', key='safe_lc_run')
+        c5, c6 = st.columns(2)
+        with c5:
+            require_vwap = st.checkbox('Require price above VWAP', value=False, key='safe_lc_req_vwap')
+        with c6:
+            max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.5, max_value=10.0, value=2.5, step=0.5, key='safe_lc_dayloss') / 100.0
 
-            if run_lc:
-                d = _intraday_clean_frame(df_main, today_only=bool(lc_today_only))
-                if d.empty or len(d) < 25:
-                    st.session_state['safe_lc_pack'] = None
-                    st.warning('Not enough intraday bars. Use Live Mode with 1m/5m/15m, or turn off today/session only.')
-                else:
-                    entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap))
-                    trades_df, eq, summ = _run_intraday_capture(
-                        d, entry,
-                        target_pct=float(target_pct),
-                        stop_pct=float(stop_pct),
-                        trail_pct=float(trail_pct),
-                        min_hold_bars=2,
-                        max_hold_bars=int(max_hold),
-                        max_trades=int(max_trades),
-                        max_day_loss=float(max_day_loss),
-                        let_winners_run=bool(let_winners_run),
-                    )
-                    st.session_state['safe_lc_pack'] = {'d': d, 'entry': entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ}
+        run_lc = st.button('Fetch TODAY intraday + Run Capture Engine', key='safe_lc_run')
 
-            pack = st.session_state.get('safe_lc_pack')
+        if run_lc:
+            fresh, fetch_msg = _load_fresh_intraday_for_capture(TICKER, interval=lc_interval, period=lc_period, include_prepost=include_prepost)
+            if fetch_msg:
+                st.warning(fetch_msg)
+            d = _intraday_clean_frame(fresh, today_only=bool(force_latest_session))
+            if d.empty or len(d) < 10:
+                st.session_state['safe_lc_pack'] = None
+                st.error('No usable intraday candles. Select 1m/5m and Data window = 1d or 5d. This tab no longer uses old 2024 daily rows.')
+            else:
+                entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap))
+                trades_df, eq, summ = _run_intraday_capture(
+                    d, entry,
+                    target_pct=float(target_pct),
+                    stop_pct=float(stop_pct),
+                    trail_pct=float(trail_pct),
+                    min_hold_bars=2,
+                    max_hold_bars=int(max_hold),
+                    max_trades=int(max_trades),
+                    max_day_loss=float(max_day_loss),
+                    let_winners_run=bool(let_winners_run),
+                )
+                st.session_state['safe_lc_pack'] = {
+                    'd': d, 'entry': entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ,
+                    'interval': lc_interval, 'period': lc_period, 'latest_bar': str(d.index[-1]), 'first_bar': str(d.index[0])
+                }
+
+        pack = st.session_state.get('safe_lc_pack')
             if isinstance(pack, dict):
+                st.info(f"Intraday source used: {pack.get('interval', 'N/A')} / {pack.get('period', 'N/A')} | first bar: {pack.get('first_bar', 'N/A')} | latest bar: {pack.get('latest_bar', 'N/A')}")
                 summ = pack.get('summary', {})
                 trades_df = pack.get('trades', pd.DataFrame())
                 eq = pack.get('equity', pd.Series(dtype=float))
