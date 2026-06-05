@@ -8995,7 +8995,7 @@ with tab16:
                 top10 = filtered.head(10)
                 for _, row in top10.iterrows():
                     with st.expander(f"{'🟢' if 'BUY' in row['verdict'] else '🟡'} {row['ticker']} — {row['name']} | Score: {row['score']:.1f} | {row['verdict']}"):
-                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1, m2, m3, m4, m5, m6 = st.columns(6)
                         m1.metric("Price", f"${row['price']:.2f}")
                         m2.metric("ATM IV", f"{row['atm_iv']:.1f}%")
                         m3.metric("IV Rank", f"{row['iv_rank']:.0f}")
@@ -9151,12 +9151,19 @@ def _intraday_clean_frame(source_df, today_only=True):
         return pd.DataFrame()
 
 
-def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=True):
-    """Intraday entry setup designed for 0.5%-plus captures and runner continuation."""
+def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False, direction_mode='Both Long & Short'):
+    """
+    Bidirectional intraday signal engine.
+
+    Goal:
+    - Catch upside runners: +5% type trend days.
+    - Catch downside runners: -5%, bounce to -4.5%, then continuation to -7% type days.
+    - This is NOT a swing model. It uses only same-session intraday bars.
+    """
     close = d['Close'].astype(float)
-    high = d['High'].astype(float)
-    low = d['Low'].astype(float)
-    vol = d['Volume'].astype(float).replace(0, np.nan).fillna(1.0)
+    high = d['High'].astype(float) if 'High' in d.columns else close
+    low = d['Low'].astype(float) if 'Low' in d.columns else close
+    vol = d['Volume'].astype(float).replace(0, np.nan).fillna(1.0) if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
 
     ema5 = close.ewm(span=5, adjust=False).mean()
     ema9 = close.ewm(span=9, adjust=False).mean()
@@ -9164,43 +9171,91 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=True)
     ema50 = close.ewm(span=50, adjust=False).mean()
     typical = (high + low + close) / 3.0
     vwap = (typical * vol).cumsum() / vol.cumsum().replace(0, np.nan)
+
     rng = (high - low).replace(0, np.nan)
-    body_strength = ((close - low) / rng).fillna(0.5)
+    close_location = ((close - low) / rng).fillna(0.5)   # near 1 = strong close, near 0 = weak close
+    red_body_strength = ((high - close) / rng).fillna(0.5)
+
     ret1 = close.pct_change().fillna(0)
     mom3 = close.pct_change(3).fillna(0)
     mom6 = close.pct_change(6).fillna(0)
+    session_move = (close / close.iloc[0] - 1.0) if len(close) else pd.Series(0, index=close.index)
     vol_ratio = (vol / vol.rolling(20, min_periods=5).mean()).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
     hh20 = high.rolling(20, min_periods=5).max().shift(1)
-    pullback_ok = (close > ema21) & (low <= ema9 * 1.001) & (close > ema5)
-    reclaim = (close > vwap) & (close.shift(1) <= vwap.shift(1))
-    breakout = (close > hh20) & (mom3 > 0)
-    trend_stack = (ema5 > ema9) & (ema9 > ema21)
-    runner_trend = (close > ema21) & (ema21 > ema50) & (mom6 > 0)
+    ll20 = low.rolling(20, min_periods=5).min().shift(1)
+
+    # Long-side structure: trend continuation, VWAP reclaim, breakout, or shallow pullback continuation.
+    long_stack = (ema5 > ema9) & (ema9 > ema21)
+    long_reclaim = (close > vwap) & (close.shift(1) <= vwap.shift(1))
+    long_breakout = (close > hh20) & (mom3 > 0)
+    long_pullback_cont = (close > ema21) & (low <= ema9 * 1.001) & (close > ema5)
+    long_runner_trend = (close > ema21) & (ema21 > ema50) & (mom6 > 0)
+
+    # Short-side structure: trend continuation down, VWAP rejection, breakdown, or weak bounce then continuation.
+    short_stack = (ema5 < ema9) & (ema9 < ema21)
+    short_reject = (close < vwap) & (close.shift(1) >= vwap.shift(1))
+    short_breakdown = (close < ll20) & (mom3 < 0)
+    short_bounce_fail = (close < ema21) & (high >= ema9 * 0.999) & (close < ema5)
+    short_runner_trend = (close < ema21) & (ema21 < ema50) & (mom6 < 0)
 
     if sensitivity == 'Aggressive':
-        volume_ok = vol_ratio > 0.80
-        momentum_ok = (mom3 > 0.0005) | (ret1 > 0.0008)
-        structure_ok = trend_stack | (close > vwap) | pullback_ok | breakout
+        volume_ok = vol_ratio > 0.70
+        long_momentum_ok = (mom3 > 0.0003) | (ret1 > 0.0005)
+        short_momentum_ok = (mom3 < -0.0003) | (ret1 < -0.0005)
+        long_structure_ok = long_stack | (close > vwap) | long_pullback_cont | long_breakout | long_reclaim
+        short_structure_ok = short_stack | (close < vwap) | short_bounce_fail | short_breakdown | short_reject
     elif sensitivity == 'Strict':
         volume_ok = vol_ratio > 1.05
-        momentum_ok = (mom3 > 0.0020) & (body_strength > 0.55)
-        structure_ok = (trend_stack & (close > vwap)) | (breakout & close > vwap)
+        long_momentum_ok = (mom3 > 0.0020) & (close_location > 0.55)
+        short_momentum_ok = (mom3 < -0.0020) & (close_location < 0.45)
+        long_structure_ok = (long_stack & (close > vwap)) | (long_breakout & (close > vwap))
+        short_structure_ok = (short_stack & (close < vwap)) | (short_breakdown & (close < vwap))
     else:
-        volume_ok = vol_ratio > 0.90
-        momentum_ok = (mom3 > 0.0010) | ((mom6 > 0.0020) & (body_strength > 0.50))
-        structure_ok = (trend_stack & (close > ema21)) | reclaim | breakout | pullback_ok
+        volume_ok = vol_ratio > 0.85
+        long_momentum_ok = (mom3 > 0.0010) | ((mom6 > 0.0020) & (close_location > 0.50))
+        short_momentum_ok = (mom3 < -0.0010) | ((mom6 < -0.0020) & (close_location < 0.50))
+        long_structure_ok = (long_stack & (close > ema21)) | long_reclaim | long_breakout | long_pullback_cont
+        short_structure_ok = (short_stack & (close < ema21)) | short_reject | short_breakdown | short_bounce_fail
 
-    vwap_filter = (close > vwap) if require_vwap else (close > ema21)
-    primary_entry = structure_ok & momentum_ok & volume_ok & vwap_filter
+    long_vwap_filter = (close > vwap) if require_vwap else (close > ema21)
+    short_vwap_filter = (close < vwap) if require_vwap else (close < ema21)
 
-    # Runner fallback: on a strong day, avoid the zero-trade problem.
-    session_move = (close / close.iloc[0] - 1.0) if len(close) else pd.Series(0, index=close.index)
-    strong_day = session_move > 0.008
-    runner_entry = runner_trend & strong_day & (body_strength > 0.45) & (vol_ratio > 0.65)
+    long_primary = long_structure_ok & long_momentum_ok & volume_ok & long_vwap_filter
+    short_primary = short_structure_ok & short_momentum_ok & volume_ok & short_vwap_filter
 
-    # Debounce entries so it doesn't fire every bar.
-    raw_entry = (primary_entry | runner_entry).fillna(False)
-    entry = raw_entry & ~raw_entry.shift(1).fillna(False)
+    # Strong-day fallback. This solves the zero-trade problem on obvious runners.
+    long_runner_entry = long_runner_trend & (session_move > 0.006) & (close_location > 0.42) & (vol_ratio > 0.55)
+    short_runner_entry = short_runner_trend & (session_move < -0.006) & (close_location < 0.58) & (vol_ratio > 0.55)
+
+    # Institutional-style continuation after bounce/fade:
+    # For shorts: stock is already deeply red, bounces a little, then fails under EMA/VWAP and resumes lower.
+    rolling_low_from_open = low.cummin()
+    bounce_from_low = (close / rolling_low_from_open - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+    short_red_day_cont = (session_move < -0.015) & (bounce_from_low > 0.0025) & (close < ema9) & (mom3 < 0) & (vol_ratio > 0.55)
+
+    rolling_high_from_open = high.cummax()
+    pullback_from_high = (close / rolling_high_from_open - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+    long_green_day_cont = (session_move > 0.015) & (pullback_from_high < -0.0025) & (close > ema9) & (mom3 > 0) & (vol_ratio > 0.55)
+
+    raw_long = (long_primary | long_runner_entry | long_green_day_cont).fillna(False)
+    raw_short = (short_primary | short_runner_entry | short_red_day_cont).fillna(False)
+
+    # Mode selection
+    dm = str(direction_mode).lower()
+    if 'long only' in dm:
+        raw_short[:] = False
+    elif 'short only' in dm:
+        raw_long[:] = False
+
+    # Debounce so entries are event-like, not every bar.
+    long_entry = raw_long & ~raw_long.shift(1).fillna(False)
+    short_entry = raw_short & ~raw_short.shift(1).fillna(False)
+
+    # If both fire on the same bar, choose the side matching session direction.
+    both = long_entry & short_entry
+    long_entry = long_entry & ~(both & (session_move < 0))
+    short_entry = short_entry & ~(both & (session_move >= 0))
 
     features = pd.DataFrame({
         'Close': close,
@@ -9209,36 +9264,54 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=True)
         'EMA9': ema9,
         'EMA21': ema21,
         'EMA50': ema50,
+        'Session Move %': session_move * 100,
         'Mom3 %': mom3 * 100,
         'Mom6 %': mom6 * 100,
         'Vol Ratio': vol_ratio,
-        'Body Strength': body_strength,
-        'Primary Entry': primary_entry.astype(int),
-        'Runner Entry': runner_entry.astype(int),
-        'Final Entry': entry.astype(int),
+        'Close Location': close_location,
+        'Long Primary': long_primary.astype(int),
+        'Long Runner': long_runner_entry.astype(int),
+        'Long Continuation': long_green_day_cont.astype(int),
+        'Short Primary': short_primary.astype(int),
+        'Short Runner': short_runner_entry.astype(int),
+        'Short Bounce-Fail': short_red_day_cont.astype(int),
+        'Long Entry': long_entry.astype(int),
+        'Short Entry': short_entry.astype(int),
+        'Final Entry': (long_entry | short_entry).astype(int),
     }, index=d.index)
-    return entry.astype(bool), features
+    return long_entry.astype(bool), short_entry.astype(bool), features
 
 
-def _run_intraday_capture(d, entry_signal, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
+def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
                           min_hold_bars=2, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
-                          let_winners_run=True):
-    """Single-position long-only intraday engine with target + trailing runner logic."""
+                          let_winners_run=True, allow_shorts=True):
+    """Single-position bidirectional intraday engine with target + trailing runner exits."""
     close = d['Close'].astype(float)
     high = d['High'].astype(float) if 'High' in d.columns else close
     low = d['Low'].astype(float) if 'Low' in d.columns else close
+    if short_entry_signal is None:
+        short_entry_signal = pd.Series(False, index=close.index)
+    short_entry_signal = pd.Series(short_entry_signal, index=close.index).fillna(False).astype(bool)
+    long_entry_signal = pd.Series(long_entry_signal, index=close.index).fillna(False).astype(bool)
+
     initial = 10000.0
     equity = initial
     in_pos = False
+    side = None
     entry_price = 0.0
     entry_time = None
     entry_equity = initial
-    peak_price = 0.0
+    best_price = 0.0
     bars_held = 0
     trades_today = 0
     disabled = False
     trades = []
     eq_vals = []
+
+    def open_return(px):
+        if not in_pos or entry_price <= 0:
+            return 0.0
+        return (px / entry_price - 1.0) if side == 'Long' else (entry_price / px - 1.0)
 
     for i, ts in enumerate(close.index):
         px = float(close.iloc[i])
@@ -9247,37 +9320,53 @@ def _run_intraday_capture(d, entry_signal, target_pct=0.0075, stop_pct=0.0035, t
 
         if in_pos:
             bars_held += 1
-            peak_price = max(peak_price, hi, px)
             exit_reason = None
             exit_price = px
-            open_ret = (px / entry_price) - 1.0 if entry_price > 0 else 0.0
 
-            if bars_held >= int(min_hold_bars):
-                # Stop first, then target/trailing. This is conservative for OHLC bars.
-                if lo <= entry_price * (1 - stop_pct):
-                    exit_price = entry_price * (1 - stop_pct)
-                    exit_reason = 'Stop hit'
-                elif let_winners_run and peak_price >= entry_price * (1 + target_pct):
-                    trail_stop_price = peak_price * (1 - trail_pct)
-                    if lo <= trail_stop_price:
-                        exit_price = max(trail_stop_price, entry_price * (1 + target_pct * 0.35))
-                        exit_reason = 'Runner trailing exit'
-                elif (not let_winners_run) and hi >= entry_price * (1 + target_pct):
-                    exit_price = entry_price * (1 + target_pct)
-                    exit_reason = 'Target hit'
-                elif bars_held >= int(max_hold_bars):
-                    exit_price = px
-                    exit_reason = 'Max hold exit'
+            if side == 'Long':
+                best_price = max(best_price, hi, px)
+                if bars_held >= int(min_hold_bars):
+                    if lo <= entry_price * (1 - stop_pct):
+                        exit_price = entry_price * (1 - stop_pct)
+                        exit_reason = 'Long stop hit'
+                    elif let_winners_run and best_price >= entry_price * (1 + target_pct):
+                        trail_stop_price = best_price * (1 - trail_pct)
+                        if lo <= trail_stop_price:
+                            exit_price = max(trail_stop_price, entry_price * (1 + target_pct * 0.35))
+                            exit_reason = 'Long runner trailing exit'
+                    elif (not let_winners_run) and hi >= entry_price * (1 + target_pct):
+                        exit_price = entry_price * (1 + target_pct)
+                        exit_reason = 'Long target hit'
+                    elif bars_held >= int(max_hold_bars):
+                        exit_price = px
+                        exit_reason = 'Long max hold exit'
+            else:
+                best_price = min(best_price, lo, px)
+                if bars_held >= int(min_hold_bars):
+                    if hi >= entry_price * (1 + stop_pct):
+                        exit_price = entry_price * (1 + stop_pct)
+                        exit_reason = 'Short stop hit'
+                    elif let_winners_run and best_price <= entry_price * (1 - target_pct):
+                        trail_stop_price = best_price * (1 + trail_pct)
+                        if hi >= trail_stop_price:
+                            exit_price = min(trail_stop_price, entry_price * (1 - target_pct * 0.35))
+                            exit_reason = 'Short runner trailing exit'
+                    elif (not let_winners_run) and lo <= entry_price * (1 - target_pct):
+                        exit_price = entry_price * (1 - target_pct)
+                        exit_reason = 'Short target hit'
+                    elif bars_held >= int(max_hold_bars):
+                        exit_price = px
+                        exit_reason = 'Short max hold exit'
 
             if exit_reason:
-                trade_ret = (exit_price / entry_price) - 1.0
+                trade_ret = (exit_price / entry_price - 1.0) if side == 'Long' else (entry_price / exit_price - 1.0)
                 equity = entry_equity * (1 + trade_ret)
                 trades.append({
-                    'Side': 'Long',
+                    'Side': side,
                     'Entry Date': entry_time,
                     'Exit Date': ts,
-                    'Buy Price': round(entry_price, 4),
-                    'Sell Price': round(exit_price, 4),
+                    'Buy Price' if side == 'Long' else 'Short Price': round(entry_price, 4),
+                    'Sell Price' if side == 'Long' else 'Cover Price': round(exit_price, 4),
                     'PnL (%)': round(trade_ret * 100, 3),
                     'Cumulative Return (%)': round((equity / initial - 1) * 100, 3),
                     'Bars Held': int(bars_held),
@@ -9285,35 +9374,45 @@ def _run_intraday_capture(d, entry_signal, target_pct=0.0075, stop_pct=0.0035, t
                     'Reason': exit_reason,
                 })
                 in_pos = False
+                side = None
                 entry_price = 0.0
                 entry_time = None
                 bars_held = 0
-                peak_price = 0.0
+                best_price = 0.0
                 if (equity / initial - 1.0) <= -float(max_day_loss):
                     disabled = True
 
         if (not in_pos) and (not disabled) and trades_today < int(max_trades):
-            if bool(entry_signal.iloc[i]):
+            go_long = bool(long_entry_signal.iloc[i])
+            go_short = bool(short_entry_signal.iloc[i]) and bool(allow_shorts)
+            if go_long or go_short:
                 in_pos = True
+                side = 'Short' if go_short and not go_long else 'Long'
                 entry_price = px
                 entry_time = ts
                 entry_equity = equity
-                peak_price = px
+                best_price = px
                 bars_held = 0
                 trades_today += 1
 
-        mark_equity = entry_equity * (px / entry_price) if in_pos and entry_price > 0 else equity
+        mark_equity = entry_equity * (1 + open_return(px)) if in_pos and entry_price > 0 else equity
         eq_vals.append(mark_equity)
 
     if in_pos and entry_price > 0:
         px = float(close.iloc[-1])
-        mark_equity = entry_equity * (px / entry_price)
+        mark_equity = entry_equity * (1 + open_return(px))
+        trade_ret = open_return(px)
         trades.append({
-            'Side': 'Long', 'Entry Date': entry_time, 'Exit Date': 'Open',
-            'Buy Price': round(entry_price, 4), 'Sell Price': round(px, 4),
-            'PnL (%)': round((px / entry_price - 1) * 100, 3),
+            'Side': side,
+            'Entry Date': entry_time,
+            'Exit Date': 'Open',
+            'Buy Price' if side == 'Long' else 'Short Price': round(entry_price, 4),
+            'Sell Price' if side == 'Long' else 'Cover Price': round(px, 4),
+            'PnL (%)': round(trade_ret * 100, 3),
             'Cumulative Return (%)': round((mark_equity / initial - 1) * 100, 3),
-            'Bars Held': int(bars_held), 'Status': 'Open', 'Reason': 'Open runner mark-to-market'
+            'Bars Held': int(bars_held),
+            'Status': 'Open',
+            'Reason': 'Open runner mark-to-market'
         })
         if eq_vals:
             eq_vals[-1] = mark_equity
@@ -9323,7 +9422,17 @@ def _run_intraday_capture(d, entry_signal, target_pct=0.0075, stop_pct=0.0035, t
     bh = ((float(close.iloc[-1]) / float(close.iloc[0])) - 1.0) * 100 if len(close) >= 2 and close.iloc[0] > 0 else np.nan
     strat = ((float(eq.iloc[-1]) / initial) - 1.0) * 100 if not eq.empty else np.nan
     dd = ((eq / eq.cummax()) - 1.0).min() * 100 if not eq.empty else np.nan
-    return trades_df, eq, {'Strategy Return %': strat, 'Buy & Hold Return %': bh, 'Max Drawdown %': dd, 'Trades': len(trades_df), 'Daily Guard Hit': disabled}
+    longs = int((trades_df['Side'] == 'Long').sum()) if 'Side' in trades_df.columns else 0
+    shorts = int((trades_df['Side'] == 'Short').sum()) if 'Side' in trades_df.columns else 0
+    return trades_df, eq, {
+        'Strategy Return %': strat,
+        'Buy & Hold Return %': bh,
+        'Max Drawdown %': dd,
+        'Trades': len(trades_df),
+        'Long Trades': longs,
+        'Short Trades': shorts,
+        'Daily Guard Hit': disabled
+    }
 
 
 # ==========================================
@@ -9461,8 +9570,8 @@ except Exception as e:
 # ==========================================
 try:
     with tab21:
-        st.header('⚡ Intraday 0.5%+ Live Capture')
-        st.caption('This final tab now pulls fresh intraday candles directly. It does NOT use the 2024 start-date/daily dataset from the main dashboard.')
+        st.header('⚡ Bidirectional Intraday Capture: Long + Short')
+        st.caption('Fresh intraday candles only. This tab can capture upside runners AND downside continuation/fade moves. It does NOT use the 2024 daily dataset.')
 
         c0a, c0b, c0c, c0d = st.columns(4)
         with c0a:
@@ -9477,6 +9586,7 @@ try:
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=0, key='safe_lc_sensitivity')
+            direction_mode = st.selectbox('Direction mode', ['Both Long & Short', 'Long Only', 'Short Only'], index=0, key='safe_lc_direction')
         with c2:
             target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.75, step=0.05, key='safe_lc_target') / 100.0
             stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.35, step=0.05, key='safe_lc_stop') / 100.0
@@ -9489,11 +9599,11 @@ try:
 
         c5, c6 = st.columns(2)
         with c5:
-            require_vwap = st.checkbox('Require price above VWAP', value=False, key='safe_lc_req_vwap')
+            require_vwap = st.checkbox('Require VWAP side filter', value=False, key='safe_lc_req_vwap', help='Longs require above VWAP; shorts require below VWAP. OFF is more aggressive.')
         with c6:
             max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.5, max_value=10.0, value=2.5, step=0.5, key='safe_lc_dayloss') / 100.0
 
-        run_lc = st.button('Fetch TODAY intraday + Run Capture Engine', key='safe_lc_run')
+        run_lc = st.button('Fetch TODAY intraday + Run Bidirectional Engine', key='safe_lc_run')
 
         if run_lc:
             fresh, fetch_msg = _load_fresh_intraday_for_capture(TICKER, interval=lc_interval, period=lc_period, include_prepost=include_prepost)
@@ -9504,9 +9614,9 @@ try:
                 st.session_state['safe_lc_pack'] = None
                 st.error('No usable intraday candles. Select 1m/5m and Data window = 1d or 5d. This tab no longer uses old 2024 daily rows.')
             else:
-                entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap))
+                long_entry, short_entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap), direction_mode=direction_mode)
                 trades_df, eq, summ = _run_intraday_capture(
-                    d, entry,
+                    d, long_entry, short_entry,
                     target_pct=float(target_pct),
                     stop_pct=float(stop_pct),
                     trail_pct=float(trail_pct),
@@ -9517,8 +9627,8 @@ try:
                     let_winners_run=bool(let_winners_run),
                 )
                 st.session_state['safe_lc_pack'] = {
-                    'd': d, 'entry': entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ,
-                    'interval': lc_interval, 'period': lc_period, 'latest_bar': str(d.index[-1]), 'first_bar': str(d.index[0])
+                    'd': d, 'long_entry': long_entry, 'short_entry': short_entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ,
+                    'interval': lc_interval, 'period': lc_period, 'direction_mode': direction_mode, 'latest_bar': str(d.index[-1]), 'first_bar': str(d.index[0])
                 }
 
         pack = st.session_state.get('safe_lc_pack')
@@ -9529,12 +9639,13 @@ try:
             eq = pack.get('equity', pd.Series(dtype=float))
             feats = pack.get('features', pd.DataFrame())
             d = pack.get('d', pd.DataFrame())
-            m1, m2, m3, m4, m5 = st.columns(5)
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric('Strategy Return', f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else 'N/A')
             m2.metric('Buy & Hold', f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else 'N/A')
             m3.metric('Max DD', f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else 'N/A')
             m4.metric('Trades', str(int(summ.get('Trades', 0))))
-            m5.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
+            m5.metric('Long/Short', f"{int(summ.get('Long Trades', 0))}/{int(summ.get('Short Trades', 0))}")
+            m6.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
 
             if isinstance(d, pd.DataFrame) and not d.empty:
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=(f'{TICKER} Intraday Setup', 'Equity Curve'))
@@ -9545,7 +9656,14 @@ try:
                 if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
                     closed_or_open = trades_df.copy()
                     buys = closed_or_open[closed_or_open['Entry Date'].notna()]
-                    fig.add_trace(go.Scatter(x=buys['Entry Date'], y=buys['Buy Price'], mode='markers', name='Entry'), row=1, col=1)
+                    if 'Buy Price' in buys.columns:
+                        long_buys = buys[buys.get('Side', '') == 'Long'] if 'Side' in buys.columns else buys
+                        if not long_buys.empty:
+                            fig.add_trace(go.Scatter(x=long_buys['Entry Date'], y=long_buys['Buy Price'], mode='markers', name='Long Entry'), row=1, col=1)
+                    if 'Short Price' in buys.columns and 'Side' in buys.columns:
+                        short_buys = buys[buys['Side'] == 'Short']
+                        if not short_buys.empty:
+                            fig.add_trace(go.Scatter(x=short_buys['Entry Date'], y=short_buys['Short Price'], mode='markers', name='Short Entry'), row=1, col=1)
                 if isinstance(eq, pd.Series) and not eq.empty:
                     fig.add_trace(go.Scatter(x=eq.index, y=eq, mode='lines', name='Equity'), row=2, col=1)
                 fig.update_layout(height=760, template='plotly_dark', hovermode='x unified')
@@ -9561,15 +9679,15 @@ try:
                 st.dataframe(display_trades, use_container_width=True, hide_index=True)
                 st.download_button('Download intraday capture trade log', display_trades.to_csv(index=False).encode('utf-8'), file_name=f'{TICKER}_intraday_capture_trades.csv', mime='text/csv', key='safe_lc_download')
             else:
-                st.warning('No trades fired. Try Aggressive sensitivity, remove VWAP requirement, or use 1m/5m live data.')
+                st.warning('No trades fired. Try Aggressive sensitivity, Both Long & Short, remove VWAP requirement, or use 1m/5m live data.')
 
             with st.expander('Signal diagnostics / features', expanded=False):
                 if isinstance(feats, pd.DataFrame) and not feats.empty:
-                    st.caption(f"Signals: primary={int(feats['Primary Entry'].sum())}, runner={int(feats['Runner Entry'].sum())}, final={int(feats['Final Entry'].sum())}")
+                    st.caption(f"Signals: long={int(feats['Long Entry'].sum())}, short={int(feats['Short Entry'].sum())}, final={int(feats['Final Entry'].sum())}")
                     st.dataframe(feats.tail(300), use_container_width=True)
 
         st.markdown('---')
-        st.caption('This is an intraday execution tab. It is not trying to predict the whole stock move; it is trying to participate in clean momentum and let strong trades run.')
+        st.caption('This is an intraday execution tab. It is not trying to predict the whole stock move; it tries to participate in clean momentum both up and down, then lets strong trades run with trailing exits.')
 except Exception as e:
     _safe_last_tab_error(tab21, 'Intraday Live Capture tab', e)
 
