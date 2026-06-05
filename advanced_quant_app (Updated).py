@@ -9522,51 +9522,51 @@ try:
                 }
 
         pack = st.session_state.get('safe_lc_pack')
-            if isinstance(pack, dict):
-                st.info(f"Intraday source used: {pack.get('interval', 'N/A')} / {pack.get('period', 'N/A')} | first bar: {pack.get('first_bar', 'N/A')} | latest bar: {pack.get('latest_bar', 'N/A')}")
-                summ = pack.get('summary', {})
-                trades_df = pack.get('trades', pd.DataFrame())
-                eq = pack.get('equity', pd.Series(dtype=float))
-                feats = pack.get('features', pd.DataFrame())
-                d = pack.get('d', pd.DataFrame())
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric('Strategy Return', f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else 'N/A')
-                m2.metric('Buy & Hold', f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else 'N/A')
-                m3.metric('Max DD', f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else 'N/A')
-                m4.metric('Trades', str(int(summ.get('Trades', 0))))
-                m5.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
+        if isinstance(pack, dict):
+            st.info(f"Intraday source used: {pack.get('interval', 'N/A')} / {pack.get('period', 'N/A')} | first bar: {pack.get('first_bar', 'N/A')} | latest bar: {pack.get('latest_bar', 'N/A')}")
+            summ = pack.get('summary', {})
+            trades_df = pack.get('trades', pd.DataFrame())
+            eq = pack.get('equity', pd.Series(dtype=float))
+            feats = pack.get('features', pd.DataFrame())
+            d = pack.get('d', pd.DataFrame())
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric('Strategy Return', f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else 'N/A')
+            m2.metric('Buy & Hold', f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else 'N/A')
+            m3.metric('Max DD', f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else 'N/A')
+            m4.metric('Trades', str(int(summ.get('Trades', 0))))
+            m5.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
 
-                if isinstance(d, pd.DataFrame) and not d.empty:
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=(f'{TICKER} Intraday Setup', 'Equity Curve'))
-                    fig.add_trace(go.Scatter(x=d.index, y=d['Close'], mode='lines', name='Close'), row=1, col=1)
-                    if isinstance(feats, pd.DataFrame) and 'VWAP' in feats.columns:
-                        fig.add_trace(go.Scatter(x=feats.index, y=feats['VWAP'], mode='lines', name='VWAP'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=feats.index, y=feats['EMA21'], mode='lines', name='EMA21'), row=1, col=1)
-                    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                        closed_or_open = trades_df.copy()
-                        buys = closed_or_open[closed_or_open['Entry Date'].notna()]
-                        fig.add_trace(go.Scatter(x=buys['Entry Date'], y=buys['Buy Price'], mode='markers', name='Entry'), row=1, col=1)
-                    if isinstance(eq, pd.Series) and not eq.empty:
-                        fig.add_trace(go.Scatter(x=eq.index, y=eq, mode='lines', name='Equity'), row=2, col=1)
-                    fig.update_layout(height=760, template='plotly_dark', hovermode='x unified')
-                    st.plotly_chart(fig, use_container_width=True)
-
-                st.write('#### Intraday Capture Trade Log')
+            if isinstance(d, pd.DataFrame) and not d.empty:
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=(f'{TICKER} Intraday Setup', 'Equity Curve'))
+                fig.add_trace(go.Scatter(x=d.index, y=d['Close'], mode='lines', name='Close'), row=1, col=1)
+                if isinstance(feats, pd.DataFrame) and 'VWAP' in feats.columns:
+                    fig.add_trace(go.Scatter(x=feats.index, y=feats['VWAP'], mode='lines', name='VWAP'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=feats.index, y=feats['EMA21'], mode='lines', name='EMA21'), row=1, col=1)
                 if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                    display_trades = trades_df.copy()
-                    try:
-                        display_trades = apply_trade_log_timestamp_display(display_trades)
-                    except Exception:
-                        pass
-                    st.dataframe(display_trades, use_container_width=True, hide_index=True)
-                    st.download_button('Download intraday capture trade log', display_trades.to_csv(index=False).encode('utf-8'), file_name=f'{TICKER}_intraday_capture_trades.csv', mime='text/csv', key='safe_lc_download')
-                else:
-                    st.warning('No trades fired. Try Aggressive sensitivity, remove VWAP requirement, or use 1m/5m live data.')
+                    closed_or_open = trades_df.copy()
+                    buys = closed_or_open[closed_or_open['Entry Date'].notna()]
+                    fig.add_trace(go.Scatter(x=buys['Entry Date'], y=buys['Buy Price'], mode='markers', name='Entry'), row=1, col=1)
+                if isinstance(eq, pd.Series) and not eq.empty:
+                    fig.add_trace(go.Scatter(x=eq.index, y=eq, mode='lines', name='Equity'), row=2, col=1)
+                fig.update_layout(height=760, template='plotly_dark', hovermode='x unified')
+                st.plotly_chart(fig, use_container_width=True)
 
-                with st.expander('Signal diagnostics / features', expanded=False):
-                    if isinstance(feats, pd.DataFrame) and not feats.empty:
-                        st.caption(f"Signals: primary={int(feats['Primary Entry'].sum())}, runner={int(feats['Runner Entry'].sum())}, final={int(feats['Final Entry'].sum())}")
-                        st.dataframe(feats.tail(300), use_container_width=True)
+            st.write('#### Intraday Capture Trade Log')
+            if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                display_trades = trades_df.copy()
+                try:
+                    display_trades = apply_trade_log_timestamp_display(display_trades)
+                except Exception:
+                    pass
+                st.dataframe(display_trades, use_container_width=True, hide_index=True)
+                st.download_button('Download intraday capture trade log', display_trades.to_csv(index=False).encode('utf-8'), file_name=f'{TICKER}_intraday_capture_trades.csv', mime='text/csv', key='safe_lc_download')
+            else:
+                st.warning('No trades fired. Try Aggressive sensitivity, remove VWAP requirement, or use 1m/5m live data.')
+
+            with st.expander('Signal diagnostics / features', expanded=False):
+                if isinstance(feats, pd.DataFrame) and not feats.empty:
+                    st.caption(f"Signals: primary={int(feats['Primary Entry'].sum())}, runner={int(feats['Runner Entry'].sum())}, final={int(feats['Final Entry'].sum())}")
+                    st.dataframe(feats.tail(300), use_container_width=True)
 
         st.markdown('---')
         st.caption('This is an intraday execution tab. It is not trying to predict the whole stock move; it is trying to participate in clean momentum and let strong trades run.')
