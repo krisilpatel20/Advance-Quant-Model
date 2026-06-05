@@ -4883,8 +4883,18 @@ with st.sidebar:
         stop_loss = st.slider("Hard Stop Loss (%)", 0.0, 30.0, 8.0, step=0.5) / 100 if use_stop_loss else 0.0
 
     st.divider()
+    st.header("🚀 Fast Startup")
+    fast_intraday_mode = st.toggle(
+        "Fast intraday-only startup",
+        value=True,
+        help="ON = skip heavy GARCH/Markov/full-dashboard calculations so the app opens fast. Use the final 0.5% Live Capture tab for today's intraday trades. Turn OFF when you want the full thesis dashboard."
+    )
+    if fast_intraday_mode:
+        st.success("Fast mode ON: heavy models skipped. Go straight to ⚡ 0.5% Live Capture.")
+
+    st.divider()
     st.header("⚡ Live Decision Mode")
-    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
+    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support. Ignored when Fast intraday-only startup is ON.")
     if live_mode:
         data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
         st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
@@ -4992,7 +5002,12 @@ with st.sidebar:
 # Standardize current time to the nearest minute for robust caching
 now_rounded = datetime.now().replace(second=0, microsecond=0)
 
-if live_mode:
+if fast_intraday_mode:
+    # Fast intraday-only startup: do NOT load the big historical dataset and do NOT run
+    # GARCH/Markov/Monte Carlo on app open. The final tab fetches fresh intraday data
+    # only when the user clicks its Run button.
+    df_main = None
+elif live_mode:
     # Intraday limits: 1m (7d), 5m-15m (60d), 60m (730d)
     # We use 30d as a robust default for decision support models to have enough history
     lookback_days = 7 if data_interval == '1m' else 30
@@ -5001,7 +5016,7 @@ else:
     df_main = load_data(TICKER, start_date, end_date, interval='1d')
 
 st.subheader("Asset & Macro Analysis Suite")
-st.caption('Performance mode: CVD, VWAP, Time Series, and Microstructure are lazy-loaded so the main model opens fast.')
+st.caption('Fast mode skips heavy model loading. Last five tabs are lazy-loaded; final tab fetches today intraday only when you click Run.')
 
 # 5. UNIFIED TAB ARCHITECTURE
 # ==========================================
@@ -9570,8 +9585,8 @@ except Exception as e:
 # ==========================================
 try:
     with tab21:
-        st.header('⚡ Bidirectional Intraday Capture: Long + Short')
-        st.caption('Fresh intraday candles only. This tab can capture upside runners AND downside continuation/fade moves. It does NOT use the 2024 daily dataset.')
+        st.header('⚡ Long-Only Intraday Capture: Momentum + Dip Bounce')
+        st.caption('Fresh intraday candles only. Long-only: captures green-day momentum and red-day dip-bounce waves. No short selling, no puts, no inverse logic.')
 
         c0a, c0b, c0c, c0d = st.columns(4)
         with c0a:
@@ -9586,7 +9601,8 @@ try:
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=0, key='safe_lc_sensitivity')
-            direction_mode = st.selectbox('Direction mode', ['Both Long & Short', 'Long Only', 'Short Only'], index=0, key='safe_lc_direction')
+            direction_mode = 'Long Only'
+            st.info('Direction mode: Long Only — no short selling.')
         with c2:
             target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.75, step=0.05, key='safe_lc_target') / 100.0
             stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.35, step=0.05, key='safe_lc_stop') / 100.0
@@ -9603,7 +9619,7 @@ try:
         with c6:
             max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.5, max_value=10.0, value=2.5, step=0.5, key='safe_lc_dayloss') / 100.0
 
-        run_lc = st.button('Fetch TODAY intraday + Run Bidirectional Engine', key='safe_lc_run')
+        run_lc = st.button('Fetch TODAY intraday + Run Long-Only Engine', key='safe_lc_run')
 
         if run_lc:
             fresh, fetch_msg = _load_fresh_intraday_for_capture(TICKER, interval=lc_interval, period=lc_period, include_prepost=include_prepost)
@@ -9628,7 +9644,7 @@ try:
                 )
                 st.session_state['safe_lc_pack'] = {
                     'd': d, 'long_entry': long_entry, 'short_entry': short_entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ,
-                    'interval': lc_interval, 'period': lc_period, 'direction_mode': direction_mode, 'latest_bar': str(d.index[-1]), 'first_bar': str(d.index[0])
+                    'interval': lc_interval, 'period': lc_period, 'direction_mode': 'Long Only', 'latest_bar': str(d.index[-1]), 'first_bar': str(d.index[0])
                 }
 
         pack = st.session_state.get('safe_lc_pack')
@@ -9644,7 +9660,7 @@ try:
             m2.metric('Buy & Hold', f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else 'N/A')
             m3.metric('Max DD', f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else 'N/A')
             m4.metric('Trades', str(int(summ.get('Trades', 0))))
-            m5.metric('Long/Short', f"{int(summ.get('Long Trades', 0))}/{int(summ.get('Short Trades', 0))}")
+            m5.metric('Long Trades', str(int(summ.get('Long Trades', 0))))
             m6.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
 
             if isinstance(d, pd.DataFrame) and not d.empty:
@@ -9660,7 +9676,7 @@ try:
                         long_buys = buys[buys.get('Side', '') == 'Long'] if 'Side' in buys.columns else buys
                         if not long_buys.empty:
                             fig.add_trace(go.Scatter(x=long_buys['Entry Date'], y=long_buys['Buy Price'], mode='markers', name='Long Entry'), row=1, col=1)
-                    if 'Short Price' in buys.columns and 'Side' in buys.columns:
+                    if False and 'Short Price' in buys.columns and 'Side' in buys.columns:
                         short_buys = buys[buys['Side'] == 'Short']
                         if not short_buys.empty:
                             fig.add_trace(go.Scatter(x=short_buys['Entry Date'], y=short_buys['Short Price'], mode='markers', name='Short Entry'), row=1, col=1)
@@ -9679,7 +9695,7 @@ try:
                 st.dataframe(display_trades, use_container_width=True, hide_index=True)
                 st.download_button('Download intraday capture trade log', display_trades.to_csv(index=False).encode('utf-8'), file_name=f'{TICKER}_intraday_capture_trades.csv', mime='text/csv', key='safe_lc_download')
             else:
-                st.warning('No trades fired. Try Aggressive sensitivity, Both Long & Short, remove VWAP requirement, or use 1m/5m live data.')
+                st.warning('No long trades fired. Try Aggressive sensitivity, remove VWAP requirement, lower bounce/target settings, or use 1m/5m live data.')
 
             with st.expander('Signal diagnostics / features', expanded=False):
                 if isinstance(feats, pd.DataFrame) and not feats.empty:
@@ -9687,7 +9703,7 @@ try:
                     st.dataframe(feats.tail(300), use_container_width=True)
 
         st.markdown('---')
-        st.caption('This is an intraday execution tab. It is not trying to predict the whole stock move; it tries to participate in clean momentum both up and down, then lets strong trades run with trailing exits.')
+        st.caption('Long-only intraday execution tab. It captures upside momentum or bounce waves after red-day panic; it does not short sell.')
 except Exception as e:
     _safe_last_tab_error(tab21, 'Intraday Live Capture tab', e)
 
