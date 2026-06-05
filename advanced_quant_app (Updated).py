@@ -9043,7 +9043,7 @@ with tab16:
 # ==========================================
 with tab17:
     st.header('📊 CVD & Volume Delta')
-    _load_cvd_tab = st.checkbox('Load CVD module', value=False, key='lazy_load_cvd_tab')
+    _load_cvd_tab = st.checkbox('Load CVD module', value=False, key='lazy_load_cvd_tab_v3')
     if not _load_cvd_tab:
         st.info('CVD is ready, but not loaded yet. Click the checkbox above to run this tab so the full app stays fast.')
     else:
@@ -9394,7 +9394,7 @@ with tab17:
     # ==========================================
 with tab18:
     st.header('📈 Institutional VWAP')
-    _load_vwap_tab = st.checkbox('Load VWAP module', value=False, key='lazy_load_vwap_tab')
+    _load_vwap_tab = st.checkbox('Load VWAP module', value=False, key='lazy_load_vwap_tab_v3')
     if not _load_vwap_tab:
         st.info('VWAP is ready, but not loaded yet. Click the checkbox above to run this tab so the full app stays fast.')
     else:
@@ -9755,7 +9755,7 @@ with tab18:
     # ==========================================
 with tab19:
     st.header('🔬 Time Series Analysis')
-    _load_ts_tab = st.checkbox('Load Time Series module', value=False, key='lazy_load_timeseries_tab')
+    _load_ts_tab = st.checkbox('Load Time Series module', value=False, key='lazy_load_timeseries_tab_v3')
     if not _load_ts_tab:
         st.info('Time Series Analysis is ready, but not loaded yet. Click the checkbox above to run this tab so the full app stays fast.')
     else:
@@ -11742,7 +11742,7 @@ try:
     with tab20:
         st.header('🧬 Market Microstructure')
         st.caption('Full microstructure is available, but lazy-loaded so it does not slow the whole app.')
-        _load_micro_tab = st.checkbox('Load Market Microstructure module', value=False, key='lazy_load_microstructure_tab')
+        _load_micro_tab = st.checkbox('Load Market Microstructure module', value=False, key='lazy_load_microstructure_tab_v3')
         if not _load_micro_tab:
             st.info('Microstructure is ready. Turn this on only when you want to use Databento, replay, charts, or backtests.')
         else:
@@ -12259,235 +12259,239 @@ try:
     with tab21:
         st.header("⚡ 0.5% Live Capture Mode")
         st.caption("Execution-focused intraday module. Designed for selective 0.5%–1.0% captures using VWAP, trend, volume, spread proxy, and strict risk controls.")
-
-        if df_main is None or df_main.empty:
-            st.warning("No price data loaded yet.")
+        _load_lc_tab = st.checkbox("Load 0.5% Live Capture module", value=False, key="lazy_load_live_capture_tab_v3")
+        if not _load_lc_tab:
+            st.info("0.5% Live Capture is ready, but not loaded yet. Click the checkbox above only when you want to run this module so the full app stays fast.")
         else:
-            lc_df = df_main.copy()
-            if not isinstance(lc_df.index, pd.DatetimeIndex):
-                lc_df.index = pd.to_datetime(lc_df.index, errors='coerce')
-            lc_df = lc_df.sort_index()
 
-            ctop1, ctop2, ctop3 = st.columns(3)
-            with ctop1:
-                lc_run = st.button("Run 0.5% Live Capture Backtest", key="lc_run_button")
-                lc_live_only = st.checkbox("Use only today's session if available", value=True, key="lc_today_only")
-            with ctop2:
-                target_pct = st.number_input("Target profit (%)", min_value=0.10, max_value=3.00, value=0.60, step=0.05, key="lc_target_pct") / 100.0
-                stop_pct = st.number_input("Stop loss (%)", min_value=0.05, max_value=2.00, value=0.30, step=0.05, key="lc_stop_pct") / 100.0
-            with ctop3:
-                max_trades = st.number_input("Max trades per day", min_value=1, max_value=20, value=5, step=1, key="lc_max_trades")
-                max_day_loss = st.number_input("Max daily loss guard (%)", min_value=0.25, max_value=10.0, value=1.50, step=0.25, key="lc_max_day_loss") / 100.0
+            if df_main is None or df_main.empty:
+                st.warning("No price data loaded yet.")
+            else:
+                lc_df = df_main.copy()
+                if not isinstance(lc_df.index, pd.DatetimeIndex):
+                    lc_df.index = pd.to_datetime(lc_df.index, errors='coerce')
+                lc_df = lc_df.sort_index()
 
-            cflt1, cflt2, cflt3, cflt4 = st.columns(4)
-            with cflt1:
-                fast_span = st.number_input("Fast EMA", min_value=3, max_value=50, value=8, step=1, key="lc_fast")
-                slow_span = st.number_input("Slow EMA", min_value=5, max_value=100, value=21, step=1, key="lc_slow")
-            with cflt2:
-                vol_mult = st.number_input("Min volume vs avg", min_value=0.5, max_value=5.0, value=1.10, step=0.10, key="lc_vol_mult")
-                max_spread_proxy = st.number_input("Max candle spread proxy (%)", min_value=0.05, max_value=5.0, value=1.20, step=0.05, key="lc_spread_proxy") / 100.0
-            with cflt3:
-                min_hold_bars = st.number_input("Min hold bars", min_value=1, max_value=50, value=3, step=1, key="lc_min_hold")
-                max_hold_bars = st.number_input("Max hold bars", min_value=2, max_value=200, value=24, step=1, key="lc_max_hold")
-            with cflt4:
-                cooldown_bars = st.number_input("Cooldown bars", min_value=0, max_value=100, value=6, step=1, key="lc_cooldown")
-                use_db_pressure = st.checkbox("Use latest Databento bid-pressure confirmation if available", value=False, key="lc_use_db")
+                ctop1, ctop2, ctop3 = st.columns(3)
+                with ctop1:
+                    lc_run = st.button("Run 0.5% Live Capture Backtest", key="lc_run_button")
+                    lc_live_only = st.checkbox("Use only today's session if available", value=True, key="lc_today_only")
+                with ctop2:
+                    target_pct = st.number_input("Target profit (%)", min_value=0.10, max_value=3.00, value=0.60, step=0.05, key="lc_target_pct") / 100.0
+                    stop_pct = st.number_input("Stop loss (%)", min_value=0.05, max_value=2.00, value=0.30, step=0.05, key="lc_stop_pct") / 100.0
+                with ctop3:
+                    max_trades = st.number_input("Max trades per day", min_value=1, max_value=20, value=5, step=1, key="lc_max_trades")
+                    max_day_loss = st.number_input("Max daily loss guard (%)", min_value=0.25, max_value=10.0, value=1.50, step=0.25, key="lc_max_day_loss") / 100.0
 
-            st.info("This is not a prediction model. It is an execution model: fewer clean trades, fixed target/stop, and hard daily-loss control.")
+                cflt1, cflt2, cflt3, cflt4 = st.columns(4)
+                with cflt1:
+                    fast_span = st.number_input("Fast EMA", min_value=3, max_value=50, value=8, step=1, key="lc_fast")
+                    slow_span = st.number_input("Slow EMA", min_value=5, max_value=100, value=21, step=1, key="lc_slow")
+                with cflt2:
+                    vol_mult = st.number_input("Min volume vs avg", min_value=0.5, max_value=5.0, value=1.10, step=0.10, key="lc_vol_mult")
+                    max_spread_proxy = st.number_input("Max candle spread proxy (%)", min_value=0.05, max_value=5.0, value=1.20, step=0.05, key="lc_spread_proxy") / 100.0
+                with cflt3:
+                    min_hold_bars = st.number_input("Min hold bars", min_value=1, max_value=50, value=3, step=1, key="lc_min_hold")
+                    max_hold_bars = st.number_input("Max hold bars", min_value=2, max_value=200, value=24, step=1, key="lc_max_hold")
+                with cflt4:
+                    cooldown_bars = st.number_input("Cooldown bars", min_value=0, max_value=100, value=6, step=1, key="lc_cooldown")
+                    use_db_pressure = st.checkbox("Use latest Databento bid-pressure confirmation if available", value=False, key="lc_use_db")
 
-            def _prep_live_capture_frame(dfx, today_only=True):
-                d = dfx.copy()
-                needed = [c for c in ['Open','High','Low','Close','Volume'] if c in d.columns]
-                d = d[needed].replace([np.inf, -np.inf], np.nan).dropna()
-                if d.empty or 'Close' not in d.columns:
+                st.info("This is not a prediction model. It is an execution model: fewer clean trades, fixed target/stop, and hard daily-loss control.")
+
+                def _prep_live_capture_frame(dfx, today_only=True):
+                    d = dfx.copy()
+                    needed = [c for c in ['Open','High','Low','Close','Volume'] if c in d.columns]
+                    d = d[needed].replace([np.inf, -np.inf], np.nan).dropna()
+                    if d.empty or 'Close' not in d.columns:
+                        return d
+                    if today_only and isinstance(d.index, pd.DatetimeIndex):
+                        try:
+                            last_date = d.index[-1].date()
+                            todays = d[d.index.date == last_date]
+                            if len(todays) >= 20:
+                                d = todays
+                        except Exception:
+                            pass
                     return d
-                if today_only and isinstance(d.index, pd.DatetimeIndex):
-                    try:
-                        last_date = d.index[-1].date()
-                        todays = d[d.index.date == last_date]
-                        if len(todays) >= 20:
-                            d = todays
-                    except Exception:
-                        pass
-                return d
 
-            def _build_live_capture_signals(d, use_db=False):
-                close = d['Close'].astype(float)
-                high = d['High'].astype(float) if 'High' in d.columns else close
-                low = d['Low'].astype(float) if 'Low' in d.columns else close
-                vol = d['Volume'].astype(float) if 'Volume' in d.columns else pd.Series(1.0, index=d.index)
-                typical = (high + low + close) / 3.0
-                vwap = (typical * vol).cumsum() / (vol.cumsum() + 1e-9)
-                ema_fast = close.ewm(span=int(fast_span), adjust=False).mean()
-                ema_slow = close.ewm(span=int(slow_span), adjust=False).mean()
-                vol_avg = vol.rolling(20, min_periods=5).mean()
-                mom = close.pct_change(3).fillna(0.0)
-                spread_proxy = ((high - low) / close).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-                pullback_reclaim = (close > vwap) & (close.shift(1) <= vwap.shift(1))
-                trend_ok = (close > vwap) & (ema_fast > ema_slow) & (mom > 0)
-                liquidity_ok = (vol >= vol_avg * float(vol_mult)) & (spread_proxy <= float(max_spread_proxy))
-                entry = (trend_ok & liquidity_ok & (pullback_reclaim | (close > ema_fast))).fillna(False)
-                # Optional Databento latest top-of-book confirmation from Microstructure session buffer.
-                if use_db:
-                    try:
-                        live_key = f"mm_live_buffer_{str(TICKER).upper()}"
-                        dbdf = st.session_state.get(live_key, pd.DataFrame())
-                        if isinstance(dbdf, pd.DataFrame) and not dbdf.empty and 'imbalance' in dbdf.columns:
-                            latest_pressure = float(pd.to_numeric(dbdf['imbalance'], errors='coerce').dropna().iloc[-1])
-                            st.caption(f"Latest Databento bid pressure used: {latest_pressure*100:.1f}%")
-                            if latest_pressure < 0.55:
-                                entry = pd.Series(False, index=d.index)
-                    except Exception:
-                        pass
-                features = pd.DataFrame({
-                    'Close': close, 'VWAP': vwap, 'EMA Fast': ema_fast, 'EMA Slow': ema_slow,
-                    'Volume': vol, 'Volume Avg': vol_avg, 'Momentum 3 bars': mom, 'Spread Proxy': spread_proxy, 'Entry Setup': entry.astype(int)
-                }, index=d.index)
-                return entry, features
+                def _build_live_capture_signals(d, use_db=False):
+                    close = d['Close'].astype(float)
+                    high = d['High'].astype(float) if 'High' in d.columns else close
+                    low = d['Low'].astype(float) if 'Low' in d.columns else close
+                    vol = d['Volume'].astype(float) if 'Volume' in d.columns else pd.Series(1.0, index=d.index)
+                    typical = (high + low + close) / 3.0
+                    vwap = (typical * vol).cumsum() / (vol.cumsum() + 1e-9)
+                    ema_fast = close.ewm(span=int(fast_span), adjust=False).mean()
+                    ema_slow = close.ewm(span=int(slow_span), adjust=False).mean()
+                    vol_avg = vol.rolling(20, min_periods=5).mean()
+                    mom = close.pct_change(3).fillna(0.0)
+                    spread_proxy = ((high - low) / close).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    pullback_reclaim = (close > vwap) & (close.shift(1) <= vwap.shift(1))
+                    trend_ok = (close > vwap) & (ema_fast > ema_slow) & (mom > 0)
+                    liquidity_ok = (vol >= vol_avg * float(vol_mult)) & (spread_proxy <= float(max_spread_proxy))
+                    entry = (trend_ok & liquidity_ok & (pullback_reclaim | (close > ema_fast))).fillna(False)
+                    # Optional Databento latest top-of-book confirmation from Microstructure session buffer.
+                    if use_db:
+                        try:
+                            live_key = f"mm_live_buffer_{str(TICKER).upper()}"
+                            dbdf = st.session_state.get(live_key, pd.DataFrame())
+                            if isinstance(dbdf, pd.DataFrame) and not dbdf.empty and 'imbalance' in dbdf.columns:
+                                latest_pressure = float(pd.to_numeric(dbdf['imbalance'], errors='coerce').dropna().iloc[-1])
+                                st.caption(f"Latest Databento bid pressure used: {latest_pressure*100:.1f}%")
+                                if latest_pressure < 0.55:
+                                    entry = pd.Series(False, index=d.index)
+                        except Exception:
+                            pass
+                    features = pd.DataFrame({
+                        'Close': close, 'VWAP': vwap, 'EMA Fast': ema_fast, 'EMA Slow': ema_slow,
+                        'Volume': vol, 'Volume Avg': vol_avg, 'Momentum 3 bars': mom, 'Spread Proxy': spread_proxy, 'Entry Setup': entry.astype(int)
+                    }, index=d.index)
+                    return entry, features
 
-            def _run_live_capture_engine(d, entry_setup):
-                close = d['Close'].astype(float)
-                high = d['High'].astype(float) if 'High' in d.columns else close
-                low = d['Low'].astype(float) if 'Low' in d.columns else close
-                initial = 10000.0
-                equity = initial
-                in_pos = False
-                entry_price = 0.0
-                entry_time = None
-                entry_equity = initial
-                bars_held = 0
-                cooldown = 0
-                trades = []
-                eq_vals = []
-                trades_today = 0
-                disabled = False
+                def _run_live_capture_engine(d, entry_setup):
+                    close = d['Close'].astype(float)
+                    high = d['High'].astype(float) if 'High' in d.columns else close
+                    low = d['Low'].astype(float) if 'Low' in d.columns else close
+                    initial = 10000.0
+                    equity = initial
+                    in_pos = False
+                    entry_price = 0.0
+                    entry_time = None
+                    entry_equity = initial
+                    bars_held = 0
+                    cooldown = 0
+                    trades = []
+                    eq_vals = []
+                    trades_today = 0
+                    disabled = False
 
-                first_price = float(close.iloc[0]) if len(close) else np.nan
+                    first_price = float(close.iloc[0]) if len(close) else np.nan
 
-                for i, ts in enumerate(close.index):
-                    px = float(close.iloc[i])
-                    hi = float(high.iloc[i])
-                    lo = float(low.iloc[i])
-                    if cooldown > 0:
-                        cooldown -= 1
+                    for i, ts in enumerate(close.index):
+                        px = float(close.iloc[i])
+                        hi = float(high.iloc[i])
+                        lo = float(low.iloc[i])
+                        if cooldown > 0:
+                            cooldown -= 1
 
-                    if in_pos:
-                        bars_held += 1
-                        exit_reason = None
-                        exit_price = px
-                        # Stop/target are checked with high/low, but filled conservatively at target/stop level.
-                        if bars_held >= int(min_hold_bars):
-                            if hi >= entry_price * (1 + float(target_pct)):
-                                exit_price = entry_price * (1 + float(target_pct))
-                                exit_reason = 'Target hit'
-                            elif lo <= entry_price * (1 - float(stop_pct)):
-                                exit_price = entry_price * (1 - float(stop_pct))
-                                exit_reason = 'Stop hit'
-                            elif bars_held >= int(max_hold_bars):
-                                exit_price = px
-                                exit_reason = 'Max hold exit'
+                        if in_pos:
+                            bars_held += 1
+                            exit_reason = None
+                            exit_price = px
+                            # Stop/target are checked with high/low, but filled conservatively at target/stop level.
+                            if bars_held >= int(min_hold_bars):
+                                if hi >= entry_price * (1 + float(target_pct)):
+                                    exit_price = entry_price * (1 + float(target_pct))
+                                    exit_reason = 'Target hit'
+                                elif lo <= entry_price * (1 - float(stop_pct)):
+                                    exit_price = entry_price * (1 - float(stop_pct))
+                                    exit_reason = 'Stop hit'
+                                elif bars_held >= int(max_hold_bars):
+                                    exit_price = px
+                                    exit_reason = 'Max hold exit'
 
-                        if exit_reason:
-                            trade_ret = (exit_price / entry_price) - 1.0
-                            equity = entry_equity * (1 + trade_ret)
-                            cum_ret = (equity / initial - 1) * 100
-                            trades.append({
-                                'Side': 'Long', 'Entry Date': entry_time, 'Exit Date': ts,
-                                'Buy Price': round(float(entry_price), 4), 'Sell Price': round(float(exit_price), 4),
-                                'PnL (%)': round(float(trade_ret * 100), 3), 'Cumulative Return (%)': round(float(cum_ret), 3),
-                                'Bars Held': int(bars_held), 'Status': 'Closed', 'Reason': exit_reason
-                            })
-                            in_pos = False
-                            entry_price = 0.0
-                            entry_time = None
-                            bars_held = 0
-                            cooldown = int(cooldown_bars)
-                            if (equity / initial - 1.0) <= -float(max_day_loss):
-                                disabled = True
+                            if exit_reason:
+                                trade_ret = (exit_price / entry_price) - 1.0
+                                equity = entry_equity * (1 + trade_ret)
+                                cum_ret = (equity / initial - 1) * 100
+                                trades.append({
+                                    'Side': 'Long', 'Entry Date': entry_time, 'Exit Date': ts,
+                                    'Buy Price': round(float(entry_price), 4), 'Sell Price': round(float(exit_price), 4),
+                                    'PnL (%)': round(float(trade_ret * 100), 3), 'Cumulative Return (%)': round(float(cum_ret), 3),
+                                    'Bars Held': int(bars_held), 'Status': 'Closed', 'Reason': exit_reason
+                                })
+                                in_pos = False
+                                entry_price = 0.0
+                                entry_time = None
+                                bars_held = 0
+                                cooldown = int(cooldown_bars)
+                                if (equity / initial - 1.0) <= -float(max_day_loss):
+                                    disabled = True
 
-                    if (not in_pos) and (not disabled) and cooldown == 0 and trades_today < int(max_trades):
-                        if bool(entry_setup.iloc[i]):
-                            in_pos = True
-                            entry_price = px
-                            entry_time = ts
-                            entry_equity = equity
-                            bars_held = 0
-                            trades_today += 1
+                        if (not in_pos) and (not disabled) and cooldown == 0 and trades_today < int(max_trades):
+                            if bool(entry_setup.iloc[i]):
+                                in_pos = True
+                                entry_price = px
+                                entry_time = ts
+                                entry_equity = equity
+                                bars_held = 0
+                                trades_today += 1
 
-                    if in_pos:
-                        mark_equity = entry_equity * (px / entry_price) if entry_price > 0 else equity
+                        if in_pos:
+                            mark_equity = entry_equity * (px / entry_price) if entry_price > 0 else equity
+                        else:
+                            mark_equity = equity
+                        eq_vals.append(mark_equity)
+
+                    if in_pos and entry_price > 0:
+                        px = float(close.iloc[-1])
+                        mark_equity = entry_equity * (px / entry_price)
+                        cum_ret = (mark_equity / initial - 1) * 100
+                        trades.append({
+                            'Side': 'Long', 'Entry Date': entry_time, 'Exit Date': 'Open',
+                            'Buy Price': round(float(entry_price), 4), 'Sell Price': round(float(px), 4),
+                            'PnL (%)': round(float((px / entry_price - 1) * 100), 3), 'Cumulative Return (%)': round(float(cum_ret), 3),
+                            'Bars Held': int(bars_held), 'Status': 'Open', 'Reason': 'Open position mark-to-market'
+                        })
+                        if eq_vals:
+                            eq_vals[-1] = mark_equity
+
+                    eq = pd.Series(eq_vals, index=close.index, dtype=float) if len(eq_vals) else pd.Series(dtype=float)
+                    trades_df = pd.DataFrame(trades)
+                    bh = ((float(close.iloc[-1]) / first_price) - 1) * 100 if first_price and first_price > 0 else np.nan
+                    strat = ((float(eq.iloc[-1]) / initial) - 1) * 100 if not eq.empty else np.nan
+                    dd = ((eq / eq.cummax()) - 1).min() * 100 if not eq.empty else np.nan
+                    return trades_df, eq, {'Strategy Return %': strat, 'Buy & Hold Return %': bh, 'Max Drawdown %': dd, 'Trades': len(trades_df), 'Daily Guard Hit': disabled}
+
+                if lc_run:
+                    d = _prep_live_capture_frame(lc_df, today_only=bool(lc_live_only))
+                    if d.empty or len(d) < 30:
+                        st.warning("Not enough intraday data for 0.5% Live Capture. Try live mode with 5m/15m data or turn off today's-session-only.")
                     else:
-                        mark_equity = equity
-                    eq_vals.append(mark_equity)
+                        entry_setup, feats = _build_live_capture_signals(d, use_db=bool(use_db_pressure))
+                        trades_df, equity_curve, summ = _run_live_capture_engine(d, entry_setup)
+                        st.session_state['live_capture_pack'] = {'trades': trades_df, 'equity': equity_curve, 'features': feats, 'summary': summ}
 
-                if in_pos and entry_price > 0:
-                    px = float(close.iloc[-1])
-                    mark_equity = entry_equity * (px / entry_price)
-                    cum_ret = (mark_equity / initial - 1) * 100
-                    trades.append({
-                        'Side': 'Long', 'Entry Date': entry_time, 'Exit Date': 'Open',
-                        'Buy Price': round(float(entry_price), 4), 'Sell Price': round(float(px), 4),
-                        'PnL (%)': round(float((px / entry_price - 1) * 100), 3), 'Cumulative Return (%)': round(float(cum_ret), 3),
-                        'Bars Held': int(bars_held), 'Status': 'Open', 'Reason': 'Open position mark-to-market'
-                    })
-                    if eq_vals:
-                        eq_vals[-1] = mark_equity
+                pack = st.session_state.get('live_capture_pack')
+                if isinstance(pack, dict):
+                    summ = pack.get('summary', {})
+                    trades_df = pack.get('trades', pd.DataFrame())
+                    equity_curve = pack.get('equity', pd.Series(dtype=float))
+                    feats = pack.get('features', pd.DataFrame())
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Live Capture Return", f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else "N/A")
+                    m2.metric("Buy & Hold Return", f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else "N/A")
+                    m3.metric("Max Drawdown", f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else "N/A")
+                    m4.metric("Trades", f"{int(summ.get('Trades', 0))}")
+                    m5.metric("Daily Guard", "HIT" if summ.get('Daily Guard Hit') else "OK")
 
-                eq = pd.Series(eq_vals, index=close.index, dtype=float) if len(eq_vals) else pd.Series(dtype=float)
-                trades_df = pd.DataFrame(trades)
-                bh = ((float(close.iloc[-1]) / first_price) - 1) * 100 if first_price and first_price > 0 else np.nan
-                strat = ((float(eq.iloc[-1]) / initial) - 1) * 100 if not eq.empty else np.nan
-                dd = ((eq / eq.cummax()) - 1).min() * 100 if not eq.empty else np.nan
-                return trades_df, eq, {'Strategy Return %': strat, 'Buy & Hold Return %': bh, 'Max Drawdown %': dd, 'Trades': len(trades_df), 'Daily Guard Hit': disabled}
+                    if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=equity_curve.index, y=equity_curve, mode='lines', name='0.5% Capture Equity'))
+                        fig.update_layout(title="0.5% Live Capture Equity", template="plotly_dark", height=340, hovermode="x unified")
+                        st.plotly_chart(fig, use_container_width=True)
 
-            if lc_run:
-                d = _prep_live_capture_frame(lc_df, today_only=bool(lc_live_only))
-                if d.empty or len(d) < 30:
-                    st.warning("Not enough intraday data for 0.5% Live Capture. Try live mode with 5m/15m data or turn off today's-session-only.")
-                else:
-                    entry_setup, feats = _build_live_capture_signals(d, use_db=bool(use_db_pressure))
-                    trades_df, equity_curve, summ = _run_live_capture_engine(d, entry_setup)
-                    st.session_state['live_capture_pack'] = {'trades': trades_df, 'equity': equity_curve, 'features': feats, 'summary': summ}
+                    st.write("#### 0.5% Capture Trade Log")
+                    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                        display_trades = trades_df.copy()
+                        try:
+                            display_trades = apply_trade_log_timestamp_display(display_trades)
+                        except Exception:
+                            pass
+                        st.dataframe(display_trades, use_container_width=True, hide_index=True)
+                        csv = display_trades.to_csv(index=False).encode('utf-8')
+                        st.download_button("Download 0.5% capture trade log", csv, file_name=f"{TICKER}_live_capture_trades.csv", mime="text/csv", key="lc_download")
+                    else:
+                        st.info("No 0.5% capture trades found with current filters. This is acceptable — no trade is better than forcing bad trades.")
 
-            pack = st.session_state.get('live_capture_pack')
-            if isinstance(pack, dict):
-                summ = pack.get('summary', {})
-                trades_df = pack.get('trades', pd.DataFrame())
-                equity_curve = pack.get('equity', pd.Series(dtype=float))
-                feats = pack.get('features', pd.DataFrame())
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("Live Capture Return", f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else "N/A")
-                m2.metric("Buy & Hold Return", f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else "N/A")
-                m3.metric("Max Drawdown", f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else "N/A")
-                m4.metric("Trades", f"{int(summ.get('Trades', 0))}")
-                m5.metric("Daily Guard", "HIT" if summ.get('Daily Guard Hit') else "OK")
+                    with st.expander("Show setup/features", expanded=False):
+                        if isinstance(feats, pd.DataFrame) and not feats.empty:
+                            st.dataframe(feats.tail(300), use_container_width=True)
 
-                if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=equity_curve.index, y=equity_curve, mode='lines', name='0.5% Capture Equity'))
-                    fig.update_layout(title="0.5% Live Capture Equity", template="plotly_dark", height=340, hovermode="x unified")
-                    st.plotly_chart(fig, use_container_width=True)
-
-                st.write("#### 0.5% Capture Trade Log")
-                if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                    display_trades = trades_df.copy()
-                    try:
-                        display_trades = apply_trade_log_timestamp_display(display_trades)
-                    except Exception:
-                        pass
-                    st.dataframe(display_trades, use_container_width=True, hide_index=True)
-                    csv = display_trades.to_csv(index=False).encode('utf-8')
-                    st.download_button("Download 0.5% capture trade log", csv, file_name=f"{TICKER}_live_capture_trades.csv", mime="text/csv", key="lc_download")
-                else:
-                    st.info("No 0.5% capture trades found with current filters. This is acceptable — no trade is better than forcing bad trades.")
-
-                with st.expander("Show setup/features", expanded=False):
-                    if isinstance(feats, pd.DataFrame) and not feats.empty:
-                        st.dataframe(feats.tail(300), use_container_width=True)
-
-        st.markdown("""
-        **Institutional rule:** this tab is for execution timing, not prediction.  \n        Weekly/regime model decides whether the stock is worth touching. This tab decides whether a clean 0.5%–1.0% intraday capture is available.
-        """)
+            st.markdown("""
+            **Institutional rule:** this tab is for execution timing, not prediction.  \n        Weekly/regime model decides whether the stock is worth touching. This tab decides whether a clean 0.5%–1.0% intraday capture is available.
+            """)
 except Exception as e:
     try:
         with tab21:
