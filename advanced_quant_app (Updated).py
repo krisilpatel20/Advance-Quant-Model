@@ -9461,20 +9461,34 @@ def _intraday_clean_frame(source_df, today_only=True):
         return pd.DataFrame()
 
 
-def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False, direction_mode='Both Long & Short'):
+def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False, direction_mode='Long Only'):
     """
-    Bidirectional intraday signal engine.
+    Long-only intraday alpha engine.
 
-    Goal:
-    - Catch upside runners: +5% type trend days.
-    - Catch downside runners: -5%, bounce to -4.5%, then continuation to -7% type days.
-    - This is NOT a swing model. It uses only same-session intraday bars.
+    Institutional-style structure for retail data:
+    1) Classify the day: Trend Up, Trend Down, Panic Bounce, Chop, Opening Drive.
+    2) Score separate long setups instead of using one yes/no rule:
+       - Green-day momentum continuation
+       - Red-day dip-bounce / reclaim pulse
+       - VWAP reclaim
+       - Opening-range breakout
+    3) Apply avoid filters: weak bounce, too extended, illiquid/low volume, bad candle close.
+    4) Emit long-only entry events. No short selling is generated here.
     """
     close = d['Close'].astype(float)
     high = d['High'].astype(float) if 'High' in d.columns else close
     low = d['Low'].astype(float) if 'Low' in d.columns else close
+    open_ = d['Open'].astype(float) if 'Open' in d.columns else close
     vol = d['Volume'].astype(float).replace(0, np.nan).fillna(1.0) if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
 
+    idx = close.index
+    n = len(close)
+    false = pd.Series(False, index=idx)
+    if n < 10:
+        features = pd.DataFrame({'Close': close, 'Final Entry': 0, 'Long Entry': 0, 'Short Entry': 0}, index=idx)
+        return false, false, features
+
+    # Core intraday features
     ema5 = close.ewm(span=5, adjust=False).mean()
     ema9 = close.ewm(span=9, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
@@ -9483,89 +9497,169 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     vwap = (typical * vol).cumsum() / vol.cumsum().replace(0, np.nan)
 
     rng = (high - low).replace(0, np.nan)
-    close_location = ((close - low) / rng).fillna(0.5)   # near 1 = strong close, near 0 = weak close
-    red_body_strength = ((high - close) / rng).fillna(0.5)
-
+    close_location = ((close - low) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.5)
+    candle_body = ((close - open_) / open_.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
     ret1 = close.pct_change().fillna(0)
     mom3 = close.pct_change(3).fillna(0)
     mom6 = close.pct_change(6).fillna(0)
-    session_move = (close / close.iloc[0] - 1.0) if len(close) else pd.Series(0, index=close.index)
-    vol_ratio = (vol / vol.rolling(20, min_periods=5).mean()).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    session_move = (close / close.iloc[0] - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    hh20 = high.rolling(20, min_periods=5).max().shift(1)
-    ll20 = low.rolling(20, min_periods=5).min().shift(1)
+    vol_ma20 = vol.rolling(20, min_periods=5).mean()
+    vol_ratio = (vol / vol_ma20).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
-    # Long-side structure: trend continuation, VWAP reclaim, breakout, or shallow pullback continuation.
-    long_stack = (ema5 > ema9) & (ema9 > ema21)
-    long_reclaim = (close > vwap) & (close.shift(1) <= vwap.shift(1))
-    long_breakout = (close > hh20) & (mom3 > 0)
-    long_pullback_cont = (close > ema21) & (low <= ema9 * 1.001) & (close > ema5)
-    long_runner_trend = (close > ema21) & (ema21 > ema50) & (mom6 > 0)
+    rolling_high = high.cummax()
+    rolling_low = low.cummin()
+    bounce_from_low = (close / rolling_low - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+    pullback_from_high = (close / rolling_high - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+    distance_vwap = (close / vwap - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+    distance_ema21 = (close / ema21 - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # Short-side structure: trend continuation down, VWAP rejection, breakdown, or weak bounce then continuation.
-    short_stack = (ema5 < ema9) & (ema9 < ema21)
-    short_reject = (close < vwap) & (close.shift(1) >= vwap.shift(1))
-    short_breakdown = (close < ll20) & (mom3 < 0)
-    short_bounce_fail = (close < ema21) & (high >= ema9 * 0.999) & (close < ema5)
-    short_runner_trend = (close < ema21) & (ema21 < ema50) & (mom6 < 0)
+    # Opening range: first ~15 bars for 1m, still useful for 5m/other intervals.
+    or_bars = min(max(5, int(n * 0.08)), 20)
+    opening_high = pd.Series(high.iloc[:or_bars].max(), index=idx)
+    opening_low = pd.Series(low.iloc[:or_bars].min(), index=idx)
+    above_opening_high = close > opening_high
+    below_opening_low = close < opening_low
 
-    if sensitivity == 'Aggressive':
-        volume_ok = vol_ratio > 0.70
-        long_momentum_ok = (mom3 > 0.0003) | (ret1 > 0.0005)
-        short_momentum_ok = (mom3 < -0.0003) | (ret1 < -0.0005)
-        long_structure_ok = long_stack | (close > vwap) | long_pullback_cont | long_breakout | long_reclaim
-        short_structure_ok = short_stack | (close < vwap) | short_bounce_fail | short_breakdown | short_reject
-    elif sensitivity == 'Strict':
-        volume_ok = vol_ratio > 1.05
-        long_momentum_ok = (mom3 > 0.0020) & (close_location > 0.55)
-        short_momentum_ok = (mom3 < -0.0020) & (close_location < 0.45)
-        long_structure_ok = (long_stack & (close > vwap)) | (long_breakout & (close > vwap))
-        short_structure_ok = (short_stack & (close < vwap)) | (short_breakdown & (close < vwap))
+    # Day type classifier. This is simple, explainable, and fast.
+    trend_up_day = (session_move > 0.012) & (close > vwap) & (ema9 > ema21)
+    trend_down_day = (session_move < -0.012) & (close < vwap) & (ema9 < ema21)
+    panic_bounce_day = (session_move < -0.018) & (bounce_from_low > 0.003) & (close > ema5)
+    opening_drive_day = (above_opening_high & (session_move > 0.006)) | (below_opening_low & (session_move < -0.006))
+    chop_day = (session_move.abs() < 0.006) & (distance_vwap.abs() < 0.004)
+
+    # Setup engines, all LONG ONLY.
+    green_momentum = (
+        (session_move > 0.004) &
+        (close > ema9) & (ema9 >= ema21) &
+        ((mom3 > 0.0007) | (mom6 > 0.0015)) &
+        (close_location > 0.48)
+    )
+
+    vwap_reclaim = (
+        (close > vwap) & (close.shift(1) <= vwap.shift(1)) &
+        (mom3 > -0.0005) &
+        (close_location > 0.52)
+    )
+
+    opening_range_breakout = (
+        above_opening_high &
+        (close.shift(1) <= opening_high.shift(1).fillna(opening_high)) &
+        (vol_ratio > 0.75) &
+        (close_location > 0.52)
+    )
+
+    # Red-day dip-bounce: your exact no-short-selling logic.
+    # The stock is down hard, forms an intraday low, then confirms a rebound.
+    red_dip_bounce = (
+        (session_move < -0.010) &
+        (bounce_from_low > 0.0025) &
+        (close > ema5) &
+        ((close > ema9) | (mom3 > 0.0010)) &
+        (close_location > 0.50)
+    )
+
+    red_reclaim_pulse = (
+        (session_move < -0.006) &
+        (bounce_from_low > 0.0040) &
+        ((close > ema9) | (close > vwap)) &
+        (mom3 > 0) &
+        (vol_ratio > 0.60)
+    )
+
+    # Avoid filters: these matter more than adding indicators.
+    too_extended_up = (distance_vwap > 0.030) | (distance_ema21 > 0.025)
+    weak_bounce = (session_move < -0.010) & (close < ema5) & (close_location < 0.45)
+    still_waterfalling = (session_move < -0.020) & (close <= rolling_low.shift(1).fillna(close)) & (mom3 < 0)
+    low_quality_volume = vol_ratio < 0.45
+    bad_close = close_location < 0.34
+    avoid = (too_extended_up | weak_bounce | still_waterfalling | low_quality_volume | bad_close).fillna(False)
+    if require_vwap:
+        # Conservative toggle: for momentum/reclaim setups, require reclaiming VWAP.
+        # Red dip-bounce can still work below VWAP, but it must be reclaiming EMA9 with good score.
+        avoid = avoid | ((green_momentum | vwap_reclaim | opening_range_breakout) & (close < vwap))
+
+    # Score from 0-100. Separate components keep it explainable.
+    momentum_score = pd.Series(0.0, index=idx)
+    momentum_score += np.where(close > vwap, 18, 0)
+    momentum_score += np.where(ema5 > ema9, 12, 0)
+    momentum_score += np.where(ema9 >= ema21, 12, 0)
+    momentum_score += np.where(mom3 > 0.0010, 14, 0)
+    momentum_score += np.where(mom6 > 0.0020, 10, 0)
+    momentum_score += np.where(vol_ratio > 0.8, 10, 0)
+    momentum_score += np.where(close_location > 0.55, 10, 0)
+    momentum_score += np.where(above_opening_high, 8, 0)
+    momentum_score += np.where(trend_up_day, 6, 0)
+
+    bounce_score = pd.Series(0.0, index=idx)
+    bounce_score += np.where(session_move < -0.010, 12, 0)
+    bounce_score += np.where(session_move < -0.025, 8, 0)
+    bounce_score += np.where(bounce_from_low > 0.0025, 18, 0)
+    bounce_score += np.where(bounce_from_low > 0.0060, 10, 0)
+    bounce_score += np.where(close > ema5, 12, 0)
+    bounce_score += np.where(close > ema9, 10, 0)
+    bounce_score += np.where(mom3 > 0.0008, 14, 0)
+    bounce_score += np.where(close_location > 0.55, 10, 0)
+    bounce_score += np.where(vol_ratio > 0.70, 8, 0)
+    bounce_score += np.where(panic_bounce_day, 8, 0)
+
+    reclaim_score = pd.Series(0.0, index=idx)
+    reclaim_score += np.where(vwap_reclaim, 30, 0)
+    reclaim_score += np.where(opening_range_breakout, 25, 0)
+    reclaim_score += np.where(close > ema21, 10, 0)
+    reclaim_score += np.where(mom3 > 0, 10, 0)
+    reclaim_score += np.where(vol_ratio > 0.75, 10, 0)
+    reclaim_score += np.where(close_location > 0.50, 8, 0)
+
+    alpha_score = pd.concat([momentum_score, bounce_score, reclaim_score], axis=1).max(axis=1).clip(0, 100)
+    risk_penalty = pd.Series(0.0, index=idx)
+    risk_penalty += np.where(too_extended_up, 18, 0)
+    risk_penalty += np.where(weak_bounce, 15, 0)
+    risk_penalty += np.where(still_waterfalling, 25, 0)
+    risk_penalty += np.where(low_quality_volume, 12, 0)
+    risk_penalty += np.where(bad_close, 10, 0)
+    trade_quality_score = (alpha_score - risk_penalty).clip(0, 100)
+
+    sens = str(sensitivity).lower()
+    if sens == 'aggressive':
+        min_score = 54
+    elif sens == 'strict':
+        min_score = 74
     else:
-        volume_ok = vol_ratio > 0.85
-        long_momentum_ok = (mom3 > 0.0010) | ((mom6 > 0.0020) & (close_location > 0.50))
-        short_momentum_ok = (mom3 < -0.0010) | ((mom6 < -0.0020) & (close_location < 0.50))
-        long_structure_ok = (long_stack & (close > ema21)) | long_reclaim | long_breakout | long_pullback_cont
-        short_structure_ok = (short_stack & (close < ema21)) | short_reject | short_breakdown | short_bounce_fail
+        min_score = 64
 
-    long_vwap_filter = (close > vwap) if require_vwap else (close > ema21)
-    short_vwap_filter = (close < vwap) if require_vwap else (close < ema21)
+    setup_raw = (green_momentum | red_dip_bounce | red_reclaim_pulse | vwap_reclaim | opening_range_breakout).fillna(False)
+    raw_long = setup_raw & (trade_quality_score >= min_score) & (~avoid)
 
-    long_primary = long_structure_ok & long_momentum_ok & volume_ok & long_vwap_filter
-    short_primary = short_structure_ok & short_momentum_ok & volume_ok & short_vwap_filter
+    # Guard against chop: in chop, only permit a clean VWAP reclaim/opening breakout with enough score.
+    raw_long = raw_long & (~chop_day | vwap_reclaim | opening_range_breakout | (trade_quality_score >= min_score + 8))
 
-    # Strong-day fallback. This solves the zero-trade problem on obvious runners.
-    long_runner_entry = long_runner_trend & (session_move > 0.006) & (close_location > 0.42) & (vol_ratio > 0.55)
-    short_runner_entry = short_runner_trend & (session_move < -0.006) & (close_location < 0.58) & (vol_ratio > 0.55)
-
-    # Institutional-style continuation after bounce/fade:
-    # For shorts: stock is already deeply red, bounces a little, then fails under EMA/VWAP and resumes lower.
-    rolling_low_from_open = low.cummin()
-    bounce_from_low = (close / rolling_low_from_open - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
-    short_red_day_cont = (session_move < -0.015) & (bounce_from_low > 0.0025) & (close < ema9) & (mom3 < 0) & (vol_ratio > 0.55)
-
-    rolling_high_from_open = high.cummax()
-    pullback_from_high = (close / rolling_high_from_open - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
-    long_green_day_cont = (session_move > 0.015) & (pullback_from_high < -0.0025) & (close > ema9) & (mom3 > 0) & (vol_ratio > 0.55)
-
-    raw_long = (long_primary | long_runner_entry | long_green_day_cont).fillna(False)
-    raw_short = (short_primary | short_runner_entry | short_red_day_cont).fillna(False)
-
-    # Mode selection
-    dm = str(direction_mode).lower()
-    if 'long only' in dm:
-        raw_short[:] = False
-    elif 'short only' in dm:
-        raw_long[:] = False
-
-    # Debounce so entries are event-like, not every bar.
+    # Debounce entries and add short cooldown after a signal so the log is not noisy.
     long_entry = raw_long & ~raw_long.shift(1).fillna(False)
-    short_entry = raw_short & ~raw_short.shift(1).fillna(False)
+    cooldown = pd.Series(False, index=idx)
+    last_signal_i = -999
+    cleaned = []
+    for i, val in enumerate(long_entry.fillna(False).values):
+        if val and (i - last_signal_i) >= 4:
+            cleaned.append(True)
+            last_signal_i = i
+        else:
+            cleaned.append(False)
+    long_entry = pd.Series(cleaned, index=idx)
+    short_entry = pd.Series(False, index=idx)  # hard long-only rule
 
-    # If both fire on the same bar, choose the side matching session direction.
-    both = long_entry & short_entry
-    long_entry = long_entry & ~(both & (session_move < 0))
-    short_entry = short_entry & ~(both & (session_move >= 0))
+    day_type = pd.Series('Chop / Wait', index=idx, dtype='object')
+    day_type.loc[trend_up_day] = 'Trend Up Day'
+    day_type.loc[trend_down_day] = 'Trend Down Day'
+    day_type.loc[panic_bounce_day] = 'Panic Bounce Day'
+    day_type.loc[opening_drive_day & trend_up_day] = 'Opening Drive Up'
+
+    setup_name = pd.Series('None', index=idx, dtype='object')
+    setup_name.loc[green_momentum] = 'Green Momentum Long'
+    setup_name.loc[vwap_reclaim] = 'VWAP Reclaim Long'
+    setup_name.loc[opening_range_breakout] = 'Opening Range Breakout Long'
+    setup_name.loc[red_dip_bounce] = 'Red-Day Dip Bounce Long'
+    setup_name.loc[red_reclaim_pulse] = 'Red-Day Reclaim Pulse Long'
 
     features = pd.DataFrame({
         'Close': close,
@@ -9574,23 +9668,33 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'EMA9': ema9,
         'EMA21': ema21,
         'EMA50': ema50,
+        'Day Type': day_type,
+        'Setup Name': setup_name,
         'Session Move %': session_move * 100,
+        'Bounce From Low %': bounce_from_low * 100,
+        'Pullback From High %': pullback_from_high * 100,
+        'Distance VWAP %': distance_vwap * 100,
         'Mom3 %': mom3 * 100,
         'Mom6 %': mom6 * 100,
         'Vol Ratio': vol_ratio,
         'Close Location': close_location,
-        'Long Primary': long_primary.astype(int),
-        'Long Runner': long_runner_entry.astype(int),
-        'Long Continuation': long_green_day_cont.astype(int),
-        'Short Primary': short_primary.astype(int),
-        'Short Runner': short_runner_entry.astype(int),
-        'Short Bounce-Fail': short_red_day_cont.astype(int),
+        'Momentum Score': momentum_score.round(1),
+        'Bounce Score': bounce_score.round(1),
+        'Reclaim Score': reclaim_score.round(1),
+        'Risk Penalty': risk_penalty.round(1),
+        'Trade Quality Score': trade_quality_score.round(1),
+        'Min Score Used': min_score,
+        'Green Momentum': green_momentum.astype(int),
+        'Red Dip Bounce': red_dip_bounce.astype(int),
+        'Red Reclaim Pulse': red_reclaim_pulse.astype(int),
+        'VWAP Reclaim': vwap_reclaim.astype(int),
+        'Opening Breakout': opening_range_breakout.astype(int),
+        'Avoid Filter': avoid.astype(int),
         'Long Entry': long_entry.astype(int),
         'Short Entry': short_entry.astype(int),
-        'Final Entry': (long_entry | short_entry).astype(int),
-    }, index=d.index)
+        'Final Entry': long_entry.astype(int),
+    }, index=idx)
     return long_entry.astype(bool), short_entry.astype(bool), features
-
 
 def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
                           min_hold_bars=2, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
