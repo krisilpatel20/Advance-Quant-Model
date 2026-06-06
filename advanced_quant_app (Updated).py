@@ -8772,23 +8772,29 @@ with tab7:
                     height=560,
                     hovermode="closest",
                     dragmode="pan",
-                    margin=dict(l=30, r=30, t=60, b=30),
+                    margin=dict(l=70, r=30, t=60, b=30),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                     hoverlabel=dict(bgcolor="rgba(0,0,0,0.86)", font_size=12, font_color="white")
                 )
                 fig_price.update_xaxes(
                     rangeslider=dict(visible=True),
+                    showgrid=False,
                     showspikes=True,
                     spikemode="across",
                     spikesnap="cursor",
+                    spikecolor="white",
                     spikethickness=1,
+                    spikedash="solid",
                     showline=True
                 )
                 fig_price.update_yaxes(
+                    showgrid=True,
                     showspikes=True,
                     spikemode="across",
                     spikesnap="cursor",
+                    spikecolor="white",
                     spikethickness=1,
+                    spikedash="solid",
                     showline=True
                 )
 
@@ -8823,26 +8829,28 @@ with tab7:
 
                     html = f"""
                     <style>
-                        #{chart_div_id} .hoverlayer {{
+                        /* Hide only Plotly's floating tooltip box.
+                           Keep spike/crosshair lines visible. */
+                        #{chart_div_id} .hoverlayer .hovertext {{
                             display:none !important;
                         }}
                     </style>
                     <div style="position:relative; width:100%;">
                         <div id="{hover_panel_id}" style="
                             position:absolute;
-                            top:60px;
-                            left:14px;
+                            top:62px;
+                            left:82px;
                             z-index:9999;
-                            background:rgba(0,0,0,0.76);
+                            background:rgba(0,0,0,0.74);
                             color:white;
                             border:1px solid rgba(255,255,255,0.32);
                             border-radius:6px;
-                            padding:8px 10px;
+                            padding:7px 9px;
                             font-family:Arial, sans-serif;
                             font-size:12px;
-                            line-height:1.35;
-                            min-width:180px;
-                            max-width:240px;
+                            line-height:1.28;
+                            min-width:165px;
+                            max-width:230px;
                             pointer-events:none;">
                             <b>{TICKER}</b><br>
                             Move crosshair on chart<br>
