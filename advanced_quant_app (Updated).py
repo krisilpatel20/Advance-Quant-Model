@@ -8976,6 +8976,18 @@ with tab7:
                             try {{
                                 const b = buyPoints.filter(p => sameDay(p.t, nearest.t));
                                 const s = sellPoints.filter(p => sameDay(p.t, nearest.t));
+
+                                if (b.length > 0 || s.length > 0) {{
+                                    const sigPoint = b.length > 0 ? b[0] : s[0];
+                                    signalTxt += "<br>Signal date: <b>" + fmtDate(sigPoint.t) + "</b>";
+                                    try {{
+                                        const sigDate = new Date(sigPoint.t);
+                                        if (!isNaN(sigDate.getTime())) {{
+                                            signalTxt += "<br>Signal time: <b>" + sigDate.toLocaleTimeString("en-US", {{hour:"2-digit", minute:"2-digit"}}) + "</b>";
+                                        }}
+                                    }} catch(e) {{}}
+                                }}
+
                                 if (b.length > 0) {{
                                     signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b[0].p) + "</b>";
                                 }}
