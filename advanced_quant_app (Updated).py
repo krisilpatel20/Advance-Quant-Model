@@ -8716,6 +8716,76 @@ with tab7:
                             pass
                     return xs, ys
 
+                def _trade_log_points_for_plot(trades_df_src, date_col, price_candidates, status_filter=None, side_label=""):
+                    """
+                    Build graph marker points strictly from the displayed trade log rows.
+                    X comes from Entry Date / Exit Date in the trade log.
+                    Y comes from Buy Price / Sell Price in the trade log.
+                    This avoids marker hover times/prices drifting to nearest chart bars.
+                    """
+                    xs, ys, js_points = [], [], []
+                    try:
+                        if trades_df_src is None or trades_df_src.empty or date_col not in trades_df_src.columns:
+                            return xs, ys, js_points
+
+                        dfp = trades_df_src.copy()
+                        if status_filter is not None and "Status" in dfp.columns:
+                            dfp = dfp[status_filter(dfp["Status"].astype(str))]
+
+                        price_col = None
+                        for c in price_candidates:
+                            if c in dfp.columns:
+                                price_col = c
+                                break
+                        if price_col is None:
+                            return xs, ys, js_points
+
+                        for _, row in dfp.iterrows():
+                            raw_dt = row.get(date_col, None)
+                            ts = _clean_trade_ts_for_plot(raw_dt)
+                            if pd.isna(ts):
+                                continue
+                            px = pd.to_numeric(row.get(price_col, np.nan), errors="coerce")
+                            if pd.isna(px):
+                                continue
+
+                            raw_txt = str(raw_dt).strip()
+                            clean_txt = raw_txt.replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+
+                            # Date shown in the top-left box should be clean human format.
+                            try:
+                                date_txt = pd.Timestamp(ts).strftime("%b %d, %Y")
+                            except Exception:
+                                date_txt = clean_txt.split(" ")[0] if clean_txt else ""
+
+                            # Time must come from the trade log when it exists.
+                            time_txt = ""
+                            try:
+                                # Keep explicit CT/CST/CDT if the trade log has it.
+                                if "CT" in raw_txt or "CST" in raw_txt or "CDT" in raw_txt:
+                                    if " " in raw_txt:
+                                        time_txt = " ".join(raw_txt.split(" ")[1:])
+                                else:
+                                    tstamp = pd.Timestamp(ts)
+                                    if not (tstamp.hour == 0 and tstamp.minute == 0 and tstamp.second == 0):
+                                        time_txt = tstamp.strftime("%H:%M:%S")
+                            except Exception:
+                                time_txt = ""
+
+                            xs.append(ts)
+                            ys.append(float(px))
+                            js_points.append({
+                                "t": pd.Timestamp(ts).isoformat(),
+                                "p": float(px),
+                                "date": date_txt,
+                                "time": time_txt,
+                                "raw": raw_txt,
+                                "side": side_label
+                            })
+                    except Exception:
+                        return xs, ys, js_points
+                    return xs, ys, js_points
+
                 price_for_plot = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
 
                 # Initial fixed top-left hover panel.
@@ -8742,28 +8812,36 @@ with tab7:
                     hovertemplate="<b>%{x}</b><br>Price: $%{y:,.2f}<extra></extra>"
                 ))
 
+                buy_points_for_js = []
+                sell_points_for_js = []
+
                 if not plot_trades_df.empty and "Entry Date" in plot_trades_df.columns:
-                    bx, by = _nearest_price_points(plot_trades_df["Entry Date"], price_for_plot)
+                    bx, by, buy_points_for_js = _trade_log_points_for_plot(
+                        plot_trades_df,
+                        "Entry Date",
+                        ["Buy Price", "Entry Price", "Long Price", "Price"],
+                        side_label="Buy"
+                    )
                     if len(bx) > 0:
                         fig_price.add_trace(go.Scatter(
                             x=bx, y=by, mode="markers", name="Buy",
                             marker=dict(symbol="triangle-up", size=9, color="lime"),
-                            hovertemplate="<b>BUY</b><br>%{x}<br>Price: $%{y:,.2f}<extra></extra>"
+                            hovertemplate="<b>BUY</b><br>%{x}<br>Trade log price: $%{y:,.2f}<extra></extra>"
                         ))
 
                 if not plot_trades_df.empty and "Exit Date" in plot_trades_df.columns:
-                    exit_dates = plot_trades_df["Exit Date"]
-                    try:
-                        if "Status" in plot_trades_df.columns:
-                            exit_dates = plot_trades_df.loc[plot_trades_df["Status"].astype(str).str.lower().ne("open"), "Exit Date"]
-                    except Exception:
-                        pass
-                    sx, sy = _nearest_price_points(exit_dates, price_for_plot)
+                    sx, sy, sell_points_for_js = _trade_log_points_for_plot(
+                        plot_trades_df,
+                        "Exit Date",
+                        ["Sell Price", "Exit Price", "Cover Price", "Price"],
+                        status_filter=lambda s: s.str.lower().ne("open"),
+                        side_label="Sell/Exit"
+                    )
                     if len(sx) > 0:
                         fig_price.add_trace(go.Scatter(
                             x=sx, y=sy, mode="markers", name="Sell / Exit",
                             marker=dict(symbol="triangle-down", size=9, color="red"),
-                            hovertemplate="<b>SELL / EXIT</b><br>%{x}<br>Price: $%{y:,.2f}<extra></extra>"
+                            hovertemplate="<b>SELL / EXIT</b><br>%{x}<br>Trade log price: $%{y:,.2f}<extra></extra>"
                         ))
 
                 fig_price.update_layout(
@@ -8830,34 +8908,7 @@ with tab7:
                     except Exception:
                         price_points_for_js = []
 
-                    buy_points_for_js = []
-                    sell_points_for_js = []
-                    try:
-                        for _tr in fig_price.data:
-                            _name = str(getattr(_tr, "name", "")).lower()
-                            if not ("buy" in _name or "sell" in _name or "exit" in _name):
-                                continue
-                            _xs = list(getattr(_tr, "x", []) or [])
-                            _ys = list(getattr(_tr, "y", []) or [])
-                            for _x, _y in zip(_xs, _ys):
-                                try:
-                                    _ts = pd.Timestamp(_x)
-                                    try:
-                                        if getattr(_ts, "tzinfo", None) is not None:
-                                            _ts = _ts.tz_convert(None)
-                                    except Exception:
-                                        pass
-                                    _point = {"t": _ts.isoformat(), "p": float(_y)}
-                                    if "buy" in _name:
-                                        buy_points_for_js.append(_point)
-                                    elif "sell" in _name or "exit" in _name:
-                                        sell_points_for_js.append(_point)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        buy_points_for_js = []
-                        sell_points_for_js = []
-
+                    # Buy/sell JS points are built strictly from the displayed trade log above.
                     price_points_json = json.dumps(price_points_for_js)
                     buy_points_json = json.dumps(buy_points_for_js)
                     sell_points_json = json.dumps(sell_points_for_js)
@@ -8977,21 +9028,22 @@ with tab7:
                                 const b = buyPoints.filter(p => sameDay(p.t, nearest.t));
                                 const s = sellPoints.filter(p => sameDay(p.t, nearest.t));
 
-                                if (b.length > 0 || s.length > 0) {{
-                                    const sigPoint = b.length > 0 ? b[0] : s[0];
-                                    signalTxt += "<br>Signal date: <b>" + fmtDate(sigPoint.t) + "</b>";
-                                    try {{
-                                        const sigDate = new Date(sigPoint.t);
-                                        if (!isNaN(sigDate.getTime())) {{
-                                            signalTxt += "<br>Signal time: <b>" + sigDate.toLocaleTimeString("en-US", {{hour:"2-digit", minute:"2-digit"}}) + "</b>";
-                                        }}
-                                    }} catch(e) {{}}
+                                function addSignalLines(sigPoint) {{
+                                    if (!sigPoint) return;
+                                    if (sigPoint.date) {{
+                                        signalTxt += "<br>Signal date: <b>" + sigPoint.date + "</b>";
+                                    }}
+                                    if (sigPoint.time) {{
+                                        signalTxt += "<br>Signal time: <b>" + sigPoint.time + "</b>";
+                                    }}
                                 }}
 
                                 if (b.length > 0) {{
+                                    addSignalLines(b[0]);
                                     signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b[0].p) + "</b>";
                                 }}
                                 if (s.length > 0) {{
+                                    addSignalLines(s[0]);
                                     signalTxt += "<br>🔴 Sell/Exit: <b>" + fmtPrice(s[0].p) + "</b>";
                                 }}
                             }} catch(e) {{}}
