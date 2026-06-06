@@ -9089,37 +9089,43 @@ with tab7:
                             const nearest = nearestPointByX(xVal, pricePoints);
                             if (!nearest) return;
 
-                            const dateTxt = fmtDate(nearest.t);
-                            const priceTxt = fmtPrice(nearest.p);
-
+                            let dateTxt = fmtDate(nearest.t);
+                            let priceTxt = fmtPrice(nearest.p);
+                            let timeTxt = "";
                             let signalTxt = "";
+
                             try {{
                                 const b = nearestSignalByX(xVal, buyPoints);
                                 const s = nearestSignalByX(xVal, sellPoints);
 
-                                function addSignalLines(sigPoint) {{
-                                    if (!sigPoint) return;
-                                    if (sigPoint.date) {{
-                                        signalTxt += "<br>Signal date: <b>" + sigPoint.date + "</b>";
+                                // If a buy/sell signal is being shown, the main Date/Price must
+                                // come strictly from the trade log row, not from the nearest daily
+                                // price bar. This prevents mismatches like Date Apr 8 but Signal date Apr 7.
+                                const primarySignal = b ? b : (s ? s : null);
+                                if (primarySignal) {{
+                                    if (primarySignal.date) {{
+                                        dateTxt = primarySignal.date;
+                                    }} else {{
+                                        dateTxt = fmtDate(primarySignal.t);
                                     }}
-                                    if (sigPoint.time) {{
-                                        signalTxt += "<br>Signal time: <b>" + sigPoint.time + "</b>";
+                                    priceTxt = fmtPrice(primarySignal.p);
+                                    if (primarySignal.time) {{
+                                        timeTxt = "<br>Time: <b>" + primarySignal.time + "</b>";
                                     }}
                                 }}
 
                                 if (b) {{
-                                    addSignalLines(b);
                                     signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b.p) + "</b>";
                                 }}
                                 if (s) {{
-                                    addSignalLines(s);
                                     signalTxt += "<br>🔴 Sell/Exit: <b>" + fmtPrice(s.p) + "</b>";
                                 }}
                             }} catch(e) {{}}
 
                             panel.innerHTML = "<b>{TICKER}</b><br>"
-                                + "Date: <b>" + dateTxt + "</b><br>"
-                                + "Price: <b>" + priceTxt + "</b>"
+                                + "Date: <b>" + dateTxt + "</b>"
+                                + timeTxt
+                                + "<br>Price: <b>" + priceTxt + "</b>"
                                 + signalTxt;
                         }}
 
