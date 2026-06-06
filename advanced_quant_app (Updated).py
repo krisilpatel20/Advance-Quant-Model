@@ -2403,8 +2403,11 @@ def apply_weekly_regime_intraday_time_display(trades_df, ticker=""):
 def finalize_weekly_regime_trade_time_display(trades_df):
     """
     DISPLAY ONLY final formatter for weekly Regime Switching trade logs.
-    Replaces fake 15:00 CT timestamps on old rows with an honest label explaining
-    exact 5m intraday time is unavailable. Keeps exact recent rows as normal times.
+
+    Recent rows with available 5-minute data keep the exact CT timestamp.
+    Older rows without available intraday data show the clean weekly trade date only.
+    No "5m time unavailable" or "nearest estimate" text is appended inside the
+    Entry/Exit Date columns, so the trade log stays clean.
     """
     try:
         if trades_df is None or trades_df.empty:
@@ -2415,8 +2418,17 @@ def finalize_weekly_regime_trade_time_display(trades_df):
             try:
                 s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
                 if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
-                    return str(v)
+                    return 'Open' if s.lower() == 'open' else str(v)
                 return pd.Timestamp(s).strftime('%Y-%m-%d')
+            except Exception:
+                return str(v)
+
+        def _time_part(v):
+            try:
+                s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                    return 'Open' if s.lower() == 'open' else str(v)
+                return pd.Timestamp(s).strftime('%Y-%m-%d %H:%M:%S CT')
             except Exception:
                 return str(v)
 
@@ -2424,12 +2436,14 @@ def finalize_weekly_regime_trade_time_display(trades_df):
             vals = []
             for v, src in zip(out['Entry Date'], out['__Entry Time Source__']):
                 src = str(src)
-                if src == 'intraday_unavailable':
-                    vals.append(f"{_date_part(v)} (5m time unavailable)")
+                if src == 'exact_5m_touch':
+                    vals.append(_time_part(v))
                 elif src == 'nearest_5m_estimate':
-                    vals.append(f"{v} (nearest 5m estimate)")
+                    # Keep a clean timestamp without appending estimate text.
+                    vals.append(_time_part(v))
                 else:
-                    vals.append(v)
+                    # No fake 15:00 timestamp and no long label in the table.
+                    vals.append(_date_part(v))
             out['Entry Date'] = vals
 
         if 'Exit Date' in out.columns and '__Exit Time Source__' in out.columns:
@@ -2438,12 +2452,12 @@ def finalize_weekly_regime_trade_time_display(trades_df):
                 src = str(src)
                 if str(v).strip().lower() == 'open' or src == 'open':
                     vals.append('Open')
-                elif src == 'intraday_unavailable':
-                    vals.append(f"{_date_part(v)} (5m time unavailable)")
+                elif src == 'exact_5m_touch':
+                    vals.append(_time_part(v))
                 elif src == 'nearest_5m_estimate':
-                    vals.append(f"{v} (nearest 5m estimate)")
+                    vals.append(_time_part(v))
                 else:
-                    vals.append(v)
+                    vals.append(_date_part(v))
             out['Exit Date'] = vals
 
         out = out.drop(columns=['__Entry Time Source__', '__Exit Time Source__'], errors='ignore')
