@@ -8645,16 +8645,180 @@ with tab7:
             with met_col5:
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
 
-        # Equity Curve Plot
-        st.write("#### 📈 Equity Curve")
-        fig_bt = go.Figure()
-        fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
-        fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
-        fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
-        st.plotly_chart(fig_bt, use_container_width=True)
-        st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+        # Price / Equity Graphs
+        if strategy_type == "Regime Switching (Trend Following)":
+            st.write("#### 📈 Regime Switching Price Graph")
+            st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
+
+            try:
+                plot_trades_df = bt_results['trades'].copy()
+                if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                    try:
+                        plot_trades_df = map_weekly_trade_log_dates_only(plot_trades_df, df_bt)
+                        plot_trades_df = apply_weekly_live_trigger_display_overrides(
+                            plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
+                        )
+                        plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
+                    except Exception:
+                        pass
+
+                def _clean_trade_ts_for_plot(v):
+                    try:
+                        if v is None:
+                            return pd.NaT
+                        s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                        if s.lower() in {"", "open", "nan", "nat", "none"}:
+                            return pd.NaT
+                        ts = pd.Timestamp(s)
+                        if pd.isna(ts):
+                            return pd.NaT
+                        if getattr(ts, "tzinfo", None) is not None:
+                            ts = ts.tz_convert(None)
+                        return ts
+                    except Exception:
+                        return pd.NaT
+
+                def _nearest_price_points(ts_values, price_series):
+                    xs, ys = [], []
+                    p = pd.Series(price_series).dropna()
+                    if p.empty:
+                        return xs, ys
+                    p_index_naive = pd.DatetimeIndex(p.index)
+                    try:
+                        if p_index_naive.tz is not None:
+                            p_index_naive = p_index_naive.tz_convert(None)
+                    except Exception:
+                        pass
+                    p_tmp = pd.Series(p.values, index=p_index_naive)
+
+                    for raw_ts in ts_values:
+                        ts = _clean_trade_ts_for_plot(raw_ts)
+                        if pd.isna(ts):
+                            continue
+                        # If intraday timestamp is used while the plotted series is daily/weekly,
+                        # match by same date first, otherwise use nearest earlier available bar.
+                        try:
+                            same_day = p_tmp[p_tmp.index.normalize() == ts.normalize()]
+                            if not same_day.empty:
+                                loc_ts = same_day.index[-1]
+                                xs.append(loc_ts)
+                                ys.append(float(same_day.iloc[-1]))
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            idxer = p_tmp.index.get_indexer([ts], method="nearest")
+                            if len(idxer) and idxer[0] >= 0:
+                                loc_ts = p_tmp.index[idxer[0]]
+                                xs.append(loc_ts)
+                                ys.append(float(p_tmp.iloc[idxer[0]]))
+                        except Exception:
+                            pass
+                    return xs, ys
+
+                price_for_plot = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
+
+                fig_price = go.Figure()
+                fig_price.add_trace(go.Scatter(
+                    x=price_for_plot.index,
+                    y=price_for_plot.values,
+                    mode="lines",
+                    line=dict(color="#5b7cfa", width=2),
+                    name=f"{TICKER} Price"
+                ))
+
+                if not plot_trades_df.empty and "Entry Date" in plot_trades_df.columns:
+                    bx, by = _nearest_price_points(plot_trades_df["Entry Date"], price_for_plot)
+                    if len(bx) > 0:
+                        fig_price.add_trace(go.Scatter(
+                            x=bx, y=by, mode="markers", name="Buy",
+                            marker=dict(symbol="triangle-up", size=9, color="lime")
+                        ))
+
+                if not plot_trades_df.empty and "Exit Date" in plot_trades_df.columns:
+                    exit_dates = plot_trades_df["Exit Date"]
+                    try:
+                        if "Status" in plot_trades_df.columns:
+                            exit_dates = plot_trades_df.loc[plot_trades_df["Status"].astype(str).str.lower().ne("open"), "Exit Date"]
+                    except Exception:
+                        pass
+                    sx, sy = _nearest_price_points(exit_dates, price_for_plot)
+                    if len(sx) > 0:
+                        fig_price.add_trace(go.Scatter(
+                            x=sx, y=sy, mode="markers", name="Sell / Exit",
+                            marker=dict(symbol="triangle-down", size=9, color="red")
+                        ))
+
+                fig_price.update_layout(
+                    title=f"{TICKER} Regime Switching Price + Entry/Exit Markers",
+                    template="plotly_dark",
+                    height=560,
+                    hovermode="x unified",
+                    dragmode="pan",
+                    margin=dict(l=30, r=30, t=60, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                fig_price.update_xaxes(
+                    rangeslider=dict(visible=True),
+                    showspikes=True,
+                    spikemode="across",
+                    spikesnap="cursor",
+                    spikethickness=1,
+                    showline=True
+                )
+                fig_price.update_yaxes(
+                    showspikes=True,
+                    spikemode="across",
+                    spikesnap="cursor",
+                    spikethickness=1,
+                    showline=True
+                )
+
+                st.plotly_chart(
+                    fig_price,
+                    use_container_width=True,
+                    config={
+                        "scrollZoom": True,
+                        "displaylogo": False,
+                        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                        "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
+                    }
+                )
+                safe_report_add("Regime Price Entry Exit Chart", fig_price)
+            except Exception as plot_err:
+                st.warning(f"Could not render regime price entry/exit graph: {plot_err}")
+
+            show_equity_curve_secondary = st.checkbox(
+                "Show strategy performance / equity curve",
+                value=False,
+                key=f"show_regime_equity_curve_secondary_{TICKER}_{bt_freq}_{strategy_type}"
+            )
+            if show_equity_curve_secondary:
+                st.write("#### 📉 Strategy Performance / Equity Curve")
+                fig_bt = go.Figure()
+                fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
+                fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
+                fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
+                fig_bt.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", rangeslider=dict(visible=True))
+                fig_bt.update_yaxes(showspikes=True, spikemode="across", spikesnap="cursor")
+                st.plotly_chart(
+                    fig_bt,
+                    use_container_width=True,
+                    config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"]}
+                )
+                st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+        else:
+            # Equity Curve Plot
+            st.write("#### 📈 Equity Curve")
+            fig_bt = go.Figure()
+            fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
+            fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
+            fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
+            st.plotly_chart(fig_bt, use_container_width=True)
+            st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+
         safe_report_add("Backtest Metrics", strat_metrics)
-        
+
         # Trade Log
         st.write("#### 📝 Trade Log")
         if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
