@@ -10779,7 +10779,6 @@ with tab17:
                 return out
 
             d = d_base.copy()
-            using_intraday_source = False
             if cvd_src == "Recent 5m intraday precise":
                 try:
                     intraday = yf.download(
@@ -10794,7 +10793,6 @@ with tab17:
                     intraday = _normalize_yf_ohlcv(intraday)
                     if intraday is not None and not intraday.empty and {'Close', 'Volume'}.issubset(set(intraday.columns)):
                         d = intraday.dropna(subset=['Close']).copy()
-                        using_intraday_source = True
                     else:
                         st.warning("5m intraday data was not returned, so CVD is using current chart data.")
                 except Exception as intraday_err:
@@ -10804,16 +10802,47 @@ with tab17:
             vol = d['Volume'] if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
             vol = vol.fillna(0).astype(float)
 
-            # CVD graph data from the reference file:
-            # delta = volume * sign(close change), CVD = cumulative delta, one CVD EMA line.
+            # Same simple graph data: delta = volume * sign(close change), CVD = cumulative delta, one CVD EMA.
             delta = vol * np.sign(cl.diff().fillna(0))
             cvd = delta.cumsum()
             cvd_ema = cvd.ewm(span=8, adjust=False).mean()
 
-            # Trade log is based EXACTLY on the graph's one CVD EMA line:
-            # Buy on CVD crossing above CVD EMA. Exit on CVD crossing below CVD EMA.
-            cvd_buy = (cvd > cvd_ema) & (cvd.shift(1) <= cvd_ema.shift(1))
-            cvd_sell = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
+            # Better trade logic, still based on the same graph:
+            # Do NOT trade every tiny cross. Require a confirmed CVD regime change.
+            confirm_bars = st.slider(
+                "CVD confirmation bars",
+                2, 12, 5,
+                key="cvd_confirm_bars_v1",
+                help="Higher = fewer whipsaws. A buy/sell only fires after CVD stays on one side of its EMA for this many bars."
+            )
+            min_hold_bars = st.slider(
+                "Minimum bars to hold",
+                1, 40, 8,
+                key="cvd_min_hold_bars_v1",
+                help="Prevents immediate flip-flop exits on noisy 5-minute data."
+            )
+            require_price_trend = st.checkbox(
+                "Require price trend confirmation",
+                value=True,
+                key="cvd_require_price_trend_v1",
+                help="Uses price EMA structure so CVD crosses are not traded against weak price action."
+            )
+
+            price_ema_fast = cl.ewm(span=20, adjust=False).mean()
+            price_ema_slow = cl.ewm(span=50, adjust=False).mean()
+            cvd_side = cvd > cvd_ema
+            cvd_side_confirmed_long = cvd_side.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+            cvd_side_confirmed_exit = (~cvd_side).astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+
+            price_trend_ok = (cl > price_ema_fast) & (price_ema_fast >= price_ema_slow)
+            price_exit_weak = (cl < price_ema_fast) & (price_ema_fast < price_ema_slow)
+
+            raw_buy = cvd_side_confirmed_long & (price_trend_ok if require_price_trend else True)
+            raw_sell = cvd_side_confirmed_exit & ((price_exit_weak if require_price_trend else True) | cvd_side_confirmed_exit)
+
+            # Fire only on transition into confirmed state.
+            cvd_buy = raw_buy & (~raw_buy.shift(1).fillna(False))
+            cvd_sell = raw_sell & (~raw_sell.shift(1).fillna(False))
 
             trades = []
             in_pos = False
@@ -10821,24 +10850,31 @@ with tab17:
             entry_px = None
             entry_cvd = None
             entry_ema = None
+            bars_held = 0
 
             for dt in d.index:
+                if in_pos:
+                    bars_held += 1
+
                 if (not in_pos) and bool(cvd_buy.loc[dt]):
                     in_pos = True
+                    bars_held = 0
                     entry_dt = dt
                     entry_px = float(cl.loc[dt])
                     entry_cvd = float(cvd.loc[dt])
                     entry_ema = float(cvd_ema.loc[dt])
-                elif in_pos and bool(cvd_sell.loc[dt]):
+
+                elif in_pos and bool(cvd_sell.loc[dt]) and bars_held >= int(min_hold_bars):
                     exit_px = float(cl.loc[dt])
                     pnl = ((exit_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
                     trades.append({
-                        'Setup': 'CVD EMA Cross',
+                        'Setup': 'Confirmed CVD EMA Cross',
                         'Entry Date': entry_dt,
                         'Exit Date': dt,
                         'Buy Price': round(entry_px, 4),
                         'Sell Price': round(exit_px, 4),
                         'PnL (%)': round(pnl, 3),
+                        'Bars Held': int(bars_held),
                         'Entry CVD': round(entry_cvd, 0),
                         'Entry CVD EMA': round(entry_ema, 0),
                         'Exit CVD': round(float(cvd.loc[dt]), 0),
@@ -10850,18 +10886,19 @@ with tab17:
                     entry_px = None
                     entry_cvd = None
                     entry_ema = None
+                    bars_held = 0
 
             if in_pos and entry_dt is not None:
-                last_dt = d.index[-1]
                 last_px = float(cl.iloc[-1])
                 pnl = ((last_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
                 trades.append({
-                    'Setup': 'CVD EMA Cross',
+                    'Setup': 'Confirmed CVD EMA Cross',
                     'Entry Date': entry_dt,
                     'Exit Date': 'Open',
                     'Buy Price': round(entry_px, 4),
                     'Sell Price': round(last_px, 4),
                     'PnL (%)': round(pnl, 3),
+                    'Bars Held': int(bars_held),
                     'Entry CVD': round(entry_cvd, 0),
                     'Entry CVD EMA': round(entry_ema, 0),
                     'Exit CVD': round(float(cvd.iloc[-1]), 0),
@@ -10877,50 +10914,40 @@ with tab17:
             m3.metric('Pressure', 'BUYING' if delta.iloc[-1] > 0 else 'SELLING')
             m4.metric('Buy & Hold', f"{buy_hold_return:+.2f}%")
 
-            # Exact screenshot-style graph: price top, CVD + one EMA bottom.
             fig = make_subplots(
                 rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                 subplot_titles=(f'{TICKER} Price', 'CVD')
             )
-            fig.add_trace(
-                go.Scatter(x=d.index, y=cl, mode='lines', name='Close', line=dict(width=2)),
-                row=1, col=1
-            )
-            fig.add_trace(
-                go.Scatter(x=d.index, y=cvd, mode='lines', name='CVD', line=dict(width=2)),
-                row=2, col=1
-            )
-            fig.add_trace(
-                go.Scatter(x=d.index, y=cvd_ema, mode='lines', name='CVD EMA', line=dict(width=2)),
-                row=2, col=1
-            )
+            fig.add_trace(go.Scatter(x=d.index, y=cl, mode='lines', name='Close', line=dict(width=2)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=d.index, y=cvd, mode='lines', name='CVD', line=dict(width=2)), row=2, col=1)
+            fig.add_trace(go.Scatter(x=d.index, y=cvd_ema, mode='lines', name='CVD EMA', line=dict(width=2)), row=2, col=1)
 
-            buy_idx = cvd_buy[cvd_buy.fillna(False)].index.intersection(d.index)
-            sell_idx = cvd_sell[cvd_sell.fillna(False)].index.intersection(d.index)
-            if len(buy_idx) > 0:
-                fig.add_trace(
-                    go.Scatter(
-                        x=buy_idx, y=cl.reindex(buy_idx), mode='markers', name='Buy',
-                        marker=dict(symbol='triangle-up', size=9, color='lime')
-                    ),
-                    row=1, col=1
-                )
-            if len(sell_idx) > 0:
-                fig.add_trace(
-                    go.Scatter(
-                        x=sell_idx, y=cl.reindex(sell_idx), mode='markers', name='Sell',
-                        marker=dict(symbol='triangle-down', size=9, color='red')
-                    ),
-                    row=1, col=1
-                )
+            trades_df = pd.DataFrame(trades)
+            if not trades_df.empty:
+                entry_idx = pd.to_datetime(trades_df['Entry Date'], errors='coerce').dropna()
+                exit_idx = pd.to_datetime(trades_df.loc[trades_df['Status'].astype(str).str.lower().eq('closed'), 'Exit Date'], errors='coerce').dropna()
+                entry_idx = pd.DatetimeIndex(entry_idx).intersection(d.index)
+                exit_idx = pd.DatetimeIndex(exit_idx).intersection(d.index)
+
+                if len(entry_idx) > 0:
+                    fig.add_trace(
+                        go.Scatter(x=entry_idx, y=cl.reindex(entry_idx), mode='markers', name='Buy',
+                                   marker=dict(symbol='triangle-up', size=9, color='lime')),
+                        row=1, col=1
+                    )
+                if len(exit_idx) > 0:
+                    fig.add_trace(
+                        go.Scatter(x=exit_idx, y=cl.reindex(exit_idx), mode='markers', name='Sell',
+                                   marker=dict(symbol='triangle-down', size=9, color='red')),
+                        row=1, col=1
+                    )
 
             fig.update_layout(height=650, template='plotly_dark', hovermode='x unified')
             st.plotly_chart(fig, use_container_width=True)
 
-            st.write('#### 📒 Trade Log — CVD EMA Cross')
-            trades_df = pd.DataFrame(trades)
+            st.write('#### 📒 Trade Log — Confirmed CVD EMA Cross')
             if trades_df.empty:
-                st.info('No CVD EMA-cross trades in the selected range.')
+                st.info('No confirmed CVD EMA-cross trades in the selected range.')
             else:
                 closed = trades_df[trades_df['Status'].astype(str).str.lower().eq('closed')].copy()
                 c1, c2, c3 = st.columns(3)
@@ -10928,8 +10955,6 @@ with tab17:
                 c2.metric('Win rate', f"{((closed['PnL (%)'] > 0).mean() * 100.0) if len(closed) else 0.0:.1f}%")
                 c3.metric('Sum trade PnL', f"{closed['PnL (%)'].sum() if len(closed) else 0.0:+.2f}%")
 
-                # Do not fake 15:00 CT for daily/date-only bars.
-                # Intraday bars show their real CT time; daily bars show date only.
                 def _is_date_only_index(idx):
                     try:
                         ts = pd.DatetimeIndex(idx)
@@ -10939,9 +10964,12 @@ with tab17:
 
                 if _is_date_only_index(trades_df['Entry Date'].dropna()):
                     display_df = trades_df.copy()
-                    display_df['Entry Date'] = pd.to_datetime(display_df['Entry Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    entry_str = pd.to_datetime(display_df['Entry Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    display_df['Entry Date'] = entry_str.astype('object')
                     closed_exit_mask = display_df['Status'].astype(str).str.lower().eq('closed')
-                    display_df.loc[closed_exit_mask, 'Exit Date'] = pd.to_datetime(display_df.loc[closed_exit_mask, 'Exit Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    exit_str = pd.to_datetime(display_df.loc[closed_exit_mask, 'Exit Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    display_df['Exit Date'] = display_df['Exit Date'].astype('object')
+                    display_df.loc[closed_exit_mask, 'Exit Date'] = exit_str.astype('object')
                     display_df.loc[~closed_exit_mask, 'Exit Date'] = 'Open'
                 else:
                     try:
@@ -10954,9 +10982,9 @@ with tab17:
                 display_df = display_df.sort_values('__sort__', ascending=False).drop(columns='__sort__')
                 st.dataframe(display_df, use_container_width=True)
                 st.download_button(
-                    '📥 Download CVD EMA Cross Trade Log',
+                    '📥 Download Confirmed CVD EMA Cross Trade Log',
                     display_df.to_csv(index=False),
-                    file_name=f'CVD_EMA_Cross_TradeLog_{TICKER}.csv',
+                    file_name=f'Confirmed_CVD_EMA_Cross_TradeLog_{TICKER}.csv',
                     mime='text/csv'
                 )
 
