@@ -2269,13 +2269,68 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
         return trades_df
 
 
+def _get_secret_or_env(name: str, default: str = ""):
+    """Small safe helper. Never throws if Streamlit secrets/env are unavailable."""
+    try:
+        v = st.secrets.get(name, "")
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    try:
+        return str(os.environ.get(name, default) or default)
+    except Exception:
+        return default
+
+
+def _normalize_intraday_ohlc_ct(df, ticker: str, day):
+    """Normalize any intraday OHLC frame to CT regular-session bars."""
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        t = str(ticker).strip().upper().replace('.', '-')
+        df = _flatten_yfinance_columns(df, t)
+        lower_map = {str(c).lower(): c for c in df.columns}
+        rename = {}
+        for want in ['open', 'high', 'low', 'close']:
+            if want in lower_map:
+                rename[lower_map[want]] = want.capitalize()
+        if rename:
+            df = df.rename(columns=rename)
+        if 'Close' not in df.columns:
+            # Databento OHLCV sometimes uses price/close-like names after to_df().
+            for alt in ['close_px', 'price', 'mid', 'Close']:
+                if alt in df.columns:
+                    df['Close'] = df[alt]
+                    break
+        if 'Close' not in df.columns:
+            return pd.DataFrame()
+        for c in ['Open', 'High', 'Low']:
+            if c not in df.columns:
+                df[c] = df['Close']
+        idx = pd.DatetimeIndex(df.index)
+        try:
+            if idx.tz is None:
+                idx = idx.tz_localize('America/New_York')
+            idx = idx.tz_convert('America/Chicago')
+        except Exception:
+            idx = pd.to_datetime(df.index)
+        out = df.copy()
+        out.index = idx
+        try:
+            out = out.between_time('08:30', '15:00')
+        except Exception:
+            pass
+        day_date = pd.Timestamp(day).date()
+        out = out[out.index.date == day_date]
+        return out[['Open', 'High', 'Low', 'Close']].apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def _get_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str = "5m"):
-    """
-    Fetch recent intraday candles for one trading day.
-    Used only for DISPLAY timestamps in weekly Regime Switching trade logs.
-    It does not change strategy signals, prices, equity curve, stops, or metrics.
-    """
+def _get_yahoo_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str = "5m"):
+    """Yahoo/yfinance intraday. Good for recent trades only because Yahoo limits history."""
     try:
         t = str(ticker).strip().upper().replace('.', '-')
         if not t:
@@ -2284,31 +2339,124 @@ def _get_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str
         start = pd.Timestamp(day) - pd.Timedelta(days=1)
         end = pd.Timestamp(day) + pd.Timedelta(days=2)
         df = yf.download(t, start=start, end=end, interval=interval, progress=False, auto_adjust=False, threads=False)
-        if df is None or df.empty:
+        return _normalize_intraday_ohlc_ct(df, t, day)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_databento_intraday_for_weekly_trade_time(ticker: str, day_str: str):
+    """
+    Databento historical fallback for precise old weekly trade timestamps.
+    This only runs when DATABENTO_API_KEY is set in Streamlit secrets or env.
+    It does not affect strategy logic, prices, equity, or metrics; display timestamp only.
+    """
+    try:
+        api_key = _get_secret_or_env('DATABENTO_API_KEY', '')
+        if not api_key:
             return pd.DataFrame()
-        df = _flatten_yfinance_columns(df, t)
-        if 'Close' not in df.columns:
+        try:
+            import databento as db
+        except Exception:
             return pd.DataFrame()
-        for c in ['Open', 'High', 'Low']:
-            if c not in df.columns:
-                df[c] = df['Close']
-        idx = pd.DatetimeIndex(df.index)
-        # yfinance intraday is usually timezone-aware. Convert to Central for display.
-        try:
-            if idx.tz is None:
-                idx = idx.tz_localize('America/New_York')
-            idx_ct = idx.tz_convert('America/Chicago')
-        except Exception:
-            idx_ct = pd.to_datetime(df.index)
-        df = df.copy()
-        df.index = idx_ct
-        # Regular session only in Central Time: 8:30-15:00 CT.
-        try:
-            df = df.between_time('08:30', '15:00')
-        except Exception:
-            pass
-        df = df[df.index.date == day]
-        return df[['Open', 'High', 'Low', 'Close']].replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
+
+        t = str(ticker).strip().upper().replace('.', '-')
+        day = pd.Timestamp(day_str).date()
+        # CT regular session converted through timezone-aware timestamps.
+        start_ct = pd.Timestamp.combine(day, pd.Timestamp('08:30').time()).tz_localize('America/Chicago')
+        end_ct = pd.Timestamp.combine(day, pd.Timestamp('15:00').time()).tz_localize('America/Chicago')
+        start_utc = start_ct.tz_convert('UTC').isoformat()
+        end_utc = end_ct.tz_convert('UTC').isoformat()
+
+        client = db.Historical(key=api_key)
+        # Try OHLCV first. If entitlement differs, try common equity datasets.
+        for dataset in ['XNAS.ITCH', 'EQUS.MINI']:
+            try:
+                data = client.timeseries.get_range(
+                    dataset=dataset,
+                    schema='ohlcv-1m',
+                    symbols=[t],
+                    start=start_utc,
+                    end=end_utc,
+                )
+                df = data.to_df()
+                norm = _normalize_intraday_ohlc_ct(df, t, day)
+                if not norm.empty:
+                    return norm
+            except Exception:
+                continue
+
+        # Fallback: MBP-1 top-of-book; convert bid/ask to 1-minute OHLC midpoint.
+        for dataset in ['EQUS.MINI', 'XNAS.ITCH']:
+            try:
+                data = client.timeseries.get_range(
+                    dataset=dataset,
+                    schema='mbp-1',
+                    symbols=[t],
+                    start=start_utc,
+                    end=end_utc,
+                )
+                raw = data.to_df()
+                if raw is None or raw.empty:
+                    continue
+                # Find bid/ask columns robustly.
+                cols = {str(c).lower(): c for c in raw.columns}
+                bid_col = cols.get('bid_px_00') or cols.get('levels.0.bid_px') or cols.get('bid_px')
+                ask_col = cols.get('ask_px_00') or cols.get('levels.0.ask_px') or cols.get('ask_px')
+                if not bid_col or not ask_col:
+                    continue
+                bid = pd.to_numeric(raw[bid_col], errors='coerce')
+                ask = pd.to_numeric(raw[ask_col], errors='coerce')
+                # Normalize fixed-point prices if needed.
+                mid = (bid + ask) / 2.0
+                if mid.dropna().median() > 100000:
+                    mid = mid / 1e9
+                tmp = pd.DataFrame({'Close': mid}, index=raw.index).dropna()
+                if tmp.empty:
+                    continue
+                # Resample to 1-minute OHLC midpoint bars.
+                tmp.index = pd.DatetimeIndex(tmp.index)
+                ohlc = tmp['Close'].resample('1min').ohlc().rename(columns={'open':'Open','high':'High','low':'Low','close':'Close'})
+                norm = _normalize_intraday_ohlc_ct(ohlc, t, day)
+                if not norm.empty:
+                    return norm
+            except Exception:
+                continue
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str = "5m"):
+    """
+    Fetch intraday candles for one trading day for DISPLAY timestamps only.
+
+    Order of precision:
+    1) Yahoo recent intraday for requested interval.
+    2) Other Yahoo intervals, best available for recent history.
+    3) Databento historical 1-minute bars/MBP-1 if DATABENTO_API_KEY is configured.
+
+    Weekly candles alone cannot reveal exact 10:40/12:55-style trigger time.
+    For older trades, Databento or another historical intraday source is required.
+    """
+    try:
+        t = str(ticker).strip().upper().replace('.', '-')
+        day = pd.Timestamp(day_str).date()
+        # Try requested interval first, then faster/slower Yahoo fallbacks.
+        intervals = []
+        for iv in [interval, '1m', '2m', '5m', '15m', '30m', '60m']:
+            if iv not in intervals:
+                intervals.append(iv)
+        for iv in intervals:
+            df = _get_yahoo_intraday_for_weekly_trade_time(t, str(day), interval=iv)
+            if df is not None and not df.empty:
+                return df
+        # Paid/entitled historical fallback for old trades.
+        db_df = _get_databento_intraday_for_weekly_trade_time(t, str(day))
+        if db_df is not None and not db_df.empty:
+            return db_df
+        return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -2343,7 +2491,7 @@ def _intraday_touch_timestamp_and_source_for_weekly_trade(ticker: str, dt, targe
         day = pd.Timestamp(dt).date()
         intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
         if intraday is None or intraday.empty:
-            return dt, "intraday_unavailable"
+            return dt, "needs_historical_intraday_data"
         lows = pd.to_numeric(intraday['Low'], errors='coerce')
         highs = pd.to_numeric(intraday['High'], errors='coerce')
         closes = pd.to_numeric(intraday['Close'], errors='coerce')
@@ -2353,9 +2501,9 @@ def _intraday_touch_timestamp_and_source_for_weekly_trade(ticker: str, dt, targe
         dist = (closes - px).abs()
         if dist.notna().any():
             return dist.idxmin(), "nearest_5m_estimate"
-        return dt, "intraday_unavailable"
+        return dt, "needs_historical_intraday_data"
     except Exception:
-        return dt, "intraday_unavailable"
+        return dt, "needs_historical_intraday_data"
 
 def apply_weekly_regime_intraday_time_display(trades_df, ticker=""):
     """
@@ -2434,31 +2582,33 @@ def finalize_weekly_regime_trade_time_display(trades_df):
 
         if 'Entry Date' in out.columns and '__Entry Time Source__' in out.columns:
             vals = []
+            qvals = []
             for v, src in zip(out['Entry Date'], out['__Entry Time Source__']):
                 src = str(src)
                 if src == 'exact_5m_touch':
-                    vals.append(_time_part(v))
+                    vals.append(_time_part(v)); qvals.append('exact intraday')
                 elif src == 'nearest_5m_estimate':
-                    # Keep a clean timestamp without appending estimate text.
-                    vals.append(_time_part(v))
+                    vals.append(_time_part(v)); qvals.append('nearest intraday estimate')
                 else:
-                    # No fake 15:00 timestamp and no long label in the table.
-                    vals.append(_date_part(v))
+                    vals.append(_date_part(v)); qvals.append('needs intraday history')
             out['Entry Date'] = vals
+            out['Entry Time Quality'] = qvals
 
         if 'Exit Date' in out.columns and '__Exit Time Source__' in out.columns:
             vals = []
+            qvals = []
             for v, src in zip(out['Exit Date'], out['__Exit Time Source__']):
                 src = str(src)
                 if str(v).strip().lower() == 'open' or src == 'open':
-                    vals.append('Open')
+                    vals.append('Open'); qvals.append('open')
                 elif src == 'exact_5m_touch':
-                    vals.append(_time_part(v))
+                    vals.append(_time_part(v)); qvals.append('exact intraday')
                 elif src == 'nearest_5m_estimate':
-                    vals.append(_time_part(v))
+                    vals.append(_time_part(v)); qvals.append('nearest intraday estimate')
                 else:
-                    vals.append(_date_part(v))
+                    vals.append(_date_part(v)); qvals.append('needs intraday history')
             out['Exit Date'] = vals
+            out['Exit Time Quality'] = qvals
 
         out = out.drop(columns=['__Entry Time Source__', '__Exit Time Source__'], errors='ignore')
         return out
@@ -8435,6 +8585,8 @@ with tab7:
         
         # Trade Log
         st.write("#### 📝 Trade Log")
+        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+            st.caption("Weekly trade times: exact intraday times are shown when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly/daily candles alone cannot produce precise intraday time.")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
