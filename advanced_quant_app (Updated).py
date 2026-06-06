@@ -11010,7 +11010,7 @@ with tab17:
                     cvd_trade_log_slow = cvd_trade_log_fast + 1
                     st.warning(f"Slow EMA must be greater than fast EMA. Using slow EMA = {cvd_trade_log_slow}.")
 
-                def _display_cvd_position_trade_log(label, position_series, entry_series, exit_series, extra_cols=None):
+                def _display_cvd_position_trade_log(label, position_series, entry_series, exit_series, extra_cols=None, overlay_lines=None):
                     try:
                         bt = BacktestEngine.run_strategy(cl, position_series)
                         trades = bt.get('trades', pd.DataFrame()).copy()
@@ -11074,6 +11074,92 @@ with tab17:
                             mime="text/csv",
                             key=f"download_{label.replace(' ', '_').replace('/', '_')}_{TICKER}"
                         )
+
+                        try:
+                            st.write(f"#### 📈 {label} Trade Graph")
+                            chart = make_subplots(
+                                rows=2, cols=1, shared_xaxes=True,
+                                vertical_spacing=0.08,
+                                row_heights=[0.45, 0.55],
+                                subplot_titles=(f"{TICKER} Price with Trades", f"{label} Indicator View")
+                            )
+
+                            chart.add_trace(
+                                go.Scatter(x=cl.index, y=cl.values, mode='lines', name='Close', line=dict(width=2)),
+                                row=1, col=1
+                            )
+
+                            entry_idx = entry_series[entry_series.fillna(False)].index.intersection(cl.index)
+                            exit_idx = exit_series[exit_series.fillna(False)].index.intersection(cl.index)
+
+                            if len(entry_idx) > 0:
+                                chart.add_trace(
+                                    go.Scatter(
+                                        x=entry_idx,
+                                        y=cl.reindex(entry_idx),
+                                        mode='markers',
+                                        name='Buy',
+                                        marker=dict(symbol='triangle-up', size=10, color='lime')
+                                    ),
+                                    row=1, col=1
+                                )
+                            if len(exit_idx) > 0:
+                                chart.add_trace(
+                                    go.Scatter(
+                                        x=exit_idx,
+                                        y=cl.reindex(exit_idx),
+                                        mode='markers',
+                                        name='Sell/Exit',
+                                        marker=dict(symbol='triangle-down', size=10, color='red')
+                                    ),
+                                    row=1, col=1
+                                )
+
+                            chart.add_trace(
+                                go.Scatter(x=cvd.index, y=cvd.values, mode='lines', name='CVD', line=dict(width=2, color='#00f2ff')),
+                                row=2, col=1
+                            )
+                            if overlay_lines:
+                                palette = ['#ffd166', '#ff8fab', '#a78bfa', '#8ecae6']
+                                for i, (name, series) in enumerate(overlay_lines.items()):
+                                    chart.add_trace(
+                                        go.Scatter(
+                                            x=series.index, y=series.values, mode='lines', name=name,
+                                            line=dict(width=1.5, dash='dot', color=palette[i % len(palette)])
+                                        ),
+                                        row=2, col=1
+                                    )
+
+                            if len(entry_idx) > 0:
+                                chart.add_trace(
+                                    go.Scatter(
+                                        x=entry_idx,
+                                        y=cvd.reindex(entry_idx),
+                                        mode='markers',
+                                        name='Buy on CVD',
+                                        marker=dict(symbol='circle', size=8, color='lime')
+                                    ),
+                                    row=2, col=1
+                                )
+                            if len(exit_idx) > 0:
+                                chart.add_trace(
+                                    go.Scatter(
+                                        x=exit_idx,
+                                        y=cvd.reindex(exit_idx),
+                                        mode='markers',
+                                        name='Exit on CVD',
+                                        marker=dict(symbol='circle', size=8, color='red')
+                                    ),
+                                    row=2, col=1
+                                )
+
+                            chart.update_layout(height=700, hovermode='x unified', showlegend=True)
+                            chart.update_yaxes(title_text='Price', row=1, col=1)
+                            chart.update_yaxes(title_text='CVD', row=2, col=1)
+                            st.plotly_chart(chart, use_container_width=True)
+                        except Exception as chart_err:
+                            st.warning(f"Could not render {label} trade graph: {chart_err}")
+
                         return display_trades
                     except Exception as log_err:
                         st.error(f"{label} trade log failed: {log_err}")
@@ -11106,7 +11192,8 @@ with tab17:
                         cvd_log_position,
                         cvd_log_cross_up,
                         cvd_log_cross_down,
-                        extra_cols={"CVD Mean": cvd_log_ma}
+                        extra_cols={"CVD Mean": cvd_log_ma},
+                        overlay_lines={"CVD Mean": cvd_log_ma}
                     )
                 with cvd_log_tab2:
                     st.caption("Long when the fast CVD EMA crosses above the slow CVD EMA. Exit when the fast CVD EMA crosses below the slow CVD EMA.")
@@ -11115,7 +11202,8 @@ with tab17:
                         cvd_ema_position,
                         cvd_ema_cross_up,
                         cvd_ema_cross_down,
-                        extra_cols={"Fast CVD EMA": cvd_ema_fast_line, "Slow CVD EMA": cvd_ema_slow_line}
+                        extra_cols={"Fast CVD EMA": cvd_ema_fast_line, "Slow CVD EMA": cvd_ema_slow_line},
+                        overlay_lines={"Fast CVD EMA": cvd_ema_fast_line, "Slow CVD EMA": cvd_ema_slow_line}
                     )
 
                 # ── CVD Adaptive Strategy Backtest ──────────────────────────────
