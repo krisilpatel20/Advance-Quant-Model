@@ -5567,19 +5567,64 @@ if fast_intraday_mode:
 
     @st.cache_data(ttl=20, show_spinner=False)
     def _fast_fetch_intraday(ticker: str, period: str, interval: str) -> pd.DataFrame:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, prepost=False)
-        df = _fast_flatten_yf_columns(df)
+        """
+        Robust intraday fetch for the fast final tab.
+
+        Important: on weekends/after a holiday, Yahoo can return nothing for
+        period='1d' even though the last regular session exists. So this tries
+        wider windows automatically and the UI later keeps the latest available
+        trading session.
+        """
+        t = str(ticker).strip().upper()
+        interval = str(interval).strip()
+        requested_period = str(period).strip()
+
+        # Safe yfinance fallbacks. 1m data is normally limited, so do not ask
+        # for 30d with 1m. For 60m, 60d is safe enough for stale/weekend fetches.
+        fallback_periods = []
+        def _add_period(x):
+            if x and x not in fallback_periods:
+                fallback_periods.append(x)
+        _add_period(requested_period)
+        if interval == "1m":
+            for x in ["1d", "5d", "7d"]:
+                _add_period(x)
+        elif interval in {"2m", "5m", "15m", "30m"}:
+            for x in ["1d", "5d", "7d", "30d", "60d"]:
+                _add_period(x)
+        else:
+            for x in ["1d", "5d", "30d", "60d"]:
+                _add_period(x)
+
+        df = pd.DataFrame()
+        for per in fallback_periods:
+            try:
+                temp = yf.download(t, period=per, interval=interval, progress=False, auto_adjust=True, prepost=False, threads=False)
+                temp = _fast_flatten_yf_columns(temp) if temp is not None else pd.DataFrame()
+                if temp is not None and not temp.empty:
+                    df = temp.copy()
+                    break
+            except Exception:
+                continue
+
         if df is None or df.empty:
             return pd.DataFrame()
         needed = ["Open", "High", "Low", "Close", "Volume"]
-        df = df[[c for c in needed if c in df.columns]].dropna()
+        df = df[[c for c in needed if c in df.columns]].copy()
+        for c in ["Open", "High", "Low"]:
+            if c not in df.columns and "Close" in df.columns:
+                df[c] = df["Close"]
+        if "Volume" not in df.columns:
+            df["Volume"] = 1.0
+        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
         if df.empty:
             return pd.DataFrame()
         try:
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("America/New_York").tz_convert("America/Chicago")
+            idx = pd.DatetimeIndex(df.index)
+            if idx.tz is None:
+                df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago")
             else:
-                df.index = df.index.tz_convert("America/Chicago")
+                df.index = idx.tz_convert("America/Chicago")
         except Exception:
             pass
         return df
@@ -5765,14 +5810,14 @@ if fast_intraday_mode:
             max_trades_fast = st.number_input("Max trades", 1, 100, 10, 1, key="fast_whole_max_trades")
             cooldown_fast = st.number_input("Cooldown bars", 0, 50, 3, 1, key="fast_whole_cooldown")
 
-        run_fast = st.button("Fetch TODAY intraday + Run Long-Only Engine", type="primary", use_container_width=True, key="fast_whole_run")
+        run_fast = st.button("Fetch latest intraday session + Run Long-Only Engine", type="primary", use_container_width=True, key="fast_whole_run")
         if not run_fast:
             st.info("Click the button above. Fast mode will only fetch intraday data for this final tab; the other heavy tabs stay paused.")
         else:
             with st.spinner(f"Fetching {TICKER} intraday data..."):
                 raw_fast = _fast_fetch_intraday(TICKER, intraday_period, intraday_interval)
             if raw_fast.empty:
-                st.error("No intraday data returned. Try 5m interval or 5d window.")
+                st.error("No intraday data returned from Yahoo. Try 5m interval and 5d window, or check ticker/data availability.")
             else:
                 try:
                     latest_date = raw_fast.index[-1].date()
@@ -9910,6 +9955,10 @@ def _load_fresh_intraday_for_capture(ticker, interval='1m', period='1d', include
     Fetch fresh intraday data directly for the final Live Capture tab.
     This intentionally does NOT use df_main/start_date, because df_main can be
     daily historical data from 2024 when the rest of the dashboard is not in Live Mode.
+
+    Robust weekend/holiday behavior: if period='1d' returns empty after the
+    market is closed or on Saturday/Sunday, automatically widen the window and
+    the cleaner keeps the latest available trading session.
     """
     try:
         t = str(ticker).strip().upper()
@@ -9919,17 +9968,35 @@ def _load_fresh_intraday_for_capture(ticker, interval='1m', period='1d', include
         interval = str(interval).strip()
         period = str(period).strip()
 
-        # yfinance limits: 1m normally supports about 7 days; period=1d is best for true today.
-        kwargs = dict(period=period, interval=interval, progress=False, auto_adjust=True, prepost=bool(include_prepost), threads=False)
-        d = yf.download(t, **kwargs)
+        fallback_periods = []
+        def _add_period(x):
+            if x and x not in fallback_periods:
+                fallback_periods.append(x)
+        _add_period(period)
+        if interval == '1m':
+            for x in ['1d', '5d', '7d']:
+                _add_period(x)
+        elif interval in {'2m', '5m', '15m', '30m'}:
+            for x in ['1d', '5d', '7d', '30d', '60d']:
+                _add_period(x)
+        else:
+            for x in ['1d', '5d', '30d', '60d']:
+                _add_period(x)
+
+        d = pd.DataFrame()
+        used_period = None
+        for per in fallback_periods:
+            try:
+                temp = yf.download(t, period=per, interval=interval, progress=False, auto_adjust=True, prepost=bool(include_prepost), threads=False)
+                if temp is not None and not temp.empty:
+                    d = temp.copy()
+                    used_period = per
+                    break
+            except Exception:
+                continue
 
         if d is None or d.empty:
-            # Fallback to a slightly wider period in case market just opened / holiday edge.
-            fallback_period = '5d' if interval in {'1m', '2m', '5m', '15m', '30m'} else '1mo'
-            d = yf.download(t, period=fallback_period, interval=interval, progress=False, auto_adjust=True, prepost=bool(include_prepost), threads=False)
-
-        if d is None or d.empty:
-            return pd.DataFrame(), f"No fresh intraday data returned for {t}."
+            return pd.DataFrame(), f"No fresh intraday data returned for {t}. Yahoo may be delayed/unavailable; try 5m with 5d window."
 
         # Flatten multi-index columns if yfinance returns them.
         if isinstance(d.columns, pd.MultiIndex):
@@ -10860,7 +10927,7 @@ try:
             z_window = st.number_input('VWAP std window bars', min_value=5, max_value=80, value=15, step=1, key='safe_lc_z_window')
 
         st.warning('Capital-protection mode: no machine-gun entries. One stopped trade disables the session; Green Momentum requires strict buyer-control confirmation. Long-only, no short selling.')
-        run_lc = st.button('Fetch TODAY intraday + Run Long-Only Engine', key='safe_lc_run')
+        run_lc = st.button('Fetch latest intraday session + Run Long-Only Engine', key='safe_lc_run')
 
         if run_lc:
             fresh, fetch_msg = _load_fresh_intraday_for_capture(TICKER, interval=lc_interval, period=lc_period, include_prepost=include_prepost)
@@ -10869,7 +10936,7 @@ try:
             d = _intraday_clean_frame(fresh, today_only=bool(force_latest_session))
             if d.empty or len(d) < 10:
                 st.session_state['safe_lc_pack'] = None
-                st.error('No usable intraday candles. Select 1m/5m and Data window = 1d or 5d. This tab no longer uses old 2024 daily rows.')
+                st.error('No usable intraday candles. Try 5m interval and 5d window. On weekends, the app now uses the latest available trading session, not old 2024 daily rows.')
             else:
                 long_entry, short_entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap), direction_mode=direction_mode, use_kalman_vwap=bool(use_kalman_vwap), z_entry=float(z_entry), z_exit=float(z_exit), z_window=int(z_window))
                 trades_df, eq, summ = _run_intraday_capture(
