@@ -8718,13 +8718,46 @@ with tab7:
 
                 price_for_plot = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
 
+                # Build fixed top-left info box from the latest price and latest completed/open trade.
+                latest_price_text = "N/A"
+                try:
+                    latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
+                except Exception:
+                    pass
+
+                latest_trade_text = "No trade"
+                try:
+                    if not plot_trades_df.empty:
+                        _tmp_trades = plot_trades_df.copy()
+                        _tmp_trades["__entry_sort__"] = pd.to_datetime(_tmp_trades.get("Entry Date"), errors="coerce")
+                        _tmp_trades = _tmp_trades.sort_values("__entry_sort__", ascending=False)
+                        _last_trade = _tmp_trades.iloc[0]
+                        _status = str(_last_trade.get("Status", "")).strip()
+                        _entry = str(_last_trade.get("Entry Date", "")).replace(" CT", "").strip()
+                        _exit = str(_last_trade.get("Exit Date", "")).replace(" CT", "").strip()
+                        _buy_px = _last_trade.get("Buy Price", np.nan)
+                        _sell_px = _last_trade.get("Sell Price", np.nan)
+                        if _status.lower() == "open":
+                            latest_trade_text = f"OPEN BUY | {_entry} | Buy ${float(_buy_px):,.2f}" if pd.notna(_buy_px) else f"OPEN BUY | {_entry}"
+                        else:
+                            latest_trade_text = f"CLOSED | Buy {_entry} @ ${float(_buy_px):,.2f} | Sell {_exit} @ ${float(_sell_px):,.2f}" if pd.notna(_buy_px) and pd.notna(_sell_px) else f"CLOSED | Buy {_entry} | Sell {_exit}"
+                except Exception:
+                    latest_trade_text = "Trade info unavailable"
+
+                fixed_info_text = (
+                    f"<b>{TICKER}</b><br>"
+                    f"Latest price: <b>{latest_price_text}</b><br>"
+                    f"Latest strategy: {latest_trade_text}"
+                )
+
                 fig_price = go.Figure()
                 fig_price.add_trace(go.Scatter(
                     x=price_for_plot.index,
                     y=price_for_plot.values,
                     mode="lines",
                     line=dict(color="#5b7cfa", width=2),
-                    name=f"{TICKER} Price"
+                    name=f"{TICKER} Price",
+                    hovertemplate="<b>%{x}</b><br>Price: $%{y:,.2f}<extra></extra>"
                 ))
 
                 if not plot_trades_df.empty and "Entry Date" in plot_trades_df.columns:
@@ -8732,7 +8765,8 @@ with tab7:
                     if len(bx) > 0:
                         fig_price.add_trace(go.Scatter(
                             x=bx, y=by, mode="markers", name="Buy",
-                            marker=dict(symbol="triangle-up", size=9, color="lime")
+                            marker=dict(symbol="triangle-up", size=9, color="lime"),
+                            hovertemplate="<b>BUY</b><br>%{x}<br>Price: $%{y:,.2f}<extra></extra>"
                         ))
 
                 if not plot_trades_df.empty and "Exit Date" in plot_trades_df.columns:
@@ -8746,8 +8780,23 @@ with tab7:
                     if len(sx) > 0:
                         fig_price.add_trace(go.Scatter(
                             x=sx, y=sy, mode="markers", name="Sell / Exit",
-                            marker=dict(symbol="triangle-down", size=9, color="red")
+                            marker=dict(symbol="triangle-down", size=9, color="red"),
+                            hovertemplate="<b>SELL / EXIT</b><br>%{x}<br>Price: $%{y:,.2f}<extra></extra>"
                         ))
+
+                fig_price.add_annotation(
+                    xref="paper", yref="paper",
+                    x=0.01, y=0.99,
+                    xanchor="left", yanchor="top",
+                    align="left",
+                    text=fixed_info_text,
+                    showarrow=False,
+                    bordercolor="rgba(255,255,255,0.35)",
+                    borderwidth=1,
+                    borderpad=6,
+                    bgcolor="rgba(0,0,0,0.72)",
+                    font=dict(size=12, color="white")
+                )
 
                 fig_price.update_layout(
                     title=f"{TICKER} Regime Switching Price + Entry/Exit Markers",
@@ -8756,7 +8805,8 @@ with tab7:
                     hovermode="x unified",
                     dragmode="pan",
                     margin=dict(l=30, r=30, t=60, b=30),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    hoverlabel=dict(bgcolor="rgba(0,0,0,0.86)", font_size=12, font_color="white")
                 )
                 fig_price.update_xaxes(
                     rangeslider=dict(visible=True),
