@@ -8792,32 +8792,135 @@ with tab7:
                     showline=True
                 )
 
-                # Normal Plotly rendering: no extra overlay box, full chart interaction enabled.
-                # This restores zoom/pan/crosshair/draw-line tools and removes the duplicate
-                # fixed hover panel that was blocking chart surfing.
+                # Render with a fixed top-left hover panel that updates as the crosshair moves.
+                # Keep full Plotly interaction: zoom, pan, crosshair/spikes, draw-line tools.
                 try:
                     fig_price.update_layout(
-                        annotations=[
-                            a for a in (fig_price.layout.annotations or [])
-                            if not (getattr(a, "text", "") == fixed_info_text)
-                        ],
-                        hovermode="x unified",
-                        dragmode="pan"
+                        annotations=[],
+                        hovermode="closest",
+                        dragmode="pan",
+                        hoverlabel=dict(bgcolor="rgba(0,0,0,0.85)", font_size=12, font_color="white")
                     )
                 except Exception:
-                    fig_price.update_layout(hovermode="x unified", dragmode="pan")
+                    fig_price.update_layout(hovermode="closest", dragmode="pan")
 
-                st.plotly_chart(
-                    fig_price,
-                    use_container_width=True,
-                    config={
-                        "scrollZoom": True,
-                        "displaylogo": False,
-                        "displayModeBar": True,
-                        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-                        "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
-                    }
-                )
+                try:
+                    chart_div_id = f"regime_price_chart_{TICKER}_{bt_freq}".replace(" ", "_").replace(".", "_").replace("-", "_")
+                    hover_panel_id = f"regime_hover_panel_{TICKER}_{bt_freq}".replace(" ", "_").replace(".", "_").replace("-", "_")
+
+                    chart_html = fig_price.to_html(
+                        full_html=False,
+                        include_plotlyjs="cdn",
+                        config={
+                            "scrollZoom": True,
+                            "displaylogo": False,
+                            "displayModeBar": True,
+                            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                            "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
+                        },
+                        div_id=chart_div_id
+                    )
+
+                    html = f"""
+                    <style>
+                        #{chart_div_id} .hoverlayer {{
+                            display:none !important;
+                        }}
+                    </style>
+                    <div style="position:relative; width:100%;">
+                        <div id="{hover_panel_id}" style="
+                            position:absolute;
+                            top:60px;
+                            left:14px;
+                            z-index:9999;
+                            background:rgba(0,0,0,0.76);
+                            color:white;
+                            border:1px solid rgba(255,255,255,0.32);
+                            border-radius:6px;
+                            padding:8px 10px;
+                            font-family:Arial, sans-serif;
+                            font-size:12px;
+                            line-height:1.35;
+                            min-width:180px;
+                            max-width:240px;
+                            pointer-events:none;">
+                            <b>{TICKER}</b><br>
+                            Move crosshair on chart<br>
+                            Latest price: <b>{latest_price_text}</b>
+                        </div>
+                        {chart_html}
+                    </div>
+
+                    <script>
+                    (function() {{
+                        const plot = document.getElementById("{chart_div_id}");
+                        const panel = document.getElementById("{hover_panel_id}");
+
+                        function fmtDate(x) {{
+                            try {{
+                                const d = new Date(x);
+                                if (!isNaN(d.getTime())) {{
+                                    return d.toLocaleDateString("en-US", {{ year:"numeric", month:"short", day:"numeric" }});
+                                }}
+                            }} catch(e) {{}}
+                            return String(x);
+                        }}
+
+                        function fmtPrice(y) {{
+                            const n = Number(y);
+                            if (Number.isFinite(n)) {{
+                                return "$" + n.toLocaleString("en-US", {{ minimumFractionDigits:2, maximumFractionDigits:2 }});
+                            }}
+                            return String(y);
+                        }}
+
+                        function updatePanel(evt) {{
+                            if (!evt || !evt.points || evt.points.length === 0 || !panel) return;
+
+                            const pt = evt.points[0];
+                            const dateTxt = fmtDate(pt.x);
+                            const priceTxt = fmtPrice(pt.y);
+                            let signalTxt = "";
+
+                            const nm = (pt.data && pt.data.name) ? String(pt.data.name).toLowerCase() : "";
+                            if (nm.includes("buy")) {{
+                                signalTxt = "<br>🟢 Buy: <b>" + priceTxt + "</b>";
+                            }} else if (nm.includes("sell") || nm.includes("exit")) {{
+                                signalTxt = "<br>🔴 Sell/Exit: <b>" + priceTxt + "</b>";
+                            }}
+
+                            panel.innerHTML = "<b>{TICKER}</b><br>"
+                                + "Date: <b>" + dateTxt + "</b><br>"
+                                + "Price: <b>" + priceTxt + "</b>"
+                                + signalTxt;
+                        }}
+
+                        function attach() {{
+                            if (!plot || typeof plot.on !== "function") {{
+                                setTimeout(attach, 250);
+                                return;
+                            }}
+                            plot.on("plotly_hover", updatePanel);
+                            plot.on("plotly_click", updatePanel);
+                            plot.on("plotly_unhover", function(){{}});
+                        }}
+                        attach();
+                    }})();
+                    </script>
+                    """
+                    components.html(html, height=640, scrolling=False)
+                except Exception:
+                    st.plotly_chart(
+                        fig_price,
+                        use_container_width=True,
+                        config={
+                            "scrollZoom": True,
+                            "displaylogo": False,
+                            "displayModeBar": True,
+                            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                            "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
+                        }
+                    )
 
                 safe_report_add("Regime Price Entry Exit Chart", fig_price)
 
