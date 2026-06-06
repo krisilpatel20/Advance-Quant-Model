@@ -8786,7 +8786,38 @@ with tab7:
                         return xs, ys, js_points
                     return xs, ys, js_points
 
+                # Use a daily-basis display chart when the strategy itself is weekly.
+                # This keeps everything else the same (trade log, markers, top-left box, equity curve),
+                # but makes the visible price chart daily so weekday trade dates make more sense on the chart.
                 price_for_plot = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
+                try:
+                    if bt_freq == "Weekly" and len(price_for_plot) >= 2:
+                        chart_start = (pd.Timestamp(price_for_plot.index.min()) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+                        chart_end = (pd.Timestamp(price_for_plot.index.max()) + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+                        _daily_chart = yf.download(
+                            TICKER,
+                            start=chart_start,
+                            end=chart_end,
+                            interval="1d",
+                            auto_adjust=True,
+                            progress=False,
+                            prepost=False,
+                            threads=False
+                        )
+                        if _daily_chart is not None and not _daily_chart.empty:
+                            if isinstance(_daily_chart.columns, pd.MultiIndex):
+                                _daily_chart.columns = [c[0] if isinstance(c, tuple) else c for c in _daily_chart.columns]
+                            _close_col = None
+                            for _c in _daily_chart.columns:
+                                if str(_c).lower() == "close":
+                                    _close_col = _c
+                                    break
+                            if _close_col is not None:
+                                _daily_close = pd.to_numeric(_daily_chart[_close_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                                if not _daily_close.empty:
+                                    price_for_plot = _daily_close
+                except Exception:
+                    pass
 
                 # Initial fixed top-left hover panel.
                 # It intentionally does NOT show latest/open trade details because those belong in the trade log.
@@ -9006,12 +9037,50 @@ with tab7:
                             return best;
                         }}
 
-                        function sameDay(a, b) {{
+                        function medianPriceStepMs() {{
                             try {{
-                                return new Date(a).toDateString() === new Date(b).toDateString();
+                                if (!pricePoints || pricePoints.length < 2) return 24 * 60 * 60 * 1000;
+                                let diffs = [];
+                                for (let i = 1; i < pricePoints.length; i++) {{
+                                    const a = new Date(pricePoints[i - 1].t).getTime();
+                                    const b = new Date(pricePoints[i].t).getTime();
+                                    const d = Math.abs(b - a);
+                                    if (Number.isFinite(d) && d > 0) diffs.push(d);
+                                }}
+                                if (!diffs.length) return 24 * 60 * 60 * 1000;
+                                diffs.sort((a, b) => a - b);
+                                return diffs[Math.floor(diffs.length / 2)];
                             }} catch(e) {{
-                                return false;
+                                return 24 * 60 * 60 * 1000;
                             }}
+                        }}
+
+                        function nearestSignalByX(xVal, arr) {{
+                            if (!arr || arr.length === 0) return null;
+
+                            const target = new Date(xVal).getTime();
+                            if (!Number.isFinite(target)) return null;
+
+                            // Weekly charts skip weekday trade dates. Use half the chart bar spacing,
+                            // so a Tuesday/Wednesday trade still appears when hovering that week.
+                            const step = medianPriceStepMs();
+                            const tolerance = Math.max(step * 0.55, 12 * 60 * 60 * 1000);
+
+                            let best = null;
+                            let bestD = Infinity;
+                            for (let i = 0; i < arr.length; i++) {{
+                                const tx = new Date(arr[i].t).getTime();
+                                const py = Number(arr[i].p);
+                                if (!Number.isFinite(tx) || !Number.isFinite(py)) continue;
+                                const diff = Math.abs(tx - target);
+                                if (diff < bestD) {{
+                                    bestD = diff;
+                                    best = arr[i];
+                                }}
+                            }}
+
+                            if (best && bestD <= tolerance) return best;
+                            return null;
                         }}
 
                         function updatePanelFromX(xVal) {{
@@ -9025,8 +9094,8 @@ with tab7:
 
                             let signalTxt = "";
                             try {{
-                                const b = buyPoints.filter(p => sameDay(p.t, nearest.t));
-                                const s = sellPoints.filter(p => sameDay(p.t, nearest.t));
+                                const b = nearestSignalByX(xVal, buyPoints);
+                                const s = nearestSignalByX(xVal, sellPoints);
 
                                 function addSignalLines(sigPoint) {{
                                     if (!sigPoint) return;
@@ -9038,13 +9107,13 @@ with tab7:
                                     }}
                                 }}
 
-                                if (b.length > 0) {{
-                                    addSignalLines(b[0]);
-                                    signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b[0].p) + "</b>";
+                                if (b) {{
+                                    addSignalLines(b);
+                                    signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b.p) + "</b>";
                                 }}
-                                if (s.length > 0) {{
-                                    addSignalLines(s[0]);
-                                    signalTxt += "<br>🔴 Sell/Exit: <b>" + fmtPrice(s[0].p) + "</b>";
+                                if (s) {{
+                                    addSignalLines(s);
+                                    signalTxt += "<br>🔴 Sell/Exit: <b>" + fmtPrice(s.p) + "</b>";
                                 }}
                             }} catch(e) {{}}
 
