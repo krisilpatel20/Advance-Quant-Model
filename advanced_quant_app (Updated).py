@@ -10798,6 +10798,7 @@ with tab17:
                     st.warning(f"5m intraday fetch failed, so CVD is using current chart data: {intraday_err}")
 
             cl = d['Close'].astype(float)
+            high = d['High'].astype(float) if 'High' in d.columns else cl
             vol = d['Volume'] if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
             vol = vol.fillna(0).astype(float)
 
@@ -10807,11 +10808,57 @@ with tab17:
             cvd = delta.cumsum()
             cvd_ema = cvd.ewm(span=8, adjust=False).mean()
 
-            # EXACT trade logic from the visible graph:
-            # Buy when red/orange CVD crosses ABOVE green CVD EMA.
-            # Sell when red/orange CVD crosses BELOW green CVD EMA.
-            cvd_cross_up = (cvd > cvd_ema) & (cvd.shift(1) <= cvd_ema.shift(1))
-            cvd_cross_down = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
+            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. Choose exact graph cross or balanced regime mode.")
+
+            mode_col1, mode_col2, mode_col3 = st.columns(3)
+            with mode_col1:
+                cvd_trade_mode = st.radio(
+                    "CVD trade mode",
+                    ["Balanced regime", "Exact graph cross"],
+                    index=0,
+                    horizontal=True,
+                    key="cvd_trade_mode_balanced_or_exact",
+                    help="Exact cross is accurate but whipsaws. Balanced regime waits for CVD to actually control the auction, but still exits on the visible CVD/EMA cross down."
+                )
+            with mode_col2:
+                confirm_bars = st.slider(
+                    "Balanced confirm bars",
+                    2, 12, 5,
+                    key="cvd_balanced_confirm_bars",
+                    help="Used only in Balanced regime. Higher means fewer trades."
+                )
+            with mode_col3:
+                use_price_filter = st.checkbox(
+                    "Use price trend filter",
+                    value=True,
+                    key="cvd_balanced_price_filter",
+                    help="Used only in Balanced regime. Blocks CVD buys when price structure is weak."
+                )
+
+            exact_cross_up = (cvd > cvd_ema) & (cvd.shift(1) <= cvd_ema.shift(1))
+            exact_cross_down = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
+
+            if cvd_trade_mode == "Exact graph cross":
+                cvd_buy = exact_cross_up.fillna(False)
+                cvd_sell = exact_cross_down.fillna(False)
+                setup_name = "Exact CVD/EMA Graph Cross"
+                exit_reason_text = "CVD crossed below CVD EMA"
+            else:
+                # Balanced regime:
+                # - Entry waits for CVD to stay above EMA, EMA to slope up, and price to agree.
+                # - Exit still uses exact visible cross below, so the trade log does not ignore
+                #   the red CVD crossing below green CVD EMA.
+                ema20 = cl.ewm(span=20, adjust=False).mean()
+                ema50 = cl.ewm(span=50, adjust=False).mean()
+                cvd_above = cvd > cvd_ema
+                cvd_confirmed_above = cvd_above.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+                cvd_ema_slope_up = cvd_ema.diff(max(2, confirm_bars // 2)) > 0
+                price_ok = ((cl > ema20) & (ema20 >= ema50)) if use_price_filter else pd.Series(True, index=d.index)
+                raw_buy = cvd_confirmed_above & cvd_ema_slope_up & price_ok
+                cvd_buy = (raw_buy & (~raw_buy.shift(1).fillna(False))).fillna(False)
+                cvd_sell = exact_cross_down.fillna(False)
+                setup_name = "Balanced CVD Regime"
+                exit_reason_text = "Exact CVD/EMA cross down"
 
             trades = []
             in_pos = False
@@ -10821,18 +10868,18 @@ with tab17:
             entry_ema = None
 
             for dt in d.index:
-                if (not in_pos) and bool(cvd_cross_up.loc[dt]):
+                if (not in_pos) and bool(cvd_buy.loc[dt]):
                     in_pos = True
                     entry_dt = dt
                     entry_px = float(cl.loc[dt])
                     entry_cvd = float(cvd.loc[dt])
                     entry_ema = float(cvd_ema.loc[dt])
 
-                elif in_pos and bool(cvd_cross_down.loc[dt]):
+                elif in_pos and bool(cvd_sell.loc[dt]):
                     exit_px = float(cl.loc[dt])
                     pnl = ((exit_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
                     trades.append({
-                        'Setup': 'Exact CVD/EMA Graph Cross',
+                        'Setup': setup_name,
                         'Entry Date': entry_dt,
                         'Exit Date': dt,
                         'Buy Price': round(entry_px, 4),
@@ -10844,7 +10891,7 @@ with tab17:
                         'Exit CVD': round(float(cvd.loc[dt]), 0),
                         'Exit CVD EMA': round(float(cvd_ema.loc[dt]), 0),
                         'Status': 'Closed',
-                        'Exit Reason': 'CVD crossed below CVD EMA'
+                        'Exit Reason': exit_reason_text
                     })
                     in_pos = False
                     entry_dt = None
@@ -10856,7 +10903,7 @@ with tab17:
                 last_px = float(cl.iloc[-1])
                 pnl = ((last_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
                 trades.append({
-                    'Setup': 'Exact CVD/EMA Graph Cross',
+                    'Setup': setup_name,
                     'Entry Date': entry_dt,
                     'Exit Date': 'Open',
                     'Buy Price': round(entry_px, 4),
@@ -10879,7 +10926,6 @@ with tab17:
             m3.metric('Pressure', 'BUYING' if delta.iloc[-1] > 0 else 'SELLING')
             m4.metric('Buy & Hold', f"{buy_hold_return:+.2f}%")
 
-            # Exact screenshot-style graph: price top, CVD + one EMA bottom.
             fig = make_subplots(
                 rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                 subplot_titles=(f'{TICKER} Price', 'CVD')
@@ -10909,9 +10955,9 @@ with tab17:
             fig.update_layout(height=650, template='plotly_dark', hovermode='x unified')
             st.plotly_chart(fig, use_container_width=True)
 
-            st.write('#### 📒 Trade Log — Exact CVD/EMA Graph Cross')
+            st.write(f'#### 📒 Trade Log — {setup_name}')
             if trades_df.empty:
-                st.info('No exact CVD/EMA graph-cross trades in the selected range.')
+                st.info(f'No {setup_name} trades in the selected range.')
             else:
                 closed = trades_df[trades_df['Status'].astype(str).str.lower().eq('closed')].copy()
                 c1, c2, c3 = st.columns(3)
@@ -10945,9 +10991,9 @@ with tab17:
                 display_df = display_df.sort_values('__sort__', ascending=False).drop(columns='__sort__')
                 st.dataframe(display_df, use_container_width=True)
                 st.download_button(
-                    '📥 Download Exact CVD EMA Graph Cross Trade Log',
+                    f'📥 Download {setup_name} Trade Log',
                     display_df.to_csv(index=False),
-                    file_name=f'Exact_CVD_EMA_Graph_Cross_TradeLog_{TICKER}.csv',
+                    file_name=f'{setup_name.replace(" ", "_").replace("/", "_")}_TradeLog_{TICKER}.csv',
                     mime='text/csv'
                 )
 
