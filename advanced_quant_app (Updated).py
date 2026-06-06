@@ -8752,24 +8752,39 @@ with tab7:
                             raw_txt = str(raw_dt).strip()
                             clean_txt = raw_txt.replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
 
-                            # Date shown in the top-left box should be clean human format.
-                            try:
-                                date_txt = pd.Timestamp(ts).strftime("%b %d, %Y")
-                            except Exception:
-                                date_txt = clean_txt.split(" ")[0] if clean_txt else ""
-
-                            # Time must come from the trade log when it exists.
+                            # Date/time shown in the top-left box must match the trade log's CT display.
+                            # If raw value is UTC/tz-aware, convert to America/Chicago before displaying.
+                            # This fixes 13:30:00 showing instead of 08:30:00 CT.
+                            date_txt = ""
                             time_txt = ""
                             try:
-                                # Keep explicit CT/CST/CDT if the trade log has it.
                                 if "CT" in raw_txt or "CST" in raw_txt or "CDT" in raw_txt:
-                                    if " " in raw_txt:
-                                        time_txt = " ".join(raw_txt.split(" ")[1:])
+                                    _parts = raw_txt.split()
+                                    if len(_parts) >= 1:
+                                        date_txt = pd.Timestamp(_parts[0]).strftime("%b %d, %Y")
+                                    if len(_parts) >= 2:
+                                        time_txt = " ".join(_parts[1:])
                                 else:
-                                    tstamp = pd.Timestamp(ts)
-                                    if not (tstamp.hour == 0 and tstamp.minute == 0 and tstamp.second == 0):
-                                        time_txt = tstamp.strftime("%H:%M:%S")
+                                    tstamp_raw = pd.Timestamp(raw_dt)
+                                    try:
+                                        # If timestamp has timezone, convert to Central.
+                                        if getattr(tstamp_raw, "tzinfo", None) is not None:
+                                            tstamp_disp = tstamp_raw.tz_convert("America/Chicago")
+                                        else:
+                                            # Strings like 2026-04-07 13:30:00+00:00 sometimes parse as tz-aware,
+                                            # but keep this fallback safe.
+                                            tstamp_disp = tstamp_raw
+                                    except Exception:
+                                        tstamp_disp = pd.Timestamp(ts)
+
+                                    date_txt = pd.Timestamp(tstamp_disp).strftime("%b %d, %Y")
+                                    if not (tstamp_disp.hour == 0 and tstamp_disp.minute == 0 and tstamp_disp.second == 0):
+                                        time_txt = pd.Timestamp(tstamp_disp).strftime("%H:%M:%S CT")
                             except Exception:
+                                try:
+                                    date_txt = pd.Timestamp(ts).strftime("%b %d, %Y")
+                                except Exception:
+                                    date_txt = clean_txt.split(" ")[0] if clean_txt else ""
                                 time_txt = ""
 
                             xs.append(ts)
