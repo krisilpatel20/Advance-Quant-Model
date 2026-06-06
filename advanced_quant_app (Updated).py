@@ -6150,7 +6150,7 @@ with tab1:
                     fig_qq = go.Figure()
                     fig_qq.add_trace(go.Scatter(x=theoretical, y=observed, mode='markers', marker=dict(color='#00f2ff'), name='Data'))
                     fig_qq.add_trace(go.Scatter(x=theoretical, y=trend_y, mode='lines', line=dict(color='red'), name='Fit'))
-                    fig_qq.update_layout(title="Q-Q Plot (vs Normal)", hovermode="closest", template="plotly_dark", height=350)
+                    fig_qq.update_layout(title="Q-Q Plot (vs Normal)", hovermode="x unified", template="plotly_dark", height=350)
                     st.plotly_chart(fig_qq, use_container_width=True)
                     
                 # 3. Serial Correlation Tests
@@ -8766,20 +8766,6 @@ with tab7:
                             hovertemplate="<b>SELL / EXIT</b><br>%{x}<br>Price: $%{y:,.2f}<extra></extra>"
                         ))
 
-                fig_price.add_annotation(
-                    xref="paper", yref="paper",
-                    x=0.01, y=0.99,
-                    xanchor="left", yanchor="top",
-                    align="left",
-                    text=fixed_info_text,
-                    showarrow=False,
-                    bordercolor="rgba(255,255,255,0.35)",
-                    borderwidth=1,
-                    borderpad=6,
-                    bgcolor="rgba(0,0,0,0.72)",
-                    font=dict(size=12, color="white")
-                )
-
                 fig_price.update_layout(
                     title=f"{TICKER} Regime Switching Price + Entry/Exit Markers",
                     template="plotly_dark",
@@ -8806,143 +8792,35 @@ with tab7:
                     showline=True
                 )
 
-                # Render with a custom fixed top-left hover panel.
-                # Streamlit's normal st.plotly_chart hover box follows the cursor.
-                # This HTML wrapper keeps the changing date/price/buy/sell info fixed
-                # in the top-left corner while the user moves across the chart.
+                # Normal Plotly rendering: no extra overlay box, full chart interaction enabled.
+                # This restores zoom/pan/crosshair/draw-line tools and removes the duplicate
+                # fixed hover panel that was blocking chart surfing.
                 try:
                     fig_price.update_layout(
                         annotations=[
                             a for a in (fig_price.layout.annotations or [])
                             if not (getattr(a, "text", "") == fixed_info_text)
-                        ]
+                        ],
+                        hovermode="x unified",
+                        dragmode="pan"
                     )
                 except Exception:
-                    pass
+                    fig_price.update_layout(hovermode="x unified", dragmode="pan")
 
-                try:
-                    chart_html = fig_price.to_html(
-                        full_html=False,
-                        include_plotlyjs="cdn",
-                        config={
-                            "scrollZoom": True,
-                            "displaylogo": False,
-                            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-                            "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
-                        },
-                        div_id=f"regime_price_chart_{TICKER}_{bt_freq}".replace(".", "_").replace("-", "_")
-                    )
-
-                    hover_panel_id = f"regime_hover_panel_{TICKER}_{bt_freq}".replace(".", "_").replace("-", "_")
-                    chart_div_id = f"regime_price_chart_{TICKER}_{bt_freq}".replace(".", "_").replace("-", "_")
-
-                    html = f"""
-                    <style>
-                        /* Hide Plotly's floating hover tooltip/cube.
-                           The custom fixed panel below replaces it. */
-                        #{chart_div_id} .hoverlayer {{
-                            display: none !important;
-                        }}
-                    </style>
-                    <div style="position:relative; width:100%;">
-                        <div id="{hover_panel_id}" style="
-                            position:absolute;
-                            top:58px;
-                            left:14px;
-                            z-index:9999;
-                            background:rgba(0,0,0,0.74);
-                            color:white;
-                            border:1px solid rgba(255,255,255,0.34);
-                            border-radius:6px;
-                            padding:7px 9px;
-                            font-family:Arial, sans-serif;
-                            font-size:12px;
-                            line-height:1.32;
-                            min-width:185px;
-                            max-width:260px;
-                            pointer-events:none;">
-                            {fixed_info_text}
-                        </div>
-                        {chart_html}
-                    </div>
-                    <script>
-                    (function() {{
-                        const plot = document.getElementById("{chart_div_id}");
-                        const panel = document.getElementById("{hover_panel_id}");
-
-                        function fmtDate(x) {{
-                            try {{
-                                const d = new Date(x);
-                                if (!isNaN(d.getTime())) {{
-                                    return d.toLocaleDateString("en-US", {{year:"numeric", month:"short", day:"numeric"}});
-                                }}
-                            }} catch(e) {{}}
-                            return String(x);
-                        }}
-
-                        function fmtPrice(y) {{
-                            const n = Number(y);
-                            if (Number.isFinite(n)) {{
-                                return "$" + n.toLocaleString("en-US", {{minimumFractionDigits:2, maximumFractionDigits:2}});
-                            }}
-                            return String(y);
-                        }}
-
-                        function updatePanel(evt) {{
-                            if (!evt || !evt.points || evt.points.length === 0) return;
-
-                            let x = evt.points[0].x;
-                            let priceLine = "";
-                            let buyLine = "";
-                            let sellLine = "";
-
-                            evt.points.forEach(function(pt) {{
-                                const nm = (pt.data && pt.data.name) ? pt.data.name : "";
-                                if (nm.includes("Price")) {{
-                                    priceLine = "Price: <b>" + fmtPrice(pt.y) + "</b>";
-                                }} else if (nm.toLowerCase().includes("buy")) {{
-                                    buyLine = "🟢 Buy: <b>" + fmtPrice(pt.y) + "</b>";
-                                }} else if (nm.toLowerCase().includes("sell") || nm.toLowerCase().includes("exit")) {{
-                                    sellLine = "🔴 Sell/Exit: <b>" + fmtPrice(pt.y) + "</b>";
-                                }}
-                            }});
-
-                            if (!priceLine && evt.points[0]) {{
-                                priceLine = "Value: <b>" + fmtPrice(evt.points[0].y) + "</b>";
-                            }}
-
-                            let html = "<b>{TICKER}</b><br>Date: <b>" + fmtDate(x) + "</b><br>" + priceLine;
-                            if (buyLine) html += "<br>" + buyLine;
-                            if (sellLine) html += "<br>" + sellLine;
-                            panel.innerHTML = html;
-                        }}
-
-                        function attach() {{
-                            if (!plot || !panel || typeof plot.on !== "function") {{
-                                setTimeout(attach, 250);
-                                return;
-                            }}
-                            plot.on("plotly_hover", updatePanel);
-                            plot.on("plotly_click", updatePanel);
-                        }}
-                        attach();
-                    }})();
-                    </script>
-                    """
-                    components.html(html, height=620, scrolling=False)
-                except Exception:
-                    st.plotly_chart(
-                        fig_price,
-                        use_container_width=True,
-                        config={{
-                            "scrollZoom": True,
-                            "displaylogo": False,
-                            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-                            "toImageButtonOptions": {{"format": "png", "filename": f"{TICKER}_regime_price_chart"}}
-                        }}
-                    )
+                st.plotly_chart(
+                    fig_price,
+                    use_container_width=True,
+                    config={
+                        "scrollZoom": True,
+                        "displaylogo": False,
+                        "displayModeBar": True,
+                        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                        "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
+                    }
+                )
 
                 safe_report_add("Regime Price Entry Exit Chart", fig_price)
+
             except Exception as plot_err:
                 st.warning(f"Could not render regime price entry/exit graph: {plot_err}")
 
