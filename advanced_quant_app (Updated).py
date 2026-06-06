@@ -10156,7 +10156,31 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     waterfall = (session_move < -0.018) & lower_low_sequence & (mom3 < 0)
     distribution = trend_down_day & lower_high_sequence & (close_location < 0.55)
 
-    trend_up_day = (session_move > 0.010) & (close > vwap) & (ema9 > ema21)
+    # Real trend-up auction filter. A weak early pop is not institutional green momentum.
+    # This blocks the exact problem the user saw: repeated "Green Momentum" buys on a day
+    # that was not actually being controlled by buyers.
+    vwap_slope_up = vwap.diff(5).fillna(0) > 0
+    ema21_slope_up = ema21.diff(5).fillna(0) > 0
+    ema9_slope_up = ema9.diff(3).fillna(0) > 0
+    near_session_high = close >= (rolling_high * 0.996)
+    above_vwap_persist = (close > vwap).rolling(5, min_periods=3).sum() >= 4
+    ema_stack_persist = ((ema5 >= ema9) & (ema9 >= ema21)).rolling(5, min_periods=3).sum() >= 4
+    buyer_close_persist = (close_location > 0.60).rolling(3, min_periods=2).sum() >= 2
+    recent_seller_control = lower_low_sequence.rolling(10, min_periods=1).max().astype(bool)
+    failed_opening_drive = (bar_no < 45) & (close < opening_high) & (rolling_high >= opening_high * 1.001)
+
+    trend_up_day = (
+        (session_move > 0.0075) &
+        above_vwap_persist &
+        ema_stack_persist &
+        vwap_slope_up &
+        ema21_slope_up &
+        ema9_slope_up &
+        near_session_high &
+        buyer_close_persist &
+        (~recent_seller_control) &
+        (~failed_opening_drive)
+    )
     chop_day = (session_move.abs() < 0.005) & (distance_vwap.abs() < 0.0035)
 
     # Capitulation is not an entry. It only says: maybe wait for reversal confirmation.
@@ -10183,15 +10207,35 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         (vol_ratio > 0.75)
     )
 
-    # Green-day continuation. This should be pullback/continuation, not chase.
-    pullback_hold = (trend_up_day & (low <= ema9 * 1.003) & (close > ema9) & (close_location > 0.58) & (mom3 > -0.0008))
-    opening_breakout_quality = (above_opening_high & (close.shift(1) <= opening_high.shift(1).fillna(opening_high)) & (close > vwap) & (vol_ratio > 1.0) & (close_location > 0.62))
+    # Green-day continuation. This is now a BUYER-CONTROL setup only.
+    # No more buying every early pop. It needs a real trend-up auction, persistent VWAP hold,
+    # slope confirmation, and no recent seller-control sequence.
+    pullback_hold = (
+        trend_up_day &
+        (low <= ema9 * 1.002) &
+        (close > ema9) &
+        (close_location > 0.62) &
+        (mom3 > 0.0005) &
+        buyer_close_persist
+    )
+    opening_breakout_quality = (
+        trend_up_day &
+        above_opening_high &
+        (close.shift(1) > opening_high.shift(1).fillna(opening_high)) &
+        (close > vwap) &
+        (vol_ratio > 1.05) &
+        (close_location > 0.65) &
+        (mom3 > 0.0015)
+    )
     green_momentum = (
-        (trend_up_day | above_opening_high) &
-        (close > vwap) & (ema5 >= ema9) & (ema9 >= ema21) &
-        ((pullback_hold) | (opening_breakout_quality) | ((mom3 > 0.0015) & (break_structure_up))) &
-        (distance_vwap < 0.018) &
-        (close_location > 0.56)
+        trend_up_day &
+        (close > vwap) &
+        (ema5 >= ema9) & (ema9 >= ema21) &
+        ((pullback_hold) | (opening_breakout_quality) | ((mom3 > 0.0020) & break_structure_up & near_session_high)) &
+        (distance_vwap < 0.014) &
+        (close_location > 0.62) &
+        (~recent_seller_control) &
+        (~failed_opening_drive)
     )
 
     # VWAP reclaim needs a hold/confirmation, not just touching VWAP.
@@ -10210,6 +10254,12 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     too_extended_up = (distance_vwap > 0.020) | (distance_ema21 > 0.018)
     low_quality_volume = vol_ratio < 0.55
     bad_close = close_location < 0.50
+    # False-green protection: blocks longs when the stock had a pop but buyers are not in control.
+    false_green_pop = (
+        (setup_raw | above_opening_high) &
+        (session_move < 0.0075) &
+        ((~above_vwap_persist) | (~ema_stack_persist) | (~vwap_slope_up) | recent_seller_control | failed_opening_drive)
+    )
     first_minutes_filter = bar_no < max(10, min(20, int(n * 0.06)))
     weak_red_bounce = (session_move < -0.010) & (close < ema9) & (~break_structure_up)
     no_long_below_auction = trend_down_day & (close < opening_mid) & (~red_reversal_confirmed)
@@ -10223,6 +10273,7 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         weak_red_bounce |
         no_long_below_auction |
         require_real_reclaim_on_red |
+        false_green_pop |
         waterfall |
         distribution
     ).fillna(False)
@@ -10260,6 +10311,8 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     risk_penalty += np.where(bad_close, 14, 0)
     risk_penalty += np.where(weak_red_bounce, 24, 0)
     risk_penalty += np.where(no_long_below_auction, 28, 0)
+    risk_penalty += np.where(false_green_pop, 34, 0)
+    risk_penalty += np.where(recent_seller_control, 18, 0)
     trade_quality_score = (alpha_score - risk_penalty).clip(0, 100)
 
     sens = str(sensitivity).lower()
@@ -10344,6 +10397,7 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     model_decision.loc[waterfall] = 'NO TRADE — waterfall / lower lows'
     model_decision.loc[distribution] = 'NO TRADE — distribution below VWAP/EMA'
     model_decision.loc[weak_red_bounce] = 'NO TRADE — weak bounce, no structure'
+    model_decision.loc[false_green_pop] = 'NO TRADE — false green pop / buyers not in control'
     model_decision.loc[too_extended_up] = 'NO TRADE — chase/overextended'
     model_decision.loc[raw_long] = 'QUALIFIED SETUP — waiting debounce/execution'
     model_decision.loc[kalman_buy] = 'ENTER LONG — VWAP/Kalman flush snapback setup'
@@ -10374,6 +10428,11 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'Capitulation Seen': capitulation.astype(int),
         'Waterfall': waterfall.astype(int),
         'Distribution': distribution.astype(int),
+        'False Green Pop': false_green_pop.astype(int),
+        'Above VWAP Persist': above_vwap_persist.astype(int),
+        'EMA Stack Persist': ema_stack_persist.astype(int),
+        'VWAP Slope Up': vwap_slope_up.astype(int),
+        'Recent Seller Control': recent_seller_control.astype(int),
         'Momentum Score': momentum_score.round(1),
         'Reversal Score': reversal_score.round(1),
         'Risk Penalty': risk_penalty.round(1),
