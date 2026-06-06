@@ -10808,7 +10808,7 @@ with tab17:
             cvd = delta.cumsum()
             cvd_ema = cvd.ewm(span=8, adjust=False).mean()
 
-            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. In Exact exit mode, the trade log closes when the visible CVD line crosses below the visible CVD EMA.")
+            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. Trade log exits on exact CVD/EMA cross below, but also has price safety so it does not stay open when price collapses while CVD keeps rising.")
 
             ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
             with ctrl1:
@@ -10818,15 +10818,15 @@ with tab17:
             with ctrl3:
                 breakout_lookback = st.slider("Price breakout lookback", 10, 100, 30, key="cvd_quality_breakout_lookback")
             with ctrl4:
-                trail_stop_pct = st.slider("Protective trail stop %", 2.0, 25.0, 12.0, step=0.5, key="cvd_quality_trail_stop") / 100.0
+                trail_stop_pct = st.slider("Price safety trail %", 2.0, 35.0, 12.0, step=0.5, key="cvd_quality_trail_stop") / 100.0
 
             exit_mode = st.radio(
                 "CVD exit mode",
-                ["Exact CVD/EMA cross below", "Trend-hold filtered exit"],
+                ["Exact CVD/EMA cross below + price safety", "Exact CVD/EMA cross below only", "Trend-hold filtered exit"],
                 index=0,
                 horizontal=True,
                 key="cvd_exit_mode_exact_or_filtered",
-                help="Exact mode closes as soon as the visible CVD line crosses below the visible CVD EMA. Trend-hold mode waits for extra price weakness."
+                help="Default fixes the issue in your screenshot: CVD may stay above EMA while price reverses hard, so price safety exits the trade."
             )
 
             ema20 = cl.ewm(span=20, adjust=False).mean()
@@ -10853,8 +10853,13 @@ with tab17:
             exact_cross_down = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
             filtered_exit = cvd_confirm_exit & (cl < ema50) & (cvd_slope < 0)
 
-            if exit_mode == "Exact CVD/EMA cross below":
+            if exit_mode == "Exact CVD/EMA cross below only":
                 cvd_sell = exact_cross_down.fillna(False)
+            elif exit_mode == "Exact CVD/EMA cross below + price safety":
+                # CVD-only can fail when price dumps but CVD remains above EMA.
+                # Add price safety based on EMA50 break; trailing safety is handled in the trade loop.
+                price_safety_exit = (cl < ema50) & (cl.shift(1) >= ema50.shift(1))
+                cvd_sell = (exact_cross_down | price_safety_exit).fillna(False)
             else:
                 cvd_sell = (filtered_exit & (~filtered_exit.shift(1).fillna(False))).fillna(False)
 
@@ -10885,9 +10890,20 @@ with tab17:
                 elif in_pos:
                     trail_hit = px <= max_price * (1 - trail_stop_pct)
                     signal_exit = bool(cvd_sell.loc[dt]) and bars_held >= int(min_hold_bars)
+
                     if signal_exit or trail_hit:
                         exit_px = px
                         pnl = ((exit_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
+
+                        if trail_hit:
+                            exit_reason = 'Price Safety Trail'
+                        elif bool(exact_cross_down.loc[dt]):
+                            exit_reason = 'Exact CVD/EMA Cross Down'
+                        elif exit_mode == "Exact CVD/EMA cross below + price safety":
+                            exit_reason = 'Price Safety EMA50 Break'
+                        else:
+                            exit_reason = 'Filtered CVD Weakness'
+
                         trades.append({
                             'Setup': 'CVD Core Trend Hold',
                             'Entry Date': entry_dt,
@@ -10901,7 +10917,7 @@ with tab17:
                             'Exit CVD': round(float(cvd.loc[dt]), 0),
                             'Exit CVD EMA': round(float(cvd_ema.loc[dt]), 0),
                             'Status': 'Closed',
-                            'Exit Reason': 'Trail Stop' if trail_hit else ('Exact CVD/EMA Cross Down' if exit_mode == 'Exact CVD/EMA cross below' else 'Filtered CVD Weakness')
+                            'Exit Reason': exit_reason
                         })
                         in_pos = False
                         entry_dt = None
@@ -10958,6 +10974,11 @@ with tab17:
                 if len(exit_idx) > 0:
                     fig.add_trace(go.Scatter(x=exit_idx, y=cl.reindex(exit_idx), mode='markers', name='Sell',
                                              marker=dict(symbol='triangle-down', size=9, color='red')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=exit_idx, y=cvd.reindex(exit_idx), mode='markers', name='Sell on CVD',
+                                             marker=dict(symbol='triangle-down', size=8, color='red')), row=2, col=1)
+                if len(entry_idx) > 0:
+                    fig.add_trace(go.Scatter(x=entry_idx, y=cvd.reindex(entry_idx), mode='markers', name='Buy on CVD',
+                                             marker=dict(symbol='triangle-up', size=8, color='lime')), row=2, col=1)
 
             fig.update_layout(height=650, template='plotly_dark', hovermode='x unified')
             st.plotly_chart(fig, use_container_width=True)
