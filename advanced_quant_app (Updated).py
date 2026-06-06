@@ -8362,9 +8362,36 @@ with tab7:
             except Exception:
                 pass
 
-            # Show newest trades first by default
+            # Show newest trades first by default.
+            # IMPORTANT: weekly intraday timestamp display can create a mixed Entry Date column
+            # (Timestamp objects + strings like "2026-06-05 10:40:00 CT"). Pandas cannot
+            # directly sort mixed tz-aware/tz-naive/string values, so sort by a parsed helper key
+            # and keep the visible Entry Date unchanged.
             if 'Entry Date' in trades_df.columns:
-                trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
+                try:
+                    def _entry_sort_key_for_display(v):
+                        try:
+                            if v is None:
+                                return pd.NaT
+                            s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                            if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                                return pd.NaT
+                            ts = pd.Timestamp(s)
+                            if pd.isna(ts):
+                                return pd.NaT
+                            if getattr(ts, 'tzinfo', None) is not None:
+                                ts = ts.tz_convert(None)
+                            return ts
+                        except Exception:
+                            return pd.NaT
+                    trades_df['__entry_sort_key__'] = trades_df['Entry Date'].apply(_entry_sort_key_for_display)
+                    trades_df = (
+                        trades_df.sort_values('__entry_sort_key__', ascending=False, na_position='last')
+                                 .drop(columns=['__entry_sort_key__'], errors='ignore')
+                                 .reset_index(drop=True)
+                    )
+                except Exception:
+                    trades_df = trades_df.reset_index(drop=True)
             # Remove impossible duplicate/overlapping trade-log rows created by weekly/date mapping.
             trades_df = clean_overlapping_duplicate_trades(trades_df)
             # Format dates
