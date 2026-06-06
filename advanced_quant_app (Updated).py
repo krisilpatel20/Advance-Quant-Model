@@ -10227,13 +10227,40 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         (close_location > 0.65) &
         (mom3 > 0.0015)
     )
+    # Extra institutional green gate: a real green-day momentum long must be a controlled auction,
+    # not just a small morning pop. This is intentionally strict to stop the 3-stop-loss
+    # machine-gun behavior the user saw on AAPL/CMG-style tests.
+    price_path = close.diff().abs().rolling(20, min_periods=8).sum().replace(0, np.nan)
+    trend_efficiency_20 = ((close - close.shift(20)).abs() / price_path).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    positive_auction_20 = (close > close.shift(20)) & (trend_efficiency_20 > 0.32)
+    new_20bar_high_area = close >= high.rolling(20, min_periods=8).max() * 0.998
+    vwap_slope_strong = vwap.diff(10).fillna(0) > 0
+    ema21_slope_strong = ema21.diff(10).fillna(0) > 0
+    above_vwap_8of10 = (close > vwap).rolling(10, min_periods=6).sum() >= 8
+    ema_stack_8of10 = ((ema5 >= ema9) & (ema9 >= ema21)).rolling(10, min_periods=6).sum() >= 8
+    no_recent_close_below_ema21 = (close < ema21).rolling(10, min_periods=3).sum() == 0
+    no_recent_stop_pattern = ((close_location < 0.45) | (ret1 < -0.0025)).rolling(8, min_periods=2).sum() <= 1
+    institutional_green_gate = (
+        (session_move > 0.012) &
+        above_vwap_8of10 &
+        ema_stack_8of10 &
+        positive_auction_20 &
+        new_20bar_high_area &
+        vwap_slope_strong &
+        ema21_slope_strong &
+        no_recent_close_below_ema21 &
+        no_recent_stop_pattern &
+        (vol_ratio > 0.85)
+    )
+
     green_momentum = (
+        institutional_green_gate &
         trend_up_day &
         (close > vwap) &
         (ema5 >= ema9) & (ema9 >= ema21) &
         ((pullback_hold) | (opening_breakout_quality) | ((mom3 > 0.0020) & break_structure_up & near_session_high)) &
-        (distance_vwap < 0.014) &
-        (close_location > 0.62) &
+        (distance_vwap < 0.012) &
+        (close_location > 0.65) &
         (~recent_seller_control) &
         (~failed_opening_drive)
     )
@@ -10433,6 +10460,11 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'EMA Stack Persist': ema_stack_persist.astype(int),
         'VWAP Slope Up': vwap_slope_up.astype(int),
         'Recent Seller Control': recent_seller_control.astype(int),
+        'Institutional Green Gate': institutional_green_gate.astype(int),
+        'Trend Efficiency 20': trend_efficiency_20.round(3),
+        'Above VWAP 8/10': above_vwap_8of10.astype(int),
+        'EMA Stack 8/10': ema_stack_8of10.astype(int),
+        'No Recent Stop Pattern': no_recent_stop_pattern.astype(int),
         'Momentum Score': momentum_score.round(1),
         'Reversal Score': reversal_score.round(1),
         'Risk Penalty': risk_penalty.round(1),
@@ -10565,6 +10597,11 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
                 if trade_ret < 0:
                     consecutive_losses += 1
                     cooldown_bars = int(cooldown_after_loss)
+                    # Capital-protection kill switch: after a stopped long, do not keep firing
+                    # more bounce/momentum entries in the same session. This prevents the exact
+                    # 3-stop-loss sequence the user reported.
+                    disabled = True
+                    disabled_reason = 'First stopped trade hit — session kill switch'
                 else:
                     consecutive_losses = 0
                     cooldown_bars = 2
@@ -10797,7 +10834,7 @@ try:
             trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.30, step=0.05, key='safe_lc_trail') / 100.0
         with c4:
             max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=30, step=5, key='safe_lc_maxhold')
-            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=2, step=1, key='safe_lc_maxtrades')
+            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=1, step=1, key='safe_lc_maxtrades_v2')
 
         c5, c6 = st.columns(2)
         with c5:
@@ -10807,9 +10844,9 @@ try:
 
         c7, c8 = st.columns(2)
         with c7:
-            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=1, step=1, key='safe_lc_max_consec_losses')
+            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=1, step=1, key='safe_lc_max_consec_losses_v2')
         with c8:
-            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=90, value=45, step=1, key='safe_lc_cooldown_loss')
+            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=90, value=45, step=1, key='safe_lc_cooldown_loss_v2')
 
         st.markdown('##### VWAP Z-Score + Kalman Flush/Snapback Add-on')
         k1, k2, k3, k4 = st.columns(4)
@@ -10822,7 +10859,7 @@ try:
         with k4:
             z_window = st.number_input('VWAP std window bars', min_value=5, max_value=80, value=15, step=1, key='safe_lc_z_window')
 
-        st.warning('Auction-quality mode: institutions do not force trades. VWAP/Kalman add-on buys only extreme long-only flushes and exits on snapback; no short selling.')
+        st.warning('Capital-protection mode: no machine-gun entries. One stopped trade disables the session; Green Momentum requires strict buyer-control confirmation. Long-only, no short selling.')
         run_lc = st.button('Fetch TODAY intraday + Run Long-Only Engine', key='safe_lc_run')
 
         if run_lc:
