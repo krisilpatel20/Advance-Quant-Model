@@ -10741,586 +10741,166 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
 
 
 # ==========================================
-# TAB 17: CUMULATIVE VOLUME DELTA (CVD)
+# TAB 17: CVD & VOLUME DELTA
 # ==========================================
 with tab17:
     st.header('📊 CVD & Volume Delta')
     _load_cvd_tab = st.checkbox('Load CVD module', value=False, key='lazy_load_cvd_tab_v3')
     if not _load_cvd_tab:
         st.info('CVD is ready, but not loaded yet. Click the checkbox above to run this tab so the full app stays fast.')
+    elif df_main is None or df_main.empty:
+        st.warning('Please load a ticker first.')
     else:
-        st.write("### 📊 Institutional Cumulative Volume Delta (CVD)")
-        st.markdown("""
-        **CVD** measures the net buying vs selling pressure over time by classifying each bar's volume
-        as buy-initiated or sell-initiated. Rising CVD + Rising Price = Confirmed Uptrend.
-        Divergence between CVD and Price = Institutional Warning Signal.
-        """)
+        try:
+            d = df_main.copy()
+            cl = d['Close']
+            vol = d['Volume'] if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
 
-        if df_main is None:
-            st.warning("Please load a ticker to view CVD analysis.")
-        else:
-            # ── Configuration ──────────────────────────────────────────────────
-            cvd_col1, cvd_col2, cvd_col3 = st.columns(3)
-            with cvd_col1:
-                cvd_method = st.selectbox("Volume Classification Method", [
-                    "Aggressive (Close vs Open)",
-                    "Tick Rule (Close vs Prior Close)",
-                    "High-Low Weighted",
-                    "True Strength (OHLCV)"
-                ], help="How each bar's volume is split into buy vs sell pressure.")
-            with cvd_col2:
-                cvd_smooth = st.slider("CVD Smoothing (EMA span)", 1, 20, 3,
-                                       help="1 = raw CVD, higher = smoother signal")
-            with cvd_col3:
-                cvd_lookback = st.slider("Divergence Lookback (bars)", 5, 60, 20)
+            # Same CVD graph data logic as the uploaded reference file:
+            # delta = volume * sign(close change), CVD = cumulative delta, one EMA line.
+            delta = vol * np.sign(cl.diff().fillna(0))
+            cvd = delta.cumsum()
+            cvd_ema = cvd.ewm(span=8, adjust=False).mean()
 
-            df_cvd = df_main.copy()
+            m1, m2, m3 = st.columns(3)
+            m1.metric('Last Delta', f"{delta.iloc[-1]:+,.0f}")
+            m2.metric('CVD', f"{cvd.iloc[-1]:+,.0f}")
+            m3.metric('Pressure', 'BUYING' if delta.iloc[-1] > 0 else 'SELLING')
 
-            # ── Volume Delta Calculation ────────────────────────────────────────
-            try:
-                hi = df_cvd['High']
-                lo = df_cvd['Low']
-                op = df_cvd['Open']
-                cl = df_cvd['Close']
-                vol = df_cvd['Volume'] if 'Volume' in df_cvd.columns else pd.Series(
-                    np.ones(len(df_cvd)), index=df_cvd.index)
+            # Trade log is based ONLY on this one CVD EMA line:
+            # Long when CVD crosses above CVD EMA; exit when CVD crosses below CVD EMA.
+            cvd_buy = (cvd > cvd_ema) & (cvd.shift(1) <= cvd_ema.shift(1))
+            cvd_sell = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
 
-                if cvd_method == "Aggressive (Close vs Open)":
-                    # Positive delta when close > open (buyers won the bar)
-                    direction = np.sign(cl - op)
-                    delta = vol * direction
+            trades = []
+            in_pos = False
+            entry_dt = None
+            entry_px = None
+            entry_cvd = None
+            entry_ema = None
 
-                elif cvd_method == "Tick Rule (Close vs Prior Close)":
-                    direction = np.sign(cl - cl.shift(1)).fillna(0)
-                    delta = vol * direction
-
-                elif cvd_method == "High-Low Weighted":
-                    # Fraction of vol attributed to buys based on where close lands in H-L range
-                    hl_range = (hi - lo).replace(0, np.nan)
-                    buy_frac = ((cl - lo) / hl_range).fillna(0.5)
-                    sell_frac = 1 - buy_frac
-                    delta = vol * (buy_frac - sell_frac)
-
-                else:  # True Strength (OHLCV)
-                    # Kauffman-style: weights upper wick as selling, lower wick as buying
-                    hl_range = (hi - lo).replace(0, np.nan)
-                    upper_wick = hi - np.maximum(op, cl)
-                    lower_wick = np.minimum(op, cl) - lo
-                    body = np.abs(cl - op)
-                    buy_pressure = lower_wick + 0.5 * body * (cl > op).astype(float)
-                    sell_pressure = upper_wick + 0.5 * body * (cl <= op).astype(float)
-                    delta = vol * (buy_pressure - sell_pressure) / hl_range.fillna(1)
-
-                delta = delta.fillna(0)
-                cvd = delta.cumsum()
-
-                # Optional smoothing
-                if cvd_smooth > 1:
-                    cvd_plot = cvd.ewm(span=cvd_smooth, adjust=False).mean()
-                else:
-                    cvd_plot = cvd
-
-                # ── Divergence Detection ────────────────────────────────────────
-                price_change = cl - cl.shift(cvd_lookback)
-                cvd_change   = cvd - cvd.shift(cvd_lookback)
-
-                bull_div = (price_change < 0) & (cvd_change > 0)   # Price down, CVD up  → hidden bull
-                bear_div = (price_change > 0) & (cvd_change < 0)   # Price up, CVD down  → hidden bear
-
-                # ── Rolling Delta Bars (daily net flow) ─────────────────────────
-                rolling_delta = delta.rolling(window=5).sum()
-
-                # ── Metrics ────────────────────────────────────────────────────
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Cumulative Delta (Total)", f"{cvd.iloc[-1]:+,.0f}")
-                m2.metric("Last Bar Delta", f"{delta.iloc[-1]:+,.0f}")
-                m3.metric("5-Bar Rolling Delta", f"{rolling_delta.iloc[-1]:+,.0f}")
-                latest_pressure = "BUYING" if delta.iloc[-1] > 0 else "SELLING"
-                m4.metric("Latest Pressure", latest_pressure,
-                          delta="Bullish" if latest_pressure == "BUYING" else "Bearish",
-                          delta_color="normal" if latest_pressure == "BUYING" else "inverse")
-
-                if bear_div.iloc[-1]:
-                    st.error("🚨 **BEARISH DIVERGENCE**: Price rising but CVD declining — institutional distribution detected.")
-                elif bull_div.iloc[-1]:
-                    st.success("✅ **BULLISH DIVERGENCE**: Price falling but CVD rising — institutional accumulation detected.")
-                else:
-                    st.info("📊 No significant CVD divergence at current bar.")
-
-                # ── Main Chart ─────────────────────────────────────────────────
-                fig_cvd = make_subplots(
-                    rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                    row_heights=[0.35, 0.25, 0.25, 0.15],
-                    subplot_titles=(
-                        f"{TICKER} Price",
-                        "Cumulative Volume Delta (CVD)",
-                        "Bar-by-Bar Volume Delta",
-                        "5-Bar Rolling Net Flow"
-                    )
-                )
-
-                # Row 1 – Price (candlestick if possible, else line)
-                if all(c in df_cvd.columns for c in ['Open', 'High', 'Low', 'Close']):
-                    fig_cvd.add_trace(go.Candlestick(
-                        x=df_cvd.index, open=df_cvd['Open'], high=df_cvd['High'],
-                        low=df_cvd['Low'], close=df_cvd['Close'],
-                        name="Price", increasing_line_color='#26a69a',
-                        decreasing_line_color='#ef5350', showlegend=False
-                    ), row=1, col=1)
-                else:
-                    fig_cvd.add_trace(go.Scatter(
-                        x=df_cvd.index, y=cl, mode='lines',
-                        line=dict(color='gray', width=1.5), name="Price"
-                    ), row=1, col=1)
-
-                # Mark divergences on price chart
-                bull_dates = df_cvd.index[bull_div]
-                bear_dates = df_cvd.index[bear_div]
-                if len(bull_dates) > 0:
-                    fig_cvd.add_trace(go.Scatter(
-                        x=bull_dates, y=cl[bull_div], mode='markers',
-                        marker=dict(symbol='triangle-up', color='lime', size=10),
-                        name="Bull Divergence"
-                    ), row=1, col=1)
-                if len(bear_dates) > 0:
-                    fig_cvd.add_trace(go.Scatter(
-                        x=bear_dates, y=cl[bear_div], mode='markers',
-                        marker=dict(symbol='triangle-down', color='red', size=10),
-                        name="Bear Divergence"
-                    ), row=1, col=1)
-
-                # Row 2 – CVD
-                fig_cvd.add_trace(go.Scatter(
-                    x=df_cvd.index, y=cvd_plot, mode='lines',
-                    line=dict(color='#00f2ff', width=2), name="CVD"
-                ), row=2, col=1)
-                fig_cvd.add_hline(y=0, line_dash="dash", line_color="white",
-                                  opacity=0.3, row=2, col=1)
-                # Shade positive / negative CVD
-                cvd_pos = cvd_plot.copy(); cvd_pos[cvd_pos < 0] = 0
-                cvd_neg = cvd_plot.copy(); cvd_neg[cvd_neg > 0] = 0
-                fig_cvd.add_trace(go.Scatter(
-                    x=df_cvd.index, y=cvd_pos, fill='tozeroy',
-                    mode='lines', line=dict(width=0),
-                    fillcolor='rgba(0,255,100,0.15)', showlegend=False
-                ), row=2, col=1)
-                fig_cvd.add_trace(go.Scatter(
-                    x=df_cvd.index, y=cvd_neg, fill='tozeroy',
-                    mode='lines', line=dict(width=0),
-                    fillcolor='rgba(255,50,50,0.15)', showlegend=False
-                ), row=2, col=1)
-
-                # Row 3 – Bar Delta (colored bars)
-                bar_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in delta]
-                fig_cvd.add_trace(go.Bar(
-                    x=df_cvd.index, y=delta,
-                    marker_color=bar_colors, name="Bar Delta"
-                ), row=3, col=1)
-
-                # Row 4 – Rolling Net Flow
-                roll_colors = ['#00ff88' if v >= 0 else '#ff4444' for v in rolling_delta]
-                fig_cvd.add_trace(go.Bar(
-                    x=df_cvd.index, y=rolling_delta,
-                    marker_color=roll_colors, name="5-Bar Flow"
-                ), row=4, col=1)
-
-                fig_cvd.update_layout(
-                    height=900, hovermode="x unified", template="plotly_dark",
-                    title=f"Institutional CVD Dashboard — {TICKER}",
-                    xaxis_rangeslider_visible=False
-                )
-                st.plotly_chart(fig_cvd, use_container_width=True)
-
-                # ── CVD Trade Log ──────────────────────────────────────────────
-                st.divider()
-                st.write("#### 📝 CVD Trade Signal Log")
-                st.caption("Signals fired when CVD crosses its own rolling mean — institutional-grade entry/exit confirmation.")
-
-                cvd_ma = cvd.rolling(window=cvd_lookback).mean()
-                cvd_cross_up   = (cvd > cvd_ma) & (cvd.shift(1) <= cvd_ma.shift(1))
-                cvd_cross_down = (cvd < cvd_ma) & (cvd.shift(1) >= cvd_ma.shift(1))
-
-                trade_log_rows = []
-                for dt in df_cvd.index[cvd_cross_up]:
-                    trade_log_rows.append({
-                        "Date": dt.date(),
-                        "Signal": "🟢 BUY (CVD Cross Up)",
-                        "Price": round(float(cl.loc[dt]), 2),
-                        "CVD at Signal": round(float(cvd.loc[dt]), 0),
-                        "Bar Delta": round(float(delta.loc[dt]), 0),
-                        "5-Bar Flow": round(float(rolling_delta.loc[dt]), 0),
-                        "Divergence": "Bull Div" if bull_div.loc[dt] else "None"
+            for dt in d.index:
+                if (not in_pos) and bool(cvd_buy.loc[dt]):
+                    in_pos = True
+                    entry_dt = dt
+                    entry_px = float(cl.loc[dt])
+                    entry_cvd = float(cvd.loc[dt])
+                    entry_ema = float(cvd_ema.loc[dt])
+                elif in_pos and bool(cvd_sell.loc[dt]):
+                    exit_px = float(cl.loc[dt])
+                    pnl = ((exit_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
+                    trades.append({
+                        'Setup': 'CVD EMA Cross',
+                        'Entry Date': entry_dt,
+                        'Exit Date': dt,
+                        'Buy Price': round(entry_px, 4),
+                        'Sell Price': round(exit_px, 4),
+                        'PnL (%)': round(pnl, 3),
+                        'Entry CVD': round(entry_cvd, 0),
+                        'Entry CVD EMA': round(entry_ema, 0),
+                        'Exit CVD': round(float(cvd.loc[dt]), 0),
+                        'Exit CVD EMA': round(float(cvd_ema.loc[dt]), 0),
+                        'Status': 'Closed'
                     })
-                for dt in df_cvd.index[cvd_cross_down]:
-                    trade_log_rows.append({
-                        "Date": dt.date(),
-                        "Signal": "🔴 SELL (CVD Cross Down)",
-                        "Price": round(float(cl.loc[dt]), 2),
-                        "CVD at Signal": round(float(cvd.loc[dt]), 0),
-                        "Bar Delta": round(float(delta.loc[dt]), 0),
-                        "5-Bar Flow": round(float(rolling_delta.loc[dt]), 0),
-                        "Divergence": "Bear Div" if bear_div.loc[dt] else "None"
-                    })
+                    in_pos = False
+                    entry_dt = None
+                    entry_px = None
+                    entry_cvd = None
+                    entry_ema = None
 
-                if trade_log_rows:
-                    tlog_df = pd.DataFrame(trade_log_rows).sort_values("Date", ascending=False)
-                    st.dataframe(tlog_df, use_container_width=True)
+            if in_pos and entry_dt is not None:
+                last_dt = d.index[-1]
+                last_px = float(cl.iloc[-1])
+                pnl = ((last_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
+                trades.append({
+                    'Setup': 'CVD EMA Cross',
+                    'Entry Date': entry_dt,
+                    'Exit Date': 'Open',
+                    'Buy Price': round(entry_px, 4),
+                    'Sell Price': round(last_px, 4),
+                    'PnL (%)': round(pnl, 3),
+                    'Entry CVD': round(entry_cvd, 0),
+                    'Entry CVD EMA': round(entry_ema, 0),
+                    'Exit CVD': round(float(cvd.iloc[-1]), 0),
+                    'Exit CVD EMA': round(float(cvd_ema.iloc[-1]), 0),
+                    'Status': 'Open'
+                })
 
-                    # CVD performance quick-check
-                    buys  = tlog_df[tlog_df['Signal'].str.contains("BUY")]
-                    sells = tlog_df[tlog_df['Signal'].str.contains("SELL")]
-                    st.caption(f"Total CVD Signals: {len(tlog_df)} | Buy Signals: {len(buys)} | Sell Signals: {len(sells)}")
+            # Exact screenshot-style graph: price top, CVD + one EMA bottom.
+            fig = make_subplots(
+                rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                subplot_titles=(f'{TICKER} Price', 'CVD')
+            )
+            fig.add_trace(
+                go.Scatter(x=d.index, y=cl, mode='lines', name='Close', line=dict(width=2)),
+                row=1, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=d.index, y=cvd, mode='lines', name='CVD', line=dict(width=2)),
+                row=2, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=d.index, y=cvd_ema, mode='lines', name='CVD EMA', line=dict(width=2)),
+                row=2, col=1
+            )
 
-                    # Download
-                    csv_cvd = tlog_df.to_csv(index=False)
-                    st.download_button("📥 Download CVD Signal Log", csv_cvd,
-                                       file_name=f"CVD_SignalLog_{TICKER}.csv", mime="text/csv")
-                else:
-                    st.info("No CVD crossover signals in the selected date range.")
-
-                # ── CVD Position Trade Logs ─────────────────────────────────
-                st.divider()
-                st.write("#### 📒 CVD Position Trade Logs")
-                st.caption("Actual long-only trade logs created from CVD position systems. This is different from the signal list above: it pairs buys and sells into completed/open trades.")
-
-                log_ctrl1, log_ctrl2, log_ctrl3 = st.columns(3)
-                with log_ctrl1:
-                    cvd_trade_log_ma_window = st.slider(
-                        "CVD mean-cross window",
-                        5, 100, int(cvd_lookback),
-                        key="cvd_position_trade_log_ma_window",
-                        help="Long when CVD crosses above this rolling mean; exit when it crosses below."
-                    )
-                with log_ctrl2:
-                    cvd_trade_log_fast = st.slider(
-                        "CVD EMA fast",
-                        2, 50, int(max(3, cvd_lookback // 3)),
-                        key="cvd_position_trade_log_fast_ema",
-                        help="Fast EMA used for the CVD EMA-cross trade log."
-                    )
-                with log_ctrl3:
-                    cvd_trade_log_slow = st.slider(
-                        "CVD EMA slow",
-                        3, 150, int(max(8, cvd_lookback)),
-                        key="cvd_position_trade_log_slow_ema",
-                        help="Slow EMA used for the CVD EMA-cross trade log."
-                    )
-
-                if cvd_trade_log_slow <= cvd_trade_log_fast:
-                    cvd_trade_log_slow = cvd_trade_log_fast + 1
-                    st.warning(f"Slow EMA must be greater than fast EMA. Using slow EMA = {cvd_trade_log_slow}.")
-
-                def _display_cvd_position_trade_log(label, position_series, entry_series, exit_series, extra_cols=None, overlay_lines=None):
-                    try:
-                        bt = BacktestEngine.run_strategy(cl, position_series)
-                        trades = bt.get('trades', pd.DataFrame()).copy()
-                        trade_returns = trades['PnL (%)'] if (not trades.empty and 'PnL (%)' in trades.columns) else pd.Series(dtype=float)
-                        closed_mask = trades['Status'].astype(str).str.lower().ne('open') if (not trades.empty and 'Status' in trades.columns) else pd.Series(dtype=bool)
-                        closed = trades[closed_mask].copy() if not trades.empty else pd.DataFrame()
-
-                        mlog1, mlog2, mlog3, mlog4 = st.columns(4)
-                        mlog1.metric("Closed trades", int(len(closed)))
-                        if not closed.empty and 'PnL (%)' in closed.columns:
-                            win_rate = float((closed['PnL (%)'] > 0).mean() * 100.0)
-                            pnl_sum = float(closed['PnL (%)'].sum())
-                            avg_pnl = float(closed['PnL (%)'].mean())
-                        else:
-                            win_rate, pnl_sum, avg_pnl = 0.0, 0.0, 0.0
-                        mlog2.metric("Win rate", f"{win_rate:.1f}%")
-                        mlog3.metric("Sum trade PnL", f"{pnl_sum:+.2f}%")
-                        mlog4.metric("Avg trade PnL", f"{avg_pnl:+.2f}%")
-
-                        if trades.empty:
-                            st.info(f"No {label} trades in the selected range.")
-                            return pd.DataFrame()
-
-                        trades.insert(0, 'Setup', label)
-
-                        # Add CVD context at entry/exit so the log explains why the trade fired.
-                        def _safe_lookup(series, ts):
-                            try:
-                                if ts is None or pd.isna(ts):
-                                    return np.nan
-                                return float(series.reindex(series.index.union([pd.Timestamp(ts)])).sort_index().ffill().loc[pd.Timestamp(ts)])
-                            except Exception:
-                                try:
-                                    return float(series.loc[ts])
-                                except Exception:
-                                    return np.nan
-
-                        trades['Entry CVD'] = trades['Entry Date'].apply(lambda x: round(_safe_lookup(cvd, x), 0))
-                        trades['Exit CVD'] = trades['Exit Date'].apply(lambda x: round(_safe_lookup(cvd, x), 0) if str(x).lower() not in {'none', 'nan', 'nat'} else np.nan)
-                        trades['Entry Bar Delta'] = trades['Entry Date'].apply(lambda x: round(_safe_lookup(delta, x), 0))
-                        trades['Exit Bar Delta'] = trades['Exit Date'].apply(lambda x: round(_safe_lookup(delta, x), 0) if str(x).lower() not in {'none', 'nan', 'nat'} else np.nan)
-
-                        if extra_cols:
-                            for cname, series in extra_cols.items():
-                                trades[f"Entry {cname}"] = trades['Entry Date'].apply(lambda x, s=series: round(_safe_lookup(s, x), 2))
-                                trades[f"Exit {cname}"] = trades['Exit Date'].apply(lambda x, s=series: round(_safe_lookup(s, x), 2) if str(x).lower() not in {'none', 'nan', 'nat'} else np.nan)
-
-                        raw_sort_col = trades['Entry Date'].copy()
-                        try:
-                            display_trades = apply_trade_log_timestamp_display(trades)
-                        except Exception:
-                            display_trades = trades.copy()
-                        display_trades['__sort__'] = pd.to_datetime(raw_sort_col, errors='coerce')
-                        display_trades = display_trades.sort_values('__sort__', ascending=False).drop(columns='__sort__')
-
-                        st.dataframe(display_trades, use_container_width=True)
-                        st.download_button(
-                            f"📥 Download {label} Trade Log",
-                            display_trades.to_csv(index=False),
-                            file_name=f"{label.replace(' ', '_').replace('/', '_')}_TradeLog_{TICKER}.csv",
-                            mime="text/csv",
-                            key=f"download_{label.replace(' ', '_').replace('/', '_')}_{TICKER}"
-                        )
-
-                        try:
-                            # Screenshot-style graph: price on top; CVD and signal line(s) below.
-                            entry_idx = entry_series[entry_series.fillna(False)].index.intersection(cl.index)
-                            exit_idx = exit_series[exit_series.fillna(False)].index.intersection(cl.index)
-
-                            chart = make_subplots(
-                                rows=2, cols=1, shared_xaxes=True,
-                                vertical_spacing=0.10,
-                                row_heights=[0.48, 0.52],
-                                subplot_titles=(f"{TICKER} Price", "CVD")
-                            )
-
-                            chart.add_trace(
-                                go.Scatter(
-                                    x=cl.index, y=cl.values,
-                                    mode='lines',
-                                    name='Close',
-                                    line=dict(width=2, color='#4f7cff')
-                                ),
-                                row=1, col=1
-                            )
-
-                            if len(entry_idx) > 0:
-                                chart.add_trace(
-                                    go.Scatter(
-                                        x=entry_idx,
-                                        y=cl.reindex(entry_idx),
-                                        mode='markers',
-                                        name='Buy',
-                                        marker=dict(symbol='triangle-up', size=9, color='#00ff88')
-                                    ),
-                                    row=1, col=1
-                                )
-                            if len(exit_idx) > 0:
-                                chart.add_trace(
-                                    go.Scatter(
-                                        x=exit_idx,
-                                        y=cl.reindex(exit_idx),
-                                        mode='markers',
-                                        name='Sell',
-                                        marker=dict(symbol='triangle-down', size=9, color='#ff4d4d')
-                                    ),
-                                    row=1, col=1
-                                )
-
-                            chart.add_trace(
-                                go.Scatter(
-                                    x=cvd.index, y=cvd.values,
-                                    mode='lines',
-                                    name='CVD',
-                                    line=dict(width=2, color='#ff8c42')
-                                ),
-                                row=2, col=1
-                            )
-
-                            if overlay_lines:
-                                overlay_colors = ['#66ff99', '#ffd166', '#c084fc']
-                                for i, (name, series) in enumerate(overlay_lines.items()):
-                                    chart.add_trace(
-                                        go.Scatter(
-                                            x=series.index, y=series.values,
-                                            mode='lines',
-                                            name=name,
-                                            line=dict(width=2, color=overlay_colors[i % len(overlay_colors)])
-                                        ),
-                                        row=2, col=1
-                                    )
-
-                            chart.add_hline(y=0, line_width=1, line_color='rgba(255,255,255,0.45)', row=2, col=1)
-                            chart.update_layout(
-                                height=760,
-                                hovermode='x unified',
-                                showlegend=True,
-                                template='plotly_dark',
-                                margin=dict(l=30, r=30, t=55, b=30),
-                                legend=dict(orientation='v', yanchor='top', y=0.98, xanchor='right', x=0.99)
-                            )
-                            chart.update_xaxes(showgrid=False)
-                            chart.update_yaxes(gridcolor='rgba(255,255,255,0.18)', zeroline=False, row=1, col=1)
-                            chart.update_yaxes(gridcolor='rgba(255,255,255,0.18)', zeroline=False, row=2, col=1)
-                            st.plotly_chart(chart, use_container_width=True)
-                        except Exception as chart_err:
-                            st.warning(f"Could not render {label} trade graph: {chart_err}")
-
-                        return display_trades
-                    except Exception as log_err:
-                        st.error(f"{label} trade log failed: {log_err}")
-                        return pd.DataFrame()
-
-                cvd_log_ma = cvd.rolling(window=cvd_trade_log_ma_window, min_periods=cvd_trade_log_ma_window).mean()
-                cvd_log_cross_up = (cvd > cvd_log_ma) & (cvd.shift(1) <= cvd_log_ma.shift(1))
-                cvd_log_cross_down = (cvd < cvd_log_ma) & (cvd.shift(1) >= cvd_log_ma.shift(1))
-                cvd_log_position = make_stateful_position(
-                    cvd_log_cross_up.fillna(False),
-                    cvd_log_cross_down.fillna(False),
-                    df_cvd.index
+            buy_idx = cvd_buy[cvd_buy.fillna(False)].index.intersection(d.index)
+            sell_idx = cvd_sell[cvd_sell.fillna(False)].index.intersection(d.index)
+            if len(buy_idx) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=buy_idx, y=cl.reindex(buy_idx), mode='markers', name='Buy',
+                        marker=dict(symbol='triangle-up', size=9, color='lime')
+                    ),
+                    row=1, col=1
+                )
+            if len(sell_idx) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=sell_idx, y=cl.reindex(sell_idx), mode='markers', name='Sell',
+                        marker=dict(symbol='triangle-down', size=9, color='red')
+                    ),
+                    row=1, col=1
                 )
 
-                cvd_ema_fast_line = cvd.ewm(span=cvd_trade_log_fast, adjust=False).mean()
-                cvd_ema_slow_line = cvd.ewm(span=cvd_trade_log_slow, adjust=False).mean()
-                cvd_ema_cross_up = (cvd_ema_fast_line > cvd_ema_slow_line) & (cvd_ema_fast_line.shift(1) <= cvd_ema_slow_line.shift(1))
-                cvd_ema_cross_down = (cvd_ema_fast_line < cvd_ema_slow_line) & (cvd_ema_fast_line.shift(1) >= cvd_ema_slow_line.shift(1))
-                cvd_ema_position = make_stateful_position(
-                    cvd_ema_cross_up.fillna(False),
-                    cvd_ema_cross_down.fillna(False),
-                    df_cvd.index
+            fig.update_layout(height=650, template='plotly_dark', hovermode='x unified')
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.write('#### 📒 Trade Log — CVD EMA Cross')
+            trades_df = pd.DataFrame(trades)
+            if trades_df.empty:
+                st.info('No CVD EMA-cross trades in the selected range.')
+            else:
+                closed = trades_df[trades_df['Status'].astype(str).str.lower().eq('closed')].copy()
+                c1, c2, c3 = st.columns(3)
+                c1.metric('Closed trades', int(len(closed)))
+                c2.metric('Win rate', f"{((closed['PnL (%)'] > 0).mean() * 100.0) if len(closed) else 0.0:.1f}%")
+                c3.metric('Sum trade PnL', f"{closed['PnL (%)'].sum() if len(closed) else 0.0:+.2f}%")
+
+                try:
+                    display_df = apply_trade_log_timestamp_display(trades_df)
+                except Exception:
+                    display_df = trades_df.copy()
+
+                sort_col = pd.to_datetime(trades_df['Entry Date'], errors='coerce')
+                display_df['__sort__'] = sort_col
+                display_df = display_df.sort_values('__sort__', ascending=False).drop(columns='__sort__')
+                st.dataframe(display_df, use_container_width=True)
+                st.download_button(
+                    '📥 Download CVD EMA Cross Trade Log',
+                    display_df.to_csv(index=False),
+                    file_name=f'CVD_EMA_Cross_TradeLog_{TICKER}.csv',
+                    mime='text/csv'
                 )
 
-                cvd_log_tab1, cvd_log_tab2 = st.tabs(["CVD mean-cross trades", "CVD EMA-cross trades"])
-                with cvd_log_tab1:
-                    st.caption("Long when CVD crosses above its rolling mean. Exit when CVD crosses below its rolling mean.")
-                    cvd_mean_trade_log_df = _display_cvd_position_trade_log(
-                        "CVD Mean Cross",
-                        cvd_log_position,
-                        cvd_log_cross_up,
-                        cvd_log_cross_down,
-                        extra_cols={"CVD Mean": cvd_log_ma},
-                        overlay_lines={"CVD Mean": cvd_log_ma}
-                    )
-                with cvd_log_tab2:
-                    st.caption("Long when the fast CVD EMA crosses above the slow CVD EMA. Exit when the fast CVD EMA crosses below the slow CVD EMA.")
-                    cvd_ema_trade_log_df = _display_cvd_position_trade_log(
-                        "CVD EMA Cross",
-                        cvd_ema_position,
-                        cvd_ema_cross_up,
-                        cvd_ema_cross_down,
-                        extra_cols={"Fast CVD EMA": cvd_ema_fast_line, "Slow CVD EMA": cvd_ema_slow_line},
-                        overlay_lines={"Fast CVD EMA": cvd_ema_fast_line, "Slow CVD EMA": cvd_ema_slow_line}
-                    )
-
-                # ── CVD Adaptive Strategy Backtest ──────────────────────────────
-                st.divider()
-                st.write("#### 🧪 CVD Strategy Backtest")
-                st.caption("Goal: beat buy & hold by using CVD confirmation, price trend, and risk-off exits instead of one weak CVD mean-cross rule.")
-
-                cvd_ma = cvd.rolling(window=cvd_lookback).mean()
-                cvd_fast = cvd.ewm(span=max(3, cvd_lookback // 3), adjust=False).mean()
-                cvd_slow = cvd.ewm(span=max(8, cvd_lookback), adjust=False).mean()
-                ema20 = cl.ewm(span=20, adjust=False).mean()
-                ema50 = cl.ewm(span=50, adjust=False).mean()
-                ema200 = cl.ewm(span=200, adjust=False).mean()
-                price_mom_5 = cl.pct_change(5)
-                price_mom_20 = cl.pct_change(20)
-                cvd_mom_5 = cvd.diff(5)
-                cvd_mom_20 = cvd.diff(20)
-                flow_z = (rolling_delta - rolling_delta.rolling(50).mean()) / (rolling_delta.rolling(50).std() + 1e-9)
-                cvd_high = cvd.rolling(cvd_lookback).max().shift(1)
-                cvd_low = cvd.rolling(cvd_lookback).min().shift(1)
-
-                # Uses the exact CVD line shown in chart row 2.
-                # Long when CVD flips above zero / green zone.
-                # Exit immediately when CVD flips below zero / red zone.
-                cvd_zero_cross_up = (cvd_plot > 0) & (cvd_plot.shift(1) <= 0)
-                cvd_zero_cross_down = (cvd_plot < 0) & (cvd_plot.shift(1) >= 0)
-
-                cvd_position_basic = make_stateful_position(cvd_cross_up, cvd_cross_down, df_cvd.index)
-                cvd_position_zero_flip = make_stateful_position(
-                    cvd_zero_cross_up,
-                    (cvd_plot < 0) | cvd_zero_cross_down,
-                    df_cvd.index
-                )
-                cvd_position_confirmed = make_stateful_position(
-                    (cvd > cvd_ma) & (rolling_delta > 0) & (cl > ema20),
-                    (cvd < cvd_ma) | (rolling_delta < 0) | (cl < ema20),
-                    df_cvd.index
-                )
-                cvd_position_breakout = make_stateful_position(
-                    (cvd > cvd_high) & (cl > ema50) & (price_mom_20 > 0),
-                    (cvd < cvd_ma) | (cl < ema20) | (cvd < cvd_low),
-                    df_cvd.index
-                )
-                cvd_position_smart_money = make_stateful_position(
-                    (cvd_fast > cvd_slow) & (cvd_mom_5 > 0) & (rolling_delta > 0) & (cl > ema50),
-                    (cvd_fast < cvd_slow) | (rolling_delta < 0) | (cl < ema50),
-                    df_cvd.index
-                )
-                cvd_position_accumulation = make_stateful_position(
-                    (cvd_mom_20 > 0) & (price_mom_5 > -0.03) & (cl > ema200) & (flow_z > -0.5),
-                    (cvd_mom_20 < 0) | (cl < ema50) | (flow_z < -1.25),
-                    df_cvd.index
-                )
-                cvd_position_risk_on = make_stateful_position(
-                    (cl > ema20) & (ema20 > ema50) & (cvd > cvd_slow) & (rolling_delta > 0),
-                    (cl < ema20) | (cvd < cvd_slow) | (rolling_delta < 0),
-                    df_cvd.index
-                )
-
-                cvd_candidates = [
-                    ("CVD Zero-Line Flip", "Uses the CVD graph row 2 directly: long when CVD crosses above zero/green, cash immediately when CVD goes below zero/red.", cvd_position_zero_flip),
-                    ("CVD Mean Cross", "Long after CVD crosses above its rolling mean; cash after CVD crosses below.", cvd_position_basic),
-                    ("CVD Confirmed Trend", "Long only when CVD is above mean, rolling flow is positive, and price is above EMA20.", cvd_position_confirmed),
-                    ("CVD Breakout + Price Momentum", "Long when CVD breaks its rolling high while price is above EMA50 and 20-bar momentum is positive.", cvd_position_breakout),
-                    ("Smart-Money CVD Flow", "Long when fast CVD is above slow CVD, CVD momentum is positive, rolling delta is positive, and price is above EMA50.", cvd_position_smart_money),
-                    ("Accumulation Filter", "Long when 20-bar CVD momentum is positive, price is above EMA200, and flow is not strongly negative.", cvd_position_accumulation),
-                    ("Risk-On CVD Trend", "Long only when EMA20 > EMA50, price is above EMA20, CVD is above slow CVD, and rolling delta is positive.", cvd_position_risk_on),
-                ]
-
-                display_adaptive_strategy_lab("CVD", cl, cvd_candidates, file_prefix="CVD_Adaptive_Strategy")
-
-                # ── Delta Profile (Volume at Price bucket) ─────────────────────
-                st.divider()
-                st.write("#### 📊 Delta Profile (Buy vs Sell by Price Bucket)")
-                n_buckets = st.slider("Price Buckets", 10, 50, 20)
-
-                price_min = float(cl.min())
-                price_max = float(cl.max())
-                buckets = np.linspace(price_min, price_max, n_buckets + 1)
-                bucket_labels = [f"{b:.2f}" for b in buckets[:-1]]
-
-                buy_vol  = pd.cut(cl, bins=buckets, labels=bucket_labels).astype(str)
-                buy_profile  = delta.clip(lower=0).groupby(buy_vol).sum()
-                sell_profile = delta.clip(upper=0).abs().groupby(buy_vol).sum()
-
-                fig_profile = go.Figure()
-                fig_profile.add_trace(go.Bar(
-                    y=buy_profile.index, x=buy_profile.values,
-                    orientation='h', name='Buy Volume',
-                    marker_color='rgba(0,200,100,0.7)'
-                ))
-                fig_profile.add_trace(go.Bar(
-                    y=sell_profile.index, x=-sell_profile.values,
-                    orientation='h', name='Sell Volume',
-                    marker_color='rgba(255,80,80,0.7)'
-                ))
-                fig_profile.update_layout(
-                    barmode='overlay', template="plotly_dark",
-                    title="Volume Delta Profile (Price × Buy/Sell Pressure)",
-                    xaxis_title="Delta Volume (Buy=+, Sell=-)",
-                    yaxis_title="Price Level",
-                    height=500, hovermode="y unified"
-                )
-                st.plotly_chart(fig_profile, use_container_width=True)
-
-                if st.session_state.report_gen:
-                    st.session_state.report_gen.add_plot("CVD Dashboard", fig_cvd)
-                    if trade_log_rows:
-                        st.session_state.report_gen.add_data("CVD Trade Log", tlog_df)
-
-            except Exception as e:
-                st.error(f"CVD calculation failed: {e}")
-                st.info("Ensure the ticker has OHLCV data (Volume column required for full analysis).")
+        except Exception as e:
+            st.error(f'CVD calculation failed: {e}')
+            st.info('Ensure the ticker has OHLCV data, especially a Volume column.')
 
 
-    # ==========================================
-    # TAB 18: INSTITUTIONAL VWAP
-    # ==========================================
+# ==========================================
+# TAB 18: INSTITUTIONAL VWAP
+# ==========================================
 with tab18:
     st.header('📈 Institutional VWAP')
     _load_vwap_tab = st.checkbox('Load VWAP module', value=False, key='lazy_load_vwap_tab_v3')
