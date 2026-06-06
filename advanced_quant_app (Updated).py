@@ -10002,7 +10002,75 @@ def _intraday_clean_frame(source_df, today_only=True):
         return pd.DataFrame()
 
 
-def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False, direction_mode='Long Only'):
+
+def _calculate_intraday_vwap_zscore_kalman(d, window=15):
+    """VWAP z-score + causal Kalman estimate for long-only flush/snapback logic.
+
+    Uses only information available up to each bar. No centered windows, no future bars.
+    If pykalman is unavailable, a deterministic one-dimensional Kalman filter is used.
+    """
+    out = d.copy()
+    # Support both app OHLCV capitalization and user-provided lowercase columns.
+    colmap = {c.lower(): c for c in out.columns}
+    high = out[colmap.get('high', 'High')].astype(float) if colmap.get('high', 'High') in out.columns else out[colmap.get('close', 'Close')].astype(float)
+    low = out[colmap.get('low', 'Low')].astype(float) if colmap.get('low', 'Low') in out.columns else out[colmap.get('close', 'Close')].astype(float)
+    close = out[colmap.get('close', 'Close')].astype(float)
+    volume = out[colmap.get('volume', 'Volume')].astype(float) if colmap.get('volume', 'Volume') in out.columns else pd.Series(1.0, index=out.index)
+    volume = volume.replace(0, np.nan).fillna(1.0)
+
+    typical_price = (high + low + close) / 3.0
+    cum_vol = volume.cumsum().replace(0, np.nan)
+    vwap = (typical_price * volume).cumsum() / cum_vol
+
+    # Standard deviation of distance from VWAP is more stable than raw price std.
+    distance = typical_price - vwap
+    vwap_std = distance.rolling(int(window), min_periods=max(5, int(window)//3)).std()
+    fallback_std = typical_price.rolling(int(window), min_periods=max(5, int(window)//3)).std()
+    vwap_std = vwap_std.fillna(fallback_std).replace(0, np.nan)
+    z_score = ((close - vwap) / vwap_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    vals = close.values.astype(float)
+    kalman_vals = np.zeros(len(vals), dtype=float)
+    try:
+        from pykalman import KalmanFilter as _PyKalmanFilter
+        kf = _PyKalmanFilter(
+            transition_matrices=[1],
+            observation_matrices=[1],
+            initial_state_mean=float(vals[0]),
+            initial_state_covariance=1,
+            observation_covariance=1,
+            transition_covariance=0.01,
+        )
+        state_means, _ = kf.filter(vals)
+        kalman_vals = np.asarray(state_means).reshape(-1)
+        kalman_source = 'pykalman'
+    except Exception:
+        # Causal scalar Kalman fallback so the app does not require pykalman install.
+        q = 0.01
+        r = 1.0
+        x = float(vals[0])
+        P = 1.0
+        for i, z in enumerate(vals):
+            P = P + q
+            K = P / (P + r)
+            x = x + K * (float(z) - x)
+            P = (1 - K) * P
+            kalman_vals[i] = x
+        kalman_source = 'internal scalar fallback'
+
+    kalman_price = pd.Series(kalman_vals, index=out.index)
+    kalman_residual = close - kalman_price
+
+    out['VWAP_Z_Typical'] = typical_price
+    out['VWAP_Z_VWAP'] = vwap
+    out['VWAP_Z_STD'] = vwap_std
+    out['VWAP_Z_SCORE'] = z_score
+    out['Kalman Price'] = kalman_price
+    out['Kalman Residual'] = kalman_residual
+    out['Kalman Source'] = kalman_source
+    return out
+
+def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False, direction_mode='Long Only', use_kalman_vwap=False, z_entry=-2.5, z_exit=-1.0, z_window=15):
     """
     Long-only auction-quality intraday engine.
 
@@ -10219,8 +10287,44 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
             last_signal_i = i
         else:
             cleaned.append(False)
-    long_entry = pd.Series(cleaned, index=idx)
+    long_entry_auction = pd.Series(cleaned, index=idx)
     short_entry = pd.Series(False, index=idx)
+
+    # Optional VWAP Z-score + Kalman mean-reversion playbook supplied by user.
+    # Long-only: buy extreme flushes, exit on snapback back inside the band.
+    kalman_buy = pd.Series(False, index=idx)
+    kalman_snapback_exit = pd.Series(False, index=idx)
+    kalman_price = pd.Series(np.nan, index=idx)
+    kalman_residual = pd.Series(np.nan, index=idx)
+    vwap_z_score = pd.Series(np.nan, index=idx)
+    if bool(use_kalman_vwap):
+        try:
+            kv = _calculate_intraday_vwap_zscore_kalman(d, window=int(z_window))
+            vwap_z_score = pd.Series(kv['VWAP_Z_SCORE'], index=idx).astype(float)
+            kalman_price = pd.Series(kv['Kalman Price'], index=idx).astype(float)
+            kalman_residual = pd.Series(kv['Kalman Residual'], index=idx).astype(float)
+
+            raw_kalman_buy = (vwap_z_score < float(z_entry)) & (kalman_residual < 0)
+            # Make it safer than a blind falling-knife buy: require either capitulation, a strong close,
+            # or an early bounce from the session low. Still no shorts.
+            kalman_quality_gate = (capitulation | (close_location > 0.52) | (bounce_from_low > 0.0025)) & (~waterfall.shift(1).fillna(False))
+            raw_kalman_buy = raw_kalman_buy & kalman_quality_gate
+
+            cleaned_k = []
+            last_k = -999
+            for j, val in enumerate(raw_kalman_buy.fillna(False).values):
+                if val and (j - last_k) >= 20:
+                    cleaned_k.append(True)
+                    last_k = j
+                else:
+                    cleaned_k.append(False)
+            kalman_buy = pd.Series(cleaned_k, index=idx)
+            kalman_snapback_exit = (vwap_z_score >= float(z_exit))
+        except Exception:
+            kalman_buy = pd.Series(False, index=idx)
+            kalman_snapback_exit = pd.Series(False, index=idx)
+
+    long_entry = (long_entry_auction | kalman_buy).astype(bool)
 
     day_type = pd.Series('No Edge / Wait', index=idx, dtype='object')
     day_type.loc[chop_day] = 'Chop / Wait'
@@ -10234,6 +10338,7 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     setup_name.loc[vwap_reclaim_quality] = 'VWAP Reclaim Hold Long'
     setup_name.loc[opening_breakout_quality] = 'Opening Range Breakout Long'
     setup_name.loc[red_reclaim_pulse] = 'Confirmed Red-Day Reversal Long'
+    setup_name.loc[kalman_buy] = 'VWAP Z-Score + Kalman Flush Long'
 
     model_decision = pd.Series('WAIT — no proven long edge', index=idx, dtype='object')
     model_decision.loc[waterfall] = 'NO TRADE — waterfall / lower lows'
@@ -10241,7 +10346,8 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     model_decision.loc[weak_red_bounce] = 'NO TRADE — weak bounce, no structure'
     model_decision.loc[too_extended_up] = 'NO TRADE — chase/overextended'
     model_decision.loc[raw_long] = 'QUALIFIED SETUP — waiting debounce/execution'
-    model_decision.loc[long_entry] = 'ENTER LONG — auction confirmed'
+    model_decision.loc[kalman_buy] = 'ENTER LONG — VWAP/Kalman flush snapback setup'
+    model_decision.loc[long_entry_auction] = 'ENTER LONG — auction confirmed'
 
     features = pd.DataFrame({
         'Close': close,
@@ -10250,6 +10356,9 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'EMA9': ema9,
         'EMA21': ema21,
         'EMA50': ema50,
+        'Kalman Price': kalman_price,
+        'Kalman Residual': kalman_residual,
+        'VWAP Z-Score': vwap_z_score,
         'Day Type': day_type,
         'Setup Name': setup_name,
         'Model Decision': model_decision,
@@ -10275,6 +10384,8 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'Confirmed Red Reversal': red_reclaim_pulse.astype(int),
         'VWAP Reclaim Quality': vwap_reclaim_quality.astype(int),
         'Opening Breakout': opening_breakout_quality.astype(int),
+        'Kalman Flush Buy': kalman_buy.astype(int),
+        'Kalman Snapback Exit': kalman_snapback_exit.astype(int),
         'Avoid Filter': avoid.astype(int),
         'Long Entry': long_entry.astype(int),
         'Short Entry': short_entry.astype(int),
@@ -10282,7 +10393,7 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     }, index=idx)
     return long_entry.astype(bool), short_entry.astype(bool), features
 
-def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
+def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_exit_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
                           min_hold_bars=3, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
                           let_winners_run=True, allow_shorts=False, cooldown_after_loss=45, max_consecutive_losses=1):
     """Risk-first single-position intraday engine. Long-only by default.
@@ -10300,6 +10411,9 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_
         short_entry_signal = pd.Series(False, index=close.index)
     short_entry_signal = pd.Series(short_entry_signal, index=close.index).fillna(False).astype(bool)
     long_entry_signal = pd.Series(long_entry_signal, index=close.index).fillna(False).astype(bool)
+    if long_exit_signal is None:
+        long_exit_signal = pd.Series(False, index=close.index)
+    long_exit_signal = pd.Series(long_exit_signal, index=close.index).fillna(False).astype(bool)
 
     initial = 10000.0
     equity = initial
@@ -10342,6 +10456,9 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, target_
                     if lo <= entry_price * (1 - stop_pct):
                         exit_price = entry_price * (1 - stop_pct)
                         exit_reason = 'Long stop hit'
+                    elif bool(long_exit_signal.iloc[i]):
+                        exit_price = px
+                        exit_reason = 'VWAP/Kalman snapback exit'
                     elif let_winners_run and best_price >= entry_price * (1 + target_pct):
                         trail_stop_price = best_price * (1 - trail_pct)
                         if lo <= trail_stop_price:
@@ -10635,7 +10752,18 @@ try:
         with c8:
             cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=90, value=45, step=1, key='safe_lc_cooldown_loss')
 
-        st.warning('Auction-quality mode: institutions do not force trades. If the stock is in a trend-down auction below VWAP/EMA, this tab should say NO TRADE until higher-low + break-of-structure confirmation appears.')
+        st.markdown('##### VWAP Z-Score + Kalman Flush/Snapback Add-on')
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            use_kalman_vwap = st.checkbox('Enable VWAP/Kalman flush logic', value=True, key='safe_lc_use_kalman_vwap')
+        with k2:
+            z_entry = st.number_input('Flush buy Z-score', min_value=-6.0, max_value=-0.5, value=-2.5, step=0.1, key='safe_lc_z_entry')
+        with k3:
+            z_exit = st.number_input('Snapback exit Z-score', min_value=-3.0, max_value=1.0, value=-1.0, step=0.1, key='safe_lc_z_exit')
+        with k4:
+            z_window = st.number_input('VWAP std window bars', min_value=5, max_value=80, value=15, step=1, key='safe_lc_z_window')
+
+        st.warning('Auction-quality mode: institutions do not force trades. VWAP/Kalman add-on buys only extreme long-only flushes and exits on snapback; no short selling.')
         run_lc = st.button('Fetch TODAY intraday + Run Long-Only Engine', key='safe_lc_run')
 
         if run_lc:
@@ -10647,9 +10775,9 @@ try:
                 st.session_state['safe_lc_pack'] = None
                 st.error('No usable intraday candles. Select 1m/5m and Data window = 1d or 5d. This tab no longer uses old 2024 daily rows.')
             else:
-                long_entry, short_entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap), direction_mode=direction_mode)
+                long_entry, short_entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap), direction_mode=direction_mode, use_kalman_vwap=bool(use_kalman_vwap), z_entry=float(z_entry), z_exit=float(z_exit), z_window=int(z_window))
                 trades_df, eq, summ = _run_intraday_capture(
-                    d, long_entry, short_entry,
+                    d, long_entry, short_entry, long_exit_signal=(feats['Kalman Snapback Exit'].astype(bool) if isinstance(feats, pd.DataFrame) and 'Kalman Snapback Exit' in feats.columns else None),
                     target_pct=float(target_pct),
                     stop_pct=float(stop_pct),
                     trail_pct=float(trail_pct),
@@ -10691,6 +10819,8 @@ try:
                 if isinstance(feats, pd.DataFrame) and 'VWAP' in feats.columns:
                     fig.add_trace(go.Scatter(x=feats.index, y=feats['VWAP'], mode='lines', name='VWAP'), row=1, col=1)
                     fig.add_trace(go.Scatter(x=feats.index, y=feats['EMA21'], mode='lines', name='EMA21'), row=1, col=1)
+                    if 'Kalman Price' in feats.columns:
+                        fig.add_trace(go.Scatter(x=feats.index, y=feats['Kalman Price'], mode='lines', name='Kalman Price'), row=1, col=1)
                 if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
                     closed_or_open = trades_df.copy()
                     buys = closed_or_open[closed_or_open['Entry Date'].notna()]
