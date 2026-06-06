@@ -10808,26 +10808,17 @@ with tab17:
             cvd = delta.cumsum()
             cvd_ema = cvd.ewm(span=8, adjust=False).mean()
 
-            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. In Exact exit mode, the trade log closes when the visible CVD line crosses below the visible CVD EMA.")
+            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. Trade log now uses CVD for entry/confirmation, but holds winners through normal CVD noise so monster trends are not sold too early.")
 
             ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
             with ctrl1:
                 confirm_bars = st.slider("CVD confirmation bars", 3, 20, 8, key="cvd_quality_confirm_bars")
             with ctrl2:
-                min_hold_bars = st.slider("Minimum bars to hold", 0, 160, 0, key="cvd_quality_min_hold")
+                min_hold_bars = st.slider("Minimum bars to hold", 5, 160, 40, key="cvd_quality_min_hold")
             with ctrl3:
                 breakout_lookback = st.slider("Price breakout lookback", 10, 100, 30, key="cvd_quality_breakout_lookback")
             with ctrl4:
                 trail_stop_pct = st.slider("Protective trail stop %", 2.0, 25.0, 12.0, step=0.5, key="cvd_quality_trail_stop") / 100.0
-
-            exit_mode = st.radio(
-                "CVD exit mode",
-                ["Exact CVD/EMA cross below", "Trend-hold filtered exit"],
-                index=0,
-                horizontal=True,
-                key="cvd_exit_mode_exact_or_filtered",
-                help="Exact mode closes as soon as the visible CVD line crosses below the visible CVD EMA. Trend-hold mode waits for extra price weakness."
-            )
 
             ema20 = cl.ewm(span=20, adjust=False).mean()
             ema50 = cl.ewm(span=50, adjust=False).mean()
@@ -10847,16 +10838,8 @@ with tab17:
             raw_buy = cvd_confirm_long & (cvd_slope > 0) & price_trend & long_term_ok & (breakout | pullback_reclaim)
             cvd_buy = raw_buy & (~raw_buy.shift(1).fillna(False))
 
-            # Exit must match what the user sees on the CVD graph when Exact mode is selected.
-            # This fixes cases like RKLB where CVD crossed below CVD EMA on May 29 but the
-            # old trend-hold filter kept the trade marked Open.
-            exact_cross_down = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
-            filtered_exit = cvd_confirm_exit & (cl < ema50) & (cvd_slope < 0)
-
-            if exit_mode == "Exact CVD/EMA cross below":
-                cvd_sell = exact_cross_down.fillna(False)
-            else:
-                cvd_sell = (filtered_exit & (~filtered_exit.shift(1).fillna(False))).fillna(False)
+            raw_exit = cvd_confirm_exit & (cl < ema50) & (cvd_slope < 0)
+            cvd_sell = raw_exit & (~raw_exit.shift(1).fillna(False))
 
             trades = []
             in_pos = False
@@ -10901,7 +10884,7 @@ with tab17:
                             'Exit CVD': round(float(cvd.loc[dt]), 0),
                             'Exit CVD EMA': round(float(cvd_ema.loc[dt]), 0),
                             'Status': 'Closed',
-                            'Exit Reason': 'Trail Stop' if trail_hit else ('Exact CVD/EMA Cross Down' if exit_mode == 'Exact CVD/EMA cross below' else 'Filtered CVD Weakness')
+                            'Exit Reason': 'Trail Stop' if trail_hit else 'CVD Weakness'
                         })
                         in_pos = False
                         entry_dt = None
