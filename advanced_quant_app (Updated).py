@@ -1954,6 +1954,7 @@ def _scan_one_regime_recent_trigger(ticker, start_date, end_date, frequency, n_r
                 'Ticker': t,
                 'Action': action,
                 'Trigger Date': pd.Timestamp(actual_date).date(),
+                'Trigger Time CT': _intraday_touch_timestamp_for_weekly_trade(t, actual_date, trigger_price).strftime('%Y-%m-%d %H:%M:%S CT') if str(frequency).lower().startswith('week') and pd.notna(trigger_price) and hasattr(_intraday_touch_timestamp_for_weekly_trade(t, actual_date, trigger_price), 'strftime') else '',
                 'Signal Bar Date': pd.Timestamp(trig_dt).date(),
                 'Trigger Price': round(float(trigger_price), 2) if pd.notna(trigger_price) else np.nan,
                 'Latest Price': round(float(latest_price), 2),
@@ -2266,6 +2267,119 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
         return out
     except Exception:
         return trades_df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str = "5m"):
+    """
+    Fetch recent intraday candles for one trading day.
+    Used only for DISPLAY timestamps in weekly Regime Switching trade logs.
+    It does not change strategy signals, prices, equity curve, stops, or metrics.
+    """
+    try:
+        t = str(ticker).strip().upper().replace('.', '-')
+        if not t:
+            return pd.DataFrame()
+        day = pd.Timestamp(day_str).date()
+        start = pd.Timestamp(day) - pd.Timedelta(days=1)
+        end = pd.Timestamp(day) + pd.Timedelta(days=2)
+        df = yf.download(t, start=start, end=end, interval=interval, progress=False, auto_adjust=False, threads=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = _flatten_yfinance_columns(df, t)
+        if 'Close' not in df.columns:
+            return pd.DataFrame()
+        for c in ['Open', 'High', 'Low']:
+            if c not in df.columns:
+                df[c] = df['Close']
+        idx = pd.DatetimeIndex(df.index)
+        # yfinance intraday is usually timezone-aware. Convert to Central for display.
+        try:
+            if idx.tz is None:
+                idx = idx.tz_localize('America/New_York')
+            idx_ct = idx.tz_convert('America/Chicago')
+        except Exception:
+            idx_ct = pd.to_datetime(df.index)
+        df = df.copy()
+        df.index = idx_ct
+        # Regular session only in Central Time: 8:30-15:00 CT.
+        try:
+            df = df.between_time('08:30', '15:00')
+        except Exception:
+            pass
+        df = df[df.index.date == day]
+        return df[['Open', 'High', 'Low', 'Close']].replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
+    except Exception:
+        return pd.DataFrame()
+
+
+def _intraday_touch_timestamp_for_weekly_trade(ticker: str, dt, target_price, side: str = "entry"):
+    """
+    Display-only timestamp refinement for weekly regime trades.
+
+    Weekly Markov logic can only know the official weekly flip after the weekly bar
+    is closed. But for the trade log, users want the realistic intraday candle time
+    where the displayed buy/sell price was first touched on that trigger date.
+
+    If intraday data is unavailable (older than Yahoo's intraday history), it safely
+    returns the original daily/weekly timestamp.
+    """
+    try:
+        if dt is None or pd.isna(dt) or str(dt).strip().lower() == 'open':
+            return dt
+        px = float(target_price)
+        if not np.isfinite(px) or px <= 0:
+            return dt
+        day = pd.Timestamp(dt).date()
+        # Prefer 5m because it is stable/recent and gives exact practical times like 10:40.
+        intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
+        if intraday is None or intraday.empty:
+            return dt
+        lows = pd.to_numeric(intraday['Low'], errors='coerce')
+        highs = pd.to_numeric(intraday['High'], errors='coerce')
+        closes = pd.to_numeric(intraday['Close'], errors='coerce')
+        touched = intraday[(lows <= px) & (px <= highs)]
+        if not touched.empty:
+            return touched.index[0]
+        # Safe fallback: first candle whose close is closest to the displayed fill.
+        # This is still display-only and avoids inventing a future/next-week time.
+        dist = (closes - px).abs()
+        if dist.notna().any():
+            return dist.idxmin()
+        return dt
+    except Exception:
+        return dt
+
+
+def apply_weekly_regime_intraday_time_display(trades_df, ticker=""):
+    """
+    DISPLAY ONLY.
+    For weekly Regime Switching trade logs, replace date-only Entry/Exit Date values
+    with the first intraday 5-minute CT timestamp where the displayed buy/sell price
+    was touched on that real trigger date. No strategy logic is changed.
+    """
+    try:
+        if trades_df is None or trades_df.empty or not str(ticker).strip():
+            return trades_df
+        out = trades_df.copy()
+        if 'Entry Date' in out.columns and 'Buy Price' in out.columns:
+            out['Entry Date'] = [
+                _intraday_touch_timestamp_for_weekly_trade(str(ticker), dt, bp, side="entry")
+                for dt, bp in zip(out['Entry Date'], out['Buy Price'])
+            ]
+        if 'Exit Date' in out.columns and 'Sell Price' in out.columns:
+            status_series = out.get('Status', pd.Series([''] * len(out), index=out.index))
+            new_exit = []
+            for dt, sp, status in zip(out['Exit Date'], out['Sell Price'], status_series):
+                if str(status).strip().lower() == 'open' or pd.isna(dt):
+                    new_exit.append(dt)
+                else:
+                    new_exit.append(_intraday_touch_timestamp_for_weekly_trade(str(ticker), dt, sp, side="exit"))
+            out['Exit Date'] = new_exit
+        return out
+    except Exception:
+        return trades_df
+
 
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
@@ -8244,6 +8358,7 @@ with tab7:
                     trades_df = apply_weekly_live_trigger_display_overrides(
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
+                    trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
             except Exception:
                 pass
 
