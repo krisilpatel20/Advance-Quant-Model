@@ -3121,6 +3121,25 @@ def buy_hold_return_pct(prices):
     return (px.iloc[-1] / px.iloc[0] - 1) * 100
 
 
+def total_trade_pnl_return_pct(trades_df, include_open=True):
+    """
+    Non-cumulative total trade PnL return.
+
+    Cumulative return compounds account equity trade after trade.
+    Total Trade PnL simply adds each trade's PnL (%) values.
+    """
+    try:
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty or 'PnL (%)' not in trades_df.columns:
+            return 0.0
+        t = trades_df.copy()
+        if not include_open and 'Status' in t.columns:
+            t = t[t['Status'].astype(str).str.lower().ne('open')]
+        vals = pd.to_numeric(t['PnL (%)'], errors='coerce').dropna()
+        return float(vals.sum()) if len(vals) else 0.0
+    except Exception:
+        return 0.0
+
+
 def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=0.18, vol_throttle=True, equity_dd_guard=True, max_equity_dd=0.20, equity_guard_action="Soft Throttle"):
     """
     Causal risk-control overlay for IV Proxy signals.
@@ -4021,24 +4040,27 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         full_benchmark_pct = buy_hold_return_pct(full_period_prices) if full_period_prices is not None else np.nan
         alpha_pct = strat_ret_pct - buyhold_ret_pct
         trades_df = bt_results['trades'].copy()
+        total_pnl_ret_pct = total_trade_pnl_return_pct(trades_df)
         # Show newest trades first by default
         if not trades_df.empty and 'Entry Date' in trades_df.columns:
             trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
 
         st.write(f"#### 📊 {title}: Strategy vs Buy & Hold")
         if full_period_prices is not None and pd.notna(full_benchmark_pct):
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
-            c2.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%", help="Benchmark over the same window used for this strategy result.")
-            c3.metric("Full Benchmark", f"{full_benchmark_pct:.2f}%", help="Buy & hold over the full selected chart period. Reference only if WFO starts after a training window.")
-            c4.metric("Difference vs Test Benchmark", f"{alpha_pct:+.2f}%")
-            c5.metric("Trades", len(trades_df))
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Cumulative Return", f"{strat_ret_pct:.2f}%", help="Compounded strategy/account return.")
+            c2.metric("Total Trade PnL", f"{total_pnl_ret_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+            c3.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%", help="Benchmark over the same window used for this strategy result.")
+            c4.metric("Full Benchmark", f"{full_benchmark_pct:.2f}%", help="Buy & hold over the full selected chart period. Reference only if WFO starts after a training window.")
+            c5.metric("Difference vs Test Benchmark", f"{alpha_pct:+.2f}%")
+            c6.metric("Trades", len(trades_df))
         else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
-            c2.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%")
-            c3.metric("Difference", f"{alpha_pct:+.2f}%")
-            c4.metric("Trades", len(trades_df))
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Cumulative Return", f"{strat_ret_pct:.2f}%", help="Compounded strategy/account return.")
+            c2.metric("Total Trade PnL", f"{total_pnl_ret_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+            c3.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%")
+            c4.metric("Difference", f"{alpha_pct:+.2f}%")
+            c5.metric("Trades", len(trades_df))
 
         fig_perf = go.Figure()
         fig_perf.add_trace(go.Scatter(
@@ -8586,38 +8608,43 @@ with tab7:
         # Metrics
         strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
         bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
+        total_pnl_return_pct = total_trade_pnl_return_pct(bt_results.get('trades', pd.DataFrame()))
         
         # Display Metrics
         st.write("#### 📊 Performance Metrics")
         current_benchmark_pct = (bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100
         if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
-            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
+            met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
             with met_col1:
-                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
             with met_col2:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
             with met_col3:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col5:
                 help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
-            with met_col5:
+            with met_col6:
                 strategy_pct_now = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
                 if benchmark_label_for_metrics == "Full Benchmark":
-                    st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy return minus full-period buy & hold return.")
+                    st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
                 else:
                     st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
         else:
-            met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
             with met_col1:
-                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
             with met_col2:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
             with met_col3:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col5:
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
-            
+
         # Equity Curve Plot
         st.write("#### 📈 Equity Curve")
         fig_bt = go.Figure()
@@ -10759,7 +10786,7 @@ with tab17:
                 ["Current chart data", "Recent 5m intraday precise"],
                 index=0,
                 key="cvd_exact_source_selector",
-                help="Current chart data matches the visible chart. Recent 5m intraday precise gives real intraday timestamps when Yahoo has 5m data."
+                help="Current chart data matches the visible chart. Recent 5m intraday precise gives real 5-minute times when Yahoo has intraday data."
             )
 
             def _normalize_yf_ohlcv(raw):
@@ -10799,47 +10826,66 @@ with tab17:
 
             cl = d['Close'].astype(float)
             high = d['High'].astype(float) if 'High' in d.columns else cl
-            low = d['Low'].astype(float) if 'Low' in d.columns else cl
             vol = d['Volume'] if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
             vol = vol.fillna(0).astype(float)
 
-            # Same graph data: delta = volume * sign(close change), CVD = cumulative delta, one CVD EMA.
+            # EXACT graph data from the reference CVD tab:
+            # delta = volume * sign(close change), CVD = cumulative delta, one CVD EMA.
             delta = vol * np.sign(cl.diff().fillna(0))
             cvd = delta.cumsum()
             cvd_ema = cvd.ewm(span=8, adjust=False).mean()
 
-            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. Trade log now uses CVD for entry/confirmation, but holds winners through normal CVD noise so monster trends are not sold too early.")
+            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. Choose exact graph cross or balanced regime mode.")
 
-            ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
-            with ctrl1:
-                confirm_bars = st.slider("CVD confirmation bars", 3, 20, 8, key="cvd_quality_confirm_bars")
-            with ctrl2:
-                min_hold_bars = st.slider("Minimum bars to hold", 5, 160, 40, key="cvd_quality_min_hold")
-            with ctrl3:
-                breakout_lookback = st.slider("Price breakout lookback", 10, 100, 30, key="cvd_quality_breakout_lookback")
-            with ctrl4:
-                trail_stop_pct = st.slider("Protective trail stop %", 2.0, 25.0, 12.0, step=0.5, key="cvd_quality_trail_stop") / 100.0
+            mode_col1, mode_col2, mode_col3 = st.columns(3)
+            with mode_col1:
+                cvd_trade_mode = st.radio(
+                    "CVD trade mode",
+                    ["Balanced regime", "Exact graph cross"],
+                    index=0,
+                    horizontal=True,
+                    key="cvd_trade_mode_balanced_or_exact",
+                    help="Exact cross is accurate but whipsaws. Balanced regime waits for CVD to actually control the auction, but still exits on the visible CVD/EMA cross down."
+                )
+            with mode_col2:
+                confirm_bars = st.slider(
+                    "Balanced confirm bars",
+                    2, 12, 5,
+                    key="cvd_balanced_confirm_bars",
+                    help="Used only in Balanced regime. Higher means fewer trades."
+                )
+            with mode_col3:
+                use_price_filter = st.checkbox(
+                    "Use price trend filter",
+                    value=True,
+                    key="cvd_balanced_price_filter",
+                    help="Used only in Balanced regime. Blocks CVD buys when price structure is weak."
+                )
 
-            ema20 = cl.ewm(span=20, adjust=False).mean()
-            ema50 = cl.ewm(span=50, adjust=False).mean()
-            ema200 = cl.ewm(span=200, adjust=False).mean()
-            cvd_slope = cvd_ema.diff(5)
-            cvd_above = cvd > cvd_ema
-            cvd_below = cvd < cvd_ema
+            exact_cross_up = (cvd > cvd_ema) & (cvd.shift(1) <= cvd_ema.shift(1))
+            exact_cross_down = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
 
-            cvd_confirm_long = cvd_above.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
-            cvd_confirm_exit = cvd_below.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
-
-            price_trend = (cl > ema50) & (ema20 > ema50)
-            long_term_ok = (len(cl) < 250) | (cl > ema200) | (ema50 > ema200)
-            breakout = cl > high.shift(1).rolling(breakout_lookback, min_periods=max(5, breakout_lookback//2)).max()
-            pullback_reclaim = (cl > ema20) & (cl.shift(1) <= ema20.shift(1)) & price_trend
-
-            raw_buy = cvd_confirm_long & (cvd_slope > 0) & price_trend & long_term_ok & (breakout | pullback_reclaim)
-            cvd_buy = raw_buy & (~raw_buy.shift(1).fillna(False))
-
-            raw_exit = cvd_confirm_exit & (cl < ema50) & (cvd_slope < 0)
-            cvd_sell = raw_exit & (~raw_exit.shift(1).fillna(False))
+            if cvd_trade_mode == "Exact graph cross":
+                cvd_buy = exact_cross_up.fillna(False)
+                cvd_sell = exact_cross_down.fillna(False)
+                setup_name = "Exact CVD/EMA Graph Cross"
+                exit_reason_text = "CVD crossed below CVD EMA"
+            else:
+                # Balanced regime:
+                # - Entry waits for CVD to stay above EMA, EMA to slope up, and price to agree.
+                # - Exit still uses exact visible cross below, so the trade log does not ignore
+                #   the red CVD crossing below green CVD EMA.
+                ema20 = cl.ewm(span=20, adjust=False).mean()
+                ema50 = cl.ewm(span=50, adjust=False).mean()
+                cvd_above = cvd > cvd_ema
+                cvd_confirmed_above = cvd_above.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+                cvd_ema_slope_up = cvd_ema.diff(max(2, confirm_bars // 2)) > 0
+                price_ok = ((cl > ema20) & (ema20 >= ema50)) if use_price_filter else pd.Series(True, index=d.index)
+                raw_buy = cvd_confirmed_above & cvd_ema_slope_up & price_ok
+                cvd_buy = (raw_buy & (~raw_buy.shift(1).fillna(False))).fillna(False)
+                cvd_sell = exact_cross_down.fillna(False)
+                setup_name = "Balanced CVD Regime"
+                exit_reason_text = "Exact CVD/EMA cross down"
 
             trades = []
             in_pos = False
@@ -10847,64 +10893,50 @@ with tab17:
             entry_px = None
             entry_cvd = None
             entry_ema = None
-            bars_held = 0
-            max_price = 0.0
 
             for dt in d.index:
-                px = float(cl.loc[dt])
-                if in_pos:
-                    bars_held += 1
-                    max_price = max(max_price, px)
-
                 if (not in_pos) and bool(cvd_buy.loc[dt]):
                     in_pos = True
-                    bars_held = 0
                     entry_dt = dt
-                    entry_px = px
+                    entry_px = float(cl.loc[dt])
                     entry_cvd = float(cvd.loc[dt])
                     entry_ema = float(cvd_ema.loc[dt])
-                    max_price = px
 
-                elif in_pos:
-                    trail_hit = px <= max_price * (1 - trail_stop_pct)
-                    signal_exit = bool(cvd_sell.loc[dt]) and bars_held >= int(min_hold_bars)
-                    if signal_exit or trail_hit:
-                        exit_px = px
-                        pnl = ((exit_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
-                        trades.append({
-                            'Setup': 'CVD Core Trend Hold',
-                            'Entry Date': entry_dt,
-                            'Exit Date': dt,
-                            'Buy Price': round(entry_px, 4),
-                            'Sell Price': round(exit_px, 4),
-                            'PnL (%)': round(pnl, 3),
-                            'Bars Held': int(bars_held),
-                            'Entry CVD': round(entry_cvd, 0),
-                            'Entry CVD EMA': round(entry_ema, 0),
-                            'Exit CVD': round(float(cvd.loc[dt]), 0),
-                            'Exit CVD EMA': round(float(cvd_ema.loc[dt]), 0),
-                            'Status': 'Closed',
-                            'Exit Reason': 'Trail Stop' if trail_hit else 'CVD Weakness'
-                        })
-                        in_pos = False
-                        entry_dt = None
-                        entry_px = None
-                        entry_cvd = None
-                        entry_ema = None
-                        bars_held = 0
-                        max_price = 0.0
+                elif in_pos and bool(cvd_sell.loc[dt]):
+                    exit_px = float(cl.loc[dt])
+                    pnl = ((exit_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
+                    trades.append({
+                        'Setup': setup_name,
+                        'Entry Date': entry_dt,
+                        'Exit Date': dt,
+                        'Buy Price': round(entry_px, 4),
+                        'Sell Price': round(exit_px, 4),
+                        'PnL (%)': round(pnl, 3),
+                        'Bars Held': int(d.index.get_loc(dt) - d.index.get_loc(entry_dt)) if entry_dt in d.index else np.nan,
+                        'Entry CVD': round(entry_cvd, 0),
+                        'Entry CVD EMA': round(entry_ema, 0),
+                        'Exit CVD': round(float(cvd.loc[dt]), 0),
+                        'Exit CVD EMA': round(float(cvd_ema.loc[dt]), 0),
+                        'Status': 'Closed',
+                        'Exit Reason': exit_reason_text
+                    })
+                    in_pos = False
+                    entry_dt = None
+                    entry_px = None
+                    entry_cvd = None
+                    entry_ema = None
 
             if in_pos and entry_dt is not None:
                 last_px = float(cl.iloc[-1])
                 pnl = ((last_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
                 trades.append({
-                    'Setup': 'CVD Core Trend Hold',
+                    'Setup': setup_name,
                     'Entry Date': entry_dt,
                     'Exit Date': 'Open',
                     'Buy Price': round(entry_px, 4),
                     'Sell Price': round(last_px, 4),
                     'PnL (%)': round(pnl, 3),
-                    'Bars Held': int(bars_held),
+                    'Bars Held': int(len(d) - 1 - d.index.get_loc(entry_dt)) if entry_dt in d.index else np.nan,
                     'Entry CVD': round(entry_cvd, 0),
                     'Entry CVD EMA': round(entry_ema, 0),
                     'Exit CVD': round(float(cvd.iloc[-1]), 0),
@@ -10935,26 +10967,30 @@ with tab17:
                 exit_idx = pd.to_datetime(trades_df.loc[trades_df['Status'].astype(str).str.lower().eq('closed'), 'Exit Date'], errors='coerce').dropna()
                 entry_idx = pd.DatetimeIndex(entry_idx).intersection(d.index)
                 exit_idx = pd.DatetimeIndex(exit_idx).intersection(d.index)
+
                 if len(entry_idx) > 0:
                     fig.add_trace(go.Scatter(x=entry_idx, y=cl.reindex(entry_idx), mode='markers', name='Buy',
                                              marker=dict(symbol='triangle-up', size=9, color='lime')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=entry_idx, y=cvd.reindex(entry_idx), mode='markers', name='Buy on CVD',
+                                             marker=dict(symbol='triangle-up', size=8, color='lime')), row=2, col=1)
                 if len(exit_idx) > 0:
                     fig.add_trace(go.Scatter(x=exit_idx, y=cl.reindex(exit_idx), mode='markers', name='Sell',
                                              marker=dict(symbol='triangle-down', size=9, color='red')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=exit_idx, y=cvd.reindex(exit_idx), mode='markers', name='Sell on CVD',
+                                             marker=dict(symbol='triangle-down', size=8, color='red')), row=2, col=1)
 
             fig.update_layout(height=650, template='plotly_dark', hovermode='x unified')
             st.plotly_chart(fig, use_container_width=True)
 
-            st.write('#### 📒 Trade Log — CVD Core Trend Hold')
+            st.write(f'#### 📒 Trade Log — {setup_name}')
             if trades_df.empty:
-                st.info('No CVD core trend-hold trades in the selected range.')
+                st.info(f'No {setup_name} trades in the selected range.')
             else:
                 closed = trades_df[trades_df['Status'].astype(str).str.lower().eq('closed')].copy()
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3 = st.columns(3)
                 c1.metric('Closed trades', int(len(closed)))
                 c2.metric('Win rate', f"{((closed['PnL (%)'] > 0).mean() * 100.0) if len(closed) else 0.0:.1f}%")
                 c3.metric('Sum trade PnL', f"{closed['PnL (%)'].sum() if len(closed) else 0.0:+.2f}%")
-                c4.metric('Avg trade PnL', f"{closed['PnL (%)'].mean() if len(closed) else 0.0:+.2f}%")
 
                 def _is_date_only_index(idx):
                     try:
@@ -10982,9 +11018,9 @@ with tab17:
                 display_df = display_df.sort_values('__sort__', ascending=False).drop(columns='__sort__')
                 st.dataframe(display_df, use_container_width=True)
                 st.download_button(
-                    '📥 Download CVD Core Trend Hold Trade Log',
+                    f'📥 Download {setup_name} Trade Log',
                     display_df.to_csv(index=False),
-                    file_name=f'CVD_Core_Trend_Hold_TradeLog_{TICKER}.csv',
+                    file_name=f'{setup_name.replace(" ", "_").replace("/", "_")}_TradeLog_{TICKER}.csv',
                     mime='text/csv'
                 )
 
