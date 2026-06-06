@@ -8718,36 +8718,18 @@ with tab7:
 
                 price_for_plot = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
 
-                # Build fixed top-left info box from the latest price and latest completed/open trade.
+                # Initial fixed top-left hover panel.
+                # It intentionally does NOT show latest/open trade details because those belong in the trade log.
                 latest_price_text = "N/A"
                 try:
                     latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
                 except Exception:
                     pass
 
-                latest_trade_text = "No trade"
-                try:
-                    if not plot_trades_df.empty:
-                        _tmp_trades = plot_trades_df.copy()
-                        _tmp_trades["__entry_sort__"] = pd.to_datetime(_tmp_trades.get("Entry Date"), errors="coerce")
-                        _tmp_trades = _tmp_trades.sort_values("__entry_sort__", ascending=False)
-                        _last_trade = _tmp_trades.iloc[0]
-                        _status = str(_last_trade.get("Status", "")).strip()
-                        _entry = str(_last_trade.get("Entry Date", "")).replace(" CT", "").strip()
-                        _exit = str(_last_trade.get("Exit Date", "")).replace(" CT", "").strip()
-                        _buy_px = _last_trade.get("Buy Price", np.nan)
-                        _sell_px = _last_trade.get("Sell Price", np.nan)
-                        if _status.lower() == "open":
-                            latest_trade_text = f"OPEN BUY | {_entry} | Buy ${float(_buy_px):,.2f}" if pd.notna(_buy_px) else f"OPEN BUY | {_entry}"
-                        else:
-                            latest_trade_text = f"CLOSED | Buy {_entry} @ ${float(_buy_px):,.2f} | Sell {_exit} @ ${float(_sell_px):,.2f}" if pd.notna(_buy_px) and pd.notna(_sell_px) else f"CLOSED | Buy {_entry} | Sell {_exit}"
-                except Exception:
-                    latest_trade_text = "Trade info unavailable"
-
                 fixed_info_text = (
                     f"<b>{TICKER}</b><br>"
-                    f"Latest price: <b>{latest_price_text}</b><br>"
-                    f"Latest strategy: {latest_trade_text}"
+                    f"Move cursor on chart<br>"
+                    f"Latest price: <b>{latest_price_text}</b>"
                 )
 
                 fig_price = go.Figure()
@@ -8802,7 +8784,7 @@ with tab7:
                     title=f"{TICKER} Regime Switching Price + Entry/Exit Markers",
                     template="plotly_dark",
                     height=560,
-                    hovermode="x unified",
+                    hovermode="closest",
                     dragmode="pan",
                     margin=dict(l=30, r=30, t=60, b=30),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -8855,22 +8837,29 @@ with tab7:
                     chart_div_id = f"regime_price_chart_{TICKER}_{bt_freq}".replace(".", "_").replace("-", "_")
 
                     html = f"""
+                    <style>
+                        /* Hide Plotly's floating hover tooltip/cube.
+                           The custom fixed panel below replaces it. */
+                        #{chart_div_id} .hoverlayer {{
+                            display: none !important;
+                        }}
+                    </style>
                     <div style="position:relative; width:100%;">
                         <div id="{hover_panel_id}" style="
                             position:absolute;
                             top:58px;
                             left:14px;
                             z-index:9999;
-                            background:rgba(0,0,0,0.76);
+                            background:rgba(0,0,0,0.74);
                             color:white;
-                            border:1px solid rgba(255,255,255,0.38);
+                            border:1px solid rgba(255,255,255,0.34);
                             border-radius:6px;
-                            padding:8px 10px;
+                            padding:7px 9px;
                             font-family:Arial, sans-serif;
                             font-size:12px;
-                            line-height:1.35;
-                            min-width:245px;
-                            max-width:360px;
+                            line-height:1.32;
+                            min-width:185px;
+                            max-width:260px;
                             pointer-events:none;">
                             {fixed_info_text}
                         </div>
