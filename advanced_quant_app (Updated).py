@@ -8814,6 +8814,54 @@ with tab7:
                     chart_div_id = f"regime_price_chart_{TICKER}_{bt_freq}".replace(" ", "_").replace(".", "_").replace("-", "_")
                     hover_panel_id = f"regime_hover_panel_{TICKER}_{bt_freq}".replace(" ", "_").replace(".", "_").replace("-", "_")
 
+                    # Build plain JSON arrays for the fixed top-left panel.
+                    # This avoids Plotly typed-array serialization causing "Price: undefined".
+                    price_points_for_js = []
+                    try:
+                        for _dt, _px in price_for_plot.items():
+                            _ts = pd.Timestamp(_dt)
+                            try:
+                                if getattr(_ts, "tzinfo", None) is not None:
+                                    _ts = _ts.tz_convert(None)
+                            except Exception:
+                                pass
+                            if pd.notna(_px):
+                                price_points_for_js.append({"t": _ts.isoformat(), "p": float(_px)})
+                    except Exception:
+                        price_points_for_js = []
+
+                    buy_points_for_js = []
+                    sell_points_for_js = []
+                    try:
+                        for _tr in fig_price.data:
+                            _name = str(getattr(_tr, "name", "")).lower()
+                            if not ("buy" in _name or "sell" in _name or "exit" in _name):
+                                continue
+                            _xs = list(getattr(_tr, "x", []) or [])
+                            _ys = list(getattr(_tr, "y", []) or [])
+                            for _x, _y in zip(_xs, _ys):
+                                try:
+                                    _ts = pd.Timestamp(_x)
+                                    try:
+                                        if getattr(_ts, "tzinfo", None) is not None:
+                                            _ts = _ts.tz_convert(None)
+                                    except Exception:
+                                        pass
+                                    _point = {"t": _ts.isoformat(), "p": float(_y)}
+                                    if "buy" in _name:
+                                        buy_points_for_js.append(_point)
+                                    elif "sell" in _name or "exit" in _name:
+                                        sell_points_for_js.append(_point)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        buy_points_for_js = []
+                        sell_points_for_js = []
+
+                    price_points_json = json.dumps(price_points_for_js)
+                    buy_points_json = json.dumps(buy_points_for_js)
+                    sell_points_json = json.dumps(sell_points_for_js)
+
                     chart_html = fig_price.to_html(
                         full_html=False,
                         include_plotlyjs="cdn",
@@ -8875,74 +8923,64 @@ with tab7:
                         }}
 
                         function fmtPrice(y) {{
+                            if (y === undefined || y === null || y === "") return "N/A";
                             const n = Number(y);
                             if (Number.isFinite(n)) {{
                                 return "$" + n.toLocaleString("en-US", {{ minimumFractionDigits:2, maximumFractionDigits:2 }});
                             }}
-                            return String(y);
+                            return "N/A";
                         }}
 
-                        function getPriceTrace() {{
-                            if (!plot || !plot.data) return null;
-                            for (let i = 0; i < plot.data.length; i++) {{
-                                const nm = plot.data[i].name ? String(plot.data[i].name).toLowerCase() : "";
-                                if (nm.includes("price")) return plot.data[i];
-                            }}
-                            return plot.data.length ? plot.data[0] : null;
-                        }}
+                        const pricePoints = {price_points_json};
+                        const buyPoints = {buy_points_json};
+                        const sellPoints = {sell_points_json};
 
-                        function nearestPointByX(xVal) {{
-                            const tr = getPriceTrace();
-                            if (!tr || !tr.x || !tr.y || tr.x.length === 0) return null;
+                        function nearestPointByX(xVal, arr) {{
+                            if (!arr || arr.length === 0) return null;
 
                             const target = new Date(xVal).getTime();
-                            let bestI = 0;
+                            let best = null;
                             let bestD = Infinity;
 
-                            for (let i = 0; i < tr.x.length; i++) {{
-                                const tx = new Date(tr.x[i]).getTime();
-                                if (isNaN(tx)) continue;
+                            for (let i = 0; i < arr.length; i++) {{
+                                const tx = new Date(arr[i].t).getTime();
+                                const py = Number(arr[i].p);
+                                if (isNaN(tx) || !Number.isFinite(py)) continue;
                                 const diff = Math.abs(tx - target);
                                 if (diff < bestD) {{
                                     bestD = diff;
-                                    bestI = i;
+                                    best = arr[i];
                                 }}
                             }}
-                            return {{x: tr.x[bestI], y: tr.y[bestI]}};
+                            return best;
+                        }}
+
+                        function sameDay(a, b) {{
+                            try {{
+                                return new Date(a).toDateString() === new Date(b).toDateString();
+                            }} catch(e) {{
+                                return false;
+                            }}
                         }}
 
                         function updatePanelFromX(xVal) {{
                             if (!panel) return;
 
-                            const nearest = nearestPointByX(xVal);
+                            const nearest = nearestPointByX(xVal, pricePoints);
                             if (!nearest) return;
 
-                            const dateTxt = fmtDate(nearest.x);
-                            const priceTxt = fmtPrice(nearest.y);
+                            const dateTxt = fmtDate(nearest.t);
+                            const priceTxt = fmtPrice(nearest.p);
 
-                            // Check whether the nearest date has a buy/sell marker.
                             let signalTxt = "";
                             try {{
-                                const nd = new Date(nearest.x).toDateString();
-                                if (plot && plot.data) {{
-                                    for (let j = 0; j < plot.data.length; j++) {{
-                                        const tr = plot.data[j];
-                                        const nm = tr.name ? String(tr.name).toLowerCase() : "";
-                                        if (!(nm.includes("buy") || nm.includes("sell") || nm.includes("exit"))) continue;
-                                        if (!tr.x || !tr.y) continue;
-
-                                        for (let k = 0; k < tr.x.length; k++) {{
-                                            if (new Date(tr.x[k]).toDateString() === nd) {{
-                                                const markerPrice = fmtPrice(tr.y[k]);
-                                                if (nm.includes("buy")) {{
-                                                    signalTxt = "<br>🟢 Buy: <b>" + markerPrice + "</b>";
-                                                }}
-                                                if (nm.includes("sell") || nm.includes("exit")) {{
-                                                    signalTxt += "<br>🔴 Sell/Exit: <b>" + markerPrice + "</b>";
-                                                }}
-                                            }}
-                                        }}
-                                    }}
+                                const b = buyPoints.filter(p => sameDay(p.t, nearest.t));
+                                const s = sellPoints.filter(p => sameDay(p.t, nearest.t));
+                                if (b.length > 0) {{
+                                    signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b[0].p) + "</b>";
+                                }}
+                                if (s.length > 0) {{
+                                    signalTxt += "<br>🔴 Sell/Exit: <b>" + fmtPrice(s[0].p) + "</b>";
                                 }}
                             }} catch(e) {{}}
 
