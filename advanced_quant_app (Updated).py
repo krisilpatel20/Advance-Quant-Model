@@ -2315,71 +2315,144 @@ def _get_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str
 
 def _intraday_touch_timestamp_for_weekly_trade(ticker: str, dt, target_price, side: str = "entry"):
     """
-    Display-only timestamp refinement for weekly regime trades.
+    Backward-compatible wrapper: returns only the timestamp/display value.
+    """
+    ts, _src = _intraday_touch_timestamp_and_source_for_weekly_trade(ticker, dt, target_price, side=side)
+    return ts
 
-    Weekly Markov logic can only know the official weekly flip after the weekly bar
-    is closed. But for the trade log, users want the realistic intraday candle time
-    where the displayed buy/sell price was first touched on that trigger date.
 
-    If intraday data is unavailable (older than Yahoo's intraday history), it safely
-    returns the original daily/weekly timestamp.
+def _intraday_touch_timestamp_and_source_for_weekly_trade(ticker: str, dt, target_price, side: str = "entry"):
+    """
+    DISPLAY ONLY timestamp refinement for weekly regime trades.
+
+    Returns (timestamp_or_original_dt, source_label):
+    - "exact_5m_touch" when the displayed buy/sell price was inside a 5m candle range.
+    - "nearest_5m_estimate" when 5m data exists but the exact displayed price was not touched.
+    - "intraday_unavailable" when Yahoo/yfinance cannot provide 5m bars for that old date.
+
+    Important: this does NOT change strategy signals, equity curve, PnL logic, or model decisions.
+    It only prevents old weekly trades from being falsely displayed as if they had an exact
+    after-market 15:00 CT intraday trigger.
     """
     try:
         if dt is None or pd.isna(dt) or str(dt).strip().lower() == 'open':
-            return dt
+            return dt, "open"
         px = float(target_price)
         if not np.isfinite(px) or px <= 0:
-            return dt
+            return dt, "no_price"
         day = pd.Timestamp(dt).date()
-        # Prefer 5m because it is stable/recent and gives exact practical times like 10:40.
         intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
         if intraday is None or intraday.empty:
-            return dt
+            return dt, "intraday_unavailable"
         lows = pd.to_numeric(intraday['Low'], errors='coerce')
         highs = pd.to_numeric(intraday['High'], errors='coerce')
         closes = pd.to_numeric(intraday['Close'], errors='coerce')
         touched = intraday[(lows <= px) & (px <= highs)]
         if not touched.empty:
-            return touched.index[0]
-        # Safe fallback: first candle whose close is closest to the displayed fill.
-        # This is still display-only and avoids inventing a future/next-week time.
+            return touched.index[0], "exact_5m_touch"
         dist = (closes - px).abs()
         if dist.notna().any():
-            return dist.idxmin()
-        return dt
+            return dist.idxmin(), "nearest_5m_estimate"
+        return dt, "intraday_unavailable"
     except Exception:
-        return dt
-
+        return dt, "intraday_unavailable"
 
 def apply_weekly_regime_intraday_time_display(trades_df, ticker=""):
     """
     DISPLAY ONLY.
     For weekly Regime Switching trade logs, replace date-only Entry/Exit Date values
     with the first intraday 5-minute CT timestamp where the displayed buy/sell price
-    was touched on that real trigger date. No strategy logic is changed.
+    was touched on that real trigger date.
+
+    For old trades where 5m intraday data is unavailable, it keeps the sortable date
+    internally and tags the row so the final display says intraday time is unavailable
+    instead of falsely showing 15:00 CT as an exact buy/sell time.
     """
     try:
         if trades_df is None or trades_df.empty or not str(ticker).strip():
             return trades_df
         out = trades_df.copy()
+        entry_sources = []
+        exit_sources = []
         if 'Entry Date' in out.columns and 'Buy Price' in out.columns:
-            out['Entry Date'] = [
-                _intraday_touch_timestamp_for_weekly_trade(str(ticker), dt, bp, side="entry")
-                for dt, bp in zip(out['Entry Date'], out['Buy Price'])
-            ]
+            new_entry = []
+            for dt, bp in zip(out['Entry Date'], out['Buy Price']):
+                ts, src = _intraday_touch_timestamp_and_source_for_weekly_trade(str(ticker), dt, bp, side="entry")
+                new_entry.append(ts)
+                entry_sources.append(src)
+            out['Entry Date'] = new_entry
+            out['__Entry Time Source__'] = entry_sources
         if 'Exit Date' in out.columns and 'Sell Price' in out.columns:
             status_series = out.get('Status', pd.Series([''] * len(out), index=out.index))
             new_exit = []
             for dt, sp, status in zip(out['Exit Date'], out['Sell Price'], status_series):
                 if str(status).strip().lower() == 'open' or pd.isna(dt):
                     new_exit.append(dt)
+                    exit_sources.append('open')
                 else:
-                    new_exit.append(_intraday_touch_timestamp_for_weekly_trade(str(ticker), dt, sp, side="exit"))
+                    ts, src = _intraday_touch_timestamp_and_source_for_weekly_trade(str(ticker), dt, sp, side="exit")
+                    new_exit.append(ts)
+                    exit_sources.append(src)
             out['Exit Date'] = new_exit
+            out['__Exit Time Source__'] = exit_sources
         return out
     except Exception:
         return trades_df
 
+
+def finalize_weekly_regime_trade_time_display(trades_df):
+    """
+    DISPLAY ONLY final formatter for weekly Regime Switching trade logs.
+    Replaces fake 15:00 CT timestamps on old rows with an honest label explaining
+    exact 5m intraday time is unavailable. Keeps exact recent rows as normal times.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        out = trades_df.copy()
+
+        def _date_part(v):
+            try:
+                s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                    return str(v)
+                return pd.Timestamp(s).strftime('%Y-%m-%d')
+            except Exception:
+                return str(v)
+
+        if 'Entry Date' in out.columns and '__Entry Time Source__' in out.columns:
+            vals = []
+            for v, src in zip(out['Entry Date'], out['__Entry Time Source__']):
+                src = str(src)
+                if src == 'intraday_unavailable':
+                    vals.append(f"{_date_part(v)} (5m time unavailable)")
+                elif src == 'nearest_5m_estimate':
+                    vals.append(f"{v} (nearest 5m estimate)")
+                else:
+                    vals.append(v)
+            out['Entry Date'] = vals
+
+        if 'Exit Date' in out.columns and '__Exit Time Source__' in out.columns:
+            vals = []
+            for v, src in zip(out['Exit Date'], out['__Exit Time Source__']):
+                src = str(src)
+                if str(v).strip().lower() == 'open' or src == 'open':
+                    vals.append('Open')
+                elif src == 'intraday_unavailable':
+                    vals.append(f"{_date_part(v)} (5m time unavailable)")
+                elif src == 'nearest_5m_estimate':
+                    vals.append(f"{v} (nearest 5m estimate)")
+                else:
+                    vals.append(v)
+            out['Exit Date'] = vals
+
+        out = out.drop(columns=['__Entry Time Source__', '__Exit Time Source__'], errors='ignore')
+        return out
+    except Exception:
+        try:
+            return trades_df.drop(columns=['__Entry Time Source__', '__Exit Time Source__'], errors='ignore')
+        except Exception:
+            return trades_df
 
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
@@ -8396,6 +8469,8 @@ with tab7:
             trades_df = clean_overlapping_duplicate_trades(trades_df)
             # Format dates
             trades_df = apply_trade_log_timestamp_display(trades_df)
+            if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                trades_df = finalize_weekly_regime_trade_time_display(trades_df)
             
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
