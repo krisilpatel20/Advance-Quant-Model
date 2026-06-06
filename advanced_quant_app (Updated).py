@@ -8882,20 +8882,69 @@ with tab7:
                             return String(y);
                         }}
 
-                        function updatePanel(evt) {{
-                            if (!evt || !evt.points || evt.points.length === 0 || !panel) return;
-
-                            const pt = evt.points[0];
-                            const dateTxt = fmtDate(pt.x);
-                            const priceTxt = fmtPrice(pt.y);
-                            let signalTxt = "";
-
-                            const nm = (pt.data && pt.data.name) ? String(pt.data.name).toLowerCase() : "";
-                            if (nm.includes("buy")) {{
-                                signalTxt = "<br>🟢 Buy: <b>" + priceTxt + "</b>";
-                            }} else if (nm.includes("sell") || nm.includes("exit")) {{
-                                signalTxt = "<br>🔴 Sell/Exit: <b>" + priceTxt + "</b>";
+                        function getPriceTrace() {{
+                            if (!plot || !plot.data) return null;
+                            for (let i = 0; i < plot.data.length; i++) {{
+                                const nm = plot.data[i].name ? String(plot.data[i].name).toLowerCase() : "";
+                                if (nm.includes("price")) return plot.data[i];
                             }}
+                            return plot.data.length ? plot.data[0] : null;
+                        }}
+
+                        function nearestPointByX(xVal) {{
+                            const tr = getPriceTrace();
+                            if (!tr || !tr.x || !tr.y || tr.x.length === 0) return null;
+
+                            const target = new Date(xVal).getTime();
+                            let bestI = 0;
+                            let bestD = Infinity;
+
+                            for (let i = 0; i < tr.x.length; i++) {{
+                                const tx = new Date(tr.x[i]).getTime();
+                                if (isNaN(tx)) continue;
+                                const diff = Math.abs(tx - target);
+                                if (diff < bestD) {{
+                                    bestD = diff;
+                                    bestI = i;
+                                }}
+                            }}
+                            return {{x: tr.x[bestI], y: tr.y[bestI]}};
+                        }}
+
+                        function updatePanelFromX(xVal) {{
+                            if (!panel) return;
+
+                            const nearest = nearestPointByX(xVal);
+                            if (!nearest) return;
+
+                            const dateTxt = fmtDate(nearest.x);
+                            const priceTxt = fmtPrice(nearest.y);
+
+                            // Check whether the nearest date has a buy/sell marker.
+                            let signalTxt = "";
+                            try {{
+                                const nd = new Date(nearest.x).toDateString();
+                                if (plot && plot.data) {{
+                                    for (let j = 0; j < plot.data.length; j++) {{
+                                        const tr = plot.data[j];
+                                        const nm = tr.name ? String(tr.name).toLowerCase() : "";
+                                        if (!(nm.includes("buy") || nm.includes("sell") || nm.includes("exit"))) continue;
+                                        if (!tr.x || !tr.y) continue;
+
+                                        for (let k = 0; k < tr.x.length; k++) {{
+                                            if (new Date(tr.x[k]).toDateString() === nd) {{
+                                                const markerPrice = fmtPrice(tr.y[k]);
+                                                if (nm.includes("buy")) {{
+                                                    signalTxt = "<br>🟢 Buy: <b>" + markerPrice + "</b>";
+                                                }}
+                                                if (nm.includes("sell") || nm.includes("exit")) {{
+                                                    signalTxt += "<br>🔴 Sell/Exit: <b>" + markerPrice + "</b>";
+                                                }}
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }} catch(e) {{}}
 
                             panel.innerHTML = "<b>{TICKER}</b><br>"
                                 + "Date: <b>" + dateTxt + "</b><br>"
@@ -8903,14 +8952,41 @@ with tab7:
                                 + signalTxt;
                         }}
 
+                        function updatePanel(evt) {{
+                            if (!evt || !evt.points || evt.points.length === 0) return;
+                            updatePanelFromX(evt.points[0].x);
+                        }}
+
                         function attach() {{
                             if (!plot || typeof plot.on !== "function") {{
                                 setTimeout(attach, 250);
                                 return;
                             }}
+
                             plot.on("plotly_hover", updatePanel);
                             plot.on("plotly_click", updatePanel);
-                            plot.on("plotly_unhover", function(){{}});
+
+                            // Update panel anywhere inside plotting area using mouse x-position.
+                            plot.addEventListener("mousemove", function(e) {{
+                                try {{
+                                    const gd = plot;
+                                    const full = gd._fullLayout;
+                                    if (!full || !full.xaxis) return;
+
+                                    const bb = gd.getBoundingClientRect();
+                                    const xPixel = e.clientX - bb.left - full.margin.l;
+                                    const plotW = full.width - full.margin.l - full.margin.r;
+                                    if (xPixel < 0 || xPixel > plotW) return;
+
+                                    const xr = full.xaxis.range;
+                                    const x0 = new Date(xr[0]).getTime();
+                                    const x1 = new Date(xr[1]).getTime();
+                                    if (isNaN(x0) || isNaN(x1)) return;
+
+                                    const t = x0 + (xPixel / plotW) * (x1 - x0);
+                                    updatePanelFromX(new Date(t));
+                                }} catch(err) {{}}
+                            }});
                         }}
                         attach();
                     }})();
