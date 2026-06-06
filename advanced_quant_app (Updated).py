@@ -4036,30 +4036,115 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
         st.error(f"Error in Decision Engine for {ticker}: {e}")
         return None
 
+def _flatten_yfinance_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Normalize yfinance single-ticker / MultiIndex output."""
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            # Common yfinance structure is (PriceField, Ticker).
+            if ticker in df.columns.get_level_values(-1):
+                df = df.xs(ticker, axis=1, level=-1, drop_level=True)
+            elif ticker in df.columns.get_level_values(0):
+                df = df.xs(ticker, axis=1, level=0, drop_level=True)
+            else:
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    except Exception:
+        pass
+    return df
+
+
+def _market_close_realtime_daily_patch(ticker: str, daily_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fix stale daily close after Friday/market close.
+
+    Yahoo daily bars can lag or exclude the current date because the `end` argument is
+    exclusive. For regime/weekly close logic, we want the latest completed regular
+    session. This helper pulls recent 5m bars and appends/replaces today's daily OHLCV
+    once today's regular session bars exist. It does not use unfinished future data.
+    """
+    try:
+        if daily_df is None or daily_df.empty or 'Close' not in daily_df.columns:
+            return daily_df
+
+        intr = yf.download(ticker, period='5d', interval='5m', progress=False, auto_adjust=False, prepost=False, threads=False)
+        intr = _flatten_yfinance_columns(intr, ticker)
+        if intr is None or intr.empty or 'Close' not in intr.columns:
+            return daily_df
+
+        # Convert intraday bars to US/Central for regular-session day grouping.
+        try:
+            if intr.index.tz is None:
+                intr.index = intr.index.tz_localize('America/New_York').tz_convert('America/Chicago')
+            else:
+                intr.index = intr.index.tz_convert('America/Chicago')
+        except Exception:
+            pass
+
+        # Keep regular session only: 8:30-15:00 CT. Last 5m bar after close is the
+        # practical completed session close proxy when Yahoo daily has not updated yet.
+        intr = intr.between_time('08:30', '15:00') if hasattr(intr, 'between_time') else intr
+        if intr.empty:
+            return daily_df
+
+        session_date = pd.Timestamp(intr.index[-1]).date()
+        last_daily_date = pd.Timestamp(daily_df.index[-1]).date()
+        if session_date < last_daily_date:
+            return daily_df
+
+        day = intr[pd.Series(intr.index.date, index=intr.index).eq(session_date)]
+        if day.empty or len(day) < 10:
+            return daily_df
+
+        row = {
+            'Open': float(day['Open'].iloc[0]) if 'Open' in day.columns else float(day['Close'].iloc[0]),
+            'High': float(day['High'].max()) if 'High' in day.columns else float(day['Close'].max()),
+            'Low': float(day['Low'].min()) if 'Low' in day.columns else float(day['Close'].min()),
+            'Close': float(day['Close'].iloc[-1]),
+            'Volume': float(day['Volume'].sum()) if 'Volume' in day.columns else np.nan,
+        }
+        if 'Adj Close' in daily_df.columns:
+            row['Adj Close'] = row['Close']
+
+        patched = daily_df.copy()
+        session_ts = pd.Timestamp(session_date)
+        # Replace if same date exists; append if daily data is still stuck on yesterday.
+        patched.loc[session_ts, list(row.keys())] = list(row.values())
+        patched = patched.sort_index()
+        return patched
+    except Exception:
+        return daily_df
+
+
 @st.cache_data(ttl=60) # Cache live data for 1 minute
 def load_data(ticker, start, end, interval='1d'):
     try:
-        df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
+        # yfinance's `end` date is EXCLUSIVE for daily bars. If the user selects
+        # Friday as the end date, `end=Friday` often returns Thursday as the last
+        # row. Add one calendar day for daily/weekly/monthly historical requests.
+        download_end = end
+        if interval in ['1d', '1wk', '1mo'] and end is not None:
+            try:
+                download_end = pd.Timestamp(end) + pd.Timedelta(days=1)
+            except Exception:
+                download_end = end
+
+        df = yf.download(ticker, start=start, end=download_end, interval=interval, progress=False, auto_adjust=False, threads=False)
         if df.empty:
             return None
+
+        df = _flatten_yfinance_columns(df, ticker)
             
         # NORMALIZE TIMEZONE: Ensure all data is timezone-naive to avoid join errors
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
 
-        # Handle MultiIndex if present
-        if isinstance(df.columns, pd.MultiIndex):
-            df = df.xs(ticker, axis=1, level=1, drop_level=True) if ticker in df.columns.get_level_values(1) else df
-            # If structure is different (Ticker as top level)
-            if ticker in df.columns:
-                 df = df[ticker]
-            # Fallback for simple single ticker download structure
-            elif 'Close' in df.columns and len(df.columns) > 1 and isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-
         # Standard cleaning
         if 'Close' not in df.columns and 'Adj Close' in df.columns:
             df['Close'] = df['Adj Close']
+
+        # Patch daily data so Friday's completed session close does not stay stuck
+        # on Thursday after the market has already closed.
+        if interval == '1d':
+            df = _market_close_realtime_daily_patch(ticker, df)
             
         if 'Close' in df.columns:
             df['Returns'] = df['Close'].pct_change()
