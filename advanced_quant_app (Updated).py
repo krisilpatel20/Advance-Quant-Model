@@ -5699,6 +5699,32 @@ if fast_intraday_mode:
             out["LOWER_LOW_SEQ"] |
             out["LOWER_HIGH_SEQ"]
         ).fillna(False)
+
+        # Softer but still institutional-quality context for CMG/AAPL-type intraday waves.
+        out["BOUNCE_STRUCTURE_OK"] = (
+            (out["BOUNCE_FROM_LOW_PCT"] >= 0.25) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["MOM_2"] > 0.03) &
+            (out["CLOSE_LOCATION"] >= 0.55) &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+        out["RECLAIM_STRUCTURE_OK"] = (
+            (out["Close"] >= out["VWAP"] * 0.996) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_FAST"].shift(1)) &
+            (out["MOM_2"] > 0.05) &
+            (out["CLOSE_LOCATION"] >= 0.58) &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+        out["ADAPTIVE_TREND_OK"] = (
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_SLOW"]) &
+            (out["MOM_3"] > 0.08) &
+            (out["CLOSE_LOCATION"] >= 0.60) &
+            (out["VOL_RATIO"].fillna(1.0) >= 0.60) &
+            (~out["LOWER_LOW_SEQ"]) &
+            (~out["LOWER_HIGH_SEQ"])
+        ).fillna(False)
         return out
 
     def _fast_build_long_only_signals(df: pd.DataFrame, sensitivity: str, setup_mode: str, require_vwap: bool,
@@ -5747,16 +5773,56 @@ if fast_intraday_mode:
             volume_ok
         )
 
+        # Adaptive runner logic:
+        # - True Green Momentum remains strict.
+        # - Adaptive Trend Runner catches cleaner 0.5–1% waves without requiring the stock to already be +1.2%.
+        # - Dip/Reclaim setups have their own labels and are not mislabeled Green Momentum.
+        adaptive_trend_runner = (
+            out["ADAPTIVE_TREND_OK"] &
+            (out["Close"] >= out["VWAP"] * 0.995) &
+            volume_ok &
+            (~out["DRIFT_DOWN_RISK"])
+        ).fillna(False)
+
+        adaptive_dip_bounce = (
+            (out["FROM_OPEN_PCT"] <= -abs(min_red_drop) * 0.35) &
+            out["BOUNCE_STRUCTURE_OK"] &
+            volume_ok
+        ).fillna(False)
+
+        adaptive_reclaim = (
+            out["RECLAIM_STRUCTURE_OK"] &
+            volume_ok
+        ).fillna(False)
+
         if setup_mode == "Green-Day Momentum Only":
-            entry = green_momentum
+            entry = green_momentum | adaptive_trend_runner
         elif setup_mode == "Red-Day Dip Bounce Only":
-            entry = red_dip_bounce | reclaim_pulse
+            entry = red_dip_bounce | reclaim_pulse | adaptive_dip_bounce | adaptive_reclaim
         else:
-            entry = green_momentum | red_dip_bounce | reclaim_pulse
+            entry = green_momentum | adaptive_trend_runner | red_dip_bounce | reclaim_pulse | adaptive_dip_bounce | adaptive_reclaim
 
         # Avoid impossible repeated entries on every bar. Backtest also enforces one position at a time.
         out["ENTRY_SIGNAL"] = entry.fillna(False)
-        out["SETUP"] = np.where(red_dip_bounce, "Red-Day Dip Bounce", np.where(reclaim_pulse, "Red-Day Reclaim Pulse", np.where(green_momentum, "Green Momentum", "")))
+        out["SETUP"] = np.select(
+            [
+                green_momentum,
+                adaptive_trend_runner,
+                red_dip_bounce,
+                adaptive_dip_bounce,
+                reclaim_pulse,
+                adaptive_reclaim,
+            ],
+            [
+                "True Green Momentum",
+                "Adaptive Trend Runner",
+                "Red-Day Dip Bounce",
+                "Adaptive Dip Bounce",
+                "Red-Day Reclaim Pulse",
+                "Adaptive VWAP Reclaim",
+            ],
+            default=""
+        )
         return out
 
     def _fast_run_long_only_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
@@ -5834,8 +5900,10 @@ if fast_intraday_mode:
 
             reentry_ok = True
             if stopped_once:
-                if setup_now == "Green Momentum":
+                if setup_now == "True Green Momentum":
                     reentry_ok = bool(true_green_now) and (not drift_now)
+                elif setup_now == "Adaptive Trend Runner":
+                    reentry_ok = bool(row.get("ADAPTIVE_TREND_OK", False)) and (not drift_now)
                 else:
                     reentry_ok = (not drift_now)
 
@@ -5873,13 +5941,14 @@ if fast_intraday_mode:
         with colA:
             intraday_interval = st.selectbox("Intraday interval", ["1m", "2m", "5m", "15m", "30m", "60m"], index=2, key="fast_whole_interval")
             intraday_period = st.selectbox("Data window", ["1d", "5d", "7d", "30d"], index=0, key="fast_whole_period")
-            setup_mode_fast = st.selectbox("Setup mode", ["Both Momentum + Dip Bounce", "Green-Day Momentum Only", "Red-Day Dip Bounce Only"], index=0, key="fast_whole_setup")
+            setup_mode_fast = st.selectbox("Setup mode", ["Both Momentum + Dip Bounce", "Green-Day Momentum Only", "Red-Day Dip Bounce Only"], index=0, key="fast_whole_setup",
+                                             help="Both mode now includes Adaptive Trend Runner + Adaptive Dip Bounce + VWAP Reclaim, while fake Green Momentum is blocked.")
         with colB:
-            sensitivity_fast = st.selectbox("Entry sensitivity", ["Aggressive", "Balanced", "Strict"], index=2, key="fast_whole_sens")
+            sensitivity_fast = st.selectbox("Entry sensitivity", ["Aggressive", "Balanced", "Strict"], index=1, key="fast_whole_sens")
             require_vwap_fast = st.checkbox("Require above VWAP for green momentum", value=True, key="fast_whole_vwap")
-            min_red_drop_fast = st.number_input("Red-day trigger: down from open %", 0.2, 15.0, 2.0, 0.1, key="fast_whole_red_drop")
-            bounce_confirm_fast = st.number_input("Bounce from intraday low %", 0.05, 5.0, 0.30, 0.05, key="fast_whole_bounce")
-            min_vol_ratio_fast = st.number_input("Min volume ratio", 0.1, 5.0, 0.8, 0.1, key="fast_whole_vol_ratio")
+            min_red_drop_fast = st.number_input("Red-day trigger: down from open %", 0.2, 15.0, 1.0, 0.1, key="fast_whole_red_drop")
+            bounce_confirm_fast = st.number_input("Bounce from intraday low %", 0.05, 5.0, 0.25, 0.05, key="fast_whole_bounce")
+            min_vol_ratio_fast = st.number_input("Min volume ratio", 0.1, 5.0, 0.6, 0.1, key="fast_whole_vol_ratio")
         with colC:
             target_fast = st.number_input("Base target %", 0.05, 5.0, 0.60, 0.05, key="fast_whole_target")
             stop_fast = st.number_input("Hard stop %", 0.05, 3.0, 0.35, 0.05, key="fast_whole_stop")
