@@ -5670,6 +5670,35 @@ if fast_intraday_mode:
         out["MOM_1"] = out["Close"].pct_change(1) * 100.0
         out["MOM_2"] = out["Close"].pct_change(2) * 100.0
         out["MOM_3"] = out["Close"].pct_change(3) * 100.0
+        rng = (out["High"] - out["Low"]).replace(0, np.nan)
+        out["CLOSE_LOCATION"] = ((out["Close"] - out["Low"]) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.5)
+        out["LOWER_LOW_SEQ"] = ((out["Low"] <= out["Low"].shift(1)) & (out["Low"].shift(1) <= out["Low"].shift(2))).fillna(False)
+        out["LOWER_HIGH_SEQ"] = ((out["High"] <= out["High"].shift(1)) & (out["High"].shift(1) <= out["High"].shift(2))).fillna(False)
+        out["VWAP_SLOPE_5"] = out["VWAP"].diff(5)
+        out["EMA_GUARD_SLOPE_5"] = out["EMA_GUARD"].diff(5)
+        out["ABOVE_VWAP_8OF10"] = (out["Close"] > out["VWAP"]).rolling(10, min_periods=5).sum() >= 8
+        out["EMA_STACK_8OF10"] = ((out["EMA_FAST"] > out["EMA_SLOW"]) & (out["EMA_SLOW"] > out["EMA_GUARD"])).rolling(10, min_periods=5).sum() >= 8
+        out["TRUE_GREEN_AUCTION"] = (
+            (out["FROM_OPEN_PCT"] >= 1.20) &
+            (out["Close"] > out["VWAP"]) &
+            (out["Close"] > out["EMA_GUARD"]) &
+            (out["EMA_FAST"] > out["EMA_SLOW"]) &
+            (out["EMA_SLOW"] > out["EMA_GUARD"]) &
+            (out["VWAP_SLOPE_5"] > 0) &
+            (out["EMA_GUARD_SLOPE_5"] > 0) &
+            (out["ABOVE_VWAP_8OF10"]) &
+            (out["EMA_STACK_8OF10"]) &
+            (~out["LOWER_LOW_SEQ"]) &
+            (~out["LOWER_HIGH_SEQ"]) &
+            (out["CLOSE_LOCATION"] >= 0.68)
+        ).fillna(False)
+        out["DRIFT_DOWN_RISK"] = (
+            (out["FROM_OPEN_PCT"] < 0.50) |
+            (out["Close"] < out["VWAP"]) |
+            (out["Close"] < out["EMA_GUARD"]) |
+            out["LOWER_LOW_SEQ"] |
+            out["LOWER_HIGH_SEQ"]
+        ).fillna(False)
         return out
 
     def _fast_build_long_only_signals(df: pd.DataFrame, sensitivity: str, setup_mode: str, require_vwap: bool,
@@ -5685,11 +5714,15 @@ if fast_intraday_mode:
         vwap_ok = (out["Close"] >= out["VWAP"]) if require_vwap else pd.Series(True, index=out.index)
         volume_ok = out["VOL_RATIO"].fillna(1.0) >= min_vol_ratio
 
+        # TRUE Green Momentum only.
+        # A small bounce on a red/drifting-down day is NOT Green Momentum.
         green_momentum = (
-            (out["MOM_3"] >= mom_req) &
+            out["TRUE_GREEN_AUCTION"] &
+            (out["MOM_3"] >= max(mom_req, 0.18)) &
             (out["Close"] > out["EMA_FAST"]) &
             ((out["EMA_FAST"] > out["EMA_SLOW"]) if ema_req else True) &
-            vwap_ok & volume_ok
+            vwap_ok & volume_ok &
+            (~out["DRIFT_DOWN_RISK"])
         )
 
         # Long-only red-day bounce: no short selling. Wait for panic/drop, then buy the reclaim bounce.
@@ -5704,9 +5737,13 @@ if fast_intraday_mode:
         # Failed selloff reclaim: useful when stock falls hard, bounces, dips again, then bounces again.
         reclaim_pulse = (
             (out["FROM_OPEN_PCT"] <= -abs(min_red_drop) * 0.75) &
+            (out["BOUNCE_FROM_LOW_PCT"] >= bounce_confirm) &
             (out["Close"] > out["EMA_FAST"]) &
+            (out["Close"] >= out["VWAP"] * 0.998) &
             (out["EMA_FAST"] >= out["EMA_FAST"].shift(1)) &
-            (out["MOM_2"] > 0) &
+            (out["MOM_2"] > 0.10) &
+            (out["CLOSE_LOCATION"] >= 0.62) &
+            (~out["LOWER_LOW_SEQ"]) &
             volume_ok
         )
 
@@ -5731,6 +5768,8 @@ if fast_intraday_mode:
         high_since = None
         bars_held = 0
         cooldown = 0
+        consecutive_stops = 0
+        stopped_once = False
 
         for i in range(len(df)):
             row = df.iloc[i]
@@ -5776,17 +5815,35 @@ if fast_intraday_mode:
                         "Exit Reason": exit_reason,
                         "Bars Held": bars_held,
                     })
+                    if exit_reason == "Stop":
+                        consecutive_stops += 1
+                        stopped_once = True
+                        cooldown = max(int(cooldown_bars), 20)
+                    else:
+                        consecutive_stops = 0
+                        cooldown = int(cooldown_bars)
                     in_pos = False
-                    cooldown = cooldown_bars
-                    if len(trades) >= max_trades:
+                    if len(trades) >= max_trades or consecutive_stops >= 2:
                         break
                     continue
 
-            if (not in_pos) and cooldown == 0 and bool(row.get("ENTRY_SIGNAL", False)):
+            entry_signal_now = bool(row.get("ENTRY_SIGNAL", False))
+            setup_now = str(row.get("SETUP", "Long")) or "Long"
+            drift_now = bool(row.get("DRIFT_DOWN_RISK", True))
+            true_green_now = bool(row.get("TRUE_GREEN_AUCTION", False))
+
+            reentry_ok = True
+            if stopped_once:
+                if setup_now == "Green Momentum":
+                    reentry_ok = bool(true_green_now) and (not drift_now)
+                else:
+                    reentry_ok = (not drift_now)
+
+            if (not in_pos) and cooldown == 0 and entry_signal_now and reentry_ok and consecutive_stops < 2:
                 in_pos = True
                 entry_price = price
                 entry_time = ts
-                entry_setup = str(row.get("SETUP", "Long")) or "Long"
+                entry_setup = setup_now
                 stop_price = entry_price * (1.0 - stop_pct / 100.0)
                 target_price = entry_price * (1.0 + target_pct / 100.0)
                 high_since = price
@@ -5818,8 +5875,8 @@ if fast_intraday_mode:
             intraday_period = st.selectbox("Data window", ["1d", "5d", "7d", "30d"], index=0, key="fast_whole_period")
             setup_mode_fast = st.selectbox("Setup mode", ["Both Momentum + Dip Bounce", "Green-Day Momentum Only", "Red-Day Dip Bounce Only"], index=0, key="fast_whole_setup")
         with colB:
-            sensitivity_fast = st.selectbox("Entry sensitivity", ["Aggressive", "Balanced", "Strict"], index=0, key="fast_whole_sens")
-            require_vwap_fast = st.checkbox("Require above VWAP for green momentum", value=False, key="fast_whole_vwap")
+            sensitivity_fast = st.selectbox("Entry sensitivity", ["Aggressive", "Balanced", "Strict"], index=2, key="fast_whole_sens")
+            require_vwap_fast = st.checkbox("Require above VWAP for green momentum", value=True, key="fast_whole_vwap")
             min_red_drop_fast = st.number_input("Red-day trigger: down from open %", 0.2, 15.0, 2.0, 0.1, key="fast_whole_red_drop")
             bounce_confirm_fast = st.number_input("Bounce from intraday low %", 0.05, 5.0, 0.30, 0.05, key="fast_whole_bounce")
             min_vol_ratio_fast = st.number_input("Min volume ratio", 0.1, 5.0, 0.8, 0.1, key="fast_whole_vol_ratio")
@@ -5829,8 +5886,8 @@ if fast_intraday_mode:
             runner_fast = st.checkbox("Let winners run after target", value=True, key="fast_whole_runner")
             trail_fast = st.number_input("Runner trail %", 0.05, 3.0, 0.35, 0.05, key="fast_whole_trail")
             max_hold_fast = st.number_input("Max hold bars", 2, 200, 30, 1, key="fast_whole_hold")
-            max_trades_fast = st.number_input("Max trades", 1, 100, 10, 1, key="fast_whole_max_trades")
-            cooldown_fast = st.number_input("Cooldown bars", 0, 50, 3, 1, key="fast_whole_cooldown")
+            max_trades_fast = st.number_input("Max trades", 1, 20, 8, 1, key="fast_whole_max_trades")
+            cooldown_fast = st.number_input("Cooldown bars", 0, 80, 20, 1, key="fast_whole_cooldown")
 
         run_fast = st.button("Fetch latest intraday session + Run Long-Only Engine", type="primary", use_container_width=True, key="fast_whole_run")
         if not run_fast:
