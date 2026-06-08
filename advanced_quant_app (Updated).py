@@ -10764,6 +10764,17 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     - overextended chase
     - low volume / bad candle close
     """
+    # Adaptive edge mode: enough trade attempts to capture multiple waves,
+    # but no unlimited machine-gun behavior.
+    try:
+        max_trades = max(1, min(int(max_trades), 15))
+    except Exception:
+        max_trades = 8
+    try:
+        max_consecutive_losses = max(1, int(max_consecutive_losses))
+    except Exception:
+        max_consecutive_losses = 2
+
     close = d['Close'].astype(float)
     high = d['High'].astype(float) if 'High' in d.columns else close
     low = d['Low'].astype(float) if 'Low' in d.columns else close
@@ -11159,7 +11170,8 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
 
 def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_exit_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
                           min_hold_bars=3, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
-                          let_winners_run=True, allow_shorts=False, cooldown_after_loss=45, max_consecutive_losses=1):
+                          let_winners_run=True, allow_shorts=False, cooldown_after_loss=12, max_consecutive_losses=2,
+                          quality_score=None, reentry_quality_boost=8.0, session_profit_target_pct=0.05):
     """Risk-first single-position intraday engine. Long-only by default.
 
     Capital protection upgrades:
@@ -11175,6 +11187,10 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
         short_entry_signal = pd.Series(False, index=close.index)
     short_entry_signal = pd.Series(short_entry_signal, index=close.index).fillna(False).astype(bool)
     long_entry_signal = pd.Series(long_entry_signal, index=close.index).fillna(False).astype(bool)
+    if quality_score is None:
+        quality_score = pd.Series(100.0, index=close.index)
+    else:
+        quality_score = pd.Series(quality_score, index=close.index).reindex(close.index).ffill().fillna(0.0).astype(float)
     if long_exit_signal is None:
         long_exit_signal = pd.Series(False, index=close.index)
     long_exit_signal = pd.Series(long_exit_signal, index=close.index).fillna(False).astype(bool)
@@ -11270,14 +11286,18 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
                 if trade_ret < 0:
                     consecutive_losses += 1
                     cooldown_bars = int(cooldown_after_loss)
-                    # Capital-protection kill switch: after a stopped long, do not keep firing
-                    # more bounce/momentum entries in the same session. This prevents the exact
-                    # 3-stop-loss sequence the user reported.
-                    disabled = True
-                    disabled_reason = 'First stopped trade hit — session kill switch'
+
+                    # Adaptive reset: one loss does not kill the whole day.
+                    # But the next entry must pass a higher quality score gate.
+                    if consecutive_losses >= int(max_consecutive_losses):
+                        disabled = True
+                        disabled_reason = f'Adaptive stop: {consecutive_losses} consecutive losses hit'
                 else:
                     consecutive_losses = 0
                     cooldown_bars = 2
+                    if int(max_trades) <= 1:
+                        disabled = True
+                        disabled_reason = 'One completed trade limit reached'
                 in_pos = False
                 side = None
                 entry_price = 0.0
@@ -11290,9 +11310,15 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
                 if (equity / initial - 1.0) <= -float(max_day_loss):
                     disabled = True
                     disabled_reason = f'Max session loss guard hit ({max_day_loss*100:.2f}%)'
+                if (equity / initial - 1.0) >= float(session_profit_target_pct):
+                    disabled = True
+                    disabled_reason = f'Session profit target reached ({session_profit_target_pct*100:.2f}%)'
 
         if (not in_pos) and (not disabled) and cooldown_bars == 0 and trades_today < int(max_trades):
-            go_long = bool(long_entry_signal.iloc[i])
+            q_now = float(quality_score.iloc[i]) if i < len(quality_score) else 0.0
+            min_q_after_loss = 88.0 + float(reentry_quality_boost) if consecutive_losses > 0 else 0.0
+            quality_reentry_ok = (consecutive_losses == 0) or (q_now >= min_q_after_loss)
+            go_long = bool(long_entry_signal.iloc[i]) and bool(quality_reentry_ok)
             go_short = bool(short_entry_signal.iloc[i]) and bool(allow_shorts)
             if go_long or go_short:
                 in_pos = True
@@ -11342,7 +11368,8 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
         'Short Trades': shorts,
         'Daily Guard Hit': disabled,
         'Disabled Reason': disabled_reason,
-        'Consecutive Losses': consecutive_losses
+        'Consecutive Losses': consecutive_losses,
+        'Adaptive Edge Mode': 'ON'
     }
 
 
@@ -14620,20 +14647,26 @@ try:
             let_winners_run = st.checkbox('Let winners run', value=True, key='safe_lc_runner')
             trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.30, step=0.05, key='safe_lc_trail') / 100.0
         with c4:
-            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=30, step=5, key='safe_lc_maxhold')
-            max_trades = st.number_input('Max trades/session', min_value=1, max_value=50, value=1, step=1, key='safe_lc_maxtrades_v2')
+            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=45, step=5, key='safe_lc_maxhold')
+            max_trades = st.number_input('Max trades/session', min_value=1, max_value=15, value=8, step=1, key='safe_lc_maxtrades_v4',
+                                         help='Adaptive mode: enough chances to capture multiple 0.5–1% waves, but still guarded by loss limits and quality reset.')
 
         c5, c6 = st.columns(2)
         with c5:
             require_vwap = st.checkbox('Require VWAP side filter', value=False, key='safe_lc_req_vwap', help='Longs require above VWAP; shorts require below VWAP. OFF is more aggressive.')
         with c6:
-            max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.3, max_value=10.0, value=0.8, step=0.1, key='safe_lc_dayloss') / 100.0
+            max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.3, max_value=10.0, value=1.20, step=0.10, key='safe_lc_dayloss',
+                                           help='Stops the session if total strategy drawdown reaches this level. Adaptive default gives room without allowing a blow-up.') / 100.0
 
-        c7, c8 = st.columns(2)
+        c7, c8, c9 = st.columns(3)
         with c7:
-            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=1, step=1, key='safe_lc_max_consec_losses_v2')
+            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=2, step=1, key='safe_lc_max_consec_losses_v4',
+                                                help='First stop does not kill the day; second consecutive stop does.')
         with c8:
-            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=90, value=45, step=1, key='safe_lc_cooldown_loss_v2')
+            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=90, value=12, step=1, key='safe_lc_cooldown_loss_v4',
+                                                  help='Pause after a stop, then only allow higher-quality re-entry.')
+        with c9:
+            session_profit_target = st.number_input('Session profit target (%)', min_value=0.5, max_value=15.0, value=5.0, step=0.5, key='safe_lc_session_profit_target') / 100.0
 
         st.markdown('##### VWAP Z-Score + Kalman Flush/Snapback Add-on')
         k1, k2, k3, k4 = st.columns(4)
@@ -14646,7 +14679,7 @@ try:
         with k4:
             z_window = st.number_input('VWAP std window bars', min_value=5, max_value=80, value=15, step=1, key='safe_lc_z_window')
 
-        st.warning('Capital-protection mode: no machine-gun entries. One stopped trade disables the session; Green Momentum requires strict buyer-control confirmation. Long-only, no short selling.')
+        st.warning('Adaptive edge mode ON: not killed after one loss, but after a stop it requires a stronger quality score before re-entry. Goal is multi-wave capture without machine-gun stops.')
 
         st.markdown('##### Institutional Context Add-on')
         ic1, ic2 = st.columns(2)
@@ -14680,6 +14713,9 @@ try:
                     allow_shorts=False,
                     cooldown_after_loss=int(cooldown_after_loss),
                     max_consecutive_losses=int(max_consec_losses),
+                    quality_score=(feats['Trade Quality Score'] if isinstance(feats, pd.DataFrame) and 'Trade Quality Score' in feats.columns else None),
+                    reentry_quality_boost=8.0,
+                    session_profit_target_pct=float(session_profit_target),
                 )
                 inst_context = _build_last_tab_institutional_context(d)
                 st.session_state['safe_lc_pack'] = {
@@ -14696,13 +14732,14 @@ try:
             eq = pack.get('equity', pd.Series(dtype=float))
             feats = pack.get('features', pd.DataFrame())
             d = pack.get('d', pd.DataFrame())
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
             m1.metric('Strategy Return', f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else 'N/A')
             m2.metric('Buy & Hold', f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else 'N/A')
             m3.metric('Max DD', f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else 'N/A')
             m4.metric('Trades', str(int(summ.get('Trades', 0))))
             m5.metric('Long Trades', str(int(summ.get('Long Trades', 0))))
             m6.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
+            m7.metric('Edge Mode', summ.get('Adaptive Edge Mode', 'ON'))
             if summ.get('Daily Guard Hit'):
                 st.error(f"Trading disabled by risk guard: {summ.get('Disabled Reason', 'Guard hit')}")
 
