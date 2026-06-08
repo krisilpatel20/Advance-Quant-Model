@@ -14471,6 +14471,125 @@ except Exception as e:
         pass
 
 
+
+def _build_last_tab_institutional_context(d):
+    """
+    Lightweight institutional context pack for the final intraday tab.
+
+    Uses helper logic already present in the thesis code:
+    - Ehlers SuperSmoother / Decycler for smoother trend read
+    - rolling Hurst for trend/chop context
+    - RealizedVolatility RV/BV jump component
+    - HawkesVolatility clustering proxy
+    - Kalman local trend proxy
+
+    Display/support only. It does not alter trade execution unless the user reads
+    the context and changes final-tab settings manually.
+    """
+    out = {
+        "metrics": {},
+        "series": pd.DataFrame(),
+        "verdict": "Neutral / observe",
+        "notes": []
+    }
+    try:
+        if d is None or not isinstance(d, pd.DataFrame) or d.empty or "Close" not in d.columns:
+            return out
+
+        close = pd.to_numeric(d["Close"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if len(close) < 10:
+            return out
+
+        idx = close.index
+        ctx_series = pd.DataFrame(index=idx)
+        ctx_series["Close"] = close
+
+        # Ehlers smoother/decycler
+        try:
+            ss_period = max(5, min(20, max(5, len(close) // 8)))
+            dc_period = max(20, min(80, max(20, len(close) // 3)))
+            ctx_series["Ehlers SuperSmoother"] = EhlersFilters.super_smoother(close, period=ss_period)
+            ctx_series["Ehlers Decycler"] = EhlersFilters.simple_decycler(close, period=dc_period)
+            decycler_slope = float(ctx_series["Ehlers Decycler"].diff(3).iloc[-1])
+            out["metrics"]["Ehlers Slope"] = decycler_slope
+        except Exception:
+            out["metrics"]["Ehlers Slope"] = np.nan
+
+        # Kalman local trend, causal
+        try:
+            kf = KalmanFilterTrend(process_noise=1e-5, measurement_noise=1e-3)
+            kalman_vals, _ = kf.filter(close.values.astype(float))
+            ctx_series["Kalman Trend"] = pd.Series(kalman_vals, index=idx)
+            out["metrics"]["Kalman Residual %"] = float((close.iloc[-1] / ctx_series["Kalman Trend"].iloc[-1] - 1.0) * 100.0) if ctx_series["Kalman Trend"].iloc[-1] else np.nan
+        except Exception:
+            out["metrics"]["Kalman Residual %"] = np.nan
+
+        # Returns for RV / Hawkes / Hurst
+        rets = np.log(close / close.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
+
+        try:
+            if len(close) >= 60:
+                h_window = max(40, min(120, len(close) // 2))
+                h = rolling_hurst(close, window=h_window, max_lag=min(20, max(8, h_window // 4)))
+                out["metrics"]["Hurst"] = float(h.dropna().iloc[-1]) if not h.dropna().empty else np.nan
+            else:
+                out["metrics"]["Hurst"] = np.nan
+        except Exception:
+            out["metrics"]["Hurst"] = np.nan
+
+        try:
+            j = RealizedVolatility.jump_component(rets.values if hasattr(rets, "values") else rets)
+            out["metrics"]["Jump Ratio"] = float(j.get("jump_ratio", np.nan)) * 100.0
+            out["metrics"]["Jump Z"] = float(j.get("z_score", np.nan))
+        except Exception:
+            out["metrics"]["Jump Ratio"] = np.nan
+            out["metrics"]["Jump Z"] = np.nan
+
+        try:
+            hv = HawkesVolatility().fit(rets.values if hasattr(rets, "values") else rets)
+            out["metrics"]["Hawkes Branching"] = float(hv.branching_ratio())
+            out["metrics"]["Shock Half-Life Bars"] = float(hv.half_life())
+        except Exception:
+            out["metrics"]["Hawkes Branching"] = np.nan
+            out["metrics"]["Shock Half-Life Bars"] = np.nan
+
+        # Simple action context
+        hurst_val = out["metrics"].get("Hurst", np.nan)
+        jump_ratio = out["metrics"].get("Jump Ratio", np.nan)
+        branch = out["metrics"].get("Hawkes Branching", np.nan)
+        e_slope = out["metrics"].get("Ehlers Slope", np.nan)
+
+        trend_up = pd.notna(e_slope) and e_slope > 0
+        trend_down = pd.notna(e_slope) and e_slope < 0
+        jumpy = pd.notna(jump_ratio) and jump_ratio > 20
+        clustered = pd.notna(branch) and branch > 0.65
+        trending = pd.notna(hurst_val) and hurst_val > 0.55
+        choppy = pd.notna(hurst_val) and hurst_val < 0.45
+
+        if trend_up and trending and not jumpy:
+            out["verdict"] = "Trend participation favored"
+        elif trend_down or jumpy or clustered:
+            out["verdict"] = "Risk guard / wait for stronger confirmation"
+        elif choppy:
+            out["verdict"] = "Chop regime — smaller targets or no trade"
+        else:
+            out["verdict"] = "Neutral / confirmation needed"
+
+        if jumpy:
+            out["notes"].append("High jump component: avoid chasing weak bounces.")
+        if clustered:
+            out["notes"].append("Volatility clustering elevated: stops can trigger faster.")
+        if choppy:
+            out["notes"].append("Hurst below trend zone: expect whipsaw.")
+        if trend_up and trending:
+            out["notes"].append("Trend structure supportive if VWAP/auction conditions agree.")
+
+        out["series"] = ctx_series
+        return out
+    except Exception:
+        return out
+
+
 # ==========================================
 # TAB 21: 0.5% LIVE CAPTURE — INTRADAY RUNNER ENGINE
 # ==========================================
@@ -14528,6 +14647,14 @@ try:
             z_window = st.number_input('VWAP std window bars', min_value=5, max_value=80, value=15, step=1, key='safe_lc_z_window')
 
         st.warning('Capital-protection mode: no machine-gun entries. One stopped trade disables the session; Green Momentum requires strict buyer-control confirmation. Long-only, no short selling.')
+
+        st.markdown('##### Institutional Context Add-on')
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            show_inst_context = st.checkbox('Show institutional context metrics', value=True, key='safe_lc_show_inst_context')
+        with ic2:
+            overlay_inst_lines = st.checkbox('Overlay Ehlers/Kalman trend lines', value=True, key='safe_lc_overlay_inst_lines')
+
         run_lc = st.button('Fetch latest intraday session + Run Long-Only Engine', key='safe_lc_run')
 
         if run_lc:
@@ -14554,8 +14681,10 @@ try:
                     cooldown_after_loss=int(cooldown_after_loss),
                     max_consecutive_losses=int(max_consec_losses),
                 )
+                inst_context = _build_last_tab_institutional_context(d)
                 st.session_state['safe_lc_pack'] = {
                     'd': d, 'long_entry': long_entry, 'short_entry': short_entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ,
+                    'institutional_context': inst_context,
                     'interval': lc_interval, 'period': lc_period, 'direction_mode': 'Long Only', 'latest_bar': str(d.index[-1]), 'first_bar': str(d.index[0])
                 }
 
@@ -14577,6 +14706,27 @@ try:
             if summ.get('Daily Guard Hit'):
                 st.error(f"Trading disabled by risk guard: {summ.get('Disabled Reason', 'Guard hit')}")
 
+            inst_context = pack.get('institutional_context', {})
+            if bool(st.session_state.get('safe_lc_show_inst_context', True)) and isinstance(inst_context, dict):
+                ctx_metrics = inst_context.get('metrics', {}) if isinstance(inst_context.get('metrics', {}), dict) else {}
+                st.write('#### Institutional Context Snapshot')
+                cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
+                _h = ctx_metrics.get('Hurst', np.nan)
+                _jr = ctx_metrics.get('Jump Ratio', np.nan)
+                _br = ctx_metrics.get('Hawkes Branching', np.nan)
+                _hl = ctx_metrics.get('Shock Half-Life Bars', np.nan)
+                _kr = ctx_metrics.get('Kalman Residual %', np.nan)
+                _es = ctx_metrics.get('Ehlers Slope', np.nan)
+                cc1.metric('Context Verdict', inst_context.get('verdict', 'N/A'))
+                cc2.metric('Hurst', f"{_h:.2f}" if pd.notna(_h) else 'N/A')
+                cc3.metric('Jump Ratio', f"{_jr:.1f}%" if pd.notna(_jr) else 'N/A')
+                cc4.metric('Hawkes Branch', f"{_br:.2f}" if pd.notna(_br) else 'N/A')
+                cc5.metric('Shock Half-Life', f"{_hl:.1f} bars" if pd.notna(_hl) else 'N/A')
+                cc6.metric('Kalman Residual', f"{_kr:+.2f}%" if pd.notna(_kr) else 'N/A')
+                _notes = inst_context.get('notes', [])
+                if isinstance(_notes, list) and _notes:
+                    st.caption(' | '.join([str(x) for x in _notes[:4]]))
+
             if isinstance(d, pd.DataFrame) and not d.empty:
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=(f'{TICKER} Intraday Setup', 'Equity Curve'))
                 fig.add_trace(go.Scatter(x=d.index, y=d['Close'], mode='lines', name='Close'), row=1, col=1)
@@ -14585,6 +14735,12 @@ try:
                     fig.add_trace(go.Scatter(x=feats.index, y=feats['EMA21'], mode='lines', name='EMA21'), row=1, col=1)
                     if 'Kalman Price' in feats.columns:
                         fig.add_trace(go.Scatter(x=feats.index, y=feats['Kalman Price'], mode='lines', name='Kalman Price'), row=1, col=1)
+                if bool(st.session_state.get('safe_lc_overlay_inst_lines', True)) and isinstance(inst_context, dict):
+                    ctx_series = inst_context.get('series', pd.DataFrame())
+                    if isinstance(ctx_series, pd.DataFrame) and not ctx_series.empty:
+                        for _col in ['Ehlers SuperSmoother', 'Ehlers Decycler', 'Kalman Trend']:
+                            if _col in ctx_series.columns:
+                                fig.add_trace(go.Scatter(x=ctx_series.index, y=ctx_series[_col], mode='lines', name=_col, line=dict(width=1)), row=1, col=1)
                 if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
                     closed_or_open = trades_df.copy()
                     buys = closed_or_open[closed_or_open['Entry Date'].notna()]
@@ -14617,6 +14773,9 @@ try:
                 if isinstance(feats, pd.DataFrame) and not feats.empty:
                     st.caption(f"Signals: long={int(feats['Long Entry'].sum())}, short={int(feats['Short Entry'].sum())}, final={int(feats['Final Entry'].sum())}")
                     st.dataframe(feats.tail(300), use_container_width=True)
+                    if isinstance(inst_context, dict) and isinstance(inst_context.get('series', None), pd.DataFrame):
+                        st.write('##### Institutional context series')
+                        st.dataframe(inst_context.get('series').tail(300), use_container_width=True)
 
         st.markdown('---')
         st.caption('Long-only intraday execution tab. It captures upside momentum or bounce waves after red-day panic; it does not short sell.')
