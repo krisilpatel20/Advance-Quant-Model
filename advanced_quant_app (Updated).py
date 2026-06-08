@@ -10937,26 +10937,39 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         (vol_ratio > 0.85)
     )
 
+    # Green Momentum must be a TRUE controlled up-auction.
+    # It is blocked if the stock is below VWAP/EMA21, making lower lows/highs,
+    # or the session is not firmly green. This prevents repeated "Green Momentum"
+    # buys on a red/drifting-down session.
     green_momentum = (
         institutional_green_gate &
         trend_up_day &
+        (session_move > 0.012) &
         (close > vwap) &
+        (close > ema21) &
         (ema5 >= ema9) & (ema9 >= ema21) &
+        (close > close.shift(5)) &
         ((pullback_hold) | (opening_breakout_quality) | ((mom3 > 0.0020) & break_structure_up & near_session_high)) &
         (distance_vwap < 0.012) &
-        (close_location > 0.65) &
+        (close_location > 0.68) &
         (~recent_seller_control) &
+        (~lower_high_sequence) &
+        (~lower_low_sequence) &
         (~failed_opening_drive)
     )
 
     # VWAP reclaim needs a hold/confirmation, not just touching VWAP.
     vwap_reclaim_quality = (
         reclaim_vwap &
+        hold_vwap &
         (close > ema9) &
-        (mom3 > 0.0008) &
-        (close_location > 0.60) &
-        (vol_ratio > 0.85) &
-        (~waterfall)
+        (ema9 >= ema21) &
+        (mom3 > 0.0012) &
+        (close_location > 0.65) &
+        (vol_ratio > 0.95) &
+        (~waterfall) &
+        (~distribution) &
+        (~lower_high_sequence)
     )
 
     setup_raw = (green_momentum | red_reclaim_pulse | vwap_reclaim_quality | opening_breakout_quality).fillna(False)
@@ -11164,6 +11177,9 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
         'Avoid Filter': avoid.astype(int),
         'Long Entry': long_entry.astype(int),
         'Short Entry': short_entry.astype(int),
+        'True Green Session': ((session_move > 0.012) & (close > vwap) & (close > ema21)).astype(int),
+        'Lower High Sequence': lower_high_sequence.astype(int),
+        'Lower Low Sequence': lower_low_sequence.astype(int),
         'Final Entry': long_entry.astype(int),
     }, index=idx)
     return long_entry.astype(bool), short_entry.astype(bool), features
@@ -11171,7 +11187,8 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
 def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_exit_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
                           min_hold_bars=3, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
                           let_winners_run=True, allow_shorts=False, cooldown_after_loss=12, max_consecutive_losses=2,
-                          quality_score=None, reentry_quality_boost=8.0, session_profit_target_pct=0.05):
+                          quality_score=None, reentry_quality_boost=8.0, session_profit_target_pct=0.05,
+                          auction_ok=None, drift_risk=None):
     """Risk-first single-position intraday engine. Long-only by default.
 
     Capital protection upgrades:
@@ -11191,6 +11208,14 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
         quality_score = pd.Series(100.0, index=close.index)
     else:
         quality_score = pd.Series(quality_score, index=close.index).reindex(close.index).ffill().fillna(0.0).astype(float)
+    if auction_ok is None:
+        auction_ok = pd.Series(True, index=close.index)
+    else:
+        auction_ok = pd.Series(auction_ok, index=close.index).reindex(close.index).ffill().fillna(False).astype(bool)
+    if drift_risk is None:
+        drift_risk = pd.Series(False, index=close.index)
+    else:
+        drift_risk = pd.Series(drift_risk, index=close.index).reindex(close.index).ffill().fillna(False).astype(bool)
     if long_exit_signal is None:
         long_exit_signal = pd.Series(False, index=close.index)
     long_exit_signal = pd.Series(long_exit_signal, index=close.index).fillna(False).astype(bool)
@@ -11316,9 +11341,16 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
 
         if (not in_pos) and (not disabled) and cooldown_bars == 0 and trades_today < int(max_trades):
             q_now = float(quality_score.iloc[i]) if i < len(quality_score) else 0.0
+            auction_now = bool(auction_ok.iloc[i]) if i < len(auction_ok) else False
+            drift_now = bool(drift_risk.iloc[i]) if i < len(drift_risk) else True
+
+            # After a loss, do not buy the next random bounce.
+            # Re-entry must be a clean auction again and not a lower-high/lower-low drift.
             min_q_after_loss = 88.0 + float(reentry_quality_boost) if consecutive_losses > 0 else 0.0
             quality_reentry_ok = (consecutive_losses == 0) or (q_now >= min_q_after_loss)
-            go_long = bool(long_entry_signal.iloc[i]) and bool(quality_reentry_ok)
+            auction_reentry_ok = auction_now and (not drift_now)
+
+            go_long = bool(long_entry_signal.iloc[i]) and bool(quality_reentry_ok) and bool(auction_reentry_ok)
             go_short = bool(short_entry_signal.iloc[i]) and bool(allow_shorts)
             if go_long or go_short:
                 in_pos = True
@@ -14716,6 +14748,8 @@ try:
                     quality_score=(feats['Trade Quality Score'] if isinstance(feats, pd.DataFrame) and 'Trade Quality Score' in feats.columns else None),
                     reentry_quality_boost=8.0,
                     session_profit_target_pct=float(session_profit_target),
+                    auction_ok=(feats['True Green Session'].astype(bool) if isinstance(feats, pd.DataFrame) and 'True Green Session' in feats.columns else None),
+                    drift_risk=(((feats['Lower High Sequence'].astype(bool)) | (feats['Lower Low Sequence'].astype(bool)) | (feats['Distribution'].astype(bool)) | (feats['Waterfall'].astype(bool))) if isinstance(feats, pd.DataFrame) and all(c in feats.columns for c in ['Lower High Sequence','Lower Low Sequence','Distribution','Waterfall']) else None),
                 )
                 inst_context = _build_last_tab_institutional_context(d)
                 st.session_state['safe_lc_pack'] = {
