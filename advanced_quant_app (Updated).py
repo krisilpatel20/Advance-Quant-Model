@@ -5825,6 +5825,226 @@ if fast_intraday_mode:
         )
         return out
 
+
+    def _fast_build_micro_wave_signals(df: pd.DataFrame, sensitivity: str, require_vwap: bool,
+                                       bounce_confirm: float, min_vol_ratio: float) -> pd.DataFrame:
+        """
+        Long-only Micro-Wave Capture engine.
+
+        Goal:
+        - Not one-and-done.
+        - Not fake Green Momentum.
+        - Capture repeated 0.5–1.0% intraday waves when structure confirms.
+
+        Key difference from the old fast engine:
+        - Uses wave confirmation labels: Micro Trend Wave, Micro VWAP Reclaim, Micro Dip Bounce.
+        - Does not label weak drift bounces as Green Momentum.
+        - Entry still requires actual price confirmation in the backtest function.
+        """
+        out = _fast_add_intraday_indicators(df)
+
+        if sensitivity == "Aggressive":
+            mom1_req, mom2_req, close_loc_req = 0.01, 0.03, 0.52
+        elif sensitivity == "Strict":
+            mom1_req, mom2_req, close_loc_req = 0.04, 0.10, 0.62
+        else:
+            mom1_req, mom2_req, close_loc_req = 0.02, 0.06, 0.57
+
+        volume_ok = out["VOL_RATIO"].fillna(1.0) >= min_vol_ratio
+        above_vwap_soft = out["Close"] >= out["VWAP"] * (1.000 if require_vwap else 0.996)
+
+        # "Do not buy obvious drift-down noise" guard.
+        drift_guard = (
+            (out["LOWER_LOW_SEQ"]) |
+            ((out["Close"] < out["EMA_GUARD"]) & (out["VWAP_SLOPE_5"] <= 0) & (out["FROM_OPEN_PCT"] < -0.35))
+        ).fillna(False)
+
+        micro_trend_wave = (
+            above_vwap_soft &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_SLOW"]) &
+            (out["MOM_1"] > mom1_req) &
+            (out["MOM_2"] > mom2_req) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~drift_guard)
+        ).fillna(False)
+
+        micro_vwap_reclaim = (
+            (out["Close"] >= out["VWAP"] * 0.998) &
+            (out["Close"].shift(1) < out["VWAP"].shift(1) * 1.001) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["MOM_1"] > mom1_req) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+
+        micro_dip_bounce = (
+            (out["BOUNCE_FROM_LOW_PCT"] >= bounce_confirm) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["MOM_1"] > 0) &
+            (out["MOM_2"] > mom2_req * 0.65) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+
+        # Avoid chasing a stretched bar too far above VWAP/EMA.
+        dist_vwap = (out["Close"] / out["VWAP"] - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0) * 100
+        chase_guard = dist_vwap > 1.35
+
+        entry = (micro_trend_wave | micro_vwap_reclaim | micro_dip_bounce) & (~chase_guard)
+
+        out["ENTRY_SIGNAL"] = entry.fillna(False)
+        out["SETUP"] = np.select(
+            [micro_vwap_reclaim, micro_dip_bounce, micro_trend_wave],
+            ["Micro VWAP Reclaim", "Micro Dip Bounce", "Micro Trend Wave"],
+            default=""
+        )
+        out["DRIFT_GUARD"] = drift_guard.astype(bool)
+        out["CHASE_GUARD"] = chase_guard.astype(bool)
+        return out
+
+
+    def _fast_run_micro_wave_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
+                                      trail_pct: float, max_hold_bars: int, max_trades: int, cooldown_bars: int,
+                                      max_consecutive_stops: int = 2) -> pd.DataFrame:
+        """
+        Micro-wave execution:
+        - Requires one-bar confirmation after a signal.
+        - Allows multiple waves per session.
+        - After a stop, pauses and requires a fresh signal.
+        - Blocks repeated same-price reentries after a stop.
+        """
+        trades = []
+        in_pos = False
+        pending = None
+        entry_price = entry_time = entry_setup = None
+        stop_price = target_price = None
+        high_since = None
+        bars_held = 0
+        cooldown = 0
+        consecutive_stops = 0
+        last_stop_price = None
+
+        for i in range(len(df)):
+            row = df.iloc[i]
+            ts = df.index[i]
+            price = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+                exit_reason = None
+                exit_price = None
+
+                if low <= stop_price:
+                    exit_reason = "Stop"
+                    exit_price = stop_price
+                elif runner_on and high >= target_price:
+                    trail_stop = high_since * (1.0 - trail_pct / 100.0)
+                    if low <= trail_stop:
+                        exit_reason = "Runner Trail"
+                        exit_price = max(trail_stop, entry_price * (1.0 + target_pct * 0.30 / 100.0))
+                elif (not runner_on) and high >= target_price:
+                    exit_reason = "Target"
+                    exit_price = target_price
+                elif bars_held >= max_hold_bars:
+                    exit_reason = "Max Hold"
+                    exit_price = price
+
+                if exit_reason is not None:
+                    pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+                    trades.append({
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_price, 4),
+                        "Sell Price": round(exit_price, 4),
+                        "PnL %": round(pnl_pct, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": bars_held,
+                    })
+                    if exit_reason == "Stop":
+                        consecutive_stops += 1
+                        last_stop_price = exit_price
+                        cooldown = max(int(cooldown_bars), 6)
+                    else:
+                        consecutive_stops = 0
+                        cooldown = max(1, int(cooldown_bars // 2))
+                    in_pos = False
+                    pending = None
+                    entry_price = entry_time = entry_setup = None
+                    stop_price = target_price = high_since = None
+                    bars_held = 0
+                    if len(trades) >= max_trades or consecutive_stops >= max_consecutive_stops:
+                        break
+                    continue
+
+            # Pending signal confirms on the next bar, not on the same bar.
+            if (not in_pos) and pending is not None and cooldown == 0:
+                sig_price = float(pending["price"])
+                sig_high = float(pending["high"])
+                sig_setup = str(pending["setup"])
+                drift_now = bool(row.get("DRIFT_GUARD", False))
+                chase_now = bool(row.get("CHASE_GUARD", False))
+
+                confirmed = (
+                    (price >= sig_price * 1.0002) or
+                    ((high >= sig_high * 1.0001) and (price >= sig_price * 0.9995))
+                )
+                not_same_failed_level = True
+                if last_stop_price is not None:
+                    not_same_failed_level = price >= float(last_stop_price) * 1.001 or str(sig_setup) != str(pending.get("last_setup", ""))
+
+                if confirmed and (not drift_now) and (not chase_now) and not_same_failed_level:
+                    in_pos = True
+                    entry_price = price
+                    entry_time = ts
+                    entry_setup = sig_setup
+                    stop_price = entry_price * (1.0 - stop_pct / 100.0)
+                    target_price = entry_price * (1.0 + target_pct / 100.0)
+                    high_since = price
+                    bars_held = 0
+                    pending = None
+                    continue
+                else:
+                    # signal failed confirmation; drop it
+                    pending = None
+
+            if (not in_pos) and cooldown == 0 and len(trades) < int(max_trades):
+                if bool(row.get("ENTRY_SIGNAL", False)) and str(row.get("SETUP", "")):
+                    pending = {
+                        "time": ts,
+                        "price": price,
+                        "high": high,
+                        "setup": str(row.get("SETUP", "Micro Wave")),
+                        "last_setup": trades[-1]["Setup"] if len(trades) else ""
+                    }
+
+        if in_pos:
+            last = df.iloc[-1]
+            exit_price = float(last["Close"])
+            pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+            trades.append({
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_price, 4),
+                "Sell Price": round(exit_price, 4),
+                "PnL %": round(pnl_pct, 3),
+                "Exit Reason": "Open",
+                "Bars Held": bars_held,
+            })
+        return pd.DataFrame(trades)
+
+
     def _fast_run_long_only_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
                                      trail_pct: float, max_hold_bars: int, max_trades: int, cooldown_bars: int) -> pd.DataFrame:
         trades = []
@@ -5937,6 +6157,15 @@ if fast_intraday_mode:
         st.header("⚡ 0.5% Live Capture — FAST Long-Only Intraday")
         st.caption("Whole app file, fast path. No short selling. Captures green-day momentum and red-day dip-bounce/reclaim waves.")
 
+        exec_model_fast = st.radio(
+            "Execution model",
+            ["Micro-Wave Capture", "Conservative Setup Capture"],
+            index=0,
+            horizontal=True,
+            key="fast_whole_exec_model",
+            help="Micro-Wave Capture is designed to catch multiple 0.5–1% intraday waves. Conservative mode uses the older stricter setup engine."
+        )
+
         colA, colB, colC = st.columns(3)
         with colA:
             intraday_interval = st.selectbox("Intraday interval", ["1m", "2m", "5m", "15m", "30m", "60m"], index=2, key="fast_whole_interval")
@@ -5976,8 +6205,12 @@ if fast_intraday_mode:
                     st.warning("Latest session has very few bars. Showing all fetched bars instead.")
                     day_fast = raw_fast.copy()
 
-                signals_fast = _fast_build_long_only_signals(day_fast, sensitivity_fast, setup_mode_fast, require_vwap_fast, min_red_drop_fast, bounce_confirm_fast, min_vol_ratio_fast)
-                trades_fast = _fast_run_long_only_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast))
+                if exec_model_fast == "Micro-Wave Capture":
+                    signals_fast = _fast_build_micro_wave_signals(day_fast, sensitivity_fast, require_vwap_fast, bounce_confirm_fast, min_vol_ratio_fast)
+                    trades_fast = _fast_run_micro_wave_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast), max_consecutive_stops=2)
+                else:
+                    signals_fast = _fast_build_long_only_signals(day_fast, sensitivity_fast, setup_mode_fast, require_vwap_fast, min_red_drop_fast, bounce_confirm_fast, min_vol_ratio_fast)
+                    trades_fast = _fast_run_long_only_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast))
 
                 first_bar = signals_fast.index[0]
                 last_bar = signals_fast.index[-1]
@@ -6006,7 +6239,7 @@ if fast_intraday_mode:
 
                 st.subheader("Trade Log")
                 if trades_fast.empty:
-                    st.warning("0 trades. For CMG-type runners/dip-bounces, try Aggressive, lower bounce to 0.20–0.30, lower volume ratio to 0.6–0.8, or use 1m/5m.")
+                    st.warning("0 trades. No confirmed micro-wave after one-bar confirmation. Try 1m/5m, lower bounce to 0.20, or lower volume ratio to 0.5 — but do not force trades on chop.")
                 else:
                     st.dataframe(trades_fast, use_container_width=True, hide_index=True)
                     closed = trades_fast[trades_fast["Exit Reason"] != "Open"]
@@ -6019,7 +6252,8 @@ if fast_intraday_mode:
                         c3.metric("Sum of trade PnL", f"{total_pnl:.2f}%")
 
                 with st.expander("Diagnostics", expanded=False):
-                    st.dataframe(signals_fast[["Close", "VWAP", "EMA_FAST", "EMA_SLOW", "FROM_OPEN_PCT", "BOUNCE_FROM_LOW_PCT", "MOM_1", "MOM_2", "MOM_3", "VOL_RATIO", "ENTRY_SIGNAL", "SETUP"]].tail(80), use_container_width=True)
+                    _diag_cols = [c for c in ["Close", "VWAP", "EMA_FAST", "EMA_SLOW", "FROM_OPEN_PCT", "BOUNCE_FROM_LOW_PCT", "MOM_1", "MOM_2", "MOM_3", "VOL_RATIO", "CLOSE_LOCATION", "DRIFT_GUARD", "CHASE_GUARD", "ENTRY_SIGNAL", "SETUP"] if c in signals_fast.columns]
+                    st.dataframe(signals_fast[_diag_cols].tail(100), use_container_width=True)
 
     st.stop()
 
