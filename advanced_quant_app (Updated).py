@@ -13665,10 +13665,11 @@ with tab19:
         min_hold_records=8,
         cooldown_records=10,
         confirm_records=3,
-        per_trade_stop_pct=1.50,
-        trailing_stop_pct=3.00,
+        per_trade_stop_pct=0.75,
+        trailing_stop_pct=0.50,
+        take_profit_pct=1.00,
         max_day_loss_pct=2.50,
-        max_trades=2,
+        max_trades=50,
     ):
         """
         Databento MBP-1 historical replay trade log — runner-aware version.
@@ -13872,14 +13873,17 @@ with tab19:
                     trail_dd_pct = ((px - high_since_entry) / high_since_entry * 100.0) if high_since_entry else 0.0
 
                     stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
+                    tp_hit = pnl_pct >= abs(float(take_profit_pct))
                     trailing_hit = (bars_held >= max(5, int(min_hold_records))) and (trail_dd_pct <= -abs(float(trailing_stop_pct)))
                     signal_exit = (bars_held >= max(8, int(min_hold_records))) and bool(close_cond.loc[ts])
 
-                    if stop_hit or trailing_hit or signal_exit:
+                    if stop_hit or tp_hit or trailing_hit or signal_exit:
                         cash = shares * px
                         pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
                         cum = ((cash / equity0) - 1.0) * 100.0
-                        if stop_hit:
+                        if tp_hit:
+                            reason = f'Take profit hit ({pnl_pct:.2f}%)'
+                        elif stop_hit:
                             reason = f'Per-trade stop hit ({pnl_pct:.2f}%)'
                         elif trailing_hit:
                             reason = f'Trailing stop hit ({trail_dd_pct:.2f}%)'
