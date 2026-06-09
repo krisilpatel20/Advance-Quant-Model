@@ -6651,16 +6651,27 @@ with tab2:
     st.markdown("[Reference: Regime Switching Models (James D. Hamilton)](https://econweb.ucsd.edu/~jhamilton/palgrave.pdf)")
     
     # ===== CONFIGURATION =====
-    col_config1, col_config2, col_config3 = st.columns(3)
-    
+    col_config1, col_config2, col_config3, col_config4 = st.columns(4)
+
     with col_config1:
-        # CHANGED: Default index 1 is Weekly (0=Daily, 1=Weekly)
-        regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=1)
+        # Default remains Weekly for cleaner regime confirmation.
+        regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=1, key="regime_freq_main")
     with col_config2:
-        # CHANGED: Default value 2
-        lookback_years = st.slider("Lookback Period (Years)", 1, 10, 2)
+        regime_window_mode = st.selectbox(
+            "Regime Window",
+            ["Rolling 1-Year", "Custom Lookback"],
+            index=0,
+            key="regime_window_mode_main",
+            help="Rolling 1-Year is best for live/current signals. Custom Lookback is better for historical comparison."
+        )
     with col_config3:
-        n_regimes = st.slider("Number of Regimes", 2, 4, 2)
+        if regime_window_mode == "Rolling 1-Year":
+            lookback_years = 1
+            st.metric("Lookback", "1Y rolling")
+        else:
+            lookback_years = st.slider("Lookback Period (Years)", 1, 10, 2, key="regime_custom_lookback_years")
+    with col_config4:
+        n_regimes = st.slider("Number of Regimes", 2, 4, 2, key="regime_n_regimes_main")
     
     # New: Signal Stability Control
     # CHANGED: Default value 4
@@ -6681,22 +6692,30 @@ with tab2:
     
     # ===== PRE-FLIGHT CHECKS =====
     warnings = []
-    if lookback_years <= 1:
-        warnings.append("⚠️ Very short history - consider 3+ years for stable regimes")
-        if regime_freq == "Weekly":
-            warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
-            regime_freq = "Daily"
-    
-    if regime_freq == "Daily" and switch_trend and lookback_years < 3:
-        warnings.append("⚠️ Daily + Switching Trend needs 3+ years. Disabling...")
-        switch_trend = False
-    
+    if regime_window_mode == "Rolling 1-Year":
+        st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
+    else:
+        if lookback_years <= 1:
+            warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
+            if regime_freq == "Weekly":
+                warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
+                regime_freq = "Daily"
+
+        if regime_freq == "Daily" and switch_trend and lookback_years < 3:
+            warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
+            switch_trend = False
+
     if warnings:
         for w in warnings:
             st.warning(w)
     
     # ===== DATA PREPARATION =====
-    start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
+    if regime_window_mode == "Rolling 1-Year":
+        # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
+        _regime_end_ts = pd.Timestamp(end_date)
+        start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
+    else:
+        start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
     df_regime = load_data(TICKER, start_dt_regime, end_date)
     
     if df_regime is None:
@@ -6737,7 +6756,8 @@ with tab2:
         st.error(f"Data Prep Error: {e}")
         st.stop()
     
-    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {start_dt_regime.date()}")
+    _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
+    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
     
     # ===== MODEL FITTING =====
     with st.spinner(f"Fitting {n_regimes}-regime model..."):
@@ -13665,11 +13685,10 @@ with tab19:
         min_hold_records=8,
         cooldown_records=10,
         confirm_records=3,
-        per_trade_stop_pct=0.75,
-        trailing_stop_pct=0.50,
-        take_profit_pct=1.00,
+        per_trade_stop_pct=1.50,
+        trailing_stop_pct=3.00,
         max_day_loss_pct=2.50,
-        max_trades=50,
+        max_trades=2,
     ):
         """
         Databento MBP-1 historical replay trade log — runner-aware version.
@@ -13873,17 +13892,14 @@ with tab19:
                     trail_dd_pct = ((px - high_since_entry) / high_since_entry * 100.0) if high_since_entry else 0.0
 
                     stop_hit = pnl_pct <= -abs(float(per_trade_stop_pct))
-                    tp_hit = pnl_pct >= abs(float(take_profit_pct))
                     trailing_hit = (bars_held >= max(5, int(min_hold_records))) and (trail_dd_pct <= -abs(float(trailing_stop_pct)))
                     signal_exit = (bars_held >= max(8, int(min_hold_records))) and bool(close_cond.loc[ts])
 
-                    if stop_hit or tp_hit or trailing_hit or signal_exit:
+                    if stop_hit or trailing_hit or signal_exit:
                         cash = shares * px
                         pnl = ((px - entry_price) / entry_price * 100.0) if entry_price else 0.0
                         cum = ((cash / equity0) - 1.0) * 100.0
-                        if tp_hit:
-                            reason = f'Take profit hit ({pnl_pct:.2f}%)'
-                        elif stop_hit:
+                        if stop_hit:
                             reason = f'Per-trade stop hit ({pnl_pct:.2f}%)'
                         elif trailing_hit:
                             reason = f'Trailing stop hit ({trail_dd_pct:.2f}%)'
