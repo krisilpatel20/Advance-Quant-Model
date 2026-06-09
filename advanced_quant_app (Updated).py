@@ -5930,6 +5930,179 @@ if fast_intraday_mode:
         return out
 
 
+
+    def _fast_build_trend_day_core_signals(df: pd.DataFrame, sensitivity: str, require_vwap: bool,
+                                           min_vol_ratio: float) -> pd.DataFrame:
+        """
+        Trend-Day Core Capture.
+
+        This is the honest retail-friendly approach for a stock that moves 5–6%:
+        identify the trend day, enter once after confirmation, hold the core runner,
+        and exit only when the trend actually breaks. It avoids noisy 0.5% chop scalps.
+        """
+        out = _fast_add_intraday_indicators(df)
+
+        if sensitivity == "Aggressive":
+            move_req, mom_req, close_loc_req = 0.35, 0.035, 0.52
+        elif sensitivity == "Strict":
+            move_req, mom_req, close_loc_req = 0.90, 0.090, 0.62
+        else:
+            move_req, mom_req, close_loc_req = 0.55, 0.055, 0.56
+
+        volume_ok = out["VOL_RATIO"].fillna(1.0) >= max(0.45, float(min_vol_ratio) * 0.75)
+        vwap_ok = out["Close"] >= out["VWAP"] if require_vwap else out["Close"] >= out["VWAP"] * 0.995
+
+        bullish_stack = (
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_SLOW"]) &
+            (out["Close"] >= out["EMA_GUARD"] * 0.997)
+        )
+
+        trend_day_confirm = (
+            (out["FROM_OPEN_PCT"] >= move_req) &
+            vwap_ok &
+            bullish_stack &
+            (out["MOM_2"] >= mom_req) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+
+        # Allow a later entry after first pullback resume on trend day.
+        pullback_resume = (
+            (out["FROM_OPEN_PCT"] >= move_req) &
+            (out["PULLBACK_FROM_HIGH_PCT"] <= -0.20) &
+            (out["PULLBACK_FROM_HIGH_PCT"] >= -2.20) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["Close"] >= out["VWAP"] * 0.995) &
+            (out["MOM_1"] > 0) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+
+        out["ENTRY_SIGNAL"] = (trend_day_confirm | pullback_resume).fillna(False)
+        out["SETUP"] = np.select(
+            [trend_day_confirm, pullback_resume],
+            ["Trend-Day Core Long", "Trend-Day Pullback Resume"],
+            default=""
+        )
+        out["TREND_DAY_CONFIRM"] = trend_day_confirm.astype(bool)
+        out["TREND_DAY_PULLBACK"] = pullback_resume.astype(bool)
+        return out
+
+
+    def _fast_run_trend_day_core_backtest(df: pd.DataFrame, initial_stop_pct: float,
+                                          trail_pct: float, max_hold_bars: int) -> pd.DataFrame:
+        """
+        Core runner execution:
+        - One main core trade.
+        - No forced 0.5% profit exit.
+        - Uses break-of-trend exit and adaptive trailing stop.
+        """
+        trades = []
+        in_pos = False
+        pending = None
+        entry_price = entry_time = entry_setup = None
+        stop_price = None
+        high_since = None
+        bars_held = 0
+
+        for i in range(len(df)):
+            row = df.iloc[i]
+            ts = df.index[i]
+            price = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+
+                # Trail only after price proves itself.
+                gain_pct = (high_since / entry_price - 1.0) * 100.0
+                adaptive_trail = trail_pct
+                if gain_pct >= 2.0:
+                    adaptive_trail = max(trail_pct, 0.75)
+                elif gain_pct >= 1.0:
+                    adaptive_trail = max(trail_pct, 0.50)
+
+                trail_stop = high_since * (1.0 - adaptive_trail / 100.0)
+
+                # Trend break: below VWAP and EMA fast, or lower-low damage after run.
+                trend_break = (
+                    (price < float(row.get("VWAP", price)) * 0.997 and price < float(row.get("EMA_FAST", price)) * 0.997) or
+                    (bool(row.get("LOWER_LOW_SEQ", False)) and price < float(row.get("EMA_SLOW", price)) * 0.998)
+                )
+
+                exit_reason = None
+                exit_price = None
+                if low <= stop_price:
+                    exit_reason = "Initial Stop"
+                    exit_price = stop_price
+                elif gain_pct >= 0.70 and low <= trail_stop:
+                    exit_reason = "Core Trail"
+                    exit_price = trail_stop
+                elif trend_break and bars_held >= 3:
+                    exit_reason = "Trend Break"
+                    exit_price = price
+                elif bars_held >= max_hold_bars:
+                    exit_reason = "Max Hold"
+                    exit_price = price
+
+                if exit_reason is not None:
+                    pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+                    trades.append({
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_price, 4),
+                        "Sell Price": round(exit_price, 4),
+                        "PnL %": round(pnl_pct, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": bars_held,
+                    })
+                    in_pos = False
+                    break
+
+            # Confirm entry on next bar so we do not buy the first fake candle.
+            if (not in_pos) and pending is not None:
+                sig_price = float(pending["price"])
+                sig_high = float(pending["high"])
+                confirmed = (price >= sig_price * 1.0002) or (high >= sig_high * 1.0001 and price >= sig_price * 0.999)
+                if confirmed:
+                    in_pos = True
+                    entry_price = price
+                    entry_time = ts
+                    entry_setup = str(pending["setup"])
+                    stop_price = entry_price * (1.0 - initial_stop_pct / 100.0)
+                    high_since = price
+                    bars_held = 0
+                    pending = None
+                    continue
+                else:
+                    pending = None
+
+            if (not in_pos) and pending is None and bool(row.get("ENTRY_SIGNAL", False)) and str(row.get("SETUP", "")):
+                pending = {"time": ts, "price": price, "high": high, "setup": str(row.get("SETUP", "Trend-Day Core Long"))}
+
+        if in_pos:
+            last = df.iloc[-1]
+            exit_price = float(last["Close"])
+            pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+            trades.append({
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_price, 4),
+                "Sell Price": round(exit_price, 4),
+                "PnL %": round(pnl_pct, 3),
+                "Exit Reason": "Open",
+                "Bars Held": bars_held,
+            })
+        return pd.DataFrame(trades)
+
+
     def _fast_run_micro_wave_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
                                       trail_pct: float, max_hold_bars: int, max_trades: int, cooldown_bars: int,
                                       max_consecutive_stops: int = 2, profit_rearm_bars: int = 1) -> pd.DataFrame:
@@ -6180,15 +6353,15 @@ if fast_intraday_mode:
 
     with tab21:
         st.header("⚡ 0.5% Live Capture — FAST Long-Only Intraday")
-        st.caption("Whole app file, fast path. No short selling. Captures green-day momentum and red-day dip-bounce/reclaim waves.")
+        st.caption("Whole app file, fast path. No short selling. Trend-Day Core Capture is designed for 5–6% mover days where scalping every wiggle fails.")
 
         exec_model_fast = st.radio(
             "Execution model",
-            ["Micro-Wave Capture", "Conservative Setup Capture"],
+            ["Trend-Day Core Capture", "Micro-Wave Capture", "Conservative Setup Capture"],
             index=0,
             horizontal=True,
             key="fast_whole_exec_model",
-            help="Micro-Wave Capture is designed to catch multiple 0.5–1% intraday waves. Conservative mode uses the older stricter setup engine."
+            help="Trend-Day Core is best for 5–6% mover days like GLXY. Micro-Wave is for repeated smaller waves. Conservative mode uses the older stricter setup engine."
         )
 
         colA, colB, colC = st.columns(3)
@@ -6233,7 +6406,10 @@ if fast_intraday_mode:
                     st.warning("Latest session has very few bars. Showing all fetched bars instead.")
                     day_fast = raw_fast.copy()
 
-                if exec_model_fast == "Micro-Wave Capture":
+                if exec_model_fast == "Trend-Day Core Capture":
+                    signals_fast = _fast_build_trend_day_core_signals(day_fast, sensitivity_fast, require_vwap_fast, min_vol_ratio_fast)
+                    trades_fast = _fast_run_trend_day_core_backtest(signals_fast, stop_fast, trail_fast, int(max_hold_fast))
+                elif exec_model_fast == "Micro-Wave Capture":
                     signals_fast = _fast_build_micro_wave_signals(day_fast, sensitivity_fast, require_vwap_fast, bounce_confirm_fast, min_vol_ratio_fast, wave_density_fast)
                     trades_fast = _fast_run_micro_wave_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast), max_consecutive_stops=2, profit_rearm_bars=int(profit_rearm_fast))
                 else:
