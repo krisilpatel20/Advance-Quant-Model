@@ -5827,42 +5827,48 @@ if fast_intraday_mode:
 
 
     def _fast_build_micro_wave_signals(df: pd.DataFrame, sensitivity: str, require_vwap: bool,
-                                       bounce_confirm: float, min_vol_ratio: float) -> pd.DataFrame:
+                                       bounce_confirm: float, min_vol_ratio: float, wave_density: str = "Active") -> pd.DataFrame:
         """
         Long-only Micro-Wave Capture engine.
 
-        Goal:
-        - Not one-and-done.
-        - Not fake Green Momentum.
-        - Capture repeated 0.5–1.0% intraday waves when structure confirms.
-
-        Key difference from the old fast engine:
-        - Uses wave confirmation labels: Micro Trend Wave, Micro VWAP Reclaim, Micro Dip Bounce.
-        - Does not label weak drift bounces as Green Momentum.
-        - Entry still requires actual price confirmation in the backtest function.
+        Designed for stocks that move up/down 0.5–1.0% multiple times in one session.
+        It creates repeated wave entries but still blocks obvious fake pops / drift-down noise.
         """
         out = _fast_add_intraday_indicators(df)
 
         if sensitivity == "Aggressive":
-            mom1_req, mom2_req, close_loc_req = 0.01, 0.03, 0.52
+            mom1_req, mom2_req, close_loc_req = 0.005, 0.018, 0.50
         elif sensitivity == "Strict":
-            mom1_req, mom2_req, close_loc_req = 0.04, 0.10, 0.62
+            mom1_req, mom2_req, close_loc_req = 0.035, 0.085, 0.61
         else:
-            mom1_req, mom2_req, close_loc_req = 0.02, 0.06, 0.57
+            mom1_req, mom2_req, close_loc_req = 0.012, 0.040, 0.54
+
+        if wave_density == "Calm":
+            mom1_req *= 1.40
+            mom2_req *= 1.35
+            close_loc_req += 0.04
+            chase_limit = 1.10
+        elif wave_density == "High Activity":
+            mom1_req *= 0.55
+            mom2_req *= 0.60
+            close_loc_req -= 0.04
+            chase_limit = 1.75
+        else:  # Active
+            chase_limit = 1.45
 
         volume_ok = out["VOL_RATIO"].fillna(1.0) >= min_vol_ratio
-        above_vwap_soft = out["Close"] >= out["VWAP"] * (1.000 if require_vwap else 0.996)
+        above_vwap_soft = out["Close"] >= out["VWAP"] * (1.000 if require_vwap else 0.994)
 
-        # "Do not buy obvious drift-down noise" guard.
+        # Block true garbage: lower lows while below VWAP/EMA guard. But do not block every normal pullback.
         drift_guard = (
-            (out["LOWER_LOW_SEQ"]) |
-            ((out["Close"] < out["EMA_GUARD"]) & (out["VWAP_SLOPE_5"] <= 0) & (out["FROM_OPEN_PCT"] < -0.35))
+            (out["LOWER_LOW_SEQ"] & (out["Close"] < out["VWAP"]) & (out["EMA_GUARD_SLOPE_5"] <= 0)) |
+            ((out["Close"] < out["EMA_GUARD"]) & (out["VWAP_SLOPE_5"] <= 0) & (out["FROM_OPEN_PCT"] < -0.60))
         ).fillna(False)
 
+        # Repeated continuation waves.
         micro_trend_wave = (
             above_vwap_soft &
             (out["Close"] > out["EMA_FAST"]) &
-            (out["EMA_FAST"] >= out["EMA_SLOW"]) &
             (out["MOM_1"] > mom1_req) &
             (out["MOM_2"] > mom2_req) &
             (out["CLOSE_LOCATION"] >= close_loc_req) &
@@ -5870,36 +5876,53 @@ if fast_intraday_mode:
             (~drift_guard)
         ).fillna(False)
 
+        # VWAP reclaim or VWAP hold continuation. This is what was too restrictive before.
         micro_vwap_reclaim = (
-            (out["Close"] >= out["VWAP"] * 0.998) &
-            (out["Close"].shift(1) < out["VWAP"].shift(1) * 1.001) &
+            (out["Close"] >= out["VWAP"] * 0.996) &
+            (
+                (out["Close"].shift(1) < out["VWAP"].shift(1) * 1.0015) |
+                ((out["Low"] <= out["VWAP"] * 1.003) & (out["Close"] > out["Open"]))
+            ) &
             (out["Close"] > out["EMA_FAST"]) &
-            (out["MOM_1"] > mom1_req) &
+            (out["MOM_1"] > mom1_req * 0.70) &
             (out["CLOSE_LOCATION"] >= close_loc_req) &
             volume_ok &
-            (~out["LOWER_LOW_SEQ"])
+            (~drift_guard)
         ).fillna(False)
 
+        # Dip bounce from intraday swing lows.
         micro_dip_bounce = (
             (out["BOUNCE_FROM_LOW_PCT"] >= bounce_confirm) &
             (out["Close"] > out["EMA_FAST"]) &
             (out["MOM_1"] > 0) &
-            (out["MOM_2"] > mom2_req * 0.65) &
+            (out["MOM_2"] > mom2_req * 0.45) &
             (out["CLOSE_LOCATION"] >= close_loc_req) &
             volume_ok &
-            (~out["LOWER_LOW_SEQ"])
+            (~drift_guard)
         ).fillna(False)
 
-        # Avoid chasing a stretched bar too far above VWAP/EMA.
-        dist_vwap = (out["Close"] / out["VWAP"] - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0) * 100
-        chase_guard = dist_vwap > 1.35
+        # Pullback resume: catches another wave after a shallow pullback in an up session.
+        pullback_resume = (
+            (out["PULLBACK_FROM_HIGH_PCT"] <= -0.25) &
+            (out["PULLBACK_FROM_HIGH_PCT"] >= -1.80) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["Close"] >= out["VWAP"] * 0.994) &
+            (out["MOM_1"] > 0) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~drift_guard)
+        ).fillna(False)
 
-        entry = (micro_trend_wave | micro_vwap_reclaim | micro_dip_bounce) & (~chase_guard)
+        # Avoid chasing a stretched bar too far above VWAP.
+        dist_vwap = (out["Close"] / out["VWAP"] - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0) * 100
+        chase_guard = dist_vwap > chase_limit
+
+        entry = (micro_trend_wave | micro_vwap_reclaim | micro_dip_bounce | pullback_resume) & (~chase_guard)
 
         out["ENTRY_SIGNAL"] = entry.fillna(False)
         out["SETUP"] = np.select(
-            [micro_vwap_reclaim, micro_dip_bounce, micro_trend_wave],
-            ["Micro VWAP Reclaim", "Micro Dip Bounce", "Micro Trend Wave"],
+            [micro_vwap_reclaim, micro_dip_bounce, pullback_resume, micro_trend_wave],
+            ["Micro VWAP Reclaim", "Micro Dip Bounce", "Micro Pullback Resume", "Micro Trend Wave"],
             default=""
         )
         out["DRIFT_GUARD"] = drift_guard.astype(bool)
@@ -5909,7 +5932,7 @@ if fast_intraday_mode:
 
     def _fast_run_micro_wave_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
                                       trail_pct: float, max_hold_bars: int, max_trades: int, cooldown_bars: int,
-                                      max_consecutive_stops: int = 2) -> pd.DataFrame:
+                                      max_consecutive_stops: int = 2, profit_rearm_bars: int = 1) -> pd.DataFrame:
         """
         Micro-wave execution:
         - Requires one-bar confirmation after a signal.
@@ -5974,10 +5997,11 @@ if fast_intraday_mode:
                     if exit_reason == "Stop":
                         consecutive_stops += 1
                         last_stop_price = exit_price
-                        cooldown = max(int(cooldown_bars), 6)
+                        cooldown = max(int(cooldown_bars), 4)
                     else:
+                        # Winning/neutral exits should re-arm quickly; otherwise a 5–6% trend only gives 1–2 trades.
                         consecutive_stops = 0
-                        cooldown = max(1, int(cooldown_bars // 2))
+                        cooldown = max(0, int(profit_rearm_bars))
                     in_pos = False
                     pending = None
                     entry_price = entry_time = entry_setup = None
@@ -5996,8 +6020,9 @@ if fast_intraday_mode:
                 chase_now = bool(row.get("CHASE_GUARD", False))
 
                 confirmed = (
-                    (price >= sig_price * 1.0002) or
-                    ((high >= sig_high * 1.0001) and (price >= sig_price * 0.9995))
+                    (price >= sig_price * 1.0001) or
+                    ((high >= sig_high * 1.00005) and (price >= sig_price * 0.9990)) or
+                    (str(sig_setup) in {"Micro Dip Bounce", "Micro Pullback Resume"} and price >= sig_price * 0.9985)
                 )
                 not_same_failed_level = True
                 if last_stop_price is not None:
@@ -6177,15 +6202,18 @@ if fast_intraday_mode:
             require_vwap_fast = st.checkbox("Require above VWAP for green momentum", value=True, key="fast_whole_vwap")
             min_red_drop_fast = st.number_input("Red-day trigger: down from open %", 0.2, 15.0, 1.0, 0.1, key="fast_whole_red_drop")
             bounce_confirm_fast = st.number_input("Bounce from intraday low %", 0.05, 5.0, 0.25, 0.05, key="fast_whole_bounce")
-            min_vol_ratio_fast = st.number_input("Min volume ratio", 0.1, 5.0, 0.6, 0.1, key="fast_whole_vol_ratio")
+            min_vol_ratio_fast = st.number_input("Min volume ratio", 0.1, 5.0, 0.55, 0.1, key="fast_whole_vol_ratio")
+            wave_density_fast = st.selectbox("Wave density", ["Calm", "Active", "High Activity"], index=1, key="fast_wave_density",
+                                             help="Use High Activity for GLXY/CMG-type days where the stock is moving 5–6% and you want more controlled waves.")
         with colC:
-            target_fast = st.number_input("Base target %", 0.05, 5.0, 0.60, 0.05, key="fast_whole_target")
+            target_fast = st.number_input("Base target %", 0.05, 5.0, 0.50, 0.05, key="fast_whole_target")
             stop_fast = st.number_input("Hard stop %", 0.05, 3.0, 0.35, 0.05, key="fast_whole_stop")
             runner_fast = st.checkbox("Let winners run after target", value=True, key="fast_whole_runner")
             trail_fast = st.number_input("Runner trail %", 0.05, 3.0, 0.35, 0.05, key="fast_whole_trail")
-            max_hold_fast = st.number_input("Max hold bars", 2, 200, 30, 1, key="fast_whole_hold")
-            max_trades_fast = st.number_input("Max trades", 1, 20, 8, 1, key="fast_whole_max_trades")
-            cooldown_fast = st.number_input("Cooldown bars", 0, 80, 20, 1, key="fast_whole_cooldown")
+            max_hold_fast = st.number_input("Max hold bars", 2, 200, 24, 1, key="fast_whole_hold")
+            max_trades_fast = st.number_input("Max trades", 1, 30, 12, 1, key="fast_whole_max_trades")
+            cooldown_fast = st.number_input("Cooldown bars after stop", 0, 80, 6, 1, key="fast_whole_cooldown")
+            profit_rearm_fast = st.number_input("Re-arm bars after winner", 0, 20, 1, 1, key="fast_profit_rearm")
 
         run_fast = st.button("Fetch latest intraday session + Run Long-Only Engine", type="primary", use_container_width=True, key="fast_whole_run")
         if not run_fast:
@@ -6206,8 +6234,8 @@ if fast_intraday_mode:
                     day_fast = raw_fast.copy()
 
                 if exec_model_fast == "Micro-Wave Capture":
-                    signals_fast = _fast_build_micro_wave_signals(day_fast, sensitivity_fast, require_vwap_fast, bounce_confirm_fast, min_vol_ratio_fast)
-                    trades_fast = _fast_run_micro_wave_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast), max_consecutive_stops=2)
+                    signals_fast = _fast_build_micro_wave_signals(day_fast, sensitivity_fast, require_vwap_fast, bounce_confirm_fast, min_vol_ratio_fast, wave_density_fast)
+                    trades_fast = _fast_run_micro_wave_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast), max_consecutive_stops=2, profit_rearm_bars=int(profit_rearm_fast))
                 else:
                     signals_fast = _fast_build_long_only_signals(day_fast, sensitivity_fast, setup_mode_fast, require_vwap_fast, min_red_drop_fast, bounce_confirm_fast, min_vol_ratio_fast)
                     trades_fast = _fast_run_long_only_backtest(signals_fast, target_fast, stop_fast, runner_fast, trail_fast, int(max_hold_fast), int(max_trades_fast), int(cooldown_fast))
@@ -6239,7 +6267,7 @@ if fast_intraday_mode:
 
                 st.subheader("Trade Log")
                 if trades_fast.empty:
-                    st.warning("0 trades. No confirmed micro-wave after one-bar confirmation. Try 1m/5m, lower bounce to 0.20, or lower volume ratio to 0.5 — but do not force trades on chop.")
+                    st.warning("0 trades. No confirmed micro-wave. For GLXY/CMG-type mover days, try Wave density = High Activity, 1m/5m, bounce 0.20, or volume ratio 0.5 — but do not force trades on chop.")
                 else:
                     st.dataframe(trades_fast, use_container_width=True, hide_index=True)
                     closed = trades_fast[trades_fast["Exit Reason"] != "Open"]
