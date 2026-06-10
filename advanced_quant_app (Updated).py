@@ -6580,6 +6580,195 @@ if fast_intraday_mode:
             df = df.sort_values(["Score"], ascending=False, na_position="last")
         return df.reset_index(drop=True)
 
+    def _rs_build_trade_log(ticker: str, interval: str, period: str, benchmark: str,
+                            target_pct: float, stop_pct: float, trail_pct: float,
+                            max_trades: int, min_score: float, min_vol_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Institutional Momentum trade log.
+
+        Logic:
+        Entry only when the stock has unusual volume + relative strength + VWAP/EMA buyer control.
+        Exit on target, trail, VWAP/EMA breakdown, hard stop, or end of session.
+        Long-only. No forced scalping.
+        """
+        raw = _rs_fetch_intraday_one(ticker, period=period, interval=interval)
+        day = _rs_add_features(_rs_latest_session(raw))
+        bench = _rs_add_features(_rs_latest_session(_rs_fetch_intraday_one(benchmark, period=period, interval=interval)))
+        if day is None or day.empty or len(day) < 8:
+            return pd.DataFrame(), day
+
+        try:
+            bench_ret_now = 0.0
+            if bench is not None and not bench.empty and len(bench) >= 2:
+                bench_open = float(bench["Open"].iloc[0])
+                bench_close = float(bench["Close"].iloc[-1])
+                bench_ret_now = (bench_close / bench_open - 1.0) * 100.0
+        except Exception:
+            bench_ret_now = 0.0
+
+        trades = []
+        in_pos = False
+        entry_px = entry_time = entry_setup = None
+        stop_px = target_px = None
+        high_since = None
+        bars_held = 0
+        cooldown = 0
+
+        # Store bar-by-bar signal score for diagnostics/chart markers.
+        sig_scores = []
+        entry_flags = []
+        exit_flags = []
+
+        for i in range(len(day)):
+            row = day.iloc[i]
+            ts = day.index[i]
+            px = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+            open0 = float(day["Open"].iloc[0])
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            from_open = (px / open0 - 1.0) * 100.0
+            rel_strength = from_open - bench_ret_now
+            vol_ratio = float(row.get("VOL_RATIO", 1.0) if pd.notna(row.get("VOL_RATIO", 1.0)) else 1.0)
+            above_vwap = px > float(row.get("VWAP", px))
+            ema_stack = px > float(row.get("EMA9", px)) > float(row.get("EMA21", px))
+            close_loc = float(row.get("CLOSE_LOC", 0.5))
+            mom3 = float(row.get("MOM_3", 0.0) if pd.notna(row.get("MOM_3", 0.0)) else 0.0)
+            near_high = float(row.get("OFF_HIGH_%", -99.0)) >= -0.85
+
+            # Bar score intentionally simpler than the scanner score.
+            bar_score = 0.0
+            bar_score += max(min(rel_strength * 10.0, 30), -20)
+            bar_score += max(min(from_open * 5.0, 20), -12)
+            bar_score += 18 if above_vwap else -12
+            bar_score += 15 if ema_stack else -8
+            bar_score += 12 if vol_ratio >= min_vol_ratio else -6
+            bar_score += 8 if close_loc >= 0.60 else -4
+            bar_score += 7 if mom3 > 0.08 else -4
+            bar_score += 5 if near_high else -3
+
+            sig_scores.append(round(bar_score, 2))
+            entry_flags.append(False)
+            exit_flags.append(False)
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+                trail_stop = high_since * (1.0 - trail_pct / 100.0)
+                trend_break = (
+                    (px < float(row.get("VWAP", px)) * 0.996 and px < float(row.get("EMA9", px)) * 0.996) or
+                    (px < float(row.get("EMA21", px)) * 0.994)
+                )
+
+                exit_reason = None
+                exit_px = None
+                if low <= stop_px:
+                    exit_reason = "Hard Stop"
+                    exit_px = stop_px
+                elif high >= target_px:
+                    # Take first target, but if it runs hard, trail may capture better later in live interpretation.
+                    exit_reason = "Target"
+                    exit_px = target_px
+                elif high_since > entry_px * 1.008 and low <= trail_stop:
+                    exit_reason = "Trail"
+                    exit_px = trail_stop
+                elif trend_break and bars_held >= 2:
+                    exit_reason = "VWAP/EMA Breakdown"
+                    exit_px = px
+
+                if exit_reason is not None:
+                    pnl = (exit_px / entry_px - 1.0) * 100.0
+                    trades.append({
+                        "Ticker": ticker,
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_px, 4),
+                        "Sell Price": round(exit_px, 4),
+                        "PnL %": round(pnl, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": int(bars_held),
+                    })
+                    exit_flags[-1] = True
+                    in_pos = False
+                    entry_px = entry_time = entry_setup = None
+                    stop_px = target_px = high_since = None
+                    bars_held = 0
+                    cooldown = 2
+                    if len(trades) >= int(max_trades):
+                        break
+                    continue
+
+            # Entry: only institutional momentum, not random wiggles.
+            clean_entry = (
+                (not in_pos) and
+                cooldown == 0 and
+                (bar_score >= min_score) and
+                (rel_strength > 0.30) and
+                above_vwap and
+                (ema_stack or px > float(row.get("EMA21", px))) and
+                (vol_ratio >= min_vol_ratio) and
+                (close_loc >= 0.58) and
+                (mom3 > 0.04 or from_open > 0.80)
+            )
+
+            if clean_entry:
+                in_pos = True
+                entry_px = px
+                entry_time = ts
+                entry_setup = "Institutional Momentum Long"
+                # Stop is the tighter of fixed stop or VWAP/EMA structure, but not above entry.
+                structure_stop = min(float(row.get("VWAP", px)), float(row.get("EMA21", px))) * 0.994
+                fixed_stop = entry_px * (1.0 - stop_pct / 100.0)
+                stop_px = min(entry_px * 0.999, max(structure_stop, fixed_stop))
+                target_px = entry_px * (1.0 + target_pct / 100.0)
+                high_since = px
+                bars_held = 0
+                entry_flags[-1] = True
+
+        if in_pos:
+            last = day.iloc[-1]
+            exit_px = float(last["Close"])
+            pnl = (exit_px / entry_px - 1.0) * 100.0
+            trades.append({
+                "Ticker": ticker,
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_px, 4),
+                "Sell Price": round(exit_px, 4),
+                "PnL %": round(pnl, 3),
+                "Exit Reason": "Open",
+                "Bars Held": int(bars_held),
+            })
+
+        try:
+            day["Signal Score"] = pd.Series(sig_scores, index=day.index[:len(sig_scores)])
+            day["Trade Entry"] = pd.Series(entry_flags, index=day.index[:len(entry_flags)]).fillna(False)
+            day["Trade Exit"] = pd.Series(exit_flags, index=day.index[:len(exit_flags)]).fillna(False)
+        except Exception:
+            pass
+
+        return pd.DataFrame(trades), day
+
+    def _rs_build_multi_trade_logs(tickers: list, interval: str, period: str, benchmark: str,
+                                   target_pct: float, stop_pct: float, trail_pct: float,
+                                   max_trades_each: int, min_score: float, min_vol_ratio: float) -> tuple[pd.DataFrame, dict]:
+        all_trades = []
+        chart_data = {}
+        for t in tickers:
+            tr, d = _rs_build_trade_log(t, interval, period, benchmark, target_pct, stop_pct, trail_pct,
+                                        max_trades_each, min_score, min_vol_ratio)
+            chart_data[t] = d
+            if tr is not None and not tr.empty:
+                all_trades.append(tr)
+        if all_trades:
+            return pd.concat(all_trades, ignore_index=True), chart_data
+        return pd.DataFrame(), chart_data
+
     with tab21:
         st.header("🚨 Institutional Momentum Scanner — Relative Strength + Unusual Volume")
         st.caption("Replaces the old 0.5% scalper. Goal: find the few stocks acting strong while the broader market is weak, then build a clean trade plan.")
@@ -6598,6 +6787,20 @@ if fast_intraday_mode:
             min_price = st.number_input("Min price", 1.0, 1000.0, 5.0, 1.0, key="inst_mom_min_price")
             min_dollar_vol_m = st.number_input("Min intraday dollar vol ($M)", 0.0, 5000.0, 20.0, 5.0, key="inst_mom_min_dv")
             top_n = st.number_input("Show top N", 5, 50, 15, 1, key="inst_mom_topn")
+
+        with st.expander("Trade log engine settings", expanded=False):
+            tl1, tl2, tl3, tl4, tl5 = st.columns(5)
+            with tl1:
+                tl_target = st.number_input("Target %", 0.20, 10.0, 1.20, 0.10, key="inst_mom_tl_target")
+            with tl2:
+                tl_stop = st.number_input("Hard stop %", 0.10, 5.0, 0.70, 0.05, key="inst_mom_tl_stop")
+            with tl3:
+                tl_trail = st.number_input("Trail %", 0.10, 5.0, 0.80, 0.05, key="inst_mom_tl_trail")
+            with tl4:
+                tl_min_score = st.number_input("Min signal score", 20.0, 90.0, 48.0, 1.0, key="inst_mom_tl_score")
+            with tl5:
+                tl_min_vol_ratio = st.number_input("Min vol ratio", 0.20, 5.0, 1.10, 0.10, key="inst_mom_tl_minvol")
+                tl_max_trades = st.number_input("Max trades / stock", 1, 20, 5, 1, key="inst_mom_tl_maxtr")
 
         tickers = [x.strip().upper() for x in universe_text.replace("\n", ",").split(",") if x.strip()]
         run_scan = st.button("Run Institutional Momentum Scan", type="primary", use_container_width=True, key="inst_mom_run")
@@ -6636,11 +6839,48 @@ if fast_intraday_mode:
                     m4.metric("Top Score", f"{float(top['Score'].max()):.1f}")
 
                     best = str(top.iloc[0]["Ticker"])
-                    selected = st.selectbox("Chart / trade plan ticker", top["Ticker"].tolist(), index=0, key="inst_mom_selected")
+                    trade_log_choices = top["Ticker"].tolist()
+                    selected_logs = st.multiselect(
+                        "Select stocks for trade logs",
+                        trade_log_choices,
+                        default=trade_log_choices[:min(5, len(trade_log_choices))],
+                        key="inst_mom_trade_log_select",
+                        help="Choose one or more ranked tickers to generate institutional momentum trade logs."
+                    )
 
+                    if selected_logs:
+                        trade_logs, chart_map = _rs_build_multi_trade_logs(
+                            selected_logs, interval, period, benchmark,
+                            float(tl_target), float(tl_stop), float(tl_trail),
+                            int(tl_max_trades), float(tl_min_score), float(tl_min_vol_ratio)
+                        )
+
+                        st.subheader("Institutional Momentum Trade Logs")
+                        if trade_logs.empty:
+                            st.warning("No trade-log entries passed the institutional momentum execution filter for the selected stocks. This means the scan may like the name, but no clean intraday entry confirmed under the trade-log rules.")
+                        else:
+                            st.dataframe(trade_logs, use_container_width=True, hide_index=True)
+                            closed_logs = trade_logs[trade_logs["Exit Reason"] != "Open"].copy()
+                            if not closed_logs.empty:
+                                k1, k2, k3, k4 = st.columns(4)
+                                k1.metric("Closed trades", len(closed_logs))
+                                k2.metric("Win rate", f"{(closed_logs['PnL %'] > 0).mean()*100:.1f}%")
+                                k3.metric("Sum PnL", f"{closed_logs['PnL %'].sum():.2f}%")
+                                k4.metric("Avg PnL", f"{closed_logs['PnL %'].mean():.2f}%")
+
+                        chart_pick = st.selectbox("Chart / detailed trade-plan ticker", selected_logs, index=0, key="inst_mom_chart_pick")
+                    else:
+                        trade_logs = pd.DataFrame()
+                        chart_map = {}
+                        chart_pick = best
+                        st.info("Select at least one stock to generate trade logs.")
+
+                    selected = chart_pick
                     raw_sel = _rs_fetch_intraday_one(selected, period=period, interval=interval)
-                    day_sel = _rs_add_features(_rs_latest_session(raw_sel))
-                    row_sel = top[top["Ticker"] == selected].iloc[0].to_dict()
+                    day_sel = chart_map.get(selected)
+                    if day_sel is None or day_sel.empty:
+                        day_sel = _rs_add_features(_rs_latest_session(raw_sel))
+                    row_sel = top[top["Ticker"] == selected].iloc[0].to_dict() if selected in top["Ticker"].tolist() else {}
 
                     st.subheader(f"{selected} — Institutional Trade Plan")
                     p1, p2, p3, p4 = st.columns(4)
@@ -6663,6 +6903,25 @@ if fast_intraday_mode:
                         fig.add_trace(go.Scatter(x=day_sel.index, y=day_sel["VWAP"], name="VWAP", mode="lines"))
                         fig.add_trace(go.Scatter(x=day_sel.index, y=day_sel["EMA9"], name="EMA9", mode="lines"))
                         fig.add_trace(go.Scatter(x=day_sel.index, y=day_sel["EMA21"], name="EMA21", mode="lines"))
+
+                        # Plot trade-log markers for this selected stock.
+                        try:
+                            if not trade_logs.empty:
+                                one_tr = trade_logs[trade_logs["Ticker"] == selected].copy()
+                                if not one_tr.empty:
+                                    entry_x = pd.to_datetime(one_tr["Entry Time CT"], errors="coerce")
+                                    entry_y = one_tr["Buy Price"].astype(float)
+                                    fig.add_trace(go.Scatter(x=entry_x, y=entry_y, name="Trade Entries", mode="markers",
+                                                             marker=dict(size=11, symbol="triangle-up")))
+                                    exits = one_tr[one_tr["Exit Time CT"] != "Open / Marked at latest bar"].copy()
+                                    if not exits.empty:
+                                        exit_x = pd.to_datetime(exits["Exit Time CT"], errors="coerce")
+                                        exit_y = exits["Sell Price"].astype(float)
+                                        fig.add_trace(go.Scatter(x=exit_x, y=exit_y, name="Trade Exits", mode="markers",
+                                                                 marker=dict(size=10, symbol="x")))
+                        except Exception:
+                            pass
+
                         try:
                             fig.add_hline(y=float(row_sel.get("Entry Zone")), line_dash="dash", annotation_text="Entry zone")
                             fig.add_hline(y=float(row_sel.get("Invalidation")), line_dash="dot", annotation_text="Invalidation")
@@ -6670,8 +6929,12 @@ if fast_intraday_mode:
                         except Exception:
                             pass
                         fig.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_dark",
-                                          title=f"{selected} Intraday RS / Volume Structure")
+                                          title=f"{selected} Intraday RS / Volume Structure + Trade Log")
                         st.plotly_chart(fig, use_container_width=True)
+
+                    with st.expander("Selected ticker diagnostics", expanded=False):
+                        diag_cols = [c for c in ["Close", "VWAP", "EMA9", "EMA21", "FROM_OPEN_%", "MOM_3", "MOM_6", "VOL_RATIO", "CLOSE_LOC", "Signal Score", "Trade Entry", "Trade Exit"] if c in day_sel.columns]
+                        st.dataframe(day_sel[diag_cols].tail(120), use_container_width=True)
 
                     with st.expander("How to read this institutional scanner", expanded=False):
                         st.markdown("""
