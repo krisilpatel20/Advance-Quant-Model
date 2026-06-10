@@ -8774,25 +8774,36 @@ with tab7:
         with vt_c1:
             vt_interval = st.selectbox("Chart timeframe", ["15m", "30m", "60m", "90m", "1d"], index=1, key="bt_vt_interval")
             vt_twap_len = st.number_input("TWAP length (bars)", min_value=5, max_value=200, value=20, step=1, key="bt_vt_twap_len")
-            vt_entry_mode = st.selectbox("Entry mode", ["State Trend Filter", "Strict Cross Only"], index=0, key="bt_vt_entry_mode",
-                                         help="State Trend Filter can enter when price is already in a bullish VWAP/TWAP state. Strict Cross Only waits only for fresh VWAP cross above TWAP.")
+            vt_entry_mode = st.selectbox("Entry mode", ["Institutional Swing Hold", "State Trend Filter", "Strict Cross Only"], index=0, key="bt_vt_entry_mode",
+                                         help="Institutional Swing Hold is default: fewer trades, requires persistent trend, holds through small VWAP/TWAP noise.")
         with vt_c2:
             vt_use_ema50 = st.checkbox("Use 50 EMA trend filter", value=True, key="bt_vt_use_ema50")
+            vt_use_ema_slope = st.checkbox("Require EMA50 slope up", value=True, key="bt_vt_ema_slope",
+                                           help="Reduces chop trades. Entry needs EMA50 rising/flat.")
             vt_use_volume = st.checkbox("Require volume on entry", value=False, key="bt_vt_use_volume",
-                                        help="For swing trend filtering, volume should confirm entries but should not block every good trend.")
+                                        help="For swing trend filtering, volume should confirm, but not block every good trend.")
             vt_vol_mult = st.number_input("Volume higher than normal x", min_value=0.5, max_value=5.0, value=1.00, step=0.05, key="bt_vt_vol_mult")
         with vt_c3:
             vt_use_rs = st.checkbox("Use market relative strength filter", value=True, key="bt_vt_use_rs")
             vt_benchmark = st.text_input("Market benchmark", value="SPY", key="bt_vt_benchmark")
-            vt_rs_threshold = st.number_input("Min RS vs benchmark %", min_value=-5.0, max_value=5.0, value=-0.10, step=0.05, key="bt_vt_rs_thresh",
-                                              help="Small negative default avoids missing strong stocks from tiny benchmark alignment issues.")
+            vt_rs_threshold = st.number_input("Min RS vs benchmark %", min_value=-5.0, max_value=5.0, value=0.00, step=0.05, key="bt_vt_rs_thresh",
+                                              help="0 means stock must be at least as strong as benchmark over the lookback.")
         with vt_c4:
-            vt_chop_window = st.number_input("Chop flip window", min_value=3, max_value=50, value=12, step=1, key="bt_vt_chop_window")
-            vt_max_flips = st.number_input("Max flips allowed", min_value=1, max_value=10, value=4, step=1, key="bt_vt_max_flips")
-            vt_exit_confirm = st.number_input("Exit confirmation bars", min_value=1, max_value=10, value=2, step=1, key="bt_vt_exit_confirm",
-                                              help="Require weakness to persist before exiting. This prevents tiny VWAP dips from killing swing trades.")
+            vt_chop_window = st.number_input("Chop flip window", min_value=3, max_value=80, value=18, step=1, key="bt_vt_chop_window")
+            vt_max_flips = st.number_input("Max flips allowed", min_value=1, max_value=10, value=3, step=1, key="bt_vt_max_flips")
+            vt_entry_confirm = st.number_input("Entry confirmation bars", min_value=1, max_value=10, value=3, step=1, key="bt_vt_entry_confirm",
+                                               help="Require bullish VWAP/TWAP state to persist before entering.")
+            vt_exit_confirm = st.number_input("Exit confirmation bars", min_value=1, max_value=12, value=4, step=1, key="bt_vt_exit_confirm",
+                                              help="Require weakness to persist before exiting. Default 4 reduces 55-trade churn.")
+        vt_c5, vt_c6 = st.columns(2)
+        with vt_c5:
+            vt_cooldown = st.number_input("Re-entry cooldown bars", min_value=0, max_value=100, value=8, step=1, key="bt_vt_cooldown",
+                                          help="Stops same-day repeated churn after an exit.")
+        with vt_c6:
+            vt_break_buffer = st.number_input("Breakdown buffer %", min_value=0.0, max_value=5.0, value=0.25, step=0.05, key="bt_vt_break_buffer",
+                                             help="Exit only if price breaks below VWAP/TWAP/EMA by this buffer. Reduces noise exits.")
 
-        st.info("Bullish setup: VWAP above TWAP, price above both, optional EMA50 confirms, relative strength is positive/acceptable. Default mode uses VWAP/TWAP as a swing trend filter, not a rare cross-only scalper.")
+        st.info("Default is now Institutional Swing Hold: fewer trades, confirmed bullish VWAP/TWAP state, EMA50 trend support, RS confirmation, cooldown after exits, and buffered breakdown exits.")
 
         # For this strategy, load the selected timeframe directly.
         # Yahoo limits intraday history, so we automatically fall back to safe recent periods.
@@ -8895,15 +8906,18 @@ with tab7:
             cross_up = (session_vwap > twap) & (session_vwap.shift(1) <= twap.shift(1))
             cross_down = (session_vwap < twap) & (session_vwap.shift(1) >= twap.shift(1))
 
-            bullish_state = (
+            buffer = float(vt_break_buffer) / 100.0
+            bullish_state_raw = (
                 (session_vwap > twap) &
                 (vt_df["Close"] > session_vwap) &
                 (vt_df["Close"] > twap)
             )
+            bullish_state = bullish_state_raw.rolling(int(vt_entry_confirm), min_periods=1).sum() >= int(vt_entry_confirm)
 
             price_above = (vt_df["Close"] > session_vwap) & (vt_df["Close"] > twap)
             ema_ok = (vt_df["Close"] > ema50) if bool(vt_use_ema50) else pd.Series(True, index=vt_df.index)
-            ema_bad_raw = (vt_df["Close"] < ema50) if bool(vt_use_ema50) else pd.Series(False, index=vt_df.index)
+            ema_slope_ok = (ema50.diff(5) >= 0) if bool(vt_use_ema_slope) else pd.Series(True, index=vt_df.index)
+            ema_bad_raw = (vt_df["Close"] < ema50 * (1.0 - buffer)) if bool(vt_use_ema50) else pd.Series(False, index=vt_df.index)
 
             # Relative strength threshold in percentage terms over the same lookback.
             if bool(vt_use_rs):
@@ -8920,28 +8934,45 @@ with tab7:
 
             entry_volume_ok = vol_ok if bool(vt_use_volume) else pd.Series(True, index=vt_df.index)
 
-            # State Trend Filter fixes the original issue:
-            # The strategy can enter an already-healthy bullish VWAP/TWAP trend instead of waiting for a rare fresh cross.
-            if str(vt_entry_mode) == "Strict Cross Only":
-                long_cond = cross_up & price_above & ema_ok & entry_volume_ok & rs_ok & chop_ok
-            else:
-                trend_reclaim = bullish_state & (~bullish_state.shift(1).fillna(False))
-                trend_continuation = bullish_state & ema_ok & rs_ok & chop_ok
-                long_cond = (cross_up | trend_reclaim | trend_continuation) & ema_ok & entry_volume_ok & rs_ok & chop_ok
+            trend_reclaim = bullish_state & (~bullish_state.shift(1).fillna(False))
+            trend_continuation = bullish_state & ema_ok & ema_slope_ok & rs_ok & chop_ok
 
-            # Exit only after confirmed weakness. Do not exit on one small intrabar dip.
-            weak_vwap_twap = ((vt_df["Close"] < session_vwap) & (vt_df["Close"] < twap))
-            weak_cross = (session_vwap < twap)
+            if str(vt_entry_mode) == "Strict Cross Only":
+                raw_long_cond = cross_up & price_above & ema_ok & ema_slope_ok & entry_volume_ok & rs_ok & chop_ok
+            elif str(vt_entry_mode) == "State Trend Filter":
+                raw_long_cond = (cross_up | trend_reclaim | trend_continuation) & ema_ok & ema_slope_ok & entry_volume_ok & rs_ok & chop_ok
+            else:
+                # Institutional Swing Hold: fewer, higher-quality entries only.
+                raw_long_cond = (trend_reclaim | (bullish_state & cross_up)) & ema_ok & ema_slope_ok & entry_volume_ok & rs_ok & chop_ok
+
+            # Exit only after confirmed structural weakness with a buffer.
+            weak_vwap_twap = ((vt_df["Close"] < session_vwap * (1.0 - buffer)) & (vt_df["Close"] < twap * (1.0 - buffer)))
+            weak_cross = (session_vwap < twap * (1.0 - buffer))
             weak_ema = ema_bad_raw
             weakness_raw = weak_cross | weak_vwap_twap | weak_ema | (~chop_ok)
             weakness_confirmed = weakness_raw.rolling(int(vt_exit_confirm), min_periods=1).sum() >= int(vt_exit_confirm)
 
             exit_cond = weakness_confirmed
 
-            vt_sig = pd.Series(np.nan, index=vt_df.index)
-            vt_sig.loc[long_cond.fillna(False)] = 1
-            vt_sig.loc[exit_cond.fillna(False)] = 0
-            signals = vt_sig.ffill().fillna(0).clip(0, 1)
+            # Stateful signal with cooldown to prevent 55-trade churn.
+            signals = pd.Series(0.0, index=vt_df.index)
+            long_cond = pd.Series(False, index=vt_df.index)
+            in_pos = False
+            cooldown_left = 0
+            for _i, _dt in enumerate(vt_df.index):
+                if cooldown_left > 0:
+                    cooldown_left -= 1
+                if in_pos:
+                    signals.iloc[_i] = 1.0
+                    if bool(exit_cond.loc[_dt]):
+                        in_pos = False
+                        signals.iloc[_i] = 0.0
+                        cooldown_left = int(vt_cooldown)
+                else:
+                    if cooldown_left == 0 and bool(raw_long_cond.loc[_dt]):
+                        in_pos = True
+                        long_cond.loc[_dt] = True
+                        signals.iloc[_i] = 1.0
 
             strat_prices = vt_df["Close"].dropna()
             prices_bt = strat_prices
@@ -8986,7 +9017,8 @@ with tab7:
                     "Vol OK": vol_ok,
                     "RS Spread %": rs_spread_pct,
                     "RS OK": rs_ok,
-                    "Bullish State": bullish_state,
+                    "Bullish State Confirmed": bullish_state,
+                    "Raw Bullish State": bullish_state_raw,
                     "Flip Count": flip_count,
                     "Long Condition": long_cond,
                     "Exit/Avoid Condition": exit_cond,
