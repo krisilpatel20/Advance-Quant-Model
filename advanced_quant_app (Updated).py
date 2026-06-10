@@ -8789,6 +8789,13 @@ with tab7:
                                       help="Tests multiple VWAP/TWAP settings and selects only if it improves vs buy & hold after drawdown/trade penalties.")
             vt_selection_mode = st.selectbox("Selection objective", ["Beat Benchmark", "Risk Adjusted", "Low Churn"], index=0, key="bt_vt_selection_mode")
             vt_allow_no_edge = st.checkbox("Show No Edge if it cannot beat benchmark", value=True, key="bt_vt_no_edge")
+            vt_no_edge_fallback = st.selectbox(
+                "If no custom edge",
+                ["Benchmark Fallback", "Cash / No Trade"],
+                index=0,
+                key="bt_vt_no_edge_fallback",
+                help="Benchmark Fallback keeps exposure like buy & hold so metrics stay realistic. Cash / No Trade shows what happens if you avoid the trade completely."
+            )
             vt_optimizer_speed = st.selectbox("Optimizer speed", ["Fast", "Balanced", "Deep"], index=0, key="bt_vt_opt_speed",
                                              help="Fast is recommended. Deep tests many combinations and can be slow.")
 
@@ -9076,14 +9083,28 @@ with tab7:
                 best_row = None
                 best_sig = None
                 best_diag = None
-                st.caption(f"Optimizer speed: {vt_optimizer_speed} | Testing {len(grid)} candidate settings.")
+                st.caption(f"Optimizer speed: {vt_optimizer_speed} | Testing {len(grid)} VWAP/TWAP candidate settings plus benchmark baselines.")
                 with st.spinner(f"Optimizing {len(grid)} VWAP/TWAP candidates against benchmark..."):
+                    # Baseline 1: buy and hold. If custom strategy cannot beat this, no custom edge exists.
+                    bh_sig = pd.Series(1.0, index=vt_df.index)
+                    bh_row = _score_vt_candidate(bh_sig, {**manual_params, "twap_len": int(vt_twap_len), "entry_mode": "Benchmark Buy & Hold", "entry_confirm": 0, "exit_confirm": 0, "break_buffer": 0.0, "cooldown": 0})
+                    if bh_row is not None:
+                        rows.append(bh_row)
+
+                    # Baseline 2: simple major trend hold using EMA50 only.
+                    ema_trend_sig = (vt_df["Close"] > ema50).astype(float).ffill().fillna(0)
+                    ema_row = _score_vt_candidate(ema_trend_sig, {**manual_params, "twap_len": int(vt_twap_len), "entry_mode": "EMA50 Trend Baseline", "entry_confirm": 0, "exit_confirm": 0, "break_buffer": 0.0, "cooldown": 0})
+                    if ema_row is not None:
+                        rows.append(ema_row)
+
                     for params in grid:
                         sig_try, diag_try = _build_vt_signal(params)
                         row = _score_vt_candidate(sig_try, params)
                         if row is None:
                             continue
                         rows.append(row)
+                        if str(row.get("entry_mode", "")) in ["Benchmark Buy & Hold", "EMA50 Trend Baseline"]:
+                            continue
                         if best_row is None or row["Objective"] > best_row["Objective"]:
                             best_row = row
                             best_sig = sig_try
@@ -9096,11 +9117,18 @@ with tab7:
                         vt_diag = best_diag
                         st.success(f"Optimizer selected VWAP/TWAP candidate with Alpha {best_row['Alpha %']:.2f}% vs buy & hold. Objective {best_row['Objective']:.2f}.")
                     else:
-                        # No custom edge: show it honestly. Use cash signal so metrics don't pretend the strategy is good.
-                        signals = pd.Series(0.0, index=vt_df.index)
+                        # No custom edge: show it honestly.
+                        # Do NOT default to an all-cash signal because it creates useless 0% returns
+                        # and can produce absurd Sharpe from near-zero variance.
+                        if str(vt_no_edge_fallback) == "Benchmark Fallback":
+                            signals = pd.Series(1.0, index=vt_df.index)
+                            st.error(f"NO CUSTOM EDGE: best VWAP/TWAP candidate alpha was only {best_row['Alpha %']:.2f}% vs buy & hold, below required {float(vt_min_alpha):.2f}%.")
+                            st.info("Using Benchmark Fallback for metrics: this means the honest answer is buy/hold was better than the custom VWAP/TWAP timing strategy for this sample.")
+                        else:
+                            signals = pd.Series(0.0, index=vt_df.index)
+                            st.error(f"NO CUSTOM EDGE: best VWAP/TWAP candidate alpha was only {best_row['Alpha %']:.2f}% vs buy & hold, below required {float(vt_min_alpha):.2f}%.")
+                            st.info("Using Cash / No Trade fallback. This will show 0% return and is mainly for comparison, not as a valid alpha strategy.")
                         vt_diag = _build_vt_signal(manual_params)[1]
-                        st.error(f"NO CUSTOM EDGE: best VWAP/TWAP candidate alpha was only {best_row['Alpha %']:.2f}% vs buy & hold, below required {float(vt_min_alpha):.2f}%.")
-                        st.info("This means the benchmark was better for this sample. In that case, either buy & hold is the better choice, or this ticker/timeframe is not suitable for VWAP/TWAP.")
                 else:
                     signals, vt_diag = _build_vt_signal(manual_params)
             else:
