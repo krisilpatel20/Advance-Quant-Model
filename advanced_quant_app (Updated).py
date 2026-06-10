@@ -8145,7 +8145,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -8765,6 +8765,153 @@ with tab7:
                 
                 fig_ctx.update_layout(title="Momentum Hedge Signal (EMA/SMA Cross)", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "VWAP/TWAP Swing Filter":
+        st.markdown("### 🧭 VWAP/TWAP Swing Filter")
+        st.caption("Designed for swing-style trend filtering, not fast scalping. Default: 30-minute chart, Session VWAP, TWAP length 20, optional 50 EMA confirmation.")
+
+        vt_c1, vt_c2, vt_c3, vt_c4 = st.columns(4)
+        with vt_c1:
+            vt_interval = st.selectbox("Chart timeframe", ["15m", "30m", "60m", "90m", "1d"], index=1, key="bt_vt_interval")
+            vt_twap_len = st.number_input("TWAP length (bars)", min_value=5, max_value=200, value=20, step=1, key="bt_vt_twap_len")
+        with vt_c2:
+            vt_use_ema50 = st.checkbox("Use 50 EMA trend filter", value=True, key="bt_vt_use_ema50")
+            vt_vol_mult = st.number_input("Volume higher than normal x", min_value=0.5, max_value=5.0, value=1.10, step=0.05, key="bt_vt_vol_mult")
+        with vt_c3:
+            vt_use_rs = st.checkbox("Use market relative strength filter", value=True, key="bt_vt_use_rs")
+            vt_benchmark = st.text_input("Market benchmark", value="SPY", key="bt_vt_benchmark")
+        with vt_c4:
+            vt_chop_window = st.number_input("Chop flip window", min_value=3, max_value=50, value=10, step=1, key="bt_vt_chop_window")
+            vt_max_flips = st.number_input("Max flips allowed", min_value=1, max_value=10, value=3, step=1, key="bt_vt_max_flips")
+
+        st.info("Bullish setup: VWAP crosses above TWAP, close is above both, optional 50 EMA confirms, volume is above normal, and relative strength vs market is positive.")
+
+        # For this strategy, load the selected timeframe directly.
+        try:
+            if live_mode:
+                vt_df = load_data(TICKER, start_date, end_date, interval=str(vt_interval))
+            else:
+                vt_df = load_data(TICKER, bt_start_date, bt_end_date, interval=str(vt_interval))
+        except Exception:
+            vt_df = pd.DataFrame()
+
+        if vt_df is None or vt_df.empty or "Close" not in vt_df.columns:
+            st.error("Could not load VWAP/TWAP timeframe data. For 30m intraday, use a recent date range because Yahoo intraday history is limited.")
+            signals = None
+        else:
+            vt_df = vt_df.copy().replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+            # Ensure required OHLCV columns exist
+            for _c in ["Open", "High", "Low"]:
+                if _c not in vt_df.columns:
+                    vt_df[_c] = vt_df["Close"]
+            if "Volume" not in vt_df.columns:
+                vt_df["Volume"] = 1.0
+
+            # Session VWAP resets every day for intraday. For 1d, this behaves like daily cumulative over each day.
+            typical_vt = (vt_df["High"] + vt_df["Low"] + vt_df["Close"]) / 3.0
+            vol_vt = vt_df["Volume"].replace(0, np.nan).fillna(1.0)
+            try:
+                session_key = pd.DatetimeIndex(vt_df.index).date
+                vt_cum_pv = (typical_vt * vol_vt).groupby(session_key).cumsum()
+                vt_cum_v = vol_vt.groupby(session_key).cumsum()
+                session_vwap = vt_cum_pv / (vt_cum_v + 1e-9)
+            except Exception:
+                session_vwap = (typical_vt * vol_vt).cumsum() / (vol_vt.cumsum() + 1e-9)
+
+            # TWAP = rolling time-weighted average of typical price.
+            twap = typical_vt.rolling(int(vt_twap_len), min_periods=max(3, int(vt_twap_len)//3)).mean()
+            ema50 = vt_df["Close"].ewm(span=50, adjust=False).mean()
+            vol_avg = vt_df["Volume"].rolling(20, min_periods=5).mean()
+            vol_ok = vt_df["Volume"] > (vol_avg * float(vt_vol_mult))
+
+            # Market relative strength filter
+            rs_ok = pd.Series(True, index=vt_df.index)
+            bench_ret = pd.Series(0.0, index=vt_df.index)
+            asset_ret = vt_df["Close"].pct_change(max(3, int(vt_twap_len)//2))
+            if bool(vt_use_rs):
+                try:
+                    if live_mode:
+                        bench_df = load_data(str(vt_benchmark), start_date, end_date, interval=str(vt_interval))
+                    else:
+                        bench_df = load_data(str(vt_benchmark), bt_start_date, bt_end_date, interval=str(vt_interval))
+                    if bench_df is not None and not bench_df.empty and "Close" in bench_df.columns:
+                        bench_close = bench_df["Close"].reindex(vt_df.index).ffill()
+                        bench_ret = bench_close.pct_change(max(3, int(vt_twap_len)//2)).fillna(0)
+                        rs_ok = (asset_ret.fillna(0) - bench_ret.fillna(0)) > 0
+                    else:
+                        st.warning("Benchmark data not available. Relative strength filter ignored.")
+                except Exception as e:
+                    st.warning(f"Benchmark RS filter failed: {e}. Relative strength filter ignored.")
+
+            # Cross and state logic
+            cross_up = (session_vwap > twap) & (session_vwap.shift(1) <= twap.shift(1))
+            cross_down = (session_vwap < twap) & (session_vwap.shift(1) >= twap.shift(1))
+            price_above = (vt_df["Close"] > session_vwap) & (vt_df["Close"] > twap)
+            price_below_avoid = (vt_df["Close"] < session_vwap) | (vt_df["Close"] < twap)
+            ema_ok = (vt_df["Close"] > ema50) if bool(vt_use_ema50) else pd.Series(True, index=vt_df.index)
+            ema_bad = (vt_df["Close"] < ema50) if bool(vt_use_ema50) else pd.Series(False, index=vt_df.index)
+
+            # Avoid chop: if VWAP/TWAP relationship flips too much recently, block new longs.
+            flip_event = (cross_up | cross_down).astype(int)
+            flip_count = flip_event.rolling(int(vt_chop_window), min_periods=1).sum()
+            chop_ok = flip_count <= int(vt_max_flips)
+
+            long_cond = cross_up & price_above & ema_ok & vol_ok & rs_ok & chop_ok
+            exit_cond = cross_down | price_below_avoid | ema_bad | (~chop_ok)
+
+            vt_sig = pd.Series(np.nan, index=vt_df.index)
+            vt_sig.loc[long_cond] = 1
+            vt_sig.loc[exit_cond] = 0
+            signals = vt_sig.ffill().fillna(0).clip(0, 1)
+
+            strat_prices = vt_df["Close"].dropna()
+            prices_bt = strat_prices
+            returns_bt = strat_prices.pct_change().fillna(0)
+            df_bt = vt_df
+            benchmark_label_for_metrics = f"Buy & Hold ({vt_interval})"
+
+            with st.expander("See VWAP/TWAP Strategy Context", expanded=True):
+                fig_ctx = go.Figure()
+                fig_ctx.add_trace(go.Candlestick(
+                    x=vt_df.index, open=vt_df["Open"], high=vt_df["High"], low=vt_df["Low"], close=vt_df["Close"], name="Price"
+                ))
+                fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=session_vwap, mode="lines", name="Session VWAP"))
+                fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=twap, mode="lines", name=f"TWAP ({int(vt_twap_len)})"))
+                if bool(vt_use_ema50):
+                    fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=ema50, mode="lines", name="EMA 50"))
+
+                buys = vt_df[long_cond.fillna(False)]
+                sells = vt_df[exit_cond.fillna(False)]
+                if not buys.empty:
+                    fig_ctx.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="VWAP/TWAP Buy", marker=dict(size=11, symbol="triangle-up")))
+                if not sells.empty:
+                    fig_ctx.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="Avoid/Exit", marker=dict(size=9, symbol="x")))
+
+                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.10)
+                fig_ctx.update_layout(
+                    title=f"VWAP/TWAP Swing Filter — {TICKER} ({vt_interval})",
+                    hovermode="x unified",
+                    template="plotly_dark",
+                    height=650,
+                    xaxis_rangeslider_visible=False
+                )
+                st.plotly_chart(fig_ctx, use_container_width=True)
+
+                diag = pd.DataFrame({
+                    "Close": vt_df["Close"],
+                    "Session VWAP": session_vwap,
+                    f"TWAP {int(vt_twap_len)}": twap,
+                    "EMA50": ema50,
+                    "Volume": vt_df["Volume"],
+                    "Vol Avg20": vol_avg,
+                    "Vol OK": vol_ok,
+                    "RS OK": rs_ok,
+                    "Flip Count": flip_count,
+                    "Long Condition": long_cond,
+                    "Exit/Avoid Condition": exit_cond,
+                    "Signal": signals
+                })
+                st.dataframe(diag.tail(120), use_container_width=True)
 
     elif strategy_type == "MAD Trend Modes":
         st.markdown("### 📊 MAD Trend Modes Settings")
