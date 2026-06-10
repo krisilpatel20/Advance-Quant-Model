@@ -8768,7 +8768,7 @@ with tab7:
 
     elif strategy_type == "VWAP/TWAP Swing Filter":
         st.markdown("### 🧭 VWAP/TWAP Swing Filter")
-        st.caption("Designed for swing-style trend filtering, not fast scalping. Default: 30-minute chart, Session VWAP, TWAP length 20, optional 50 EMA confirmation.")
+        st.caption("Designed for swing-style trend filtering, not fast scalping. Default: 30-minute chart, Session VWAP, TWAP length 20, optional 50 EMA confirmation. Intraday data automatically falls back to Yahoo's most recent supported window.")
 
         vt_c1, vt_c2, vt_c3, vt_c4 = st.columns(4)
         with vt_c1:
@@ -8787,18 +8787,58 @@ with tab7:
         st.info("Bullish setup: VWAP crosses above TWAP, close is above both, optional 50 EMA confirms, volume is above normal, and relative strength vs market is positive.")
 
         # For this strategy, load the selected timeframe directly.
+        # Yahoo limits intraday history, so we automatically fall back to safe recent periods.
+        def _bt_vt_fetch_safe(ticker, interval, start_dt, end_dt):
+            try:
+                df0 = load_data(ticker, start_dt, end_dt, interval=str(interval))
+                if df0 is not None and not df0.empty and "Close" in df0.columns:
+                    return df0, "selected date range"
+            except Exception:
+                pass
+
+            # Intraday fallback windows supported more reliably by Yahoo.
+            try:
+                interval_s = str(interval)
+                if interval_s == "1m":
+                    per = "7d"
+                elif interval_s in ["2m", "5m", "15m", "30m", "60m", "90m"]:
+                    per = "60d"
+                else:
+                    per = "2y"
+
+                yf_df = yf.download(str(ticker).strip().upper(), period=per, interval=interval_s, progress=False, auto_adjust=True, prepost=False, threads=False)
+                if yf_df is not None and not yf_df.empty:
+                    if isinstance(yf_df.columns, pd.MultiIndex):
+                        yf_df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in yf_df.columns]
+                    yf_df = yf_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+                    # match app timezone behavior when possible
+                    try:
+                        idx = pd.DatetimeIndex(yf_df.index)
+                        if idx.tz is None and interval_s != "1d":
+                            yf_df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago")
+                        elif idx.tz is not None:
+                            yf_df.index = idx.tz_convert("America/Chicago")
+                    except Exception:
+                        pass
+                    return yf_df, f"Yahoo fallback period={per}"
+            except Exception:
+                pass
+
+            return pd.DataFrame(), "failed"
+
         try:
             if live_mode:
-                vt_df = load_data(TICKER, start_date, end_date, interval=str(vt_interval))
+                vt_df, vt_data_source = _bt_vt_fetch_safe(TICKER, vt_interval, start_date, end_date)
             else:
-                vt_df = load_data(TICKER, bt_start_date, bt_end_date, interval=str(vt_interval))
+                vt_df, vt_data_source = _bt_vt_fetch_safe(TICKER, vt_interval, bt_start_date, bt_end_date)
         except Exception:
-            vt_df = pd.DataFrame()
+            vt_df, vt_data_source = pd.DataFrame(), "failed"
 
         if vt_df is None or vt_df.empty or "Close" not in vt_df.columns:
-            st.error("Could not load VWAP/TWAP timeframe data. For 30m intraday, use a recent date range because Yahoo intraday history is limited.")
+            st.error("Could not load VWAP/TWAP data. Try 30m with recent dates, 60m, or switch timeframe to 1d for longer backtests.")
             signals = None
         else:
+            st.caption(f"VWAP/TWAP data source: {vt_data_source}. For intraday Yahoo data, old date ranges are automatically replaced with the most recent supported window.")
             vt_df = vt_df.copy().replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
             # Ensure required OHLCV columns exist
             for _c in ["Open", "High", "Low"]:
