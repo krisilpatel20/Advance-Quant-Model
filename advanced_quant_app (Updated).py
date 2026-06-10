@@ -8767,46 +8767,48 @@ with tab7:
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "VWAP/TWAP Swing Filter":
-        st.markdown("### 🧭 VWAP/TWAP Swing Filter")
-        st.caption("Designed for swing-style trend filtering, not fast scalping. Default: 30-minute chart, Session VWAP, TWAP length 20, optional 50 EMA confirmation. Intraday data automatically falls back to Yahoo's most recent supported window.")
+        st.markdown("### 🧭 VWAP/TWAP Benchmark-Aware Swing Filter")
+        st.caption("Goal: not just signals — benchmark-aware selection. If the custom VWAP/TWAP logic cannot beat buy & hold in the selected sample, the app clearly shows 'No custom edge'.")
 
         vt_c1, vt_c2, vt_c3, vt_c4 = st.columns(4)
         with vt_c1:
             vt_interval = st.selectbox("Chart timeframe", ["15m", "30m", "60m", "90m", "1d"], index=1, key="bt_vt_interval")
-            vt_twap_len = st.number_input("TWAP length (bars)", min_value=5, max_value=200, value=20, step=1, key="bt_vt_twap_len")
-            vt_entry_mode = st.selectbox("Entry mode", ["Institutional Swing Hold", "State Trend Filter", "Strict Cross Only"], index=0, key="bt_vt_entry_mode",
-                                         help="Institutional Swing Hold is default: fewer trades, requires persistent trend, holds through small VWAP/TWAP noise.")
+            vt_twap_len = st.number_input("Manual TWAP length", min_value=5, max_value=200, value=20, step=1, key="bt_vt_twap_len")
+            vt_entry_mode = st.selectbox("Manual entry mode", ["Institutional Swing Hold", "State Trend Filter", "Strict Cross Only"], index=0, key="bt_vt_entry_mode")
         with vt_c2:
             vt_use_ema50 = st.checkbox("Use 50 EMA trend filter", value=True, key="bt_vt_use_ema50")
-            vt_use_ema_slope = st.checkbox("Require EMA50 slope up", value=True, key="bt_vt_ema_slope",
-                                           help="Reduces chop trades. Entry needs EMA50 rising/flat.")
-            vt_use_volume = st.checkbox("Require volume on entry", value=False, key="bt_vt_use_volume",
-                                        help="For swing trend filtering, volume should confirm, but not block every good trend.")
+            vt_use_ema_slope = st.checkbox("Require EMA50 slope up", value=True, key="bt_vt_ema_slope")
+            vt_use_volume = st.checkbox("Require volume on entry", value=False, key="bt_vt_use_volume")
             vt_vol_mult = st.number_input("Volume higher than normal x", min_value=0.5, max_value=5.0, value=1.00, step=0.05, key="bt_vt_vol_mult")
         with vt_c3:
             vt_use_rs = st.checkbox("Use market relative strength filter", value=True, key="bt_vt_use_rs")
             vt_benchmark = st.text_input("Market benchmark", value="SPY", key="bt_vt_benchmark")
-            vt_rs_threshold = st.number_input("Min RS vs benchmark %", min_value=-5.0, max_value=5.0, value=0.00, step=0.05, key="bt_vt_rs_thresh",
-                                              help="0 means stock must be at least as strong as benchmark over the lookback.")
+            vt_rs_threshold = st.number_input("Min RS vs benchmark %", min_value=-5.0, max_value=5.0, value=0.00, step=0.05, key="bt_vt_rs_thresh")
         with vt_c4:
-            vt_chop_window = st.number_input("Chop flip window", min_value=3, max_value=80, value=18, step=1, key="bt_vt_chop_window")
-            vt_max_flips = st.number_input("Max flips allowed", min_value=1, max_value=10, value=3, step=1, key="bt_vt_max_flips")
-            vt_entry_confirm = st.number_input("Entry confirmation bars", min_value=1, max_value=10, value=3, step=1, key="bt_vt_entry_confirm",
-                                               help="Require bullish VWAP/TWAP state to persist before entering.")
-            vt_exit_confirm = st.number_input("Exit confirmation bars", min_value=1, max_value=12, value=4, step=1, key="bt_vt_exit_confirm",
-                                              help="Require weakness to persist before exiting. Default 4 reduces 55-trade churn.")
-        vt_c5, vt_c6 = st.columns(2)
-        with vt_c5:
-            vt_cooldown = st.number_input("Re-entry cooldown bars", min_value=0, max_value=100, value=8, step=1, key="bt_vt_cooldown",
-                                          help="Stops same-day repeated churn after an exit.")
-        with vt_c6:
-            vt_break_buffer = st.number_input("Breakdown buffer %", min_value=0.0, max_value=5.0, value=0.25, step=0.05, key="bt_vt_break_buffer",
-                                             help="Exit only if price breaks below VWAP/TWAP/EMA by this buffer. Reduces noise exits.")
+            vt_optimize = st.checkbox("Benchmark-aware optimizer", value=True, key="bt_vt_optimizer",
+                                      help="Tests multiple VWAP/TWAP settings and selects only if it improves vs buy & hold after drawdown/trade penalties.")
+            vt_selection_mode = st.selectbox("Selection objective", ["Beat Benchmark", "Risk Adjusted", "Low Churn"], index=0, key="bt_vt_selection_mode")
+            vt_allow_no_edge = st.checkbox("Show No Edge if it cannot beat benchmark", value=True, key="bt_vt_no_edge")
 
-        st.info("Default is now Institutional Swing Hold: fewer trades, confirmed bullish VWAP/TWAP state, EMA50 trend support, RS confirmation, cooldown after exits, and buffered breakdown exits.")
+        with st.expander("Manual / optimizer controls", expanded=False):
+            oc1, oc2, oc3, oc4, oc5 = st.columns(5)
+            with oc1:
+                vt_chop_window = st.number_input("Chop flip window", min_value=3, max_value=80, value=18, step=1, key="bt_vt_chop_window")
+                vt_max_flips = st.number_input("Max flips allowed", min_value=1, max_value=10, value=3, step=1, key="bt_vt_max_flips")
+            with oc2:
+                vt_entry_confirm = st.number_input("Entry confirm bars", min_value=1, max_value=10, value=3, step=1, key="bt_vt_entry_confirm")
+                vt_exit_confirm = st.number_input("Exit confirm bars", min_value=1, max_value=12, value=4, step=1, key="bt_vt_exit_confirm")
+            with oc3:
+                vt_cooldown = st.number_input("Re-entry cooldown bars", min_value=0, max_value=100, value=8, step=1, key="bt_vt_cooldown")
+                vt_break_buffer = st.number_input("Breakdown buffer %", min_value=0.0, max_value=5.0, value=0.25, step=0.05, key="bt_vt_break_buffer")
+            with oc4:
+                vt_trade_penalty = st.number_input("Trade penalty", min_value=0.0, max_value=2.0, value=0.03, step=0.01, key="bt_vt_trade_penalty")
+                vt_dd_penalty = st.number_input("Drawdown penalty", min_value=0.0, max_value=3.0, value=0.35, step=0.05, key="bt_vt_dd_penalty")
+            with oc5:
+                vt_min_alpha = st.number_input("Minimum alpha required %", min_value=-20.0, max_value=20.0, value=0.25, step=0.25, key="bt_vt_min_alpha")
 
-        # For this strategy, load the selected timeframe directly.
-        # Yahoo limits intraday history, so we automatically fall back to safe recent periods.
+        st.info("My honest rule: if this cannot beat buy & hold after penalties, it should say No Custom Edge instead of pretending the strategy is good.")
+
         def _bt_vt_fetch_safe(ticker, interval, start_dt, end_dt):
             try:
                 df0 = load_data(ticker, start_dt, end_dt, interval=str(interval))
@@ -8814,8 +8816,6 @@ with tab7:
                     return df0, "selected date range"
             except Exception:
                 pass
-
-            # Intraday fallback windows supported more reliably by Yahoo.
             try:
                 interval_s = str(interval)
                 if interval_s == "1m":
@@ -8824,13 +8824,11 @@ with tab7:
                     per = "60d"
                 else:
                     per = "2y"
-
                 yf_df = yf.download(str(ticker).strip().upper(), period=per, interval=interval_s, progress=False, auto_adjust=True, prepost=False, threads=False)
                 if yf_df is not None and not yf_df.empty:
                     if isinstance(yf_df.columns, pd.MultiIndex):
                         yf_df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in yf_df.columns]
                     yf_df = yf_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
-                    # match app timezone behavior when possible
                     try:
                         idx = pd.DatetimeIndex(yf_df.index)
                         if idx.tz is None and interval_s != "1d":
@@ -8842,7 +8840,6 @@ with tab7:
                     return yf_df, f"Yahoo fallback period={per}"
             except Exception:
                 pass
-
             return pd.DataFrame(), "failed"
 
         try:
@@ -8854,125 +8851,230 @@ with tab7:
             vt_df, vt_data_source = pd.DataFrame(), "failed"
 
         if vt_df is None or vt_df.empty or "Close" not in vt_df.columns:
-            st.error("Could not load VWAP/TWAP data. Try 30m with recent dates, 60m, or switch timeframe to 1d for longer backtests.")
+            st.error("Could not load VWAP/TWAP data. Try 30m recent range, 60m, or 1d for longer history.")
             signals = None
         else:
-            st.caption(f"VWAP/TWAP data source: {vt_data_source}. For intraday Yahoo data, old date ranges are automatically replaced with the most recent supported window.")
+            st.caption(f"VWAP/TWAP data source: {vt_data_source}")
             vt_df = vt_df.copy().replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
-            # Ensure required OHLCV columns exist
             for _c in ["Open", "High", "Low"]:
                 if _c not in vt_df.columns:
                     vt_df[_c] = vt_df["Close"]
             if "Volume" not in vt_df.columns:
                 vt_df["Volume"] = 1.0
 
-            # Session VWAP resets every day for intraday. For 1d, this behaves like daily cumulative over each day.
             typical_vt = (vt_df["High"] + vt_df["Low"] + vt_df["Close"]) / 3.0
             vol_vt = vt_df["Volume"].replace(0, np.nan).fillna(1.0)
             try:
                 session_key = pd.DatetimeIndex(vt_df.index).date
-                vt_cum_pv = (typical_vt * vol_vt).groupby(session_key).cumsum()
-                vt_cum_v = vol_vt.groupby(session_key).cumsum()
-                session_vwap = vt_cum_pv / (vt_cum_v + 1e-9)
+                session_vwap = ((typical_vt * vol_vt).groupby(session_key).cumsum()) / (vol_vt.groupby(session_key).cumsum() + 1e-9)
             except Exception:
                 session_vwap = (typical_vt * vol_vt).cumsum() / (vol_vt.cumsum() + 1e-9)
 
-            # TWAP = rolling time-weighted average of typical price.
-            twap = typical_vt.rolling(int(vt_twap_len), min_periods=max(3, int(vt_twap_len)//3)).mean()
             ema50 = vt_df["Close"].ewm(span=50, adjust=False).mean()
             vol_avg = vt_df["Volume"].rolling(20, min_periods=5).mean()
-            vol_ok = vt_df["Volume"] > (vol_avg * float(vt_vol_mult))
 
-            # Market relative strength filter
-            rs_ok = pd.Series(True, index=vt_df.index)
+            # benchmark relative strength
             bench_ret = pd.Series(0.0, index=vt_df.index)
-            asset_ret = vt_df["Close"].pct_change(max(3, int(vt_twap_len)//2))
-            if bool(vt_use_rs):
-                try:
-                    if live_mode:
-                        bench_df = load_data(str(vt_benchmark), start_date, end_date, interval=str(vt_interval))
-                    else:
-                        bench_df = load_data(str(vt_benchmark), bt_start_date, bt_end_date, interval=str(vt_interval))
-                    if bench_df is not None and not bench_df.empty and "Close" in bench_df.columns:
-                        bench_close = bench_df["Close"].reindex(vt_df.index).ffill()
-                        bench_ret = bench_close.pct_change(max(3, int(vt_twap_len)//2)).fillna(0)
-                        rs_ok = (asset_ret.fillna(0) - bench_ret.fillna(0)) > 0
-                    else:
-                        st.warning("Benchmark data not available. Relative strength filter ignored.")
-                except Exception as e:
-                    st.warning(f"Benchmark RS filter failed: {e}. Relative strength filter ignored.")
-
-            # Cross and state logic
-            cross_up = (session_vwap > twap) & (session_vwap.shift(1) <= twap.shift(1))
-            cross_down = (session_vwap < twap) & (session_vwap.shift(1) >= twap.shift(1))
-
-            buffer = float(vt_break_buffer) / 100.0
-            bullish_state_raw = (
-                (session_vwap > twap) &
-                (vt_df["Close"] > session_vwap) &
-                (vt_df["Close"] > twap)
-            )
-            bullish_state = bullish_state_raw.rolling(int(vt_entry_confirm), min_periods=1).sum() >= int(vt_entry_confirm)
-
-            price_above = (vt_df["Close"] > session_vwap) & (vt_df["Close"] > twap)
-            ema_ok = (vt_df["Close"] > ema50) if bool(vt_use_ema50) else pd.Series(True, index=vt_df.index)
-            ema_slope_ok = (ema50.diff(5) >= 0) if bool(vt_use_ema_slope) else pd.Series(True, index=vt_df.index)
-            ema_bad_raw = (vt_df["Close"] < ema50 * (1.0 - buffer)) if bool(vt_use_ema50) else pd.Series(False, index=vt_df.index)
-
-            # Relative strength threshold in percentage terms over the same lookback.
-            if bool(vt_use_rs):
-                rs_spread_pct = (asset_ret.fillna(0) - bench_ret.fillna(0)) * 100.0
-                rs_ok = rs_spread_pct >= float(vt_rs_threshold)
-            else:
-                rs_spread_pct = pd.Series(0.0, index=vt_df.index)
-                rs_ok = pd.Series(True, index=vt_df.index)
-
-            # Avoid chop: if VWAP/TWAP relationship flips too much recently, block new entries.
-            flip_event = (cross_up | cross_down).astype(int)
-            flip_count = flip_event.rolling(int(vt_chop_window), min_periods=1).sum()
-            chop_ok = flip_count <= int(vt_max_flips)
-
-            entry_volume_ok = vol_ok if bool(vt_use_volume) else pd.Series(True, index=vt_df.index)
-
-            trend_reclaim = bullish_state & (~bullish_state.shift(1).fillna(False))
-            trend_continuation = bullish_state & ema_ok & ema_slope_ok & rs_ok & chop_ok
-
-            if str(vt_entry_mode) == "Strict Cross Only":
-                raw_long_cond = cross_up & price_above & ema_ok & ema_slope_ok & entry_volume_ok & rs_ok & chop_ok
-            elif str(vt_entry_mode) == "State Trend Filter":
-                raw_long_cond = (cross_up | trend_reclaim | trend_continuation) & ema_ok & ema_slope_ok & entry_volume_ok & rs_ok & chop_ok
-            else:
-                # Institutional Swing Hold: fewer, higher-quality entries only.
-                raw_long_cond = (trend_reclaim | (bullish_state & cross_up)) & ema_ok & ema_slope_ok & entry_volume_ok & rs_ok & chop_ok
-
-            # Exit only after confirmed structural weakness with a buffer.
-            weak_vwap_twap = ((vt_df["Close"] < session_vwap * (1.0 - buffer)) & (vt_df["Close"] < twap * (1.0 - buffer)))
-            weak_cross = (session_vwap < twap * (1.0 - buffer))
-            weak_ema = ema_bad_raw
-            weakness_raw = weak_cross | weak_vwap_twap | weak_ema | (~chop_ok)
-            weakness_confirmed = weakness_raw.rolling(int(vt_exit_confirm), min_periods=1).sum() >= int(vt_exit_confirm)
-
-            exit_cond = weakness_confirmed
-
-            # Stateful signal with cooldown to prevent 55-trade churn.
-            signals = pd.Series(0.0, index=vt_df.index)
-            long_cond = pd.Series(False, index=vt_df.index)
-            in_pos = False
-            cooldown_left = 0
-            for _i, _dt in enumerate(vt_df.index):
-                if cooldown_left > 0:
-                    cooldown_left -= 1
-                if in_pos:
-                    signals.iloc[_i] = 1.0
-                    if bool(exit_cond.loc[_dt]):
-                        in_pos = False
-                        signals.iloc[_i] = 0.0
-                        cooldown_left = int(vt_cooldown)
+            try:
+                if live_mode:
+                    bench_df = load_data(str(vt_benchmark), start_date, end_date, interval=str(vt_interval))
                 else:
-                    if cooldown_left == 0 and bool(raw_long_cond.loc[_dt]):
-                        in_pos = True
-                        long_cond.loc[_dt] = True
-                        signals.iloc[_i] = 1.0
+                    bench_df = load_data(str(vt_benchmark), bt_start_date, bt_end_date, interval=str(vt_interval))
+                if bench_df is not None and not bench_df.empty and "Close" in bench_df.columns:
+                    bench_close = bench_df["Close"].reindex(vt_df.index).ffill()
+                else:
+                    bench_close = pd.Series(index=vt_df.index, data=np.nan)
+            except Exception:
+                bench_close = pd.Series(index=vt_df.index, data=np.nan)
+
+            def _build_vt_signal(params):
+                twap_len = int(params.get("twap_len", 20))
+                entry_mode = str(params.get("entry_mode", "Institutional Swing Hold"))
+                use_ema = bool(params.get("use_ema", True))
+                use_slope = bool(params.get("use_slope", True))
+                use_vol = bool(params.get("use_vol", False))
+                vol_mult = float(params.get("vol_mult", 1.0))
+                use_rs = bool(params.get("use_rs", True))
+                rs_thresh = float(params.get("rs_thresh", 0.0))
+                chop_window = int(params.get("chop_window", 18))
+                max_flips = int(params.get("max_flips", 3))
+                entry_confirm = int(params.get("entry_confirm", 3))
+                exit_confirm = int(params.get("exit_confirm", 4))
+                cooldown = int(params.get("cooldown", 8))
+                break_buffer = float(params.get("break_buffer", 0.25)) / 100.0
+
+                twap_local = typical_vt.rolling(twap_len, min_periods=max(3, twap_len//3)).mean()
+                asset_ret_local = vt_df["Close"].pct_change(max(3, twap_len//2)).fillna(0)
+                if bench_close.notna().sum() > 5:
+                    bench_ret_local = bench_close.pct_change(max(3, twap_len//2)).fillna(0)
+                    rs_spread_pct_local = (asset_ret_local - bench_ret_local) * 100.0
+                else:
+                    rs_spread_pct_local = pd.Series(0.0, index=vt_df.index)
+
+                cross_up_local = (session_vwap > twap_local) & (session_vwap.shift(1) <= twap_local.shift(1))
+                cross_down_local = (session_vwap < twap_local) & (session_vwap.shift(1) >= twap_local.shift(1))
+                bullish_state_raw_local = (session_vwap > twap_local) & (vt_df["Close"] > session_vwap) & (vt_df["Close"] > twap_local)
+                bullish_state_local = bullish_state_raw_local.rolling(entry_confirm, min_periods=1).sum() >= entry_confirm
+                ema_ok_local = (vt_df["Close"] > ema50) if use_ema else pd.Series(True, index=vt_df.index)
+                ema_slope_ok_local = (ema50.diff(5) >= 0) if use_slope else pd.Series(True, index=vt_df.index)
+                ema_bad_local = (vt_df["Close"] < ema50 * (1.0 - break_buffer)) if use_ema else pd.Series(False, index=vt_df.index)
+                rs_ok_local = (rs_spread_pct_local >= rs_thresh) if use_rs else pd.Series(True, index=vt_df.index)
+                vol_ok_local = (vt_df["Volume"] > vol_avg * vol_mult) if use_vol else pd.Series(True, index=vt_df.index)
+                flip_event_local = (cross_up_local | cross_down_local).astype(int)
+                flip_count_local = flip_event_local.rolling(chop_window, min_periods=1).sum()
+                chop_ok_local = flip_count_local <= max_flips
+
+                trend_reclaim_local = bullish_state_local & (~bullish_state_local.shift(1).fillna(False))
+                trend_cont_local = bullish_state_local & ema_ok_local & ema_slope_ok_local & rs_ok_local & chop_ok_local
+
+                if entry_mode == "Strict Cross Only":
+                    raw_long_local = cross_up_local & bullish_state_raw_local & ema_ok_local & ema_slope_ok_local & vol_ok_local & rs_ok_local & chop_ok_local
+                elif entry_mode == "State Trend Filter":
+                    raw_long_local = (cross_up_local | trend_reclaim_local | trend_cont_local) & ema_ok_local & ema_slope_ok_local & vol_ok_local & rs_ok_local & chop_ok_local
+                else:
+                    raw_long_local = (trend_reclaim_local | (bullish_state_local & cross_up_local)) & ema_ok_local & ema_slope_ok_local & vol_ok_local & rs_ok_local & chop_ok_local
+
+                weak_vt_local = (vt_df["Close"] < session_vwap * (1.0 - break_buffer)) & (vt_df["Close"] < twap_local * (1.0 - break_buffer))
+                weak_cross_local = session_vwap < twap_local * (1.0 - break_buffer)
+                weakness_local = weak_vt_local | weak_cross_local | ema_bad_local | (~chop_ok_local)
+                exit_local = weakness_local.rolling(exit_confirm, min_periods=1).sum() >= exit_confirm
+
+                sig_local = pd.Series(0.0, index=vt_df.index)
+                long_marks_local = pd.Series(False, index=vt_df.index)
+                in_pos_local = False
+                cd = 0
+                for ii, dt in enumerate(vt_df.index):
+                    if cd > 0:
+                        cd -= 1
+                    if in_pos_local:
+                        sig_local.iloc[ii] = 1.0
+                        if bool(exit_local.loc[dt]):
+                            in_pos_local = False
+                            sig_local.iloc[ii] = 0.0
+                            cd = cooldown
+                    else:
+                        if cd == 0 and bool(raw_long_local.loc[dt]):
+                            in_pos_local = True
+                            sig_local.iloc[ii] = 1.0
+                            long_marks_local.loc[dt] = True
+
+                diag_local = {
+                    "twap": twap_local,
+                    "rs_spread_pct": rs_spread_pct_local,
+                    "bullish_state": bullish_state_local,
+                    "raw_bullish_state": bullish_state_raw_local,
+                    "flip_count": flip_count_local,
+                    "long_cond": long_marks_local,
+                    "exit_cond": exit_local,
+                    "chop_ok": chop_ok_local
+                }
+                return sig_local.clip(0, 1), diag_local
+
+            def _score_vt_candidate(sig, params):
+                px = vt_df["Close"].dropna()
+                common = px.index.intersection(sig.index)
+                px = px.loc[common]
+                sg = sig.loc[common].ffill().fillna(0)
+                if len(px) < 10:
+                    return None
+                bt_tmp = BacktestEngine.run_strategy(px, sg, initial_cap, trailing_stop, stop_loss)
+                eq = bt_tmp.get("equity_curve", pd.Series(dtype=float))
+                rets = bt_tmp.get("returns", pd.Series(dtype=float))
+                trades_tmp = bt_tmp.get("trades", pd.DataFrame())
+                if eq.empty:
+                    return None
+                strat_ret = (float(eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
+                bh_ret = (float(px.iloc[-1]) / float(px.iloc[0]) - 1.0) * 100.0 if float(px.iloc[0]) != 0 else np.nan
+                curve = (1 + rets.fillna(0)).cumprod()
+                dd = ((curve / curve.cummax()) - 1.0).min() * 100.0 if len(curve) else 0.0
+                trades_n = len(trades_tmp) if trades_tmp is not None else 0
+                alpha = strat_ret - bh_ret
+                objective = alpha - float(vt_dd_penalty) * abs(dd) - float(vt_trade_penalty) * trades_n
+                if str(vt_selection_mode) == "Risk Adjusted":
+                    metrics_tmp = BacktestEngine.calculate_metrics(rets)
+                    objective = float(metrics_tmp.get("Sharpe Ratio", 0.0)) * 10 + alpha - float(vt_trade_penalty) * trades_n
+                elif str(vt_selection_mode) == "Low Churn":
+                    objective = alpha - float(vt_trade_penalty) * trades_n * 2.0 - float(vt_dd_penalty) * abs(dd)
+                return {
+                    "Objective": objective,
+                    "Strategy Return %": strat_ret,
+                    "BuyHold %": bh_ret,
+                    "Alpha %": alpha,
+                    "MaxDD %": dd,
+                    "Trades": trades_n,
+                    **params
+                }
+
+            manual_params = {
+                "twap_len": int(vt_twap_len),
+                "entry_mode": str(vt_entry_mode),
+                "use_ema": bool(vt_use_ema50),
+                "use_slope": bool(vt_use_ema_slope),
+                "use_vol": bool(vt_use_volume),
+                "vol_mult": float(vt_vol_mult),
+                "use_rs": bool(vt_use_rs),
+                "rs_thresh": float(vt_rs_threshold),
+                "chop_window": int(vt_chop_window),
+                "max_flips": int(vt_max_flips),
+                "entry_confirm": int(vt_entry_confirm),
+                "exit_confirm": int(vt_exit_confirm),
+                "cooldown": int(vt_cooldown),
+                "break_buffer": float(vt_break_buffer)
+            }
+
+            selected_params = manual_params.copy()
+            optimizer_df = pd.DataFrame()
+            if bool(vt_optimize):
+                grid = []
+                for twl in [12, 16, 20, 24, 30, 40]:
+                    for emode in ["Institutional Swing Hold", "State Trend Filter"]:
+                        for exconf in [3, 4, 5, 6]:
+                            for entconf in [2, 3, 4]:
+                                for bbuf in [0.15, 0.25, 0.40, 0.60]:
+                                    for cdv in [4, 8, 12, 18]:
+                                        for slopev in [True, False]:
+                                            grid.append({
+                                                **manual_params,
+                                                "twap_len": twl,
+                                                "entry_mode": emode,
+                                                "entry_confirm": entconf,
+                                                "exit_confirm": exconf,
+                                                "break_buffer": bbuf,
+                                                "cooldown": cdv,
+                                                "use_slope": slopev
+                                            })
+                rows = []
+                best_row = None
+                best_sig = None
+                best_diag = None
+                with st.spinner(f"Optimizing {len(grid)} VWAP/TWAP candidates against benchmark..."):
+                    for params in grid:
+                        sig_try, diag_try = _build_vt_signal(params)
+                        row = _score_vt_candidate(sig_try, params)
+                        if row is None:
+                            continue
+                        rows.append(row)
+                        if best_row is None or row["Objective"] > best_row["Objective"]:
+                            best_row = row
+                            best_sig = sig_try
+                            best_diag = diag_try
+                optimizer_df = pd.DataFrame(rows).sort_values("Objective", ascending=False) if rows else pd.DataFrame()
+                if best_row is not None:
+                    if (float(best_row["Alpha %"]) >= float(vt_min_alpha)) or not bool(vt_allow_no_edge):
+                        selected_params = {k: best_row[k] for k in manual_params.keys() if k in best_row}
+                        signals = best_sig
+                        vt_diag = best_diag
+                        st.success(f"Optimizer selected VWAP/TWAP candidate with Alpha {best_row['Alpha %']:.2f}% vs buy & hold. Objective {best_row['Objective']:.2f}.")
+                    else:
+                        # No custom edge: show it honestly. Use cash signal so metrics don't pretend the strategy is good.
+                        signals = pd.Series(0.0, index=vt_df.index)
+                        vt_diag = _build_vt_signal(manual_params)[1]
+                        st.error(f"NO CUSTOM EDGE: best VWAP/TWAP candidate alpha was only {best_row['Alpha %']:.2f}% vs buy & hold, below required {float(vt_min_alpha):.2f}%.")
+                        st.info("This means the benchmark was better for this sample. In that case, either buy & hold is the better choice, or this ticker/timeframe is not suitable for VWAP/TWAP.")
+                else:
+                    signals, vt_diag = _build_vt_signal(manual_params)
+            else:
+                signals, vt_diag = _build_vt_signal(manual_params)
 
             strat_prices = vt_df["Close"].dropna()
             prices_bt = strat_prices
@@ -8980,26 +9082,40 @@ with tab7:
             df_bt = vt_df
             benchmark_label_for_metrics = f"Buy & Hold ({vt_interval})"
 
+            if bool(vt_optimize) and not optimizer_df.empty:
+                with st.expander("Optimizer leaderboard", expanded=False):
+                    st.dataframe(
+                        optimizer_df.head(25)[["Objective", "Strategy Return %", "BuyHold %", "Alpha %", "MaxDD %", "Trades", "twap_len", "entry_mode", "entry_confirm", "exit_confirm", "break_buffer", "cooldown", "use_slope"]],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
             with st.expander("See VWAP/TWAP Strategy Context", expanded=True):
+                twap = vt_diag["twap"]
+                rs_spread_pct = vt_diag["rs_spread_pct"]
+                bullish_state = vt_diag["bullish_state"]
+                bullish_state_raw = vt_diag["raw_bullish_state"]
+                flip_count = vt_diag["flip_count"]
+                long_cond = vt_diag["long_cond"]
+                exit_cond = vt_diag["exit_cond"]
+
                 fig_ctx = go.Figure()
                 fig_ctx.add_trace(go.Candlestick(
                     x=vt_df.index, open=vt_df["Open"], high=vt_df["High"], low=vt_df["Low"], close=vt_df["Close"], name="Price"
                 ))
                 fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=session_vwap, mode="lines", name="Session VWAP"))
-                fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=twap, mode="lines", name=f"TWAP ({int(vt_twap_len)})"))
-                if bool(vt_use_ema50):
+                fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=twap, mode="lines", name=f"TWAP ({int(selected_params.get('twap_len', vt_twap_len))})"))
+                if bool(selected_params.get("use_ema", True)):
                     fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=ema50, mode="lines", name="EMA 50"))
-
                 buys = vt_df[long_cond.fillna(False)]
                 sells = vt_df[exit_cond.fillna(False)]
                 if not buys.empty:
                     fig_ctx.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="VWAP/TWAP Buy", marker=dict(size=11, symbol="triangle-up")))
                 if not sells.empty:
                     fig_ctx.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="Avoid/Exit", marker=dict(size=9, symbol="x")))
-
                 highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.10)
                 fig_ctx.update_layout(
-                    title=f"VWAP/TWAP Swing Filter — {TICKER} ({vt_interval})",
+                    title=f"VWAP/TWAP Benchmark-Aware Swing Filter — {TICKER} ({vt_interval})",
                     hovermode="x unified",
                     template="plotly_dark",
                     height=650,
@@ -9010,13 +9126,11 @@ with tab7:
                 diag = pd.DataFrame({
                     "Close": vt_df["Close"],
                     "Session VWAP": session_vwap,
-                    f"TWAP {int(vt_twap_len)}": twap,
+                    f"TWAP {int(selected_params.get('twap_len', vt_twap_len))}": twap,
                     "EMA50": ema50,
                     "Volume": vt_df["Volume"],
                     "Vol Avg20": vol_avg,
-                    "Vol OK": vol_ok,
                     "RS Spread %": rs_spread_pct,
-                    "RS OK": rs_ok,
                     "Bullish State Confirmed": bullish_state,
                     "Raw Bullish State": bullish_state_raw,
                     "Flip Count": flip_count,
