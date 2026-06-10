@@ -8789,6 +8789,8 @@ with tab7:
                                       help="Tests multiple VWAP/TWAP settings and selects only if it improves vs buy & hold after drawdown/trade penalties.")
             vt_selection_mode = st.selectbox("Selection objective", ["Beat Benchmark", "Risk Adjusted", "Low Churn"], index=0, key="bt_vt_selection_mode")
             vt_allow_no_edge = st.checkbox("Show No Edge if it cannot beat benchmark", value=True, key="bt_vt_no_edge")
+            vt_optimizer_speed = st.selectbox("Optimizer speed", ["Fast", "Balanced", "Deep"], index=0, key="bt_vt_opt_speed",
+                                             help="Fast is recommended. Deep tests many combinations and can be slow.")
 
         with st.expander("Manual / optimizer controls", expanded=False):
             oc1, oc2, oc3, oc4, oc5 = st.columns(5)
@@ -9026,13 +9028,40 @@ with tab7:
             optimizer_df = pd.DataFrame()
             if bool(vt_optimize):
                 grid = []
-                for twl in [12, 16, 20, 24, 30, 40]:
-                    for emode in ["Institutional Swing Hold", "State Trend Filter"]:
-                        for exconf in [3, 4, 5, 6]:
-                            for entconf in [2, 3, 4]:
-                                for bbuf in [0.15, 0.25, 0.40, 0.60]:
-                                    for cdv in [4, 8, 12, 18]:
-                                        for slopev in [True, False]:
+                # Speed control:
+                # Fast ≈ 24 candidates, Balanced ≈ 144, Deep ≈ previous larger search.
+                if str(vt_optimizer_speed) == "Fast":
+                    _twaps = [16, 20, 30]
+                    _emodes = ["Institutional Swing Hold", "State Trend Filter"]
+                    _exits = [4, 6]
+                    _entries = [2, 3]
+                    _buffers = [0.25]
+                    _cooldowns = [8]
+                    _slopes = [True]
+                elif str(vt_optimizer_speed) == "Balanced":
+                    _twaps = [12, 16, 20, 24, 30, 40]
+                    _emodes = ["Institutional Swing Hold", "State Trend Filter"]
+                    _exits = [3, 4, 6]
+                    _entries = [2, 3]
+                    _buffers = [0.20, 0.35]
+                    _cooldowns = [6, 12]
+                    _slopes = [True]
+                else:
+                    _twaps = [12, 16, 20, 24, 30, 40]
+                    _emodes = ["Institutional Swing Hold", "State Trend Filter"]
+                    _exits = [3, 4, 5, 6]
+                    _entries = [2, 3, 4]
+                    _buffers = [0.15, 0.25, 0.40, 0.60]
+                    _cooldowns = [4, 8, 12, 18]
+                    _slopes = [True, False]
+
+                for twl in _twaps:
+                    for emode in _emodes:
+                        for exconf in _exits:
+                            for entconf in _entries:
+                                for bbuf in _buffers:
+                                    for cdv in _cooldowns:
+                                        for slopev in _slopes:
                                             grid.append({
                                                 **manual_params,
                                                 "twap_len": twl,
@@ -9047,6 +9076,7 @@ with tab7:
                 best_row = None
                 best_sig = None
                 best_diag = None
+                st.caption(f"Optimizer speed: {vt_optimizer_speed} | Testing {len(grid)} candidate settings.")
                 with st.spinner(f"Optimizing {len(grid)} VWAP/TWAP candidates against benchmark..."):
                     for params in grid:
                         sig_try, diag_try = _build_vt_signal(params)
