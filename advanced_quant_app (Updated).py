@@ -4080,7 +4080,16 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         st.write(f"#### 📝 {title} Trade Log")
         if not trades_df.empty:
             trades_df = apply_trade_log_timestamp_display(trades_df)
-            st.dataframe(trades_df.style.format({
+            try:
+                if len(trades_df) > 300:
+                    st.caption(f"Showing latest 300 trade-log rows for speed out of {len(trades_df)} total rows. Download/export can be added if needed.")
+                    _display_trades_df = trades_df.head(300)
+                else:
+                    _display_trades_df = trades_df
+            except Exception:
+                _display_trades_df = trades_df
+
+            st.dataframe(_display_trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
                 "PnL (%)": "{:.2f}%",
@@ -10292,6 +10301,32 @@ with tab7:
             st.write("#### 📈 Regime Switching Price Graph")
             st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
 
+            pgc1, pgc2, pgc3 = st.columns(3)
+            with pgc1:
+                regime_graph_mode = st.selectbox(
+                    "Price graph display range",
+                    ["Recent only (fast)", "Full anchor history (slow)"],
+                    index=0,
+                    key=f"regime_price_graph_display_range_{TICKER}_{bt_freq}",
+                    help="Recent only keeps the chart fast for long anchors like 2020/01/01. Model/backtest still uses the full selected anchor history."
+                )
+            with pgc2:
+                regime_graph_bars = st.number_input(
+                    "Recent graph bars",
+                    min_value=100,
+                    max_value=5000,
+                    value=900,
+                    step=100,
+                    key=f"regime_price_graph_recent_bars_{TICKER}_{bt_freq}"
+                )
+            with pgc3:
+                regime_precise_old_times = st.checkbox(
+                    "Precise intraday times for old trades",
+                    value=False,
+                    key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
+                    help="OFF is faster. ON can be slow for old anchors because it tries to map historical trade times."
+                )
+
             try:
                 plot_trades_df = bt_results['trades'].copy()
                 if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
@@ -10300,7 +10335,8 @@ with tab7:
                         plot_trades_df = apply_weekly_live_trigger_display_overrides(
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
-                        plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
+                        if bool(regime_precise_old_times):
+                            plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
                     except Exception:
                         pass
                 try:
@@ -10375,6 +10411,19 @@ with tab7:
                             return xs, ys, js_points
 
                         dfp = trades_df_src.copy()
+                        # In fast recent graph mode, only plot markers inside the visible chart range.
+                        try:
+                            if str(regime_graph_mode).startswith("Recent") and 'price_for_plot' in locals():
+                                _visible_min = pd.Timestamp(pd.Series(price_for_plot).dropna().index.min())
+                                _visible_max = pd.Timestamp(pd.Series(price_for_plot).dropna().index.max())
+                                def _in_visible_range(_v):
+                                    _tsv = _clean_trade_ts_for_plot(_v)
+                                    if pd.isna(_tsv):
+                                        return False
+                                    return (_tsv >= _visible_min - pd.Timedelta(days=3)) and (_tsv <= _visible_max + pd.Timedelta(days=3))
+                                dfp = dfp[dfp[date_col].apply(_in_visible_range)]
+                        except Exception:
+                            pass
                         if status_filter is not None and "Status" in dfp.columns:
                             dfp = dfp[status_filter(dfp["Status"].astype(str))]
 
@@ -10495,6 +10544,17 @@ with tab7:
                         _pf.loc[_idx] = float(latest_px_disp)
                         _pf = _pf.sort_index()
                         price_for_plot = _pf[~_pf.index.duplicated(keep="last")]
+                except Exception:
+                    pass
+
+                # Fast display for long anchors: trim chart data only.
+                # This does not change model fitting, signals, metrics, or trade log.
+                try:
+                    if str(regime_graph_mode).startswith("Recent"):
+                        _pf_trim = pd.Series(price_for_plot).dropna().sort_index()
+                        if len(_pf_trim) > int(regime_graph_bars):
+                            price_for_plot = _pf_trim.tail(int(regime_graph_bars))
+                            st.caption(f"Fast graph mode: showing last {len(price_for_plot)} price bars only. Backtest/trade log still uses the full anchor history.")
                 except Exception:
                     pass
 
@@ -10941,7 +11001,12 @@ with tab7:
                     trades_df = apply_weekly_live_trigger_display_overrides(
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
-                    trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
+                    try:
+                        _precise_ok = bool(regime_precise_old_times)
+                    except Exception:
+                        _precise_ok = False
+                    if _precise_ok:
+                        trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
             except Exception:
                 pass
 
