@@ -10156,6 +10156,105 @@ with tab7:
             with met_col5:
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
 
+        def _latest_display_price_and_time_for_regime():
+            """Get the freshest available close for display-only marking."""
+            try:
+                candidates = []
+                try:
+                    if df_main is not None and not df_main.empty and "Close" in df_main.columns:
+                        candidates.append((pd.Timestamp(df_main.index[-1]), float(df_main["Close"].iloc[-1]), "loaded chart data"))
+                except Exception:
+                    pass
+                try:
+                    _fresh_daily = yf.download(
+                        TICKER,
+                        period="7d",
+                        interval="1d",
+                        auto_adjust=True,
+                        progress=False,
+                        prepost=False,
+                        threads=False
+                    )
+                    if _fresh_daily is not None and not _fresh_daily.empty:
+                        if isinstance(_fresh_daily.columns, pd.MultiIndex):
+                            _fresh_daily.columns = [c[0] if isinstance(c, tuple) else c for c in _fresh_daily.columns]
+                        _c = "Close" if "Close" in _fresh_daily.columns else None
+                        if _c:
+                            candidates.append((pd.Timestamp(_fresh_daily.index[-1]), float(_fresh_daily[_c].iloc[-1]), "fresh Yahoo daily"))
+                except Exception:
+                    pass
+                try:
+                    _sp = pd.Series(strat_prices).dropna()
+                    if not _sp.empty:
+                        candidates.append((pd.Timestamp(_sp.index[-1]), float(_sp.iloc[-1]), "strategy price"))
+                except Exception:
+                    pass
+                if not candidates:
+                    return pd.NaT, np.nan, "none"
+                candidates = sorted(candidates, key=lambda x: x[0])
+                return candidates[-1]
+            except Exception:
+                return pd.NaT, np.nan, "none"
+
+        def _mark_latest_regime_trade_open_if_signal_long(trades_in):
+            """
+            Display-only fix:
+            If the latest Regime signal is still LONG, the most recent trade is an open position.
+            The backtest engine may still show the last available weekly/daily close as an exit.
+            That made the trade log look stale/laggy. This changes only the display trade log,
+            not performance metrics or model logic.
+            """
+            try:
+                if trades_in is None or trades_in.empty:
+                    return trades_in
+                if strategy_type != "Regime Switching (Trend Following)":
+                    return trades_in
+                latest_sig = float(pd.Series(signals).dropna().iloc[-1])
+                if latest_sig <= 0:
+                    return trades_in
+
+                latest_dt, latest_px, latest_src = _latest_display_price_and_time_for_regime()
+                if pd.isna(latest_dt) or not np.isfinite(latest_px):
+                    return trades_in
+
+                out = trades_in.copy()
+                if "Entry Date" in out.columns:
+                    def _parse_sort_dt(v):
+                        try:
+                            s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                            ts = pd.Timestamp(s)
+                            if getattr(ts, "tzinfo", None) is not None:
+                                ts = ts.tz_convert(None)
+                            return ts
+                        except Exception:
+                            return pd.NaT
+                    sort_key = out["Entry Date"].apply(_parse_sort_dt)
+                    idx_latest = sort_key.sort_values(ascending=False, na_position="last").index[0]
+                else:
+                    idx_latest = out.index[-1]
+
+                if "Status" in out.columns:
+                    out.loc[idx_latest, "Status"] = "Open"
+                if "Exit Date" in out.columns:
+                    out.loc[idx_latest, "Exit Date"] = "Open"
+                if "Exit Time" in out.columns:
+                    out.loc[idx_latest, "Exit Time"] = f"Open — marked latest close ({latest_src})"
+                if "Sell Price" in out.columns:
+                    out.loc[idx_latest, "Sell Price"] = float(latest_px)
+                if "Exit Price" in out.columns:
+                    out.loc[idx_latest, "Exit Price"] = float(latest_px)
+                if "PnL (%)" in out.columns:
+                    buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+                    if buy_col is not None:
+                        buy_px = pd.to_numeric(out.loc[idx_latest, buy_col], errors="coerce")
+                        if pd.notna(buy_px) and float(buy_px) != 0:
+                            out.loc[idx_latest, "PnL (%)"] = (float(latest_px) / float(buy_px) - 1.0) * 100.0
+                out["Latest Mark Source"] = ""
+                out.loc[idx_latest, "Latest Mark Source"] = f"{latest_src} @ {pd.Timestamp(latest_dt).strftime('%Y-%m-%d')}"
+                return out
+            except Exception:
+                return trades_in
+
         # Price / Equity Graphs
         if strategy_type == "Regime Switching (Trend Following)":
             st.write("#### 📈 Regime Switching Price Graph")
@@ -10172,6 +10271,10 @@ with tab7:
                         plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
                     except Exception:
                         pass
+                try:
+                    plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
+                except Exception:
+                    pass
 
                 def _clean_trade_ts_for_plot(v):
                     try:
@@ -10342,6 +10445,24 @@ with tab7:
                                 _daily_close = pd.to_numeric(_daily_chart[_close_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
                                 if not _daily_close.empty:
                                     price_for_plot = _daily_close
+                except Exception:
+                    pass
+
+                # Display-only freshness fix: weekly model prices can stop at last closed weekly bar.
+                # Append/replace latest available close so the price graph top-left panel is not stale.
+                try:
+                    latest_dt_disp, latest_px_disp, latest_src_disp = _latest_display_price_and_time_for_regime()
+                    if pd.notna(latest_dt_disp) and np.isfinite(latest_px_disp):
+                        _pf = pd.Series(price_for_plot).copy()
+                        _idx = pd.Timestamp(latest_dt_disp)
+                        try:
+                            if getattr(_idx, "tzinfo", None) is not None:
+                                _idx = _idx.tz_convert(None)
+                        except Exception:
+                            pass
+                        _pf.loc[_idx] = float(latest_px_disp)
+                        _pf = _pf.sort_index()
+                        price_for_plot = _pf[~_pf.index.duplicated(keep="last")]
                 except Exception:
                     pass
 
@@ -10760,6 +10881,11 @@ with tab7:
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
                     trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
+            except Exception:
+                pass
+
+            try:
+                trades_df = _mark_latest_regime_trade_open_if_signal_long(trades_df)
             except Exception:
                 pass
 
