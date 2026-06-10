@@ -10165,6 +10165,35 @@ with tab7:
                         candidates.append((pd.Timestamp(df_main.index[-1]), float(df_main["Close"].iloc[-1]), "loaded chart data"))
                 except Exception:
                     pass
+                # Try live/recent intraday first so the graph box does not get stuck on yesterday
+                # while the market/current session already has bars.
+                for _intv, _per in [("1m", "1d"), ("5m", "5d"), ("15m", "5d")]:
+                    try:
+                        _fresh_intra = yf.download(
+                            TICKER,
+                            period=_per,
+                            interval=_intv,
+                            auto_adjust=True,
+                            progress=False,
+                            prepost=False,
+                            threads=False
+                        )
+                        if _fresh_intra is not None and not _fresh_intra.empty:
+                            if isinstance(_fresh_intra.columns, pd.MultiIndex):
+                                _fresh_intra.columns = [c[0] if isinstance(c, tuple) else c for c in _fresh_intra.columns]
+                            _c = "Close" if "Close" in _fresh_intra.columns else None
+                            if _c:
+                                _idx = pd.Timestamp(_fresh_intra.index[-1])
+                                try:
+                                    if getattr(_idx, "tzinfo", None) is not None:
+                                        _idx = _idx.tz_convert("America/Chicago").tz_localize(None)
+                                except Exception:
+                                    pass
+                                candidates.append((_idx, float(_fresh_intra[_c].iloc[-1]), f"fresh Yahoo {_intv}"))
+                                break
+                    except Exception:
+                        pass
+
                 try:
                     _fresh_daily = yf.download(
                         TICKER,
@@ -10180,7 +10209,10 @@ with tab7:
                             _fresh_daily.columns = [c[0] if isinstance(c, tuple) else c for c in _fresh_daily.columns]
                         _c = "Close" if "Close" in _fresh_daily.columns else None
                         if _c:
-                            candidates.append((pd.Timestamp(_fresh_daily.index[-1]), float(_fresh_daily[_c].iloc[-1]), "fresh Yahoo daily"))
+                            _didx = pd.Timestamp(_fresh_daily.index[-1])
+                            # Yahoo daily bars are date-only. If a fresher intraday bar exists,
+                            # that intraday timestamp will win in the final sorted candidates.
+                            candidates.append((_didx, float(_fresh_daily[_c].iloc[-1]), "fresh Yahoo daily"))
                 except Exception:
                     pass
                 try:
@@ -10469,14 +10501,28 @@ with tab7:
                 # Initial fixed top-left hover panel.
                 # It intentionally does NOT show latest/open trade details because those belong in the trade log.
                 latest_price_text = "N/A"
+                latest_date_text = "N/A"
+                latest_src_text = ""
                 try:
-                    latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
+                    _ldt, _lpx, _lsrc = _latest_display_price_and_time_for_regime()
+                    if pd.notna(_ldt) and np.isfinite(_lpx):
+                        latest_price_text = f"${float(_lpx):,.2f}"
+                        latest_date_text = pd.Timestamp(_ldt).strftime("%b %d, %Y")
+                        latest_src_text = str(_lsrc)
+                    else:
+                        latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
+                        latest_date_text = pd.Timestamp(price_for_plot.index[-1]).strftime("%b %d, %Y")
                 except Exception:
-                    pass
+                    try:
+                        latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
+                        latest_date_text = pd.Timestamp(price_for_plot.index[-1]).strftime("%b %d, %Y")
+                    except Exception:
+                        pass
 
                 fixed_info_text = (
                     f"<b>{TICKER}</b><br>"
                     f"Move cursor on chart<br>"
+                    f"Latest date: <b>{latest_date_text}</b><br>"
                     f"Latest price: <b>{latest_price_text}</b>"
                 )
 
@@ -10586,6 +10632,20 @@ with tab7:
                     except Exception:
                         price_points_for_js = []
 
+                    # Force the top-left panel data to include the freshest latest display point.
+                    try:
+                        _ldt2, _lpx2, _lsrc2 = _latest_display_price_and_time_for_regime()
+                        if pd.notna(_ldt2) and np.isfinite(_lpx2):
+                            _ts2 = pd.Timestamp(_ldt2)
+                            try:
+                                if getattr(_ts2, "tzinfo", None) is not None:
+                                    _ts2 = _ts2.tz_convert(None)
+                            except Exception:
+                                pass
+                            price_points_for_js.append({"t": _ts2.isoformat(), "p": float(_lpx2)})
+                    except Exception:
+                        pass
+
                     # Buy/sell JS points are built strictly from the displayed trade log above.
                     price_points_json = json.dumps(price_points_for_js)
                     buy_points_json = json.dumps(buy_points_for_js)
@@ -10631,6 +10691,7 @@ with tab7:
                             pointer-events:none;">
                             <b>{TICKER}</b><br>
                             Move crosshair on chart<br>
+                            Latest date: <b>{latest_date_text}</b><br>
                             Latest price: <b>{latest_price_text}</b>
                         </div>
                         {chart_html}
