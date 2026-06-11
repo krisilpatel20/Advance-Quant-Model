@@ -2618,6 +2618,25 @@ def finalize_weekly_regime_trade_time_display(trades_df):
         except Exception:
             return trades_df
 
+
+def apply_regime_intraday_time_display(trades_df, ticker=""):
+    """
+    DISPLAY ONLY.
+    Same timestamp refinement as weekly, but usable for both Daily and Weekly Regime Switching.
+    It maps Entry/Exit Date + Buy/Sell Price to the first 5-minute CT candle where price was touched.
+    If historical intraday is unavailable, it keeps the date clean instead of falsely showing 15:00 CT.
+    """
+    return apply_weekly_regime_intraday_time_display(trades_df, ticker=ticker)
+
+
+def finalize_regime_trade_time_display(trades_df):
+    """
+    DISPLAY ONLY final formatter for Daily/Weekly Regime Switching trade logs.
+    Reuses the weekly formatter because the same source columns are produced.
+    """
+    return finalize_weekly_regime_trade_time_display(trades_df)
+
+
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
     DISPLAY ONLY for the latest/open weekly trade.
@@ -10320,7 +10339,7 @@ with tab7:
         # strategy logic intact, but make the displayed performance metrics use that
         # same latest open-trade mark so Total Return matches the trade log.
         try:
-            if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+            if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
                 _metric_trades = bt_results['trades'].copy()
                 if not _metric_trades.empty:
                     _metric_trades = map_weekly_trade_log_dates_only(_metric_trades, df_bt)
@@ -10543,14 +10562,15 @@ with tab7:
 
             try:
                 plot_trades_df = bt_results['trades'].copy()
-                if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
                     try:
-                        plot_trades_df = map_weekly_trade_log_dates_only(plot_trades_df, df_bt)
+                        if bt_freq == "Weekly":
+                            plot_trades_df = map_weekly_trade_log_dates_only(plot_trades_df, df_bt)
                         plot_trades_df = apply_weekly_live_trigger_display_overrides(
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
                         if bool(regime_precise_old_times):
-                            plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
+                            plot_trades_df = apply_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
                     except Exception:
                         pass
                 try:
@@ -11203,24 +11223,25 @@ with tab7:
 
         # Trade Log
         st.write("#### 📝 Trade Log")
-        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
-            st.caption("Weekly trade times: exact intraday times are shown when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly/daily candles alone cannot produce precise intraday time.")
+        if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
+            st.caption(f"{bt_freq} trade times: exact intraday times are shown when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. {bt_freq} candles alone cannot produce precise intraday time.")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
             # actual raw trading date in that week. Returns/metrics are unchanged.
             try:
-                if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
-                    trades_df = map_weekly_trade_log_dates_only(trades_df, df_bt)
+                if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
+                    if bt_freq == "Weekly":
+                        trades_df = map_weekly_trade_log_dates_only(trades_df, df_bt)
                     trades_df = apply_weekly_live_trigger_display_overrides(
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
                     try:
                         _precise_ok = bool(regime_precise_old_times)
                     except Exception:
-                        _precise_ok = False
+                        _precise_ok = True
                     if _precise_ok:
-                        trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
+                        trades_df = apply_regime_intraday_time_display(trades_df, ticker=TICKER)
             except Exception:
                 pass
 
@@ -11263,8 +11284,8 @@ with tab7:
             trades_df = clean_overlapping_duplicate_trades(trades_df)
             # Format dates
             trades_df = apply_trade_log_timestamp_display(trades_df)
-            if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
-                trades_df = finalize_weekly_regime_trade_time_display(trades_df)
+            if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
+                trades_df = finalize_regime_trade_time_display(trades_df)
             
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
