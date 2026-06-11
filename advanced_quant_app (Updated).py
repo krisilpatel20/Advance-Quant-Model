@@ -2637,6 +2637,46 @@ def finalize_regime_trade_time_display(trades_df):
     return finalize_weekly_regime_trade_time_display(trades_df)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_regime_intraday_time_display_csv(trades_csv: str, ticker: str):
+    """
+    Performance-only cache for Daily/Weekly precise intraday display mapping.
+    Same logic/output as apply_regime_intraday_time_display(), but avoids redoing
+    every 5m intraday lookup on each Streamlit rerun.
+    """
+    try:
+        from io import StringIO
+        df = pd.read_csv(StringIO(trades_csv))
+        return apply_regime_intraday_time_display(df, ticker=ticker)
+    except Exception:
+        try:
+            from io import StringIO
+            return pd.read_csv(StringIO(trades_csv))
+        except Exception:
+            return pd.DataFrame()
+
+
+def apply_regime_intraday_time_display_fast(trades_df, ticker=""):
+    """
+    Performance-only wrapper. No strategy/model/metric logic change.
+    Uses Streamlit cache so Daily timeframe with smoothing=10 does not recompute
+    the same old-trade intraday timestamps on every app refresh.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        # CSV keeps this cache key stable across reruns and avoids hashing large object internals.
+        csv_payload = trades_df.to_csv(index=False)
+        cached = _cached_regime_intraday_time_display_csv(csv_payload, str(ticker).strip().upper())
+        if cached is None or cached.empty:
+            return trades_df
+        return cached
+    except Exception:
+        return apply_regime_intraday_time_display(trades_df, ticker=ticker)
+
+
+
+
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
     DISPLAY ONLY for the latest/open weekly trade.
@@ -10580,7 +10620,7 @@ with tab7:
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
                         if bool(regime_precise_old_times):
-                            plot_trades_df = apply_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
+                            plot_trades_df = apply_regime_intraday_time_display_fast(plot_trades_df, ticker=TICKER)
                     except Exception:
                         pass
                 try:
@@ -11251,7 +11291,7 @@ with tab7:
                     except Exception:
                         _precise_ok = True
                     if _precise_ok:
-                        trades_df = apply_regime_intraday_time_display(trades_df, ticker=TICKER)
+                        trades_df = apply_regime_intraday_time_display_fast(trades_df, ticker=TICKER)
             except Exception:
                 pass
 
