@@ -2723,105 +2723,109 @@ def apply_regime_intraday_time_display_limited(trades_df, ticker="", max_rows=60
 def _first_regular_session_5m_close_for_daily_signal(ticker: str, signal_date):
     """
     DISPLAY ONLY.
-    For a Daily Regime signal date, use a real regular-session 5-minute candle close.
-    This is not open price and not daily close price. It is the first completed 5m candle
-    after market open, so it is a more natural executable-style display price.
+    Daily Regime exact/natural timestamp helper.
+
+    Hard rule:
+    - Never fall back to the daily bar timestamp like 15:00 CT.
+    - Use a real 5-minute candle only.
+    - If real 5-minute data is unavailable, return unavailable instead of pretending.
     """
     try:
         if signal_date is None or pd.isna(signal_date) or str(signal_date).strip().lower() == "open":
-            return signal_date, np.nan, "open"
-        day = pd.Timestamp(signal_date).date()
-        intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
-        if intraday is None or intraday.empty:
-            return signal_date, np.nan, "needs_intraday_history"
+            return "Open", np.nan, "open"
 
-        intraday = intraday.copy()
-        if "Close" not in intraday.columns:
-            return signal_date, np.nan, "needs_intraday_history"
+        t = str(ticker).strip().upper().replace(".", "-")
+        day = pd.Timestamp(signal_date).date()
+
+        intraday = pd.DataFrame()
+
+        # Direct Yahoo fetch first. This avoids accidentally falling back to a daily bar.
+        try:
+            start_dt = pd.Timestamp(day)
+            end_dt = start_dt + pd.Timedelta(days=1)
+            raw = yf.download(
+                t,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                interval="5m",
+                auto_adjust=True,
+                progress=False,
+                prepost=False,
+                threads=False
+            )
+            if raw is not None and not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
+                intraday = raw.copy()
+                try:
+                    idx = pd.DatetimeIndex(intraday.index)
+                    if idx.tz is None:
+                        intraday.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago").tz_localize(None)
+                    else:
+                        intraday.index = idx.tz_convert("America/Chicago").tz_localize(None)
+                except Exception:
+                    pass
+        except Exception:
+            intraday = pd.DataFrame()
+
+        # Fallback to existing helper only if it returns real intraday rows.
+        if intraday is None or intraday.empty:
+            try:
+                intraday = _get_intraday_for_weekly_trade_time(t, str(day), interval="5m")
+                if intraday is not None and not intraday.empty:
+                    intraday = intraday.copy()
+            except Exception:
+                intraday = pd.DataFrame()
+
+        if intraday is None or intraday.empty or "Close" not in intraday.columns:
+            return "Intraday unavailable", np.nan, "no_real_5m_data"
+
         intraday["Close"] = pd.to_numeric(intraday["Close"], errors="coerce")
         intraday = intraday.dropna(subset=["Close"])
         if intraday.empty:
-            return signal_date, np.nan, "needs_intraday_history"
+            return "Intraday unavailable", np.nan, "no_real_5m_data"
+
+        # Force CT timezone-naive index for display.
+        try:
+            idx = pd.DatetimeIndex(intraday.index)
+            if getattr(idx, "tz", None) is not None:
+                intraday.index = idx.tz_convert("America/Chicago").tz_localize(None)
+            else:
+                intraday.index = idx
+        except Exception:
+            pass
+
+        # Filter to the requested trading day and regular market session.
+        idx = pd.DatetimeIndex(intraday.index)
+        intraday = intraday[idx.date == day]
+        if intraday.empty:
+            return "Intraday unavailable", np.nan, "no_5m_rows_on_signal_day"
 
         idx = pd.DatetimeIndex(intraday.index)
         try:
-            # US regular session in CT is 08:30-15:00. Use first completed 5m bar after open.
             session = intraday[(idx.time >= pd.Timestamp("08:35").time()) & (idx.time <= pd.Timestamp("15:00").time())]
         except Exception:
             session = intraday
-        if session.empty:
-            session = intraday
 
+        if session.empty:
+            return "Intraday unavailable", np.nan, "no_regular_session_5m"
+
+        # Natural execution: first completed 5m candle after the signal day begins.
+        # This is real intraday time and real intraday close, not daily open/close.
         ts = session.index[0]
         px = float(session["Close"].iloc[0])
-        return ts, px, "natural_first_5m_close"
+
+        # Safety: never output market-close 15:00 as the default "exact" time.
+        # If the only available candle is 15:00, label as unavailable because that's not exact intraday timing.
+        try:
+            if pd.Timestamp(ts).time() >= pd.Timestamp("15:00").time() and len(session) <= 1:
+                return "Intraday unavailable", np.nan, "only_close_bar_available"
+        except Exception:
+            pass
+
+        return ts, px, "real_first_completed_5m_close"
     except Exception:
-        return signal_date, np.nan, "natural_daily_failed"
-
-
-
-def naturalize_existing_daily_regime_trade_log(trades_df, ticker="", max_rows=10):
-    """
-    DISPLAY ONLY for Daily Regime.
-
-    Fixes the mismatch:
-    - Performance metrics/Cumulative Return come from BacktestEngine account curve.
-    - Natural intraday display prices are only for realistic shown Buy/Sell prices.
-    Therefore this function preserves the original Cumulative Return (%) column and only
-    replaces the latest N rows' displayed Entry/Exit Date, Buy Price, Sell Price, and PnL.
-    """
-    try:
-        if trades_df is None or trades_df.empty:
-            return trades_df
-
-        max_rows = int(max(1, max_rows))
-        out = _regime_sort_latest_first_for_mapping(trades_df.copy())
-
-        # Only naturalize the latest N displayed rows. Older rows remain untouched.
-        target_idx = list(out.head(max_rows).index)
-
-        for idx in target_idx:
-            try:
-                if "Entry Date" in out.columns and "Buy Price" in out.columns:
-                    ets, ep, esrc = _first_regular_session_5m_close_for_daily_signal(ticker, out.loc[idx, "Entry Date"])
-                    if pd.notna(ets):
-                        try:
-                            out.loc[idx, "Entry Date"] = pd.Timestamp(ets).strftime("%Y-%m-%d %H:%M:%S CT")
-                        except Exception:
-                            out.loc[idx, "Entry Date"] = ets
-                    if np.isfinite(ep) and ep > 0:
-                        out.loc[idx, "Buy Price"] = float(ep)
-
-                if "Exit Date" in out.columns and "Sell Price" in out.columns:
-                    if str(out.loc[idx, "Exit Date"]).strip().lower() != "open":
-                        xts, xp, xsrc = _first_regular_session_5m_close_for_daily_signal(ticker, out.loc[idx, "Exit Date"])
-                        if pd.notna(xts):
-                            try:
-                                out.loc[idx, "Exit Date"] = pd.Timestamp(xts).strftime("%Y-%m-%d %H:%M:%S CT")
-                            except Exception:
-                                out.loc[idx, "Exit Date"] = xts
-                        if np.isfinite(xp) and xp > 0:
-                            out.loc[idx, "Sell Price"] = float(xp)
-
-                # Recalculate single-trade displayed PnL from the displayed natural prices.
-                # Do NOT recalculate Cumulative Return (%) here. That must stay tied to performance metrics.
-                if "Buy Price" in out.columns and "Sell Price" in out.columns and "PnL (%)" in out.columns:
-                    bp = pd.to_numeric(out.loc[idx, "Buy Price"], errors="coerce")
-                    sp = pd.to_numeric(out.loc[idx, "Sell Price"], errors="coerce")
-                    if pd.notna(bp) and pd.notna(sp) and float(bp) > 0 and str(out.get("Status", pd.Series(index=out.index)).get(idx, "")).lower() != "open":
-                        out.loc[idx, "PnL (%)"] = (float(sp) / float(bp) - 1.0) * 100.0
-
-                if "Intraday Time Source" not in out.columns:
-                    out["Intraday Time Source"] = ""
-                out.loc[idx, "Intraday Time Source"] = "natural first completed 5m close"
-            except Exception:
-                continue
-
-        # Keep original cumulative return from engine; remove ugly reconciliation column if present.
-        out = out.drop(columns=["Latest Price Reconciliation"], errors="ignore")
-        return out.reset_index(drop=True)
-    except Exception:
-        return trades_df
+        return "Intraday unavailable", np.nan, "natural_daily_failed"
 
 
 def build_daily_regime_natural_intraday_trade_log(signals, ticker="", max_rows=10):
@@ -2872,7 +2876,7 @@ def build_daily_regime_natural_intraday_trade_log(signals, ticker="", max_rows=1
 
             rows.append({
                 "Side": "Long",
-                "Entry Date": pd.Timestamp(ets).strftime("%Y-%m-%d %H:%M:%S CT") if hasattr(ets, "strftime") else str(ets),
+                "Entry Date": (pd.Timestamp(ets).strftime("%Y-%m-%d %H:%M:%S CT") if hasattr(ets, "strftime") else str(ets)),
                 "Exit Date": "Open" if status == "Open" else (pd.Timestamp(xts).strftime("%Y-%m-%d %H:%M:%S CT") if hasattr(xts, "strftime") else str(xts)),
                 "Buy Price": float(ep) if np.isfinite(ep) else np.nan,
                 "Sell Price": float(xp) if np.isfinite(xp) else np.nan,
