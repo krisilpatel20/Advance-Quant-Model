@@ -2759,6 +2759,71 @@ def _first_regular_session_5m_close_for_daily_signal(ticker: str, signal_date):
         return signal_date, np.nan, "natural_daily_failed"
 
 
+
+def naturalize_existing_daily_regime_trade_log(trades_df, ticker="", max_rows=10):
+    """
+    DISPLAY ONLY for Daily Regime.
+
+    Fixes the mismatch:
+    - Performance metrics/Cumulative Return come from BacktestEngine account curve.
+    - Natural intraday display prices are only for realistic shown Buy/Sell prices.
+    Therefore this function preserves the original Cumulative Return (%) column and only
+    replaces the latest N rows' displayed Entry/Exit Date, Buy Price, Sell Price, and PnL.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+
+        max_rows = int(max(1, max_rows))
+        out = _regime_sort_latest_first_for_mapping(trades_df.copy())
+
+        # Only naturalize the latest N displayed rows. Older rows remain untouched.
+        target_idx = list(out.head(max_rows).index)
+
+        for idx in target_idx:
+            try:
+                if "Entry Date" in out.columns and "Buy Price" in out.columns:
+                    ets, ep, esrc = _first_regular_session_5m_close_for_daily_signal(ticker, out.loc[idx, "Entry Date"])
+                    if pd.notna(ets):
+                        try:
+                            out.loc[idx, "Entry Date"] = pd.Timestamp(ets).strftime("%Y-%m-%d %H:%M:%S CT")
+                        except Exception:
+                            out.loc[idx, "Entry Date"] = ets
+                    if np.isfinite(ep) and ep > 0:
+                        out.loc[idx, "Buy Price"] = float(ep)
+
+                if "Exit Date" in out.columns and "Sell Price" in out.columns:
+                    if str(out.loc[idx, "Exit Date"]).strip().lower() != "open":
+                        xts, xp, xsrc = _first_regular_session_5m_close_for_daily_signal(ticker, out.loc[idx, "Exit Date"])
+                        if pd.notna(xts):
+                            try:
+                                out.loc[idx, "Exit Date"] = pd.Timestamp(xts).strftime("%Y-%m-%d %H:%M:%S CT")
+                            except Exception:
+                                out.loc[idx, "Exit Date"] = xts
+                        if np.isfinite(xp) and xp > 0:
+                            out.loc[idx, "Sell Price"] = float(xp)
+
+                # Recalculate single-trade displayed PnL from the displayed natural prices.
+                # Do NOT recalculate Cumulative Return (%) here. That must stay tied to performance metrics.
+                if "Buy Price" in out.columns and "Sell Price" in out.columns and "PnL (%)" in out.columns:
+                    bp = pd.to_numeric(out.loc[idx, "Buy Price"], errors="coerce")
+                    sp = pd.to_numeric(out.loc[idx, "Sell Price"], errors="coerce")
+                    if pd.notna(bp) and pd.notna(sp) and float(bp) > 0 and str(out.get("Status", pd.Series(index=out.index)).get(idx, "")).lower() != "open":
+                        out.loc[idx, "PnL (%)"] = (float(sp) / float(bp) - 1.0) * 100.0
+
+                if "Intraday Time Source" not in out.columns:
+                    out["Intraday Time Source"] = ""
+                out.loc[idx, "Intraday Time Source"] = "natural first completed 5m close"
+            except Exception:
+                continue
+
+        # Keep original cumulative return from engine; remove ugly reconciliation column if present.
+        out = out.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+        return out.reset_index(drop=True)
+    except Exception:
+        return trades_df
+
+
 def build_daily_regime_natural_intraday_trade_log(signals, ticker="", max_rows=10):
     """
     DISPLAY ONLY for Daily Regime.
@@ -11005,9 +11070,7 @@ with tab7:
                             if bt_freq == "Weekly":
                                 plot_trades_df = apply_regime_intraday_time_display_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                             elif bt_freq == "Daily":
-                                natural_plot_log = build_daily_regime_natural_intraday_trade_log(signals, ticker=TICKER, max_rows=int(regime_precise_time_rows))
-                                if natural_plot_log is not None and not natural_plot_log.empty:
-                                    plot_trades_df = natural_plot_log
+                                plot_trades_df = naturalize_existing_daily_regime_trade_log(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                     except Exception:
                         pass
                 try:
@@ -11685,9 +11748,7 @@ with tab7:
                         if bt_freq == "Weekly":
                             trades_df = apply_regime_intraday_time_display_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                         elif bt_freq == "Daily":
-                            natural_log = build_daily_regime_natural_intraday_trade_log(signals, ticker=TICKER, max_rows=int(regime_precise_time_rows))
-                            if natural_log is not None and not natural_log.empty:
-                                trades_df = natural_log
+                            trades_df = naturalize_existing_daily_regime_trade_log(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
             except Exception:
                 pass
 
