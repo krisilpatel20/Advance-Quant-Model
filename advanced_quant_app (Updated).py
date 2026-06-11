@@ -7734,7 +7734,17 @@ with tab3:
         st.caption(f"Using Custom Drift: {custom_ret*100:.2f}%")
 
     # Helper to generate future dates
-    last_date = df_main.index[-1]
+    # SAFE FIX: df_main can be empty/unavailable after some tab/data reloads.
+    # Do not crash the full app at df_main.index[-1].
+    try:
+        if df_main is None or getattr(df_main, "empty", True) or len(df_main.index) == 0:
+            st.warning("Simulation skipped because no loaded price data is available. Load a ticker/date range first.")
+            st.stop()
+        last_date = pd.Timestamp(df_main.index[-1])
+    except Exception:
+        st.warning("Simulation skipped because latest data date could not be read. Reload the ticker and try again.")
+        st.stop()
+
     future_dates = [last_date + timedelta(days=i) for i in range(253)] # 0 to 252
     
     import plotly.graph_objects as go
