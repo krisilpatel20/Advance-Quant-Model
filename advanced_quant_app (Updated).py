@@ -7161,7 +7161,7 @@ with tab1:
                 fig_v.add_trace(go.Scatter(x=returns_pct.index, y=res.conditional_volatility, mode='lines', line=dict(color='#00f2ff', width=1.5), name=f'{vol_model_type} Vol'))
                 fig_v.update_layout(title=f"{vol_model_type} ({dist_type}) Conditional Volatility", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_v, use_container_width=True)
-                st.session_state.report_gen.add_plot("GARCH Volatility", fig_v)
+                safe_report_add("GARCH Volatility", fig_v)
                 
             with col_res2:
                 params_df = pd.DataFrame({
@@ -7655,7 +7655,7 @@ with tab2:
     
     fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
     st.plotly_chart(fig_m, use_container_width=True)
-    st.session_state.report_gen.add_plot("Regime Switching Analysis", fig_m)
+    safe_report_add("Regime Switching Analysis", fig_m)
     
     # ===== PARAMETERS TABLE =====
     with st.expander("📋 Technical Parameters"):
@@ -7823,7 +7823,7 @@ with tab3:
                 hovermode="x unified"
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.session_state.report_gen.add_plot("Merton Jump Diffusion", fig)
+            safe_report_add("Merton Jump Diffusion", fig)
             safe_report_add("Merton Metrics", {"Mean": final_mean, "Median": final_median})
 
     elif sim_type == "Heston Stochastic Volatility":
@@ -7935,7 +7935,7 @@ with tab3:
                 hovermode="x unified"
             )
             st.plotly_chart(fig_h, use_container_width=True)
-            st.session_state.report_gen.add_plot("Heston Price Simulation", fig_h)
+            safe_report_add("Heston Price Simulation", fig_h)
             safe_report_add("Heston Metrics", {"Mean": final_mean, "Median": final_median})
             
             # Volatility Plot (Optional, keep simple or upgrade too)
@@ -7957,7 +7957,7 @@ with tab3:
                 height=300
             )
             st.plotly_chart(fig_v, use_container_width=True)
-            st.session_state.report_gen.add_plot("Heston Volatility Process", fig_v)
+            safe_report_add("Heston Volatility Process", fig_v)
 
 # ==========================================
 # TAB 4: KALMAN FILTER
@@ -8000,7 +8000,7 @@ with tab4:
                 fig_k.add_hline(y=-2.0, line_dash="dash", line_color="green", row=2, col=1)
                 fig_k.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_k, use_container_width=True)
-                st.session_state.report_gen.add_plot("Kalman Pairs Analysis", fig_k)
+                safe_report_add("Kalman Pairs Analysis", fig_k)
                 safe_report_add("Kalman Hedge Ratio", {"Beta": beta[-1]})
                 st.write(f"Current Hedge Ratio: **{beta[-1]:.4f}** (Long 1 {TICKER}, Short {beta[-1]:.4f} {PAIR_TICKER})")
             else:
@@ -8051,7 +8051,7 @@ with tab4:
             
         fig_kt.update_layout(title=f"Kalman Filter Trend: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
         st.plotly_chart(fig_kt, use_container_width=True)
-        st.session_state.report_gen.add_plot("Kalman Trend Analysis", fig_kt)
+        safe_report_add("Kalman Trend Analysis", fig_kt)
         
         # Signal & Metrics
         current_price = prices[-1]
@@ -8118,7 +8118,7 @@ with tab5:
                    hoverinfo="x+y+z"))
         fig_hm.update_layout(title="Asset Class Correlations", template="plotly_dark", width=600, height=600)
         st.plotly_chart(fig_hm, use_container_width=True)
-        st.session_state.report_gen.add_plot("Macro Correlations", fig_hm)
+        safe_report_add("Macro Correlations", fig_hm)
         safe_report_add("Correlation Matrix", corr_matrix)
         
         st.write(f"**Structural Thesis Check:**")
@@ -8158,7 +8158,7 @@ with tab6:
         fig_dec.add_trace(go.Scatter(x=decomp.resid.index, y=decomp.resid, mode='lines', name='Residuals'), row=3, col=1)
         fig_dec.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Structural Decomposition")
         st.plotly_chart(fig_dec, use_container_width=True)
-        st.session_state.report_gen.add_plot("Structural Decomposition", fig_dec)
+        safe_report_add("Structural Decomposition", fig_dec)
         safe_report_add("Decomposition Period", {"Period": period})
     else:
         st.warning("Insufficient data for decomposition with selected period.")
@@ -11208,7 +11208,7 @@ with tab7:
                     use_container_width=True,
                     config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"]}
                 )
-                st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+                safe_report_add("Backtest Performance", fig_bt)
         else:
             # Equity Curve Plot
             st.write("#### 📈 Equity Curve")
@@ -11217,7 +11217,7 @@ with tab7:
             fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
             fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
             st.plotly_chart(fig_bt, use_container_width=True)
-            st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+            safe_report_add("Backtest Performance", fig_bt)
 
         safe_report_add("Backtest Metrics", strat_metrics)
 
@@ -11372,7 +11372,7 @@ with tab8:
     fig_vol.add_hline(y=threshold, line_dash="dash", line_color="red", row=2, col=1, annotation_text="2-Sigma Threshold")
     fig_vol.update_layout(height=600, hovermode="x unified", template="plotly_dark")
     st.plotly_chart(fig_vol, use_container_width=True)
-    st.session_state.report_gen.add_plot("Volatility Clustering Visuals", fig_vol)
+    safe_report_add("Volatility Clustering Visuals", fig_vol)
 
 # ==========================================
 # TAB 9: INSTITUTIONAL REGIME DETECTION
@@ -11408,7 +11408,7 @@ with tab9:
             fig_pro.add_trace(go.Scatter(x=df_main.index, y=probs[:, i], mode='lines', line=dict(width=0), fill='tonexty' if i > 0 else 'tozeroy', stackgroup='one', name=labels[i]))
         fig_pro.update_layout(title="Multi-Factor Regime Probabilities", hovermode="x unified", template="plotly_dark", height=400)
         st.plotly_chart(fig_pro, use_container_width=True)
-        st.session_state.report_gen.add_plot("Institutional Regime Probabilities", fig_pro)
+        safe_report_add("Institutional Regime Probabilities", fig_pro)
         
         # Feature breakdown
         st.write("#### 📊 Institutional Feature Space")
@@ -11422,7 +11422,7 @@ with tab9:
         fig_feat.add_hline(y=0, line_dash="solid", line_color="white", line_width=1, row=3, col=1)
         fig_feat.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Institutional Feature Space")
         st.plotly_chart(fig_feat, use_container_width=True)
-        st.session_state.report_gen.add_plot("Regime Feature Space", fig_feat)
+        safe_report_add("Regime Feature Space", fig_feat)
 
 
 # ==========================================
@@ -11516,7 +11516,7 @@ with tab10:
                 
                 fig_dyn.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_dyn, use_container_width=True)
-                st.session_state.report_gen.add_plot("SML Factor Dynamics", fig_dyn)
+                safe_report_add("SML Factor Dynamics", fig_dyn)
                 safe_report_add("SML Analysis Results", res_sml.tail(100))
                 safe_report_add("Current SML Metrics", last_row.to_dict())
 
@@ -14018,7 +14018,7 @@ with tab18:
                 display_adaptive_strategy_lab("VWAP", cl, vwap_candidates, file_prefix="VWAP_Adaptive_Strategy")
 
                 if st.session_state.report_gen:
-                    st.session_state.report_gen.add_plot("VWAP Suite", fig_vwap)
+                    safe_report_add("VWAP Suite", fig_vwap)
                     if vwap_log:
                         st.session_state.report_gen.add_data("VWAP Touch Log", vlog_df)
 
