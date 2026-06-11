@@ -4080,7 +4080,16 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         st.write(f"#### 📝 {title} Trade Log")
         if not trades_df.empty:
             trades_df = apply_trade_log_timestamp_display(trades_df)
-            st.dataframe(trades_df.style.format({
+            try:
+                if len(trades_df) > 300:
+                    st.caption(f"Showing latest 300 trade-log rows for speed out of {len(trades_df)} total rows. Download/export can be added if needed.")
+                    _display_trades_df = trades_df.head(300)
+                else:
+                    _display_trades_df = trades_df
+            except Exception:
+                _display_trades_df = trades_df
+
+            st.dataframe(_display_trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
                 "PnL (%)": "{:.2f}%",
@@ -8145,7 +8154,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "1M 5m VWAP EMA Scalper", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -8765,6 +8774,220 @@ with tab7:
                 
                 fig_ctx.update_layout(title="Momentum Hedge Signal (EMA/SMA Cross)", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "1M 5m VWAP EMA Scalper":
+        st.markdown("### ⚡ 1-Month 5m VWAP EMA Scalper")
+        st.caption("Final settings: 1-month view, 5-minute candles, Session VWAP, EMA 9 / EMA 21, Volume MA 20, ATR 14, long only above VWAP.")
+
+        st.info("This strategy is fixed to your final settings. It is long-only and uses 5-minute candles over the most recent 1-month window.")
+
+        scalper_interval = "5m"
+        scalper_period = "1mo"
+        scalper_ema_fast_len = 9
+        scalper_ema_slow_len = 21
+        scalper_vol_len = 20
+        scalper_atr_len = 14
+
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            scalper_stop_atr = st.number_input("ATR stop multiplier", min_value=0.25, max_value=10.0, value=1.20, step=0.05, key="scalp_vwap_stop_atr")
+        with sc2:
+            scalper_target_atr = st.number_input("ATR target multiplier", min_value=0.25, max_value=20.0, value=2.00, step=0.05, key="scalp_vwap_target_atr")
+        with sc3:
+            scalper_require_volume = st.checkbox("Require volume above Volume MA20", value=True, key="scalp_vwap_require_vol")
+
+        sc4, sc5 = st.columns(2)
+        with sc4:
+            scalper_exit_mode = st.selectbox(
+                "Exit mode",
+                ["VWAP or EMA21 break", "EMA21 break only", "ATR stop/target only"],
+                index=0,
+                key="scalp_vwap_exit_mode"
+            )
+        with sc5:
+            scalper_cooldown = st.number_input("Cooldown bars after exit", min_value=0, max_value=100, value=3, step=1, key="scalp_vwap_cooldown")
+
+        def _fetch_1m_5m_scalper_data(ticker):
+            try:
+                df0 = yf.download(
+                    str(ticker).strip().upper(),
+                    period=scalper_period,
+                    interval=scalper_interval,
+                    auto_adjust=True,
+                    progress=False,
+                    prepost=False,
+                    threads=False
+                )
+                if df0 is None or df0.empty:
+                    return pd.DataFrame()
+                if isinstance(df0.columns, pd.MultiIndex):
+                    df0.columns = [c[0] if isinstance(c, tuple) else c for c in df0.columns]
+                df0 = df0.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+                try:
+                    idx = pd.DatetimeIndex(df0.index)
+                    if idx.tz is None:
+                        df0.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago")
+                    else:
+                        df0.index = idx.tz_convert("America/Chicago")
+                except Exception:
+                    pass
+                return df0
+            except Exception:
+                return pd.DataFrame()
+
+        scalp_df = _fetch_1m_5m_scalper_data(TICKER)
+
+        if scalp_df is None or scalp_df.empty or "Close" not in scalp_df.columns:
+            st.error("Could not load 1-month 5-minute data for this ticker. Yahoo may be rate-limited or the ticker may not support 5m data.")
+            signals = None
+        else:
+            scalp_df = scalp_df.copy()
+            for _c in ["Open", "High", "Low"]:
+                if _c not in scalp_df.columns:
+                    scalp_df[_c] = scalp_df["Close"]
+            if "Volume" not in scalp_df.columns:
+                scalp_df["Volume"] = 1.0
+
+            typical_price = (scalp_df["High"] + scalp_df["Low"] + scalp_df["Close"]) / 3.0
+            volume_series = scalp_df["Volume"].replace(0, np.nan).fillna(1.0)
+
+            # Session VWAP resets every trading day.
+            try:
+                session_key = pd.DatetimeIndex(scalp_df.index).date
+                session_vwap = ((typical_price * volume_series).groupby(session_key).cumsum()) / (volume_series.groupby(session_key).cumsum() + 1e-9)
+            except Exception:
+                session_vwap = (typical_price * volume_series).cumsum() / (volume_series.cumsum() + 1e-9)
+
+            ema9 = scalp_df["Close"].ewm(span=scalper_ema_fast_len, adjust=False).mean()
+            ema21 = scalp_df["Close"].ewm(span=scalper_ema_slow_len, adjust=False).mean()
+            volume_ma20 = scalp_df["Volume"].rolling(scalper_vol_len, min_periods=5).mean()
+
+            high_low = scalp_df["High"] - scalp_df["Low"]
+            high_close_prev = (scalp_df["High"] - scalp_df["Close"].shift(1)).abs()
+            low_close_prev = (scalp_df["Low"] - scalp_df["Close"].shift(1)).abs()
+            true_range = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+            atr14 = true_range.rolling(scalper_atr_len, min_periods=5).mean()
+
+            above_vwap = scalp_df["Close"] > session_vwap
+            ema_bull = ema9 > ema21
+            price_above_ema = scalp_df["Close"] > ema9
+            volume_ok = scalp_df["Volume"] > volume_ma20
+            volume_filter_ok = volume_ok if bool(scalper_require_volume) else pd.Series(True, index=scalp_df.index)
+
+            # Entry: long only above Session VWAP, EMA9 > EMA21, price above EMA9, optional volume confirmation.
+            raw_entry = above_vwap & ema_bull & price_above_ema & volume_filter_ok
+
+            if str(scalper_exit_mode) == "VWAP or EMA21 break":
+                raw_exit = (scalp_df["Close"] < session_vwap) | (scalp_df["Close"] < ema21) | (ema9 < ema21)
+            elif str(scalper_exit_mode) == "EMA21 break only":
+                raw_exit = (scalp_df["Close"] < ema21) | (ema9 < ema21)
+            else:
+                raw_exit = pd.Series(False, index=scalp_df.index)
+
+            # Stateful long-only signal with cooldown.
+            signals = pd.Series(0.0, index=scalp_df.index)
+            entry_marks = pd.Series(False, index=scalp_df.index)
+            exit_marks = pd.Series(False, index=scalp_df.index)
+
+            in_pos = False
+            cooldown_left = 0
+            entry_price = np.nan
+            stop_price = np.nan
+            target_price = np.nan
+
+            for _i, _dt in enumerate(scalp_df.index):
+                close_i = float(scalp_df["Close"].iloc[_i])
+                atr_i = float(atr14.iloc[_i]) if pd.notna(atr14.iloc[_i]) else np.nan
+
+                if cooldown_left > 0:
+                    cooldown_left -= 1
+
+                if in_pos:
+                    signals.iloc[_i] = 1.0
+                    atr_stop_hit = np.isfinite(stop_price) and close_i <= stop_price
+                    atr_target_hit = np.isfinite(target_price) and close_i >= target_price
+                    logic_exit = bool(raw_exit.loc[_dt])
+                    if atr_stop_hit or atr_target_hit or logic_exit:
+                        in_pos = False
+                        signals.iloc[_i] = 0.0
+                        exit_marks.loc[_dt] = True
+                        cooldown_left = int(scalper_cooldown)
+                        entry_price = np.nan
+                        stop_price = np.nan
+                        target_price = np.nan
+                else:
+                    if cooldown_left == 0 and bool(raw_entry.loc[_dt]):
+                        in_pos = True
+                        signals.iloc[_i] = 1.0
+                        entry_marks.loc[_dt] = True
+                        entry_price = close_i
+                        if np.isfinite(atr_i):
+                            stop_price = entry_price - atr_i * float(scalper_stop_atr)
+                            target_price = entry_price + atr_i * float(scalper_target_atr)
+                        else:
+                            stop_price = np.nan
+                            target_price = np.nan
+
+            strat_prices = scalp_df["Close"].dropna()
+            prices_bt = strat_prices
+            returns_bt = strat_prices.pct_change().fillna(0)
+            df_bt = scalp_df
+            benchmark_label_for_metrics = "Buy & Hold (1M 5m)"
+
+            with st.expander("See 1M 5m VWAP EMA Scalper Chart", expanded=True):
+                fig_scalp = go.Figure()
+                fig_scalp.add_trace(go.Candlestick(
+                    x=scalp_df.index,
+                    open=scalp_df["Open"],
+                    high=scalp_df["High"],
+                    low=scalp_df["Low"],
+                    close=scalp_df["Close"],
+                    name="Price"
+                ))
+                fig_scalp.add_trace(go.Scatter(x=scalp_df.index, y=session_vwap, mode="lines", name="Session VWAP"))
+                fig_scalp.add_trace(go.Scatter(x=scalp_df.index, y=ema9, mode="lines", name="EMA 9"))
+                fig_scalp.add_trace(go.Scatter(x=scalp_df.index, y=ema21, mode="lines", name="EMA 21"))
+
+                buys = scalp_df[entry_marks]
+                sells = scalp_df[exit_marks]
+                if not buys.empty:
+                    fig_scalp.add_trace(go.Scatter(
+                        x=buys.index, y=buys["Close"], mode="markers", name="Long Entry",
+                        marker=dict(size=10, symbol="triangle-up", color="lime")
+                    ))
+                if not sells.empty:
+                    fig_scalp.add_trace(go.Scatter(
+                        x=sells.index, y=sells["Close"], mode="markers", name="Exit",
+                        marker=dict(size=9, symbol="x", color="red")
+                    ))
+
+                highlight_plotly_zones(fig_scalp, signals == 1, "green", opacity=0.08)
+                fig_scalp.update_layout(
+                    title=f"{TICKER} 1M 5m VWAP EMA Scalper",
+                    template="plotly_dark",
+                    height=650,
+                    hovermode="x unified",
+                    xaxis_rangeslider_visible=False
+                )
+                st.plotly_chart(fig_scalp, use_container_width=True)
+
+                diag_scalp = pd.DataFrame({
+                    "Close": scalp_df["Close"],
+                    "Session VWAP": session_vwap,
+                    "EMA 9": ema9,
+                    "EMA 21": ema21,
+                    "Volume": scalp_df["Volume"],
+                    "Volume MA20": volume_ma20,
+                    "ATR 14": atr14,
+                    "Above VWAP": above_vwap,
+                    "EMA9 > EMA21": ema_bull,
+                    "Volume OK": volume_ok,
+                    "Entry": entry_marks,
+                    "Exit": exit_marks,
+                    "Signal": signals
+                })
+                st.dataframe(diag_scalp.tail(150), use_container_width=True)
+
 
     elif strategy_type == "VWAP/TWAP Swing Filter":
         st.markdown("### 🧭 VWAP/TWAP Benchmark-Aware Swing Filter")
@@ -10292,6 +10515,32 @@ with tab7:
             st.write("#### 📈 Regime Switching Price Graph")
             st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
 
+            pgc1, pgc2, pgc3 = st.columns(3)
+            with pgc1:
+                regime_graph_mode = st.selectbox(
+                    "Price graph display range",
+                    ["Recent only (fast)", "Full anchor history (slow)"],
+                    index=0,
+                    key=f"regime_price_graph_display_range_{TICKER}_{bt_freq}",
+                    help="Recent only keeps the chart fast for long anchors like 2020/01/01. Model/backtest still uses the full selected anchor history."
+                )
+            with pgc2:
+                regime_graph_bars = st.number_input(
+                    "Recent graph bars",
+                    min_value=100,
+                    max_value=5000,
+                    value=900,
+                    step=100,
+                    key=f"regime_price_graph_recent_bars_{TICKER}_{bt_freq}"
+                )
+            with pgc3:
+                regime_precise_old_times = st.checkbox(
+                    "Precise intraday times for old trades",
+                    value=False,
+                    key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
+                    help="OFF is faster. ON can be slow for old anchors because it tries to map historical trade times."
+                )
+
             try:
                 plot_trades_df = bt_results['trades'].copy()
                 if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
@@ -10300,7 +10549,8 @@ with tab7:
                         plot_trades_df = apply_weekly_live_trigger_display_overrides(
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
-                        plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
+                        if bool(regime_precise_old_times):
+                            plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
                     except Exception:
                         pass
                 try:
@@ -10375,6 +10625,19 @@ with tab7:
                             return xs, ys, js_points
 
                         dfp = trades_df_src.copy()
+                        # In fast recent graph mode, only plot markers inside the visible chart range.
+                        try:
+                            if str(regime_graph_mode).startswith("Recent") and 'price_for_plot' in locals():
+                                _visible_min = pd.Timestamp(pd.Series(price_for_plot).dropna().index.min())
+                                _visible_max = pd.Timestamp(pd.Series(price_for_plot).dropna().index.max())
+                                def _in_visible_range(_v):
+                                    _tsv = _clean_trade_ts_for_plot(_v)
+                                    if pd.isna(_tsv):
+                                        return False
+                                    return (_tsv >= _visible_min - pd.Timedelta(days=3)) and (_tsv <= _visible_max + pd.Timedelta(days=3))
+                                dfp = dfp[dfp[date_col].apply(_in_visible_range)]
+                        except Exception:
+                            pass
                         if status_filter is not None and "Status" in dfp.columns:
                             dfp = dfp[status_filter(dfp["Status"].astype(str))]
 
@@ -10495,6 +10758,17 @@ with tab7:
                         _pf.loc[_idx] = float(latest_px_disp)
                         _pf = _pf.sort_index()
                         price_for_plot = _pf[~_pf.index.duplicated(keep="last")]
+                except Exception:
+                    pass
+
+                # Fast display for long anchors: trim chart data only.
+                # This does not change model fitting, signals, metrics, or trade log.
+                try:
+                    if str(regime_graph_mode).startswith("Recent"):
+                        _pf_trim = pd.Series(price_for_plot).dropna().sort_index()
+                        if len(_pf_trim) > int(regime_graph_bars):
+                            price_for_plot = _pf_trim.tail(int(regime_graph_bars))
+                            st.caption(f"Fast graph mode: showing last {len(price_for_plot)} price bars only. Backtest/trade log still uses the full anchor history.")
                 except Exception:
                     pass
 
@@ -10941,7 +11215,12 @@ with tab7:
                     trades_df = apply_weekly_live_trigger_display_overrides(
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
-                    trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
+                    try:
+                        _precise_ok = bool(regime_precise_old_times)
+                    except Exception:
+                        _precise_ok = False
+                    if _precise_ok:
+                        trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
             except Exception:
                 pass
 
