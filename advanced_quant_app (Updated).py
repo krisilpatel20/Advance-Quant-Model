@@ -10570,6 +10570,90 @@ with tab7:
             except Exception:
                 return pd.NaT, np.nan, "none"
 
+        def _reconcile_latest_daily_regime_exit_price(trades_in):
+            """
+            DISPLAY ONLY safety fix for Daily Regime Switching.
+
+            Problem fixed:
+            During the current trading day, a daily-bar exit can show a daily/backtest sell price
+            that was not actually tradable intraday yet. Example: trade log showed a sell around
+            18.55 while fresh AMPX intraday was around 16.6-16.7.
+
+            This does NOT change model fitting, signals, equity curve, or metrics.
+            It only makes the latest Daily trade-log row honest by replacing an impossible
+            current-day exit price with the freshest available live/intraday close.
+            """
+            try:
+                if trades_in is None or trades_in.empty:
+                    return trades_in
+                if strategy_type != "Regime Switching (Trend Following)" or str(bt_freq) != "Daily":
+                    return trades_in
+
+                latest_dt, latest_px, latest_src = _latest_display_price_and_time_for_regime()
+                if pd.isna(latest_dt) or not np.isfinite(latest_px) or latest_px <= 0:
+                    return trades_in
+
+                out = trades_in.copy()
+                if "Exit Date" not in out.columns or "Sell Price" not in out.columns:
+                    return out
+
+                def _parse_dt(v):
+                    try:
+                        s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                        if s.lower() in {"", "nan", "nat", "none", "open"}:
+                            return pd.NaT
+                        ts = pd.Timestamp(s)
+                        if getattr(ts, "tzinfo", None) is not None:
+                            ts = ts.tz_convert("America/Chicago").tz_localize(None)
+                        return ts
+                    except Exception:
+                        return pd.NaT
+
+                exit_dt = out["Exit Date"].apply(_parse_dt)
+                if exit_dt.dropna().empty:
+                    return out
+
+                idx_latest_exit = exit_dt.sort_values(ascending=False, na_position="last").index[0]
+                row_exit_dt = exit_dt.loc[idx_latest_exit]
+                if pd.isna(row_exit_dt):
+                    return out
+
+                # Only correct the current/latest displayed trading day, not old historical trades.
+                if pd.Timestamp(row_exit_dt).date() != pd.Timestamp(latest_dt).date():
+                    return out
+
+                old_sell = pd.to_numeric(out.loc[idx_latest_exit, "Sell Price"], errors="coerce")
+                if pd.isna(old_sell) or float(old_sell) <= 0:
+                    return out
+
+                # If the displayed sell differs materially from fresh current price, it is not an
+                # honest current-day executable sell. Replace display with latest actual price.
+                diff_pct = abs(float(old_sell) / float(latest_px) - 1.0) * 100.0
+                if diff_pct < 0.75:
+                    return out
+
+                out.loc[idx_latest_exit, "Sell Price"] = float(latest_px)
+                if "Exit Price" in out.columns:
+                    out.loc[idx_latest_exit, "Exit Price"] = float(latest_px)
+                if "Exit Date" in out.columns:
+                    try:
+                        out.loc[idx_latest_exit, "Exit Date"] = pd.Timestamp(latest_dt).strftime("%Y-%m-%d %H:%M:%S CT")
+                    except Exception:
+                        pass
+                if "PnL (%)" in out.columns:
+                    buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+                    if buy_col is not None:
+                        buy_px = pd.to_numeric(out.loc[idx_latest_exit, buy_col], errors="coerce")
+                        if pd.notna(buy_px) and float(buy_px) > 0:
+                            out.loc[idx_latest_exit, "PnL (%)"] = (float(latest_px) / float(buy_px) - 1.0) * 100.0
+
+                out["Latest Price Reconciliation"] = out.get("Latest Price Reconciliation", "")
+                out.loc[idx_latest_exit, "Latest Price Reconciliation"] = f"Sell display corrected from {float(old_sell):.2f} to {float(latest_px):.2f} using {latest_src}"
+                return out
+            except Exception:
+                return trades_in
+
+
         def _mark_latest_regime_trade_open_if_signal_long(trades_in):
             """
             Display-only fix:
@@ -10689,6 +10773,7 @@ with tab7:
                         pass
                 try:
                     plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
+                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
                 except Exception:
                     pass
 
@@ -11361,6 +11446,7 @@ with tab7:
 
             try:
                 trades_df = _mark_latest_regime_trade_open_if_signal_long(trades_df)
+                trades_df = _reconcile_latest_daily_regime_exit_price(trades_df)
             except Exception:
                 pass
 
