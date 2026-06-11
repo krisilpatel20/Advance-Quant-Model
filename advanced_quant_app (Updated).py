@@ -2720,6 +2720,133 @@ def apply_regime_intraday_time_display_limited(trades_df, ticker="", max_rows=60
 
 
 
+def _daily_exact_intraday_timestamp_and_price(ticker: str, dt, reference_price, side: str = "entry"):
+    """
+    DISPLAY ONLY for Daily Regime.
+    Find a real 5-minute candle on the signal date and return BOTH its timestamp and
+    real close price. This prevents fake rows like timestamp=12:35 but price was never
+    near that level in the market.
+    """
+    try:
+        if dt is None or pd.isna(dt) or str(dt).strip().lower() == "open":
+            return dt, np.nan, "open"
+        day = pd.Timestamp(dt).date()
+        intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
+        if intraday is None or intraday.empty:
+            return dt, np.nan, "needs_intraday_history"
+
+        intraday = intraday.copy()
+        for c in ["Open", "High", "Low", "Close"]:
+            if c in intraday.columns:
+                intraday[c] = pd.to_numeric(intraday[c], errors="coerce")
+        intraday = intraday.dropna(subset=["Close"])
+        if intraday.empty:
+            return dt, np.nan, "needs_intraday_history"
+
+        try:
+            px = float(reference_price)
+        except Exception:
+            px = np.nan
+
+        lows = intraday["Low"] if "Low" in intraday.columns else intraday["Close"]
+        highs = intraday["High"] if "High" in intraday.columns else intraday["Close"]
+        closes = intraday["Close"]
+
+        # If the displayed daily price was actually inside a real 5m candle range,
+        # use the first such candle timestamp, but display the real candle close price.
+        # This keeps timestamp and price honest.
+        if np.isfinite(px) and px > 0:
+            touched = intraday[(lows <= px) & (px <= highs)]
+            if touched is not None and not touched.empty:
+                ts = touched.index[0]
+                real_px = float(touched["Close"].iloc[0])
+                return ts, real_px, "real_5m_touch_close"
+
+            # If it was not touched, use the nearest real 5m close.
+            dist = (closes - px).abs()
+            if dist.notna().any():
+                ts = dist.idxmin()
+                real_px = float(closes.loc[ts])
+                return ts, real_px, "nearest_real_5m_close"
+
+        # If no usable reference price, use final available regular-session candle.
+        ts = intraday.index[-1]
+        real_px = float(closes.iloc[-1])
+        return ts, real_px, "latest_real_5m_close"
+    except Exception:
+        return dt, np.nan, "daily_exact_failed"
+
+
+def apply_daily_regime_exact_intraday_prices_limited(trades_df, ticker="", max_rows=10):
+    """
+    DISPLAY ONLY for Daily Regime.
+    Maps latest N trades to real 5m timestamps AND replaces Buy/Sell Price with
+    the real 5m close at those timestamps. No fake timestamp/price mismatch.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+
+        max_rows = int(max(1, max_rows))
+        ordered = _regime_sort_latest_first_for_mapping(trades_df)
+        recent_idx = list(ordered.head(max_rows).index)
+
+        out = ordered.copy()
+        source_notes = []
+
+        for idx in out.index:
+            source_notes.append("")
+        source_map = pd.Series(source_notes, index=out.index, dtype=object)
+
+        for idx in recent_idx:
+            try:
+                if "Entry Date" in out.columns and ("Buy Price" in out.columns or "Entry Price" in out.columns):
+                    buy_col = "Buy Price" if "Buy Price" in out.columns else "Entry Price"
+                    ts, real_px, src = _daily_exact_intraday_timestamp_and_price(
+                        ticker, out.loc[idx, "Entry Date"], out.loc[idx, buy_col], side="entry"
+                    )
+                    if pd.notna(ts):
+                        try:
+                            out.loc[idx, "Entry Date"] = pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+                        except Exception:
+                            out.loc[idx, "Entry Date"] = ts
+                    if np.isfinite(real_px) and real_px > 0:
+                        out.loc[idx, buy_col] = float(real_px)
+                    source_map.loc[idx] = (str(source_map.loc[idx]) + f"Entry {src}; ").strip()
+
+                if "Exit Date" in out.columns and ("Sell Price" in out.columns or "Exit Price" in out.columns):
+                    if str(out.loc[idx, "Exit Date"]).strip().lower() != "open":
+                        sell_col = "Sell Price" if "Sell Price" in out.columns else "Exit Price"
+                        ts, real_px, src = _daily_exact_intraday_timestamp_and_price(
+                            ticker, out.loc[idx, "Exit Date"], out.loc[idx, sell_col], side="exit"
+                        )
+                        if pd.notna(ts):
+                            try:
+                                out.loc[idx, "Exit Date"] = pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+                            except Exception:
+                                out.loc[idx, "Exit Date"] = ts
+                        if np.isfinite(real_px) and real_px > 0:
+                            out.loc[idx, sell_col] = float(real_px)
+                        source_map.loc[idx] = (str(source_map.loc[idx]) + f"Exit {src}; ").strip()
+
+                # Recalculate displayed PnL using the displayed real prices.
+                buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+                sell_col = "Sell Price" if "Sell Price" in out.columns else ("Exit Price" if "Exit Price" in out.columns else None)
+                if buy_col is not None and sell_col is not None and "PnL (%)" in out.columns:
+                    bp = pd.to_numeric(out.loc[idx, buy_col], errors="coerce")
+                    sp = pd.to_numeric(out.loc[idx, sell_col], errors="coerce")
+                    if pd.notna(bp) and pd.notna(sp) and float(bp) > 0 and str(out.get("Status", pd.Series(index=out.index)).get(idx, "")).lower() != "open":
+                        out.loc[idx, "PnL (%)"] = (float(sp) / float(bp) - 1.0) * 100.0
+            except Exception:
+                continue
+
+        out["Intraday Time Source"] = source_map.replace("", np.nan)
+        return out
+    except Exception:
+        return trades_df
+
+
+
 
 
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
@@ -8547,7 +8674,7 @@ with tab7:
         # This fixes the old mismatch where model data was smoothed but execution prices were raw.
         if bt_stability > 0:
             prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
-            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
+            st.caption(f"ℹ️ Regime smoothing applied to the model brain only (span={bt_stability}). Daily trade fills use raw market prices.")
         else:
             prices_bt_model = prices_bt_resampled.copy()
 
@@ -10408,9 +10535,31 @@ with tab7:
 
     # Run Backtest Engine if signals exist
     if signals is not None:
-        # Keep original weekly model price/signal series for execution so returns,
-        # PnL, stops, equity curve, and metrics remain EXACTLY the same.
-        # Only the trade-log dates are mapped to actual raw trading dates for display.
+        # DAILY REGIME REAL-PRICE EXECUTION FIX:
+        # Smoothing is allowed for the Regime model brain, but execution/trade-log
+        # prices must be real market prices. Using smoothed prices for execution can
+        # create impossible fills that never traded intraday (example: AMPX 18.08 on
+        # a day whose real low was higher). This changes only Daily Regime execution
+        # pricing to raw daily market closes; the model/signal brain remains unchanged.
+        if strategy_type == "Regime Switching (Trend Following)" and str(bt_freq) == "Daily":
+            try:
+                _raw_exec_prices = pd.Series(regime_source_prices).replace([np.inf, -np.inf], np.nan).dropna()
+                if _raw_exec_prices is not None and not _raw_exec_prices.empty:
+                    _raw_exec_prices.index = pd.to_datetime(_raw_exec_prices.index)
+                    _sig = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(0).clip(0, 1)
+                    _sig.index = pd.to_datetime(_sig.index)
+                    _common_idx = _raw_exec_prices.index.intersection(_sig.index)
+                    if len(_common_idx) >= 2:
+                        strat_prices = _raw_exec_prices.loc[_common_idx].astype(float)
+                        signals = _sig.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                        try:
+                            returns_bt_resampled = strat_prices.pct_change().dropna()
+                        except Exception:
+                            pass
+                        st.caption("✅ Daily Regime execution uses raw market prices. Smoothing is used only for the model brain, not for Buy/Sell fills.")
+            except Exception as _e:
+                st.warning(f"Daily Regime raw-price execution alignment failed, using existing price series: {_e}")
+
         bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
 
         # --- STRATEGY SIGNAL BANNER ---
@@ -10754,15 +10903,13 @@ with tab7:
                     key=f"regime_precise_time_rows_{TICKER}_{bt_freq}",
                     help="Speed control only. Exact intraday mapping is expensive. Use 5-10 for fast loading."
                 )
-                if bt_freq == "Weekly":
-                    regime_run_precise_now = st.button(
-                        "Run exact intraday time mapping now",
-                        key=f"regime_run_precise_time_now_{TICKER}_{bt_freq}",
-                        help="Weekly only. Click only when you need exact 5-minute Entry/Exit timestamps. Normal model, metrics, and trade log load without this expensive step."
-                    )
-                else:
-                    regime_run_precise_now = False
-                    st.caption("Daily Regime uses daily-bar execution. Exact intraday price-touch mapping is disabled because it can create fake timestamps/prices that were not actually tradable.")
+                regime_run_precise_now = st.button(
+                    "Run exact intraday time mapping now",
+                    key=f"regime_run_precise_time_now_{TICKER}_{bt_freq}",
+                    help="For Daily: maps to a real 5-minute candle and replaces displayed price with that candle close so timestamp and price match. For Weekly: uses weekly intraday mapping."
+                )
+                if bt_freq == "Daily":
+                    st.caption("Daily exact mode is display-only: it maps the latest rows to real 5-minute candles and uses the real 5-minute close price, so no fake timestamp/price mismatch.")
 
             try:
                 plot_trades_df = bt_results['trades'].copy()
@@ -10773,8 +10920,11 @@ with tab7:
                         plot_trades_df = apply_weekly_live_trigger_display_overrides(
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
-                        if bt_freq == "Weekly" and bool(regime_precise_old_times) and bool(regime_run_precise_now):
-                            plot_trades_df = apply_regime_intraday_time_display_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                        if bool(regime_precise_old_times) and bool(regime_run_precise_now):
+                            if bt_freq == "Weekly":
+                                plot_trades_df = apply_regime_intraday_time_display_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                            elif bt_freq == "Daily":
+                                plot_trades_df = apply_daily_regime_exact_intraday_prices_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                     except Exception:
                         pass
                 try:
@@ -11432,7 +11582,7 @@ with tab7:
         if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
             st.caption("Weekly trade times: exact intraday times are shown only when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly candles alone cannot produce precise intraday time.")
         if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily":
-            st.caption("Daily trade times: daily Regime signals execute on daily-bar prices. Intraday price-touch mapping is disabled because it can create fake timestamps/prices that do not match real trading.")
+            st.caption("Daily exact-time button is display-only. It maps selected rows to real 5-minute candles and uses the real 5-minute close price, so timestamp and price match.")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
@@ -11448,8 +11598,11 @@ with tab7:
                         _precise_ok = bool(regime_precise_old_times)
                     except Exception:
                         _precise_ok = True
-                    if bt_freq == "Weekly" and _precise_ok and bool(regime_run_precise_now):
-                        trades_df = apply_regime_intraday_time_display_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                    if _precise_ok and bool(regime_run_precise_now):
+                        if bt_freq == "Weekly":
+                            trades_df = apply_regime_intraday_time_display_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                        elif bt_freq == "Daily":
+                            trades_df = apply_daily_regime_exact_intraday_prices_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
             except Exception:
                 pass
 
