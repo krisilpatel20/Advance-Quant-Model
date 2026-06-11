@@ -10754,11 +10754,15 @@ with tab7:
                     key=f"regime_precise_time_rows_{TICKER}_{bt_freq}",
                     help="Speed control only. Exact intraday mapping is expensive. Use 5-10 for fast loading."
                 )
-                regime_run_precise_now = st.button(
-                    "Run exact intraday time mapping now",
-                    key=f"regime_run_precise_time_now_{TICKER}_{bt_freq}",
-                    help="Click only when you need exact 5-minute Entry/Exit timestamps. Normal model, metrics, and trade log load without this expensive step."
-                )
+                if bt_freq == "Weekly":
+                    regime_run_precise_now = st.button(
+                        "Run exact intraday time mapping now",
+                        key=f"regime_run_precise_time_now_{TICKER}_{bt_freq}",
+                        help="Weekly only. Click only when you need exact 5-minute Entry/Exit timestamps. Normal model, metrics, and trade log load without this expensive step."
+                    )
+                else:
+                    regime_run_precise_now = False
+                    st.caption("Daily Regime uses daily-bar execution. Exact intraday price-touch mapping is disabled because it can create fake timestamps/prices that were not actually tradable.")
 
             try:
                 plot_trades_df = bt_results['trades'].copy()
@@ -10769,13 +10773,14 @@ with tab7:
                         plot_trades_df = apply_weekly_live_trigger_display_overrides(
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
-                        if bool(regime_precise_old_times) and bool(regime_run_precise_now):
+                        if bt_freq == "Weekly" and bool(regime_precise_old_times) and bool(regime_run_precise_now):
                             plot_trades_df = apply_regime_intraday_time_display_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                     except Exception:
                         pass
                 try:
                     plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
                     plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
+                    plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
                 except Exception:
                     pass
 
@@ -11424,8 +11429,10 @@ with tab7:
 
         # Trade Log
         st.write("#### 📝 Trade Log")
-        if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
-            st.caption(f"{bt_freq} trade times: exact intraday times are shown when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. {bt_freq} candles alone cannot produce precise intraday time.")
+        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+            st.caption("Weekly trade times: exact intraday times are shown only when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly candles alone cannot produce precise intraday time.")
+        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily":
+            st.caption("Daily trade times: daily Regime signals execute on daily-bar prices. Intraday price-touch mapping is disabled because it can create fake timestamps/prices that do not match real trading.")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
@@ -11441,7 +11448,7 @@ with tab7:
                         _precise_ok = bool(regime_precise_old_times)
                     except Exception:
                         _precise_ok = True
-                    if _precise_ok and bool(regime_run_precise_now):
+                    if bt_freq == "Weekly" and _precise_ok and bool(regime_run_precise_now):
                         trades_df = apply_regime_intraday_time_display_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
             except Exception:
                 pass
@@ -11496,6 +11503,8 @@ with tab7:
                 except Exception:
                     pass
             
+            trades_df = trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
