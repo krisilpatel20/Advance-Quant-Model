@@ -2656,23 +2656,75 @@ def _cached_regime_intraday_time_display_csv(trades_csv: str, ticker: str):
             return pd.DataFrame()
 
 
-def apply_regime_intraday_time_display_fast(trades_df, ticker=""):
+def apply_regime_intraday_time_display_fast(trades_df, ticker="", max_rows=35):
     """
     Performance-only wrapper. No strategy/model/metric logic change.
-    Uses Streamlit cache so Daily timeframe with smoothing=10 does not recompute
-    the same old-trade intraday timestamps on every app refresh.
+
+    Daily with smoothing=10 can create many rows. Exact intraday timestamp mapping
+    requires fetching intraday data day-by-day, which is the slow part. This maps the
+    newest max_rows exactly and leaves older rows date-only for speed.
     """
     try:
         if trades_df is None or trades_df.empty:
             return trades_df
-        # CSV keeps this cache key stable across reruns and avoids hashing large object internals.
-        csv_payload = trades_df.to_csv(index=False)
-        cached = _cached_regime_intraday_time_display_csv(csv_payload, str(ticker).strip().upper())
-        if cached is None or cached.empty:
-            return trades_df
-        return cached
+
+        out = trades_df.copy()
+
+        def _sort_dt(v):
+            try:
+                s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                if s.lower() in {"", "nan", "nat", "none", "open"}:
+                    return pd.NaT
+                ts = pd.Timestamp(s)
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert(None)
+                return ts
+            except Exception:
+                return pd.NaT
+
+        # Small trade logs: exact map everything, cached.
+        if len(out) <= int(max_rows):
+            csv_payload = out.to_csv(index=False)
+            cached = _cached_regime_intraday_time_display_csv(csv_payload, str(ticker).strip().upper())
+            if cached is None or cached.empty:
+                return trades_df
+            return cached
+
+        # Large trade logs: exact map only newest rows. Older rows stay clean/date-only.
+        if "Entry Date" in out.columns:
+            sort_key = out["Entry Date"].apply(_sort_dt)
+            newest_idx = sort_key.sort_values(ascending=False, na_position="last").head(int(max_rows)).index
+        else:
+            newest_idx = out.tail(int(max_rows)).index
+
+        newer = out.loc[newest_idx].copy()
+        older = out.drop(index=newest_idx).copy()
+
+        # Cache only the expensive newest subset.
+        csv_payload = newer.to_csv(index=False)
+        newer_mapped = _cached_regime_intraday_time_display_csv(csv_payload, str(ticker).strip().upper())
+        if newer_mapped is None or newer_mapped.empty:
+            newer_mapped = newer
+
+        # Older rows are intentionally not exact-mapped for speed.
+        # Add source columns so finalize_regime_trade_time_display keeps them date-only.
+        if "__Entry Time Source__" not in older.columns:
+            older["__Entry Time Source__"] = "skipped_for_speed"
+        if "__Exit Time Source__" not in older.columns:
+            older["__Exit Time Source__"] = "skipped_for_speed"
+
+        # Recombine in original row order.
+        combined = pd.concat([newer_mapped, older], axis=0)
+        try:
+            combined = combined.loc[out.index]
+        except Exception:
+            pass
+        return combined
     except Exception:
-        return apply_regime_intraday_time_display(trades_df, ticker=ticker)
+        try:
+            return trades_df
+        except Exception:
+            return apply_regime_intraday_time_display(trades_df, ticker=ticker)
 
 
 
@@ -4139,14 +4191,9 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         st.write(f"#### 📝 {title} Trade Log")
         if not trades_df.empty:
             trades_df = apply_trade_log_timestamp_display(trades_df)
-            try:
-                if len(trades_df) > 300:
-                    st.caption(f"Showing latest 300 trade-log rows for speed out of {len(trades_df)} total rows. Download/export can be added if needed.")
-                    _display_trades_df = trades_df.head(300)
-                else:
-                    _display_trades_df = trades_df
-            except Exception:
-                _display_trades_df = trades_df
+            # Show the full trade log. Speed is protected by limiting only the expensive
+            # exact-intraday timestamp mapping, not by hiding rows.
+            _display_trades_df = trades_df
 
             st.dataframe(_display_trades_df.style.format({
                 "Buy Price": "{:.2f}",
@@ -10598,7 +10645,7 @@ with tab7:
                     "Recent graph bars",
                     min_value=100,
                     max_value=5000,
-                    value=900,
+                    value=500,
                     step=100,
                     key=f"regime_price_graph_recent_bars_{TICKER}_{bt_freq}"
                 )
@@ -10608,6 +10655,27 @@ with tab7:
                     value=True,
                     key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
                     help="ON by default. Turn it OFF manually only when long anchors like 2020/01/01 make the graph/trade log too slow."
+                )
+                regime_fast_display = st.checkbox(
+                    "Fast daily display",
+                    value=True,
+                    key=f"regime_fast_daily_display_{TICKER}_{bt_freq}",
+                    help="ON = exact intraday time only for latest rows, older rows stay date-only. Strategy/metrics unchanged."
+                )
+                regime_exact_rows = st.number_input(
+                    "Exact-time rows",
+                    min_value=5,
+                    max_value=300,
+                    value=35,
+                    step=5,
+                    key=f"regime_exact_time_rows_{TICKER}_{bt_freq}",
+                    help="Number of newest trade rows to exact-map to 5m time when Fast daily display is ON."
+                )
+                regime_full_exact_now = st.checkbox(
+                    "Full exact time mapping now",
+                    value=False,
+                    key=f"regime_full_exact_time_mapping_now_{TICKER}_{bt_freq}",
+                    help="OFF = fast load. ON = maps every old trade to intraday time; this can be slow because each old trade date needs historical intraday lookup."
                 )
 
             try:
@@ -10620,7 +10688,11 @@ with tab7:
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
                         if bool(regime_precise_old_times):
-                            plot_trades_df = apply_regime_intraday_time_display_fast(plot_trades_df, ticker=TICKER)
+                            if bool(regime_full_exact_now):
+                                _exact_rows_plot = 100000
+                            else:
+                                _exact_rows_plot = int(regime_exact_rows)
+                            plot_trades_df = apply_regime_intraday_time_display_fast(plot_trades_df, ticker=TICKER, max_rows=_exact_rows_plot)
                     except Exception:
                         pass
                 try:
@@ -11275,6 +11347,13 @@ with tab7:
         st.write("#### 📝 Trade Log")
         if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
             st.caption(f"{bt_freq} trade times: exact intraday times are shown when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. {bt_freq} candles alone cannot produce precise intraday time.")
+            try:
+                if bool(regime_fast_display) and not bool(regime_full_exact_now):
+                    st.caption(f"⚡ Fast full display ON: all trade rows remain visible, latest {int(regime_exact_rows)} rows get exact 5m timestamps, older rows stay date-only for speed.")
+                elif bool(regime_full_exact_now):
+                    st.caption("⚠️ Full exact time mapping is ON: every old trade row will be mapped to intraday time. This gives maximum detail but can load slowly.")
+            except Exception:
+                pass
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
@@ -11291,7 +11370,11 @@ with tab7:
                     except Exception:
                         _precise_ok = True
                     if _precise_ok:
-                        trades_df = apply_regime_intraday_time_display_fast(trades_df, ticker=TICKER)
+                        if bool(regime_full_exact_now):
+                            _exact_rows_log = 100000
+                        else:
+                            _exact_rows_log = int(regime_exact_rows)
+                        trades_df = apply_regime_intraday_time_display_fast(trades_df, ticker=TICKER, max_rows=_exact_rows_log)
             except Exception:
                 pass
 
