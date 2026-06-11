@@ -8505,6 +8505,11 @@ with tab7:
                         st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
 
 
+        try:
+            regime_run_precise_now
+        except NameError:
+            regime_run_precise_now = False
+
         # Resample if Weekly
         regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
         live_execution_prices_for_regime = prices_bt.dropna().copy()
@@ -10652,16 +10657,21 @@ with tab7:
                     "Precise intraday times for old trades",
                     value=True,
                     key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
-                    help="ON by default. Turn it OFF manually only when long anchors like 2020/01/01 make the graph/trade log too slow."
+                    help="Keeps the option ON by default. For speed, exact mapping only runs when you click the button below."
                 )
                 regime_precise_time_rows = st.number_input(
                     "Precise-time rows to process",
-                    min_value=10,
-                    max_value=500,
-                    value=60,
-                    step=10,
+                    min_value=1,
+                    max_value=100,
+                    value=10,
+                    step=1,
                     key=f"regime_precise_time_rows_{TICKER}_{bt_freq}",
-                    help="Speed control only. Processes exact intraday time for the latest N displayed trades instead of every historical row."
+                    help="Speed control only. Exact intraday mapping is expensive. Use 5-10 for fast loading."
+                )
+                regime_run_precise_now = st.button(
+                    "Run exact intraday time mapping now",
+                    key=f"regime_run_precise_time_now_{TICKER}_{bt_freq}",
+                    help="Click only when you need exact 5-minute Entry/Exit timestamps. Normal model, metrics, and trade log load without this expensive step."
                 )
 
             try:
@@ -10673,7 +10683,7 @@ with tab7:
                         plot_trades_df = apply_weekly_live_trigger_display_overrides(
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
-                        if bool(regime_precise_old_times):
+                        if bool(regime_precise_old_times) and bool(regime_run_precise_now):
                             plot_trades_df = apply_regime_intraday_time_display_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                     except Exception:
                         pass
@@ -11344,7 +11354,7 @@ with tab7:
                         _precise_ok = bool(regime_precise_old_times)
                     except Exception:
                         _precise_ok = True
-                    if _precise_ok:
+                    if _precise_ok and bool(regime_run_precise_now):
                         trades_df = apply_regime_intraday_time_display_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
             except Exception:
                 pass
