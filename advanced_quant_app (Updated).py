@@ -2720,6 +2720,109 @@ def apply_regime_intraday_time_display_limited(trades_df, ticker="", max_rows=60
 
 
 
+def _first_regular_session_5m_close_for_daily_signal(ticker: str, signal_date):
+    """
+    DISPLAY ONLY.
+    For a Daily Regime signal date, use a real regular-session 5-minute candle close.
+    This is not open price and not daily close price. It is the first completed 5m candle
+    after market open, so it is a more natural executable-style display price.
+    """
+    try:
+        if signal_date is None or pd.isna(signal_date) or str(signal_date).strip().lower() == "open":
+            return signal_date, np.nan, "open"
+        day = pd.Timestamp(signal_date).date()
+        intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
+        if intraday is None or intraday.empty:
+            return signal_date, np.nan, "needs_intraday_history"
+
+        intraday = intraday.copy()
+        if "Close" not in intraday.columns:
+            return signal_date, np.nan, "needs_intraday_history"
+        intraday["Close"] = pd.to_numeric(intraday["Close"], errors="coerce")
+        intraday = intraday.dropna(subset=["Close"])
+        if intraday.empty:
+            return signal_date, np.nan, "needs_intraday_history"
+
+        idx = pd.DatetimeIndex(intraday.index)
+        try:
+            # US regular session in CT is 08:30-15:00. Use first completed 5m bar after open.
+            session = intraday[(idx.time >= pd.Timestamp("08:35").time()) & (idx.time <= pd.Timestamp("15:00").time())]
+        except Exception:
+            session = intraday
+        if session.empty:
+            session = intraday
+
+        ts = session.index[0]
+        px = float(session["Close"].iloc[0])
+        return ts, px, "natural_first_5m_close"
+    except Exception:
+        return signal_date, np.nan, "natural_daily_failed"
+
+
+def build_daily_regime_natural_intraday_trade_log(signals, ticker="", max_rows=10):
+    """
+    DISPLAY ONLY for Daily Regime.
+    Rebuilds latest N trade-log rows from Daily signal flips using real 5m candle closes.
+    This avoids fake touched prices and avoids daily open/close fill assumptions.
+    """
+    try:
+        sig = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(0).clip(0, 1)
+        if sig.empty:
+            return pd.DataFrame()
+        sig.index = pd.to_datetime(sig.index)
+
+        prev = sig.shift(1).fillna(0)
+        entry_dates = list(sig.index[(prev <= 0) & (sig > 0)])
+        exit_dates = list(sig.index[(prev > 0) & (sig <= 0)])
+
+        pairs = []
+        for ed in entry_dates:
+            xd = None
+            for cand in exit_dates:
+                if cand > ed:
+                    xd = cand
+                    break
+            pairs.append((ed, xd))
+
+        if not pairs:
+            return pd.DataFrame()
+
+        pairs = pairs[-int(max(1, max_rows)):]
+        rows = []
+        cum = 0.0
+
+        for ed, xd in pairs:
+            ets, ep, esrc = _first_regular_session_5m_close_for_daily_signal(ticker, ed)
+            if xd is None or pd.isna(xd):
+                xts, xp, xsrc = "Open", np.nan, "open"
+                status = "Open"
+            else:
+                xts, xp, xsrc = _first_regular_session_5m_close_for_daily_signal(ticker, xd)
+                status = "Closed"
+
+            pnl = np.nan
+            if np.isfinite(ep) and ep > 0 and np.isfinite(xp) and xp > 0:
+                pnl = (float(xp) / float(ep) - 1.0) * 100.0
+                cum += float(pnl)
+
+            rows.append({
+                "Side": "Long",
+                "Entry Date": pd.Timestamp(ets).strftime("%Y-%m-%d %H:%M:%S CT") if hasattr(ets, "strftime") else str(ets),
+                "Exit Date": "Open" if status == "Open" else (pd.Timestamp(xts).strftime("%Y-%m-%d %H:%M:%S CT") if hasattr(xts, "strftime") else str(xts)),
+                "Buy Price": float(ep) if np.isfinite(ep) else np.nan,
+                "Sell Price": float(xp) if np.isfinite(xp) else np.nan,
+                "PnL (%)": float(pnl) if np.isfinite(pnl) else np.nan,
+                "Cumulative Return (%)": round(float(cum), 2) if np.isfinite(cum) else np.nan,
+                "Status": status,
+                "Intraday Time Source": f"Entry {esrc}; Exit {xsrc}"
+            })
+
+        return pd.DataFrame(rows).sort_values("Entry Date", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+
 def _daily_exact_intraday_timestamp_and_price(ticker: str, dt, reference_price, side: str = "entry"):
     """
     DISPLAY ONLY for Daily Regime.
@@ -8674,7 +8777,7 @@ with tab7:
         # This fixes the old mismatch where model data was smoothed but execution prices were raw.
         if bt_stability > 0:
             prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
-            st.caption(f"ℹ️ Regime smoothing applied to the model brain only (span={bt_stability}). Daily trade fills use raw market prices.")
+            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
         else:
             prices_bt_model = prices_bt_resampled.copy()
 
@@ -10535,31 +10638,9 @@ with tab7:
 
     # Run Backtest Engine if signals exist
     if signals is not None:
-        # DAILY REGIME REAL-PRICE EXECUTION FIX:
-        # Smoothing is allowed for the Regime model brain, but execution/trade-log
-        # prices must be real market prices. Using smoothed prices for execution can
-        # create impossible fills that never traded intraday (example: AMPX 18.08 on
-        # a day whose real low was higher). This changes only Daily Regime execution
-        # pricing to raw daily market closes; the model/signal brain remains unchanged.
-        if strategy_type == "Regime Switching (Trend Following)" and str(bt_freq) == "Daily":
-            try:
-                _raw_exec_prices = pd.Series(regime_source_prices).replace([np.inf, -np.inf], np.nan).dropna()
-                if _raw_exec_prices is not None and not _raw_exec_prices.empty:
-                    _raw_exec_prices.index = pd.to_datetime(_raw_exec_prices.index)
-                    _sig = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(0).clip(0, 1)
-                    _sig.index = pd.to_datetime(_sig.index)
-                    _common_idx = _raw_exec_prices.index.intersection(_sig.index)
-                    if len(_common_idx) >= 2:
-                        strat_prices = _raw_exec_prices.loc[_common_idx].astype(float)
-                        signals = _sig.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                        try:
-                            returns_bt_resampled = strat_prices.pct_change().dropna()
-                        except Exception:
-                            pass
-                        st.caption("✅ Daily Regime execution uses raw market prices. Smoothing is used only for the model brain, not for Buy/Sell fills.")
-            except Exception as _e:
-                st.warning(f"Daily Regime raw-price execution alignment failed, using existing price series: {_e}")
-
+        # Keep original weekly model price/signal series for execution so returns,
+        # PnL, stops, equity curve, and metrics remain EXACTLY the same.
+        # Only the trade-log dates are mapped to actual raw trading dates for display.
         bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
 
         # --- STRATEGY SIGNAL BANNER ---
@@ -10904,12 +10985,12 @@ with tab7:
                     help="Speed control only. Exact intraday mapping is expensive. Use 5-10 for fast loading."
                 )
                 regime_run_precise_now = st.button(
-                    "Run exact intraday time mapping now",
+                    "Run natural intraday trade log now",
                     key=f"regime_run_precise_time_now_{TICKER}_{bt_freq}",
-                    help="For Daily: maps to a real 5-minute candle and replaces displayed price with that candle close so timestamp and price match. For Weekly: uses weekly intraday mapping."
+                    help="For Daily: rebuilds latest trade-log rows using real first completed 5-minute candle closes. No daily open/close and no fake touched prices."
                 )
                 if bt_freq == "Daily":
-                    st.caption("Daily exact mode is display-only: it maps the latest rows to real 5-minute candles and uses the real 5-minute close price, so no fake timestamp/price mismatch.")
+                    st.caption("Daily natural mode: latest selected rows use real 5-minute candle closes after signal day begins. It does not use daily open/close or fake touched prices.")
 
             try:
                 plot_trades_df = bt_results['trades'].copy()
@@ -10924,7 +11005,9 @@ with tab7:
                             if bt_freq == "Weekly":
                                 plot_trades_df = apply_regime_intraday_time_display_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                             elif bt_freq == "Daily":
-                                plot_trades_df = apply_daily_regime_exact_intraday_prices_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                                natural_plot_log = build_daily_regime_natural_intraday_trade_log(signals, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                                if natural_plot_log is not None and not natural_plot_log.empty:
+                                    plot_trades_df = natural_plot_log
                     except Exception:
                         pass
                 try:
@@ -11602,7 +11685,9 @@ with tab7:
                         if bt_freq == "Weekly":
                             trades_df = apply_regime_intraday_time_display_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                         elif bt_freq == "Daily":
-                            trades_df = apply_daily_regime_exact_intraday_prices_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                            natural_log = build_daily_regime_natural_intraday_trade_log(signals, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                            if natural_log is not None and not natural_log.empty:
+                                trades_df = natural_log
             except Exception:
                 pass
 
