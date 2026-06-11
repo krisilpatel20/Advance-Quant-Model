@@ -10647,7 +10647,9 @@ with tab7:
                         if pd.notna(buy_px) and float(buy_px) > 0:
                             out.loc[idx_latest_exit, "PnL (%)"] = (float(latest_px) / float(buy_px) - 1.0) * 100.0
 
-                out["Latest Price Reconciliation"] = out.get("Latest Price Reconciliation", "")
+                if "Latest Price Reconciliation" not in out.columns:
+                    out["Latest Price Reconciliation"] = ""
+                out["Latest Price Reconciliation"] = out["Latest Price Reconciliation"].fillna("").astype(str)
                 out.loc[idx_latest_exit, "Latest Price Reconciliation"] = f"Sell display corrected from {float(old_sell):.2f} to {float(latest_px):.2f} using {latest_src}"
                 return out
             except Exception:
@@ -11486,6 +11488,13 @@ with tab7:
             trades_df = apply_trade_log_timestamp_display(trades_df)
             if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
                 trades_df = finalize_regime_trade_time_display(trades_df)
+                # Exact intraday mapping can restore the current-day Daily row's
+                # model/backtest Sell Price. Reconcile again as the final display step.
+                try:
+                    if bt_freq == "Daily":
+                        trades_df = _reconcile_latest_daily_regime_exit_price(trades_df)
+                except Exception:
+                    pass
             
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
