@@ -1875,6 +1875,120 @@ def apply_confirmed_bar_execution_policy(signals, frequency="Daily", confirmed_b
     return s.shift(1).ffill().fillna(fill_value).clip(0, 1)
 
 
+
+def _regime_locked_ledger_path():
+    """Local persistent ledger file for non-repainting Regime signals."""
+    try:
+        base = Path(__file__).resolve().parent
+    except Exception:
+        base = Path(".")
+    return base / "regime_locked_signal_ledger.csv"
+
+
+def _load_regime_locked_ledger():
+    try:
+        p = _regime_locked_ledger_path()
+        if not p.exists():
+            return pd.DataFrame(columns=["key", "bar_time", "signal", "created_at"])
+        df = pd.read_csv(p)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["key", "bar_time", "signal", "created_at"])
+        for c in ["key", "bar_time", "signal", "created_at"]:
+            if c not in df.columns:
+                df[c] = np.nan
+        return df[["key", "bar_time", "signal", "created_at"]].copy()
+    except Exception:
+        return pd.DataFrame(columns=["key", "bar_time", "signal", "created_at"])
+
+
+def _save_regime_locked_ledger(df):
+    try:
+        p = _regime_locked_ledger_path()
+        df = df.copy()
+        df = df.drop_duplicates(subset=["key", "bar_time"], keep="last")
+        df.to_csv(p, index=False)
+        return True
+    except Exception:
+        return False
+
+
+def reset_regime_locked_ledger_for_key(lock_key: str):
+    """Delete locked records for one ticker/frequency/settings key."""
+    try:
+        df = _load_regime_locked_ledger()
+        if df.empty:
+            return 0
+        mask = df["key"].astype(str).eq(str(lock_key))
+        removed = int(mask.sum())
+        df = df.loc[~mask].copy()
+        _save_regime_locked_ledger(df)
+        return removed
+    except Exception:
+        return 0
+
+
+def apply_regime_locked_signal_ledger(signals, lock_key: str, enabled=True):
+    """
+    True non-repaint ledger for Regime Switching.
+
+    Once a signal for a daily/weekly closed bar is written, future model refits cannot
+    rewrite that bar. New bars are appended only when they appear.
+
+    This prevents model-refit repainting. It does not change how the model calculates
+    the new bar signal; it only freezes already recorded signals.
+    """
+    try:
+        s = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(0).clip(0, 1)
+        if not bool(enabled) or s.empty:
+            return s, 0, 0, False
+
+        # Normalize timestamps to stable strings so Streamlit/cloud reruns match.
+        idx = pd.to_datetime(s.index)
+        bar_keys = [pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S") for x in idx]
+
+        ledger = _load_regime_locked_ledger()
+        key = str(lock_key)
+
+        if ledger.empty:
+            locked_map = {}
+        else:
+            sub = ledger.loc[ledger["key"].astype(str).eq(key)].copy()
+            if sub.empty:
+                locked_map = {}
+            else:
+                sub["signal"] = pd.to_numeric(sub["signal"], errors="coerce")
+                locked_map = dict(zip(sub["bar_time"].astype(str), sub["signal"].astype(float)))
+
+        out_vals = []
+        new_rows = []
+        locked_count = 0
+        appended_count = 0
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for bar_key, val in zip(bar_keys, s.values):
+            if bar_key in locked_map and np.isfinite(locked_map[bar_key]):
+                out_vals.append(float(locked_map[bar_key]))
+                locked_count += 1
+            else:
+                v = float(val)
+                out_vals.append(v)
+                new_rows.append({"key": key, "bar_time": bar_key, "signal": v, "created_at": now_str})
+                appended_count += 1
+
+        if new_rows:
+            ledger = pd.concat([ledger, pd.DataFrame(new_rows)], ignore_index=True)
+            _save_regime_locked_ledger(ledger)
+
+        out = pd.Series(out_vals, index=s.index, dtype=float).ffill().fillna(0).clip(0, 1)
+        return out, locked_count, appended_count, True
+    except Exception:
+        try:
+            return pd.Series(signals), 0, 0, False
+        except Exception:
+            return signals, 0, 0, False
+
+
+
 def _nearest_price_at_or_before(price_series, target_date):
     """Return last available raw market close at or before target_date."""
     try:
@@ -8662,6 +8776,24 @@ with tab7:
         with col_sig3:
             confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
 
+        lock_regime_ledger = st.checkbox(
+            "Locked daily/weekly signal ledger (true non-repaint)",
+            value=True,
+            key=f"bt_regime_locked_ledger_{TICKER}_{bt_freq}",
+            help="ON = once a closed Daily/Weekly signal is recorded, future model refits cannot rewrite that bar."
+        )
+
+        regime_lock_key = (
+            f"{str(TICKER).upper()}|{str(bt_freq)}|start={pd.Timestamp(bt_start_date).date()}|"
+            f"n={int(bt_n_regimes)}|smooth={int(bt_stability)}|method={str(signal_method)}|"
+            f"conv={float(conviction):.2f}|minhold={int(min_hold_period)}|"
+            f"switchmean={bool(bt_switch_trend)}|switchvol={bool(bt_switch_vol)}|confirmed={bool(confirmed_regime_bar)}"
+        )
+
+        if st.button("Reset locked ledger for this Regime setup", key=f"reset_regime_locked_ledger_{TICKER}_{bt_freq}"):
+            _removed = reset_regime_locked_ledger_for_key(regime_lock_key)
+            st.warning(f"Reset locked ledger for this setup. Removed {_removed} saved signal rows. Run the backtest again to rebuild the ledger.")
+
         weekly_close_same_bar = True
         if str(bt_freq) == "Weekly":
             weekly_close_same_bar = st.checkbox(
@@ -9083,6 +9215,21 @@ with tab7:
                                 st.caption(f"ℹ️ Live hybrid mapped stable regime signal to {len(signals)} live candles. Current live exposure: {signals.iloc[-1]*100:.0f}%")
                         except Exception as e:
                             st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
+
+                    # TRUE NON-REPAINT LEDGER
+                    # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
+                    # cannot rewrite already recorded signals for this ticker/frequency/settings.
+                    try:
+                        if bool(lock_regime_ledger):
+                            signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
+                                signals, regime_lock_key, enabled=True
+                            )
+                            if _ledger_ok:
+                                st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
+                            else:
+                                st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
+                    except Exception as _lock_e:
+                        st.warning(f"Locked Regime Ledger failed: {_lock_e}")
 
                     # Plot Context
                     with st.expander("See Strategy Context"):
@@ -11026,6 +11173,7 @@ with tab7:
 
         # Price / Equity Graphs
         if strategy_type == "Regime Switching (Trend Following)":
+            st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
             st.write("#### 📈 Regime Switching Price Graph")
             st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
 
@@ -11706,6 +11854,7 @@ with tab7:
             except Exception as plot_err:
                 st.warning(f"Could not render regime price entry/exit graph: {plot_err}")
 
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
             show_equity_curve_secondary = st.checkbox(
                 "Show strategy performance / equity curve",
                 value=False,
@@ -11738,6 +11887,7 @@ with tab7:
         safe_report_add("Backtest Metrics", strat_metrics)
 
         # Trade Log
+        st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
         st.write("#### 📝 Trade Log")
         if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
             st.caption("Weekly trade times: exact intraday times are shown only when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly candles alone cannot produce precise intraday time.")
