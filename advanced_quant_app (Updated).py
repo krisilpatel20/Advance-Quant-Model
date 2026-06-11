@@ -2828,6 +2828,87 @@ def _first_regular_session_5m_close_for_daily_signal(ticker: str, signal_date):
         return "Intraday unavailable", np.nan, "natural_daily_failed"
 
 
+
+def naturalize_existing_daily_regime_trade_log(trades_df, ticker="", max_rows=10):
+    """
+    DISPLAY ONLY for Daily Regime.
+
+    Naturalizes latest N existing trade-log rows using real 5-minute candle closes.
+    Does not rebuild cumulative return. Does not use daily open/close. Does not allow
+    fake 15:00 CT fallback. If real 5m data is unavailable, row is clearly labeled
+    Intraday unavailable and original prices are left unchanged.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+
+        out = _regime_sort_latest_first_for_mapping(trades_df.copy())
+        max_rows = int(max(1, max_rows))
+        target_idx = list(out.head(max_rows).index)
+
+        if "Intraday Time Source" not in out.columns:
+            out["Intraday Time Source"] = ""
+
+        def _set_time_value(ts_val):
+            try:
+                if isinstance(ts_val, str):
+                    return ts_val
+                if pd.isna(ts_val):
+                    return "Intraday unavailable"
+                return pd.Timestamp(ts_val).strftime("%Y-%m-%d %H:%M:%S CT")
+            except Exception:
+                return "Intraday unavailable"
+
+        for idx in target_idx:
+            try:
+                # Entry
+                if "Entry Date" in out.columns and "Buy Price" in out.columns:
+                    ets, ep, esrc = _first_regular_session_5m_close_for_daily_signal(ticker, out.loc[idx, "Entry Date"])
+                    out.loc[idx, "Intraday Time Source"] = (str(out.loc[idx, "Intraday Time Source"]) + f" Entry {esrc};").strip()
+                    if hasattr(ets, "strftime") and np.isfinite(ep) and ep > 0:
+                        # Safety: do not permit 15:00 fake exact time.
+                        if pd.Timestamp(ets).time() < pd.Timestamp("15:00").time():
+                            out.loc[idx, "Entry Date"] = _set_time_value(ets)
+                            out.loc[idx, "Buy Price"] = float(ep)
+                        else:
+                            out.loc[idx, "Entry Date"] = "Intraday unavailable"
+                    elif isinstance(ets, str) and "unavailable" in ets.lower():
+                        out.loc[idx, "Entry Date"] = "Intraday unavailable"
+
+                # Exit
+                if "Exit Date" in out.columns and "Sell Price" in out.columns:
+                    if str(out.loc[idx, "Exit Date"]).strip().lower() != "open":
+                        xts, xp, xsrc = _first_regular_session_5m_close_for_daily_signal(ticker, out.loc[idx, "Exit Date"])
+                        out.loc[idx, "Intraday Time Source"] = (str(out.loc[idx, "Intraday Time Source"]) + f" Exit {xsrc};").strip()
+                        if hasattr(xts, "strftime") and np.isfinite(xp) and xp > 0:
+                            if pd.Timestamp(xts).time() < pd.Timestamp("15:00").time():
+                                out.loc[idx, "Exit Date"] = _set_time_value(xts)
+                                out.loc[idx, "Sell Price"] = float(xp)
+                            else:
+                                out.loc[idx, "Exit Date"] = "Intraday unavailable"
+                        elif isinstance(xts, str) and "unavailable" in xts.lower():
+                            out.loc[idx, "Exit Date"] = "Intraday unavailable"
+
+                # Recalculate single trade PnL from displayed natural prices only.
+                # Keep Cumulative Return (%) from the backtest engine.
+                if "Buy Price" in out.columns and "Sell Price" in out.columns and "PnL (%)" in out.columns:
+                    bp = pd.to_numeric(out.loc[idx, "Buy Price"], errors="coerce")
+                    sp = pd.to_numeric(out.loc[idx, "Sell Price"], errors="coerce")
+                    if pd.notna(bp) and pd.notna(sp) and float(bp) > 0 and str(out.get("Status", pd.Series(index=out.index)).get(idx, "")).lower() != "open":
+                        out.loc[idx, "PnL (%)"] = (float(sp) / float(bp) - 1.0) * 100.0
+            except Exception as _row_e:
+                try:
+                    out.loc[idx, "Intraday Time Source"] = f"naturalize failed: {_row_e}"
+                except Exception:
+                    pass
+                continue
+
+        out = out.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+        return out.reset_index(drop=True)
+    except Exception:
+        return trades_df
+
+
 def build_daily_regime_natural_intraday_trade_log(signals, ticker="", max_rows=10):
     """
     DISPLAY ONLY for Daily Regime.
@@ -5818,8 +5899,8 @@ with st.sidebar:
     st.header("🚀 Fast Startup")
     fast_intraday_mode = st.toggle(
         "Fast intraday-only startup",
-        value=True,
-        help="ON = skip heavy GARCH/Markov/full-dashboard calculations so the app opens fast. Use the final 0.5% Live Capture tab for today's intraday trades. Turn OFF when you want the full thesis dashboard."
+        value=False,
+        help="OFF by default. Turn ON only when you want to skip heavy GARCH/Markov/full-dashboard calculations and go straight to the final 0.5% Live Capture tab."
     )
     if fast_intraday_mode:
         st.success("Fast mode ON: heavy models skipped. Go straight to ⚡ 0.5% Live Capture.")
@@ -11758,7 +11839,10 @@ with tab7:
 
             try:
                 trades_df = _mark_latest_regime_trade_open_if_signal_long(trades_df)
-                trades_df = _reconcile_latest_daily_regime_exit_price(trades_df)
+                # Do not run daily latest-price reconciliation after natural intraday mode,
+                # because it can overwrite real 5m display rows back toward daily/latest values.
+                if not (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now)):
+                    trades_df = _reconcile_latest_daily_regime_exit_price(trades_df)
             except Exception:
                 pass
 
@@ -11807,6 +11891,14 @@ with tab7:
                     pass
             
             trades_df = trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+            try:
+                if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now):
+                    for _col in ["Entry Date", "Exit Date"]:
+                        if _col in trades_df.columns:
+                            _mask_3pm = trades_df[_col].astype(str).str.contains("15:00:00 CT", na=False)
+                            trades_df.loc[_mask_3pm, _col] = "Intraday unavailable"
+            except Exception:
+                pass
 
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
