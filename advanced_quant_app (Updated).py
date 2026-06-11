@@ -10536,9 +10536,9 @@ with tab7:
             with pgc3:
                 regime_precise_old_times = st.checkbox(
                     "Precise intraday times for old trades",
-                    value=False,
+                    value=True,
                     key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
-                    help="OFF is faster. ON can be slow for old anchors because it tries to map historical trade times."
+                    help="ON by default. Turn it OFF manually only when long anchors like 2020/01/01 make the graph/trade log too slow."
                 )
 
             try:
