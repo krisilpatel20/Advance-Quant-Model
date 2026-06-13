@@ -8975,11 +8975,11 @@ with tab4:
         ))
 
         if model_mode == "Institutional Trend Rail (Default)":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode='lines', line=dict(color='#00ff88', width=3.0), name='Institutional Trend Rail'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail_center, mode='lines', line=dict(color='rgba(0,255,136,0.28)', width=1.0, dash='dot'), name='Adaptive Center Reference'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail_center, mode='lines', line=dict(color='rgba(127,219,255,0.28)', width=1.0, dash='dot'), name='Adaptive Center Reference'))
             current_trend = est_rail[-1]
         elif model_mode == "Institutional Adaptive Centerline":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='#00ff88', width=2.7), name='Adaptive Kalman Centerline'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='#7FDBFF', width=2.7), name='Adaptive Kalman Centerline'))
             current_trend = est_adaptive[-1]
         elif model_mode == "Zero-Lag EMA Hybrid":
             fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=2.5), name='Zero-Lag EMA Hybrid'))
@@ -8994,8 +8994,8 @@ with tab4:
             fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode='lines', line=dict(color='blue', dash='dash', width=1.35), name='Old Standard'))
             fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode='lines', line=dict(color='purple', width=1.55), name='RTS Smooth Research'))
             fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=1.85), name='Zero-Lag Hybrid'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='rgba(0,255,136,0.35)', width=1.6), name='Adaptive Centerline'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode='lines', line=dict(color='#00ff88', width=3.0), name='Institutional Trend Rail'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='rgba(127,219,255,0.35)', width=1.6), name='Adaptive Centerline'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
             current_trend = est_rail[-1]
 
         fig_kt.update_layout(
@@ -9110,6 +9110,12 @@ with tab4:
                 key="kalman_benchmark_aware_optimizer",
                 help="ON = tests safer confirmation/buffer settings and uses the one with the best return vs buy-and-hold after drawdown/trade-count penalties."
             )
+            kalman_max_dd_allowed = st.slider(
+                "Max drawdown allowed (%)",
+                10.0, 80.0, 35.0, step=5.0,
+                key="kalman_max_dd_allowed",
+                help="Optimizer strongly rejects settings with drawdown worse than this. Your example -76% is too dangerous."
+            )
 
             trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
             def _build_kalman_signal_for_params(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
@@ -9174,11 +9180,12 @@ with tab4:
                 try:
                     bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0
                     best_pack = None
-                    # Safer grid: fewer flips, more confirmation, avoids capital death by noise.
-                    for _buf in [0.005, 0.010, 0.015, 0.020, 0.030, 0.040]:
-                        for _conf in [2, 3, 4, 5]:
-                            for _hold in [5, 10, 15, 21]:
-                                for _cool in [3, 5, 8, 13]:
+                    # Risk-first grid: fewer flips, more confirmation, avoids capital death by noise.
+                    # Includes much stricter settings because high-beta names can show huge returns with unacceptable DD.
+                    for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
+                        for _conf in [3, 4, 5, 7, 10]:
+                            for _hold in [10, 15, 21, 34, 55]:
+                                for _cool in [5, 8, 13, 21]:
                                     _sig = _build_kalman_signal_for_params(
                                         _buf, _conf, _hold, _cool,
                                         slope_confirm=bool(use_slope_confirm),
@@ -9196,17 +9203,26 @@ with tab4:
                                     _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
                                     _sh = float(_mets.get("Sharpe Ratio", 0.0))
 
-                                    # Mentor score: must care about beating B&H, but never ignore DD/overtrading.
+                                    # Mentor score: must care about beating B&H, but capital protection comes first.
+                                    _dd_abs = abs(float(_dd))
                                     _score = (
                                         (_strat - bh_reference)
-                                        + 0.18 * _strat
+                                        + 0.12 * _strat
                                         + 2.5 * _sh
-                                        - 0.55 * abs(float(_dd))
-                                        - 0.18 * max(0, _trade_n - 18)
+                                        - 1.35 * _dd_abs
+                                        - 0.35 * max(0, _trade_n - 12)
                                     )
                                     # Hard penalty if it badly underperforms B&H.
                                     if _strat < bh_reference:
-                                        _score -= (bh_reference - _strat) * 0.70
+                                        _score -= (bh_reference - _strat) * 0.85
+
+                                    # Very hard penalty if drawdown violates the user's risk cap.
+                                    if _dd_abs > float(kalman_max_dd_allowed):
+                                        _score -= ((_dd_abs - float(kalman_max_dd_allowed)) ** 2) * 2.0
+
+                                    # Extra rejection for capital-destroying drawdowns like -76%.
+                                    if _dd_abs > 60:
+                                        _score -= 5000.0
 
                                     if best_pack is None or _score > best_pack["score"]:
                                         best_pack = {
@@ -9278,8 +9294,11 @@ with tab4:
                         f"Kalman strategy is NOT beating buy-and-hold here: {k_strat_ret:.2f}% vs B&H {k_bh_ret:.2f}%. "
                         "Do not treat this as a capital-allocation strategy for this ticker. Use Regime/Rotation or buy-and-hold instead."
                     )
-                elif float(k_metrics.get('Max Drawdown', 0.0))*100 < -25:
-                    st.warning("Kalman is beating/working, but drawdown is still large. Size down or require Regime agreement.")
+                elif abs(float(k_metrics.get('Max Drawdown', 0.0))*100) > float(kalman_max_dd_allowed):
+                    st.error(
+                        f"Kalman drawdown is too high: {float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}% "
+                        f"vs allowed {float(kalman_max_dd_allowed):.0f}%. This can blow up capital even if return looks big."
+                    )
                 else:
                     st.success("Kalman strategy passes the basic benchmark/risk check for this selected window.")
             except Exception:
@@ -9288,7 +9307,7 @@ with tab4:
             # Clean visual with entries/exits
             fig_kbt = go.Figure()
             fig_kbt.add_trace(go.Scatter(x=bt_px.index, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
-            fig_kbt.add_trace(go.Scatter(x=bt_trend.index, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#00ff88", width=2.4)))
+            fig_kbt.add_trace(go.Scatter(x=bt_trend.index, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
 
             changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
             buy_idx = changes[changes > 0].index
