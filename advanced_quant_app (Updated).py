@@ -517,6 +517,48 @@ class KalmanFilterTrend:
         
         return smoothed_means, smoothed_covs
 
+
+def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055, vol_window=20, polish_span=3):
+    """
+    Causal adaptive Kalman-style trend line for the Single Asset Trend tab.
+    It turns faster in strong moves while still smoothing chop. Uses current/past bars only.
+    """
+    try:
+        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
+        if px.empty:
+            return np.array([])
+        ret = px.pct_change().abs()
+        vol = ret.rolling(int(vol_window), min_periods=max(3, int(vol_window)//3)).median().replace(0, np.nan)
+        shock = (ret / (vol + 1e-12)).replace([np.inf, -np.inf], np.nan).fillna(0).clip(0, 3) / 3.0
+        fast_gain = float(fast_gain)
+        slow_gain = float(slow_gain)
+        gains = (slow_gain + (fast_gain - slow_gain) * shock).clip(min(slow_gain, fast_gain), max(slow_gain, fast_gain))
+        out = np.zeros(len(px), dtype=float)
+        out[0] = float(px.iloc[0])
+        for i in range(1, len(px)):
+            out[i] = out[i-1] + float(gains.iloc[i]) * (float(px.iloc[i]) - out[i-1])
+        if int(polish_span) > 1:
+            out = pd.Series(out, index=px.index).ewm(span=int(polish_span), adjust=False).mean().values
+        return out
+    except Exception:
+        try:
+            return pd.Series(prices).ewm(span=8, adjust=False).mean().values
+        except Exception:
+            return np.array(prices, dtype=float)
+
+
+def zero_lag_ema_trend(prices, span=10):
+    """Causal zero-lag EMA style trend."""
+    try:
+        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
+        lag = max(1, int((int(span) - 1) / 2))
+        adj = px + (px - px.shift(lag))
+        return adj.ewm(span=int(span), adjust=False).mean().ffill().bfill().values
+    except Exception:
+        return pd.Series(prices).ewm(span=max(2, int(span)), adjust=False).mean().values
+
+
+
 def simulate_heston(S0, T, r, kappa, theta, sigma, rho, v0, steps, paths):
     """
     Simulate Monte Carlo paths for Heston Stochastic Volatility Model.
@@ -8786,46 +8828,83 @@ with tab4:
             
     elif kf_mode == "Single Asset (Trend)":
         st.write(f"**{TICKER} Trend Detection**")
-        st.caption("Uses a Kalman Filter (Local Level Model) to separate the 'True' Price Trend from Market Noise.")
+        st.caption("Uses an adaptive Kalman-style trend line to separate trend from noise with less lag than the old fixed-Q/R Kalman.")
         st.markdown("[Reference: Time Series Analysis by State Space Methods (Durbin & Koopman)](https://global.oup.com/academic/product/time-series-analysis-by-state-space-methods-9780199641178)")
         
         # Parameters
-        col_k1, col_k2, col_k3 = st.columns(3)
+        st.caption("Mentor note: the old fixed-Q/R Kalman can lag badly on fast runners. Default below is a causal adaptive trend: faster turning, smoother, and no backward/future smoothing.")
+        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
         with col_k1:
-            proc_noise = st.select_slider("Trend Flexibility (Process Noise)", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-4)
+            model_mode = st.radio(
+                "Model Type",
+                ["Institutional Adaptive (Default)", "Zero-Lag EMA Hybrid", "Smoothed RTS (Research)", "Standard Old", "Compare All"],
+                index=0,
+                key="kalman_single_asset_model_type"
+            )
         with col_k2:
-            meas_noise = st.select_slider("Noise Tolerance (Measurement Noise)", options=[1e-3, 1e-2, 1e-1, 1.0], value=1e-2)
+            fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_reaction")
         with col_k3:
-            model_mode = st.radio("Model Type", ["Smoothed (New)", "Standard (Old)", "Compare Both"])
-        
+            slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_slow_smoothing")
+        with col_k4:
+            polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_polish_span")
+
+        with st.expander("Advanced old Kalman controls", expanded=False):
+            ak1, ak2, ak3 = st.columns(3)
+            with ak1:
+                proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_old_proc_noise")
+            with ak2:
+                meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_old_meas_noise")
+            with ak3:
+                zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
+
         prices = df_main['Close'].values
         kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
-        
-        # Calculate based on mode
-        if model_mode == "Standard (Old)":
-            est_trend, _ = kf_trend.filter(prices)
-            label_trend = "Kalman Trend (Standard)"
-            color_trend = "blue"
-        elif model_mode == "Smoothed (New)":
-            est_trend, _ = kf_trend.smooth(prices)
-            label_trend = "Kalman Trend (Smoothed)"
-            color_trend = "purple"
-        else: # Compare Both
-            est_trend_smooth, _ = kf_trend.smooth(prices)
-            est_trend_std, _ = kf_trend.filter(prices)
-        
+
+        est_adaptive = institutional_adaptive_kalman_trend(
+            prices,
+            fast_gain=float(fast_gain),
+            slow_gain=float(slow_gain),
+            vol_window=20,
+            polish_span=int(polish_span)
+        )
+        est_zlema = zero_lag_ema_trend(prices, span=int(zlema_span))
+        est_std, _ = kf_trend.filter(prices)
+        est_smooth, _ = kf_trend.smooth(prices)
+
         fig_kt = go.Figure()
-        fig_kt.add_trace(go.Scatter(x=df_main.index, y=prices, mode='lines', line=dict(color='gray'), opacity=0.5, name='Actual Price'))
-        
-        if model_mode == "Compare Both":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend_std, mode='lines', line=dict(color='blue', dash='dash', width=1.5), name='Standard (Causal)'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend_smooth, mode='lines', line=dict(color='purple', width=2), name='Smoothed (RTS)'))
-            current_trend = est_trend_smooth[-1] # Use smooth for metrics
+        fig_kt.add_trace(go.Scatter(
+            x=df_main.index, y=prices, mode='lines',
+            line=dict(color='white', width=1.15),
+            opacity=0.62,
+            name='Actual Price'
+        ))
+
+        if model_mode == "Institutional Adaptive (Default)":
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='#00ff88', width=2.7), name='Adaptive Kalman Trend'))
+            current_trend = est_adaptive[-1]
+        elif model_mode == "Zero-Lag EMA Hybrid":
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=2.5), name='Zero-Lag EMA Hybrid'))
+            current_trend = est_zlema[-1]
+        elif model_mode == "Smoothed RTS (Research)":
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode='lines', line=dict(color='purple', width=2.2), name='Smoothed RTS Research'))
+            current_trend = est_smooth[-1]
+        elif model_mode == "Standard Old":
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode='lines', line=dict(color='blue', width=2.0), name='Old Standard Kalman'))
+            current_trend = est_std[-1]
         else:
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend, mode='lines', line=dict(color=color_trend, width=2), name=label_trend))
-            current_trend = est_trend[-1]
-            
-        fig_kt.update_layout(title=f"Kalman Filter Trend: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode='lines', line=dict(color='blue', dash='dash', width=1.35), name='Old Standard'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode='lines', line=dict(color='purple', width=1.55), name='RTS Smooth Research'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=1.85), name='Zero-Lag Hybrid'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='#00ff88', width=2.7), name='Adaptive Kalman Default'))
+            current_trend = est_adaptive[-1]
+
+        fig_kt.update_layout(
+            title=f"Kalman Trend: {TICKER} — Adaptive / Lower Lag",
+            hovermode="x unified",
+            template="plotly_dark",
+            height=560,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
         st.plotly_chart(fig_kt, use_container_width=True)
         safe_report_add("Kalman Trend Analysis", fig_kt)
         
