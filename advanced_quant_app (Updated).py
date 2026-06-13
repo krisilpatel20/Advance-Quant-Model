@@ -5546,9 +5546,30 @@ def load_data(ticker, start, end, interval='1d'):
 
         df = _flatten_yfinance_columns(df, ticker)
             
-        # NORMALIZE TIMEZONE: Ensure all data is timezone-naive to avoid join errors
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
+        # NORMALIZE TIMEZONE
+        # Critical for live intraday Kalman:
+        # yfinance intraday bars are normally timestamped in the exchange timezone
+        # (US equities = New York / Eastern). The app displays and trade logs in CT.
+        # Previously we stripped timezone without converting, so a 10:00 ET bar could
+        # appear as 10:00 CT, creating impossible price/time mismatches.
+        try:
+            idx = pd.DatetimeIndex(df.index)
+            is_intraday_interval = str(interval).lower() not in ["1d", "1wk", "1mo"]
+            if is_intraday_interval:
+                if idx.tz is not None:
+                    df.index = idx.tz_convert("America/Chicago").tz_localize(None)
+                else:
+                    # If yfinance returns naive intraday timestamps, treat them as
+                    # exchange/New York time first, then convert to CT.
+                    df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago").tz_localize(None)
+            else:
+                if idx.tz is not None:
+                    df.index = idx.tz_localize(None)
+                else:
+                    df.index = idx
+        except Exception:
+            if getattr(df.index, "tz", None) is not None:
+                df.index = df.index.tz_localize(None)
 
         # Standard cleaning
         if 'Close' not in df.columns and 'Adj Close' in df.columns:
