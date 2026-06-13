@@ -637,91 +637,6 @@ def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_spa
         return base, base, pd.Series([True] * len(base))
 
 
-def apply_kalman_risk_firewall(prices, signal, trend, max_trade_loss_pct=18.0, trail_stop_pct=22.0, equity_dd_stop_pct=30.0, cooldown_bars=8):
-    """
-    Risk overlay for Kalman strategy.
-
-    It does not change the trend/entry model. It only applies capital protection:
-    - hard trade stop from entry
-    - trailing stop from highest close since entry
-    - equity drawdown circuit breaker
-    - cooldown after forced exit
-
-    Causal only: current/past bars.
-    """
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        sig = pd.Series(signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0, 1)
-        tr = pd.Series(trend).reindex(px.index).ffill().bfill().astype(float)
-
-        out = pd.Series(0.0, index=px.index)
-        in_pos = False
-        entry = 0.0
-        peak_price = 0.0
-        eq = 1.0
-        peak_eq = 1.0
-        cooldown = 0
-        prev_price = None
-
-        max_trade_loss = float(max_trade_loss_pct) / 100.0
-        trail_stop = float(trail_stop_pct) / 100.0
-        equity_dd_stop = float(equity_dd_stop_pct) / 100.0
-        cooldown_bars = int(cooldown_bars)
-
-        for i, dt in enumerate(px.index):
-            p = float(px.loc[dt])
-            desired = float(sig.loc[dt])
-
-            if prev_price is not None and in_pos:
-                eq *= (p / float(prev_price))
-                peak_eq = max(peak_eq, eq)
-
-            if cooldown > 0:
-                cooldown -= 1
-
-            forced_exit = False
-            if in_pos:
-                peak_price = max(peak_price, p)
-
-                if max_trade_loss > 0 and p <= entry * (1.0 - max_trade_loss):
-                    forced_exit = True
-
-                if (not forced_exit) and trail_stop > 0 and p <= peak_price * (1.0 - trail_stop):
-                    forced_exit = True
-
-                if (not forced_exit) and equity_dd_stop > 0 and eq <= peak_eq * (1.0 - equity_dd_stop):
-                    forced_exit = True
-
-                # Secondary structural fail-safe: if price loses trend after being in position.
-                if (not forced_exit) and p < float(tr.loc[dt]) * 0.985:
-                    forced_exit = True
-
-                if forced_exit:
-                    in_pos = False
-                    cooldown = cooldown_bars
-                    out.loc[dt] = 0.0
-                elif desired >= 0.5:
-                    out.loc[dt] = 1.0
-                else:
-                    in_pos = False
-                    out.loc[dt] = 0.0
-            else:
-                if cooldown <= 0 and desired >= 0.5:
-                    in_pos = True
-                    entry = p
-                    peak_price = p
-                    out.loc[dt] = 1.0
-                else:
-                    out.loc[dt] = 0.0
-
-            prev_price = p
-
-        return out.ffill().fillna(0).clip(0, 1)
-    except Exception:
-        return pd.Series(signal).ffill().fillna(0).clip(0, 1)
-
-
-
 
 
 def simulate_heston(S0, T, r, kappa, theta, sigma, rho, v0, steps, paths):
@@ -9202,22 +9117,6 @@ with tab4:
                 help="Optimizer strongly rejects settings with drawdown worse than this. Your example -76% is too dangerous."
             )
 
-            use_kalman_risk_firewall = st.checkbox(
-                "Use Kalman risk firewall",
-                value=True,
-                key="kalman_use_risk_firewall",
-                help="Keeps the same signal logic, but adds hard loss/trailing/equity drawdown protection to reduce capital damage."
-            )
-            rf1, rf2, rf3, rf4 = st.columns(4)
-            with rf1:
-                kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
-            with rf2:
-                kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_trail_stop_pct")
-            with rf3:
-                kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_equity_dd_stop_pct")
-            with rf4:
-                kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
-
             trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
             def _build_kalman_signal_for_params(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
                 close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
@@ -9292,14 +9191,6 @@ with tab4:
                                         slope_confirm=bool(use_slope_confirm),
                                         atr_safety=bool(use_atr_safety)
                                     )
-                                    if bool(use_kalman_risk_firewall):
-                                        _sig = apply_kalman_risk_firewall(
-                                            bt_px, _sig, bt_trend,
-                                            max_trade_loss_pct=float(kalman_trade_stop_pct),
-                                            trail_stop_pct=float(kalman_trail_stop_pct),
-                                            equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                                            cooldown_bars=int(kalman_firewall_cooldown)
-                                        )
                                     _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
                                     _eq = _bt.get("equity_curve", pd.Series(dtype=float))
                                     _rets = _bt.get("returns", pd.Series(dtype=float))
@@ -9316,10 +9207,10 @@ with tab4:
                                     _dd_abs = abs(float(_dd))
                                     _score = (
                                         (_strat - bh_reference)
-                                        + 0.08 * _strat
-                                        + 8.0 * _sh
-                                        - 2.20 * _dd_abs
-                                        - 0.45 * max(0, _trade_n - 10)
+                                        + 0.12 * _strat
+                                        + 2.5 * _sh
+                                        - 1.35 * _dd_abs
+                                        - 0.35 * max(0, _trade_n - 12)
                                     )
                                     # Hard penalty if it badly underperforms B&H.
                                     if _strat < bh_reference:
@@ -9379,15 +9270,6 @@ with tab4:
                     slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
                 )
 
-            if bool(use_kalman_risk_firewall):
-                kalman_signal = apply_kalman_risk_firewall(
-                    bt_px, kalman_signal, bt_trend,
-                    max_trade_loss_pct=float(kalman_trade_stop_pct),
-                    trail_stop_pct=float(kalman_trail_stop_pct),
-                    equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                    cooldown_bars=int(kalman_firewall_cooldown)
-                )
-
             kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
             kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
@@ -9407,12 +9289,6 @@ with tab4:
 
             try:
                 st.caption(f"Chosen Kalman settings: {chosen_kalman_settings}")
-                if bool(use_kalman_risk_firewall):
-                    st.caption(
-                        f"Risk firewall ON: trade stop {kalman_trade_stop_pct:.0f}%, "
-                        f"trailing {kalman_trail_stop_pct:.0f}%, equity circuit {kalman_equity_dd_stop_pct:.0f}%, "
-                        f"cooldown {kalman_firewall_cooldown} bars."
-                    )
                 if k_strat_ret < k_bh_ret:
                     st.error(
                         f"Kalman strategy is NOT beating buy-and-hold here: {k_strat_ret:.2f}% vs B&H {k_bh_ret:.2f}%. "
@@ -9481,11 +9357,7 @@ with tab4:
                 "Total Trade PnL %": k_total_pnl,
                 "Sharpe": float(k_metrics.get("Sharpe Ratio", 0.0)),
                 "Max Drawdown %": float(k_metrics.get("Max Drawdown", 0.0))*100.0,
-                "Trend Model": active_trend_name,
-                "Risk Firewall": bool(use_kalman_risk_firewall),
-                "Trade Stop %": float(kalman_trade_stop_pct),
-                "Trailing Stop %": float(kalman_trail_stop_pct),
-                "Equity DD Circuit %": float(kalman_equity_dd_stop_pct)
+                "Trend Model": active_trend_name
             })
             safe_report_add("Kalman Strategy Chart", fig_kbt)
         except Exception as _kalman_bt_err:
