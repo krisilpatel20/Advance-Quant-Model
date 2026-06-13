@@ -8871,7 +8871,7 @@ with tab4:
     else: st.info(f"🎯 **MODEL VERDICT**: Price is trading within **{abs(trend_diff):.1%}** of the Kalman Trend (Neutral/Consolidation).")
 
     
-    kf_mode = st.radio("Analysis Mode", ["Pairs Trading (Relative Value)", "Single Asset (Trend)"])
+    kf_mode = st.radio("Analysis Mode", ["Single Asset (Trend)", "Pairs Trading (Relative Value)"], index=0, key="kalman_analysis_mode_default_single_asset")
     
     if kf_mode == "Pairs Trading (Relative Value)":
         st.write(f"**{TICKER} vs {PAIR_TICKER}**")
@@ -9104,53 +9104,155 @@ with tab4:
                 help="Adds a simple safety exit if price loses the trend by a volatility-based amount."
             )
 
+            benchmark_aware_kalman = st.checkbox(
+                "Benchmark-aware Kalman optimizer",
+                value=True,
+                key="kalman_benchmark_aware_optimizer",
+                help="ON = tests safer confirmation/buffer settings and uses the one with the best return vs buy-and-hold after drawdown/trade-count penalties."
+            )
+
             trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
-            close_above = bt_px > bt_trend * (1.0 + float(kalman_buffer_pct))
-            close_below = bt_px < bt_trend * (1.0 - float(kalman_buffer_pct))
+            def _build_kalman_signal_for_params(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
+                close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
+                close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
 
-            if bool(use_slope_confirm):
-                entry_cond = close_above & (trend_slope >= 0)
-                exit_cond = close_below & (trend_slope <= 0)
-            else:
-                entry_cond = close_above
-                exit_cond = close_below
-
-            if bool(use_atr_safety):
-                atr_proxy = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-                safety_exit = bt_px < (bt_trend - 1.25 * atr_proxy)
-                exit_cond = exit_cond | safety_exit.fillna(False)
-
-            # Confirmation: conditions must hold for N consecutive bars.
-            entry_ready = entry_cond.rolling(int(kalman_confirm_bars), min_periods=int(kalman_confirm_bars)).sum().eq(int(kalman_confirm_bars)).fillna(False)
-            exit_ready = exit_cond.rolling(int(kalman_confirm_bars), min_periods=int(kalman_confirm_bars)).sum().eq(int(kalman_confirm_bars)).fillna(False)
-
-            # Stateful long/cash signal with min hold and cooldown.
-            kalman_signal = pd.Series(0.0, index=bt_px.index)
-            in_pos = False
-            bars_held = 0
-            cooldown_left = 0
-
-            for i, dt in enumerate(bt_px.index):
-                if cooldown_left > 0:
-                    cooldown_left -= 1
-
-                if not in_pos:
-                    if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
-                        in_pos = True
-                        bars_held = 0
-                        kalman_signal.loc[dt] = 1.0
-                    else:
-                        kalman_signal.loc[dt] = 0.0
+                if bool(slope_confirm):
+                    entry_cond_i = close_above_i & (trend_slope >= 0)
+                    exit_cond_i = close_below_i & (trend_slope <= 0)
                 else:
-                    bars_held += 1
-                    can_exit = bars_held >= int(kalman_min_hold)
-                    if can_exit and bool(exit_ready.loc[dt]):
-                        in_pos = False
-                        cooldown_left = int(kalman_cooldown)
-                        kalman_signal.loc[dt] = 0.0
-                        bars_held = 0
+                    entry_cond_i = close_above_i
+                    exit_cond_i = close_below_i
+
+                if bool(atr_safety):
+                    atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+                    safety_exit_i = bt_px < (bt_trend - 1.25 * atr_proxy_i)
+                    exit_cond_i = exit_cond_i | safety_exit_i.fillna(False)
+
+                confirm_bars = int(confirm_bars)
+                min_hold_bars = int(min_hold_bars)
+                cooldown_bars = int(cooldown_bars)
+
+                entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+                exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+
+                sig_i = pd.Series(0.0, index=bt_px.index)
+                in_pos_i = False
+                bars_held_i = 0
+                cooldown_left_i = 0
+
+                for _dt in bt_px.index:
+                    if cooldown_left_i > 0:
+                        cooldown_left_i -= 1
+
+                    if not in_pos_i:
+                        if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
+                            in_pos_i = True
+                            bars_held_i = 0
+                            sig_i.loc[_dt] = 1.0
+                        else:
+                            sig_i.loc[_dt] = 0.0
                     else:
-                        kalman_signal.loc[dt] = 1.0
+                        bars_held_i += 1
+                        if bars_held_i >= min_hold_bars and bool(exit_ready_i.loc[_dt]):
+                            in_pos_i = False
+                            cooldown_left_i = cooldown_bars
+                            sig_i.loc[_dt] = 0.0
+                            bars_held_i = 0
+                        else:
+                            sig_i.loc[_dt] = 1.0
+                return sig_i.ffill().fillna(0).clip(0, 1)
+
+            chosen_kalman_settings = {
+                "Buffer %": float(kalman_buffer_pct) * 100.0,
+                "Confirm Bars": int(kalman_confirm_bars),
+                "Min Hold": int(kalman_min_hold),
+                "Cooldown": int(kalman_cooldown),
+                "Optimizer": "OFF"
+            }
+
+            if bool(benchmark_aware_kalman):
+                try:
+                    bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0
+                    best_pack = None
+                    # Safer grid: fewer flips, more confirmation, avoids capital death by noise.
+                    for _buf in [0.005, 0.010, 0.015, 0.020, 0.030, 0.040]:
+                        for _conf in [2, 3, 4, 5]:
+                            for _hold in [5, 10, 15, 21]:
+                                for _cool in [3, 5, 8, 13]:
+                                    _sig = _build_kalman_signal_for_params(
+                                        _buf, _conf, _hold, _cool,
+                                        slope_confirm=bool(use_slope_confirm),
+                                        atr_safety=bool(use_atr_safety)
+                                    )
+                                    _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
+                                    _eq = _bt.get("equity_curve", pd.Series(dtype=float))
+                                    _rets = _bt.get("returns", pd.Series(dtype=float))
+                                    _tr = _bt.get("trades", pd.DataFrame())
+                                    if _eq is None or len(_eq) < 2:
+                                        continue
+                                    _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
+                                    _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
+                                    _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
+                                    _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
+                                    _sh = float(_mets.get("Sharpe Ratio", 0.0))
+
+                                    # Mentor score: must care about beating B&H, but never ignore DD/overtrading.
+                                    _score = (
+                                        (_strat - bh_reference)
+                                        + 0.18 * _strat
+                                        + 2.5 * _sh
+                                        - 0.55 * abs(float(_dd))
+                                        - 0.18 * max(0, _trade_n - 18)
+                                    )
+                                    # Hard penalty if it badly underperforms B&H.
+                                    if _strat < bh_reference:
+                                        _score -= (bh_reference - _strat) * 0.70
+
+                                    if best_pack is None or _score > best_pack["score"]:
+                                        best_pack = {
+                                            "score": _score,
+                                            "sig": _sig,
+                                            "buffer": _buf,
+                                            "confirm": _conf,
+                                            "hold": _hold,
+                                            "cool": _cool,
+                                            "strat": _strat,
+                                            "bh": bh_reference,
+                                            "dd": _dd,
+                                            "trades": _trade_n,
+                                            "sharpe": _sh
+                                        }
+
+                    if best_pack is not None:
+                        kalman_signal = best_pack["sig"]
+                        chosen_kalman_settings = {
+                            "Buffer %": round(best_pack["buffer"] * 100.0, 2),
+                            "Confirm Bars": int(best_pack["confirm"]),
+                            "Min Hold": int(best_pack["hold"]),
+                            "Cooldown": int(best_pack["cool"]),
+                            "Optimizer": "ON",
+                            "Optimizer Score": round(best_pack["score"], 2)
+                        }
+                        st.info(
+                            f"Benchmark-aware optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
+                            f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}. "
+                            f"Tested against B&H {bh_reference:.2f}% with DD/trade-count penalty."
+                        )
+                    else:
+                        kalman_signal = _build_kalman_signal_for_params(
+                            kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
+                            slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
+                        )
+                except Exception:
+                    kalman_signal = _build_kalman_signal_for_params(
+                        kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
+                        slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
+                    )
+            else:
+                kalman_signal = _build_kalman_signal_for_params(
+                    kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
+                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
+                )
 
             kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
@@ -9168,6 +9270,20 @@ with tab4:
             km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
             km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
             km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
+
+            try:
+                st.caption(f"Chosen Kalman settings: {chosen_kalman_settings}")
+                if k_strat_ret < k_bh_ret:
+                    st.error(
+                        f"Kalman strategy is NOT beating buy-and-hold here: {k_strat_ret:.2f}% vs B&H {k_bh_ret:.2f}%. "
+                        "Do not treat this as a capital-allocation strategy for this ticker. Use Regime/Rotation or buy-and-hold instead."
+                    )
+                elif float(k_metrics.get('Max Drawdown', 0.0))*100 < -25:
+                    st.warning("Kalman is beating/working, but drawdown is still large. Size down or require Regime agreement.")
+                else:
+                    st.success("Kalman strategy passes the basic benchmark/risk check for this selected window.")
+            except Exception:
+                pass
 
             # Clean visual with entries/exits
             fig_kbt = go.Figure()
