@@ -7990,14 +7990,14 @@ if bool(kalman_fast_live_mode):
                 "Analysis Mode",
                 ["Single Asset (Trend)", "Pairs Trading (Relative Value)"],
                 index=0,
-                key="kalman_fast_analysis_mode"
+                key="kalman_analysis_mode_default_single_asset"
             )
 
             if kf_mode == "Pairs Trading (Relative Value)":
                 st.info("Pairs mode is available in full dashboard mode. Turn OFF Kalman-only fast live mode if you need pairs.")
             else:
                 st.write(f"**{TICKER} Trend Detection**")
-                st.caption("Same live Kalman trend workflow, rendered without loading the rest of the dashboard.")
+                st.caption("Same Kalman controls/optimizer grid/risk firewall as the full tab, rendered without loading the rest of the dashboard.")
 
                 col_k1, col_k2, col_k3, col_k4 = st.columns(4)
                 with col_k1:
@@ -8005,30 +8005,30 @@ if bool(kalman_fast_live_mode):
                         "Model Type",
                         ["Institutional Trend Rail (Default)", "Institutional Adaptive Centerline", "Zero-Lag EMA Hybrid", "Smoothed RTS (Research)", "Standard Old", "Compare All"],
                         index=0,
-                        key="kalman_fast_model_type"
+                        key="kalman_single_asset_model_type"
                     )
                 with col_k2:
-                    fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_fast_reaction")
+                    fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_reaction")
                 with col_k3:
-                    slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_fast_slow_smoothing")
+                    slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_slow_smoothing")
                 with col_k4:
-                    polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_fast_polish_span")
+                    polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_polish_span")
 
                 rail_mult = st.slider(
                     "Trend rail distance",
                     0.40, 3.00, 1.15, step=0.05,
-                    key="kalman_fast_trend_rail_distance",
+                    key="kalman_trend_rail_distance",
                     help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
                 )
 
                 with st.expander("Advanced old Kalman controls", expanded=False):
                     ak1, ak2, ak3 = st.columns(3)
                     with ak1:
-                        proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_fast_old_proc_noise")
+                        proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_old_proc_noise")
                     with ak2:
-                        meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_fast_old_meas_noise")
+                        meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_old_meas_noise")
                     with ak3:
-                        zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_fast_zlema_span")
+                        zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
 
                 prices = df_main["Close"].astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill().values
                 kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
@@ -8116,29 +8116,29 @@ if bool(kalman_fast_live_mode):
 
                 ks1, ks2, ks3, ks4 = st.columns(4)
                 with ks1:
-                    kalman_buffer_pct = st.slider("Cross buffer (%)", 0.00, 8.00, 1.25, step=0.25, key="kalman_fast_strategy_cross_buffer_pct") / 100.0
+                    kalman_buffer_pct = st.slider("Cross buffer (%)", 0.00, 8.00, 1.25, step=0.25, key="kalman_strategy_cross_buffer_pct") / 100.0
                 with ks2:
-                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 3, step=1, key="kalman_fast_strategy_confirm_bars")
+                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 3, step=1, key="kalman_strategy_confirm_bars")
                 with ks3:
-                    kalman_min_hold = st.slider("Minimum hold bars", 1, 40, 5, step=1, key="kalman_fast_strategy_min_hold")
+                    kalman_min_hold = st.slider("Minimum hold bars", 1, 40, 5, step=1, key="kalman_strategy_min_hold")
                 with ks4:
-                    kalman_cooldown = st.slider("Cooldown after exit", 0, 30, 3, step=1, key="kalman_fast_strategy_cooldown")
+                    kalman_cooldown = st.slider("Cooldown after exit", 0, 30, 3, step=1, key="kalman_strategy_cooldown")
 
-                use_slope_confirm = st.checkbox("Require trend slope confirmation", value=True, key="kalman_fast_strategy_slope_confirm")
-                use_atr_safety = st.checkbox("Use ATR safety exit", value=True, key="kalman_fast_strategy_atr_safety")
-                benchmark_aware_kalman = st.checkbox("Benchmark-aware Kalman optimizer", value=True, key="kalman_fast_benchmark_aware_optimizer")
-                kalman_max_dd_allowed = st.slider("Max drawdown allowed (%)", 10.0, 80.0, 35.0, step=5.0, key="kalman_fast_max_dd_allowed")
+                use_slope_confirm = st.checkbox("Require trend slope confirmation", value=True, key="kalman_strategy_slope_confirm")
+                use_atr_safety = st.checkbox("Use ATR safety exit", value=True, key="kalman_strategy_atr_safety")
+                benchmark_aware_kalman = st.checkbox("Benchmark-aware Kalman optimizer", value=True, key="kalman_benchmark_aware_optimizer")
+                kalman_max_dd_allowed = st.slider("Max drawdown allowed (%)", 10.0, 80.0, 35.0, step=5.0, key="kalman_max_dd_allowed")
 
-                use_kalman_risk_firewall = st.checkbox("Use Kalman risk firewall", value=True, key="kalman_fast_use_risk_firewall")
+                use_kalman_risk_firewall = st.checkbox("Use Kalman risk firewall", value=True, key="kalman_use_risk_firewall")
                 rf1, rf2, rf3, rf4 = st.columns(4)
                 with rf1:
-                    kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_fast_trade_stop_pct")
+                    kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
                 with rf2:
-                    kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_fast_trail_stop_pct")
+                    kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_trail_stop_pct")
                 with rf3:
-                    kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_fast_equity_dd_stop_pct")
+                    kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_equity_dd_stop_pct")
                 with rf4:
-                    kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_fast_firewall_cooldown")
+                    kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
 
                 trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
 
@@ -8181,13 +8181,13 @@ if bool(kalman_fast_live_mode):
                     return sig_i.ffill().fillna(0).clip(0, 1)
 
                 if bool(benchmark_aware_kalman):
-                    # Same benchmark-aware concept, but live-fast grid is intentionally compact to avoid slow reloads.
+                    # Same full benchmark-aware optimizer grid as the full Kalman tab; fast mode only skips non-Kalman tabs.
                     best_pack = None
                     bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-                    for _buf in [0.010, 0.020, 0.030, 0.040]:
-                        for _conf in [3, 5, 7]:
-                            for _hold in [5, 10, 21]:
-                                for _cool in [3, 8, 13]:
+                    for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
+                        for _conf in [3, 4, 5, 7, 10]:
+                            for _hold in [10, 15, 21, 34, 55]:
+                                for _cool in [5, 8, 13, 21]:
                                     _sig = _build_fast_kalman_signal(_buf, _conf, _hold, _cool, bool(use_slope_confirm), bool(use_atr_safety))
                                     if bool(use_kalman_risk_firewall):
                                         _sig = apply_kalman_risk_firewall(
