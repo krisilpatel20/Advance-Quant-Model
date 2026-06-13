@@ -8724,6 +8724,161 @@ with tab6:
     else:
         st.warning("Insufficient data for decomposition with selected period.")
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def scan_regime_rotation_dashboard_cached(
+    tickers, start_date, end_date, frequency, n_regimes, smoothing,
+    switch_vol, switch_trend, signal_method, conviction, min_hold,
+    confirmed_bar, max_tickers
+):
+    """
+    Regime Rotation Dashboard:
+    Finds current Regime Long tickers and ranks which ones deserve capital first.
+
+    This is scanner/ranking logic only. It does not alter the selected ticker's
+    backtest, ledger, trade log, or performance metrics.
+    """
+    rows = []
+    tickers = list(dict.fromkeys([str(t).strip().upper().replace(".", "-") for t in tickers if str(t).strip()]))
+    tickers = tickers[:int(max_tickers)]
+
+    for tk in tickers:
+        try:
+            raw = yf.download(
+                tk,
+                start=str(start_date),
+                end=(pd.Timestamp(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False
+            )
+            if raw is None or raw.empty:
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
+            if "Close" not in raw.columns:
+                continue
+
+            px_daily = pd.to_numeric(raw["Close"], errors="coerce").dropna()
+            if len(px_daily) < 80:
+                continue
+
+            if str(frequency) == "Weekly":
+                px = resample_to_closed_weekly_friday(px_daily)
+            else:
+                px = px_daily.copy()
+
+            px = pd.Series(px).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(px) < 40:
+                continue
+
+            if int(smoothing) > 0:
+                model_px = px.ewm(span=int(smoothing), adjust=False).mean().dropna()
+            else:
+                model_px = px.copy()
+
+            rets = model_px.pct_change().dropna()
+            model_data = rets * 100.0
+            if len(model_data) < max(30, int(n_regimes) * 10):
+                continue
+
+            res = fit_regime_model(model_data, int(n_regimes), bool(switch_vol), bool(switch_trend), search_reps=2)
+            if res is None:
+                continue
+
+            sig, ctx = build_regime_backtest_signal(
+                res, model_data.index, model_px.index, int(n_regimes), str(signal_method),
+                conviction=float(conviction), min_hold=int(min_hold)
+            )
+
+            sig = apply_confirmed_bar_execution_policy(
+                sig, frequency=str(frequency), confirmed_bar=bool(confirmed_bar),
+                weekly_close_updates=True, fill_value=0.0
+            ).reindex(model_px.index).ffill().fillna(0).clip(0, 1)
+
+            if sig.empty:
+                continue
+
+            current_sig = float(sig.iloc[-1])
+            last_dt = pd.Timestamp(sig.index[-1])
+
+            # Only rank current long names; cash names are useful but not capital candidates.
+            if current_sig <= 0:
+                continue
+
+            bt = BacktestEngine.run_strategy(model_px, sig, 10000.0)
+            trades = bt.get("trades", pd.DataFrame())
+            eq = bt.get("equity_curve", pd.Series(dtype=float))
+            returns = bt.get("returns", pd.Series(dtype=float))
+
+            strat_ret = (float(eq.iloc[-1]) / 10000.0 - 1.0) * 100.0 if isinstance(eq, pd.Series) and not eq.empty else np.nan
+            bh_ret = (float(model_px.iloc[-1]) / float(model_px.iloc[0]) - 1.0) * 100.0
+            max_dd = ((1 + returns).cumprod() / (1 + returns).cumprod().cummax() - 1).min() * 100 if isinstance(returns, pd.Series) and len(returns) else np.nan
+
+            changes = sig.diff().fillna(0)
+            buy_dates = changes[changes > 0].index
+            latest_buy_dt = pd.Timestamp(buy_dates[-1]) if len(buy_dates) else pd.Timestamp(sig.index[0])
+            bars_since_buy = int((sig.index.get_loc(last_dt) - sig.index.get_loc(latest_buy_dt))) if latest_buy_dt in sig.index else np.nan
+
+            try:
+                entry_px = float(model_px.loc[latest_buy_dt])
+                open_pnl = (float(model_px.iloc[-1]) / entry_px - 1.0) * 100.0 if entry_px > 0 else np.nan
+            except Exception:
+                entry_px = np.nan
+                open_pnl = np.nan
+
+            mom_21 = (float(model_px.iloc[-1]) / float(model_px.iloc[-22]) - 1.0) * 100.0 if len(model_px) > 22 else np.nan
+            mom_63 = (float(model_px.iloc[-1]) / float(model_px.iloc[-64]) - 1.0) * 100.0 if len(model_px) > 64 else np.nan
+
+            # Score: not just return. It rewards current long, momentum, alpha vs B&H, controlled DD,
+            # and penalizes being too extended far after the signal.
+            dd_penalty = abs(float(max_dd)) if pd.notna(max_dd) else 25.0
+            age_penalty = max(0.0, float(bars_since_buy) - (8 if str(frequency) == "Weekly" else 30)) * (0.4 if str(frequency) == "Weekly" else 0.08)
+            extension_penalty = max(0.0, float(open_pnl) - 35.0) * 0.25 if pd.notna(open_pnl) else 0.0
+            rotation_score = (
+                30.0
+                + 0.35 * (float(strat_ret) if pd.notna(strat_ret) else 0.0)
+                + 0.45 * (float(mom_21) if pd.notna(mom_21) else 0.0)
+                + 0.20 * (float(mom_63) if pd.notna(mom_63) else 0.0)
+                + 0.15 * ((float(strat_ret) - float(bh_ret)) if pd.notna(strat_ret) and pd.notna(bh_ret) else 0.0)
+                - 0.65 * dd_penalty
+                - age_penalty
+                - extension_penalty
+            )
+
+            rows.append({
+                "Rank Score": round(rotation_score, 2),
+                "Ticker": tk,
+                "Current Signal": "LONG",
+                "Frequency": str(frequency),
+                "Regimes": int(n_regimes),
+                "Smoothing": int(smoothing),
+                "Last Signal Date": str(last_dt.date()),
+                "Latest Buy Date": str(latest_buy_dt.date()),
+                "Bars Since Buy": bars_since_buy,
+                "Latest Price": float(model_px.iloc[-1]),
+                "Open PnL %": open_pnl,
+                "Momentum 21 %": mom_21,
+                "Momentum 63 %": mom_63,
+                "Strategy Return %": strat_ret,
+                "Buy & Hold %": bh_ret,
+                "Alpha vs B&H %": strat_ret - bh_ret if pd.notna(strat_ret) and pd.notna(bh_ret) else np.nan,
+                "Max DD %": max_dd,
+                "Closed Trades": 0 if trades is None or trades.empty else len(trades),
+                "Why": "Current Regime LONG; ranked by trend strength, open PnL, return, DD, and signal age."
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).sort_values("Rank Score", ascending=False).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
 # ==========================================
 # TAB 7: BACKTEST
 # ==========================================
@@ -8910,6 +9065,78 @@ with tab7:
                         file_name=f"Regime_Scanner_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                         mime="text/csv"
                     )
+
+        with st.expander("🔁 Regime Rotation Dashboard — where should capital go now?", expanded=False):
+            st.caption("Ranks all tickers that are currently Regime LONG. This helps avoid randomly moving money away from the stock that is about to run.")
+            rr1, rr2, rr3, rr4 = st.columns(4)
+            rotation_universe = rr1.selectbox(
+                "Rotation universe",
+                ["Current ticker", "Nasdaq 100", "S&P 500", "S&P 500 + Nasdaq 100", "Custom list"],
+                index=1,
+                key="regime_rotation_universe"
+            )
+            rotation_max = rr2.number_input("Max tickers", min_value=1, max_value=1000, value=75, step=25, key="regime_rotation_max")
+            rotation_topn = rr3.number_input("Show top N", min_value=1, max_value=50, value=10, step=1, key="regime_rotation_topn")
+            rotation_freq = rr4.selectbox("Rotation frequency", ["Daily", "Weekly"], index=0 if bt_freq == "Daily" else 1, key="regime_rotation_freq")
+
+            rotation_custom_text = ""
+            if rotation_universe == "Custom list":
+                rotation_custom_text = st.text_area(
+                    "Custom rotation tickers separated by comma / space / new line",
+                    value=TICKER,
+                    key="regime_rotation_custom"
+                )
+
+            st.caption(f"Uses current Regime settings: regimes={bt_n_regimes}, smoothing={bt_stability}, method={signal_method}, conviction={conviction}, min-hold={min_hold_period}.")
+
+            if st.button("Run Regime Rotation Ranking", key="run_regime_rotation_ranking", use_container_width=True):
+                if rotation_universe == "Current ticker":
+                    rotation_tickers = [TICKER]
+                elif rotation_universe == "Nasdaq 100":
+                    rotation_tickers = get_nasdaq100()
+                elif rotation_universe == "S&P 500":
+                    rotation_tickers = get_sp500()
+                elif rotation_universe == "S&P 500 + Nasdaq 100":
+                    rotation_tickers = sorted(set(get_sp500() + get_nasdaq100()))
+                else:
+                    rotation_tickers = [x.strip().upper() for x in rotation_custom_text.replace(',', ' ').replace('\n', ' ').split() if x.strip()]
+
+                with st.spinner(f"Ranking current Regime LONG names from {min(len(rotation_tickers), int(rotation_max))} tickers..."):
+                    rotation_df = scan_regime_rotation_dashboard_cached(
+                        tuple(rotation_tickers), str(bt_start_date), str(bt_end_date), str(rotation_freq),
+                        int(bt_n_regimes), int(bt_stability), bool(bt_switch_vol), bool(bt_switch_trend),
+                        str(signal_method), float(conviction), int(min_hold_period), bool(confirmed_regime_bar),
+                        int(rotation_max)
+                    )
+
+                if rotation_df is None or rotation_df.empty:
+                    st.warning("No current Regime LONG candidates found in this universe with the selected settings.")
+                else:
+                    top_rotation = rotation_df.head(int(rotation_topn)).copy()
+                    st.success(f"Found {len(rotation_df)} current Regime LONG candidates. Showing top {len(top_rotation)}.")
+                    st.dataframe(
+                        top_rotation.style.format({
+                            "Rank Score": "{:.2f}",
+                            "Latest Price": "{:.2f}",
+                            "Open PnL %": "{:.2f}%",
+                            "Momentum 21 %": "{:.2f}%",
+                            "Momentum 63 %": "{:.2f}%",
+                            "Strategy Return %": "{:.2f}%",
+                            "Buy & Hold %": "{:.2f}%",
+                            "Alpha vs B&H %": "{:.2f}%",
+                            "Max DD %": "{:.2f}%"
+                        }),
+                        use_container_width=True
+                    )
+                    st.download_button(
+                        "📥 Download Regime Rotation Ranking",
+                        rotation_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"Regime_Rotation_{_safe_filename_part(rotation_freq)}_Regimes{bt_n_regimes}_Smooth{bt_stability}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv",
+                        key=f"download_regime_rotation_{rotation_freq}_{bt_n_regimes}_{bt_stability}"
+                    )
+
+                    st.info("Mentor rule: put capital first into the highest-ranked names where Weekly/Daily context agrees and the open PnL is not already extremely extended.")
 
 
         if signal_method == "Regime Weighted Expected Return":
