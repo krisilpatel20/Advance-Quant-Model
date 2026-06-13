@@ -637,6 +637,91 @@ def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_spa
         return base, base, pd.Series([True] * len(base))
 
 
+def apply_kalman_risk_firewall(prices, signal, trend, max_trade_loss_pct=18.0, trail_stop_pct=22.0, equity_dd_stop_pct=30.0, cooldown_bars=8):
+    """
+    Risk overlay for Kalman strategy.
+
+    It does not change the trend/entry model. It only applies capital protection:
+    - hard trade stop from entry
+    - trailing stop from highest close since entry
+    - equity drawdown circuit breaker
+    - cooldown after forced exit
+
+    Causal only: current/past bars.
+    """
+    try:
+        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
+        sig = pd.Series(signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0, 1)
+        tr = pd.Series(trend).reindex(px.index).ffill().bfill().astype(float)
+
+        out = pd.Series(0.0, index=px.index)
+        in_pos = False
+        entry = 0.0
+        peak_price = 0.0
+        eq = 1.0
+        peak_eq = 1.0
+        cooldown = 0
+        prev_price = None
+
+        max_trade_loss = float(max_trade_loss_pct) / 100.0
+        trail_stop = float(trail_stop_pct) / 100.0
+        equity_dd_stop = float(equity_dd_stop_pct) / 100.0
+        cooldown_bars = int(cooldown_bars)
+
+        for i, dt in enumerate(px.index):
+            p = float(px.loc[dt])
+            desired = float(sig.loc[dt])
+
+            if prev_price is not None and in_pos:
+                eq *= (p / float(prev_price))
+                peak_eq = max(peak_eq, eq)
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            forced_exit = False
+            if in_pos:
+                peak_price = max(peak_price, p)
+
+                if max_trade_loss > 0 and p <= entry * (1.0 - max_trade_loss):
+                    forced_exit = True
+
+                if (not forced_exit) and trail_stop > 0 and p <= peak_price * (1.0 - trail_stop):
+                    forced_exit = True
+
+                if (not forced_exit) and equity_dd_stop > 0 and eq <= peak_eq * (1.0 - equity_dd_stop):
+                    forced_exit = True
+
+                # Secondary structural fail-safe: if price loses trend after being in position.
+                if (not forced_exit) and p < float(tr.loc[dt]) * 0.985:
+                    forced_exit = True
+
+                if forced_exit:
+                    in_pos = False
+                    cooldown = cooldown_bars
+                    out.loc[dt] = 0.0
+                elif desired >= 0.5:
+                    out.loc[dt] = 1.0
+                else:
+                    in_pos = False
+                    out.loc[dt] = 0.0
+            else:
+                if cooldown <= 0 and desired >= 0.5:
+                    in_pos = True
+                    entry = p
+                    peak_price = p
+                    out.loc[dt] = 1.0
+                else:
+                    out.loc[dt] = 0.0
+
+            prev_price = p
+
+        return out.ffill().fillna(0).clip(0, 1)
+    except Exception:
+        return pd.Series(signal).ffill().fillna(0).clip(0, 1)
+
+
+
 
 
 def simulate_heston(S0, T, r, kappa, theta, sigma, rho, v0, steps, paths):
@@ -6334,11 +6419,17 @@ with st.sidebar:
     if live_mode:
         data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
         st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
+        kalman_fast_live_mode = st.toggle(
+            "Kalman-only fast live mode",
+            value=True,
+            help="ON skips the heavy full-dashboard models and renders only the Kalman tab for live 5/15m work. Kalman logic itself is unchanged."
+        )
         if st.button("🔄 Refresh Live Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
     else:
         data_interval = '1d'
+        kalman_fast_live_mode = False
 
     st.divider()
     st.header("🔔 Live Buy/Sell Alerts")
@@ -7872,6 +7963,327 @@ if fast_intraday_mode:
 
     st.stop()
 
+
+# ==========================================================
+# FAST KALMAN-ONLY LIVE MODE
+# ==========================================================
+# Streamlit executes every tab by default. In live 5/15m Kalman work, that means
+# GARCH/Markov/Heston/scan tabs can run even when the user only needs Kalman.
+# This mode skips those heavy sections and renders only the Kalman tab.
+# Kalman math/strategy/risk logic below is the same family as the full tab.
+if bool(kalman_fast_live_mode):
+    for _t, _name in zip(
+        [tab0, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20, tab21],
+        ["Decision Summary", "GARCH", "Regime Switching", "Heston/Jump", "Macro", "Structural", "Backtest", "Vol Clustering", "Advanced Regime", "SML & Alpha", "Multi-Asset Scan", "FED", "Options", "Hurst", "Hot 10", "IV Scanner", "CVD", "VWAP", "Time Series", "Microstructure", "0.5% Live Capture"]
+    ):
+        with _t:
+            st.info(f"{_name} is paused because Kalman-only fast live mode is ON. Turn it OFF in the sidebar when you want the full dashboard.")
+
+    with tab4:
+        if df_main is None or df_main.empty:
+            st.warning("No live data loaded for Kalman fast mode.")
+        else:
+            st.write("### Kalman Filter Analysis — Fast Live Mode")
+            st.caption("Only this tab is running. Heavy GARCH/Markov/scan tabs are skipped to make 5m/15m live work load faster.")
+
+            kf_mode = st.radio(
+                "Analysis Mode",
+                ["Single Asset (Trend)", "Pairs Trading (Relative Value)"],
+                index=0,
+                key="kalman_fast_analysis_mode"
+            )
+
+            if kf_mode == "Pairs Trading (Relative Value)":
+                st.info("Pairs mode is available in full dashboard mode. Turn OFF Kalman-only fast live mode if you need pairs.")
+            else:
+                st.write(f"**{TICKER} Trend Detection**")
+                st.caption("Same live Kalman trend workflow, rendered without loading the rest of the dashboard.")
+
+                col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+                with col_k1:
+                    model_mode = st.radio(
+                        "Model Type",
+                        ["Institutional Trend Rail (Default)", "Institutional Adaptive Centerline", "Zero-Lag EMA Hybrid", "Smoothed RTS (Research)", "Standard Old", "Compare All"],
+                        index=0,
+                        key="kalman_fast_model_type"
+                    )
+                with col_k2:
+                    fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_fast_reaction")
+                with col_k3:
+                    slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_fast_slow_smoothing")
+                with col_k4:
+                    polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_fast_polish_span")
+
+                rail_mult = st.slider(
+                    "Trend rail distance",
+                    0.40, 3.00, 1.15, step=0.05,
+                    key="kalman_fast_trend_rail_distance",
+                    help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
+                )
+
+                with st.expander("Advanced old Kalman controls", expanded=False):
+                    ak1, ak2, ak3 = st.columns(3)
+                    with ak1:
+                        proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_fast_old_proc_noise")
+                    with ak2:
+                        meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_fast_old_meas_noise")
+                    with ak3:
+                        zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_fast_zlema_span")
+
+                prices = df_main["Close"].astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill().values
+                kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
+
+                est_adaptive = institutional_adaptive_kalman_trend(
+                    prices,
+                    fast_gain=float(fast_gain),
+                    slow_gain=float(slow_gain),
+                    vol_window=20,
+                    polish_span=int(polish_span)
+                )
+                est_rail, est_rail_center, est_rail_state = institutional_trend_rail(
+                    prices,
+                    fast_gain=float(fast_gain),
+                    slow_gain=float(slow_gain),
+                    polish_span=int(polish_span),
+                    atr_window=14,
+                    atr_mult=float(rail_mult)
+                )
+                est_zlema = zero_lag_ema_trend(prices, span=int(zlema_span))
+                est_std, _ = kf_trend.filter(prices)
+                est_smooth, _ = kf_trend.smooth(prices)
+
+                fig_kt = go.Figure()
+                fig_kt.add_trace(go.Scatter(
+                    x=df_main.index, y=prices, mode="lines",
+                    line=dict(color="white", width=1.15),
+                    opacity=0.62,
+                    name="Actual Price"
+                ))
+
+                if model_mode == "Institutional Trend Rail (Default)":
+                    active_trend_arr = est_rail
+                    active_trend_name = "Institutional Trend Rail"
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name=active_trend_name))
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail_center, mode="lines", line=dict(color="rgba(127,219,255,0.28)", width=1.0, dash="dot"), name="Adaptive Center Reference"))
+                elif model_mode == "Institutional Adaptive Centerline":
+                    active_trend_arr = est_adaptive
+                    active_trend_name = "Institutional Adaptive Centerline"
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode="lines", line=dict(color="#7FDBFF", width=2.7), name=active_trend_name))
+                elif model_mode == "Zero-Lag EMA Hybrid":
+                    active_trend_arr = est_zlema
+                    active_trend_name = "Zero-Lag EMA Hybrid"
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode="lines", line=dict(color="#7FDBFF", width=2.5), name=active_trend_name))
+                elif model_mode == "Smoothed RTS (Research)":
+                    active_trend_arr = est_smooth
+                    active_trend_name = "Smoothed RTS Research"
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode="lines", line=dict(color="#7FDBFF", width=2.2), name=active_trend_name))
+                elif model_mode == "Standard Old":
+                    active_trend_arr = est_std
+                    active_trend_name = "Standard Old"
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode="lines", line=dict(color="#7FDBFF", width=2.0), name=active_trend_name))
+                else:
+                    active_trend_arr = est_rail
+                    active_trend_name = "Institutional Trend Rail"
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode="lines", line=dict(color="blue", dash="dash", width=1.35), name="Old Standard"))
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode="lines", line=dict(color="purple", width=1.55), name="RTS Smooth Research"))
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode="lines", line=dict(color="#00d1ff", width=1.85), name="Zero-Lag Hybrid"))
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode="lines", line=dict(color="rgba(127,219,255,0.35)", width=1.6), name="Adaptive Centerline"))
+                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name="Institutional Trend Rail"))
+
+                current_trend = float(pd.Series(active_trend_arr).dropna().iloc[-1])
+                current_price = float(prices[-1])
+                diff_pct = (current_price - current_trend) / current_trend * 100.0 if current_trend else 0.0
+
+                fig_kt.update_layout(
+                    title=f"Kalman Trend: {TICKER} — Fast Live",
+                    hovermode="x unified",
+                    template="plotly_dark",
+                    height=560,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                st.plotly_chart(fig_kt, use_container_width=True)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Current Price", f"{CURRENCY}{current_price:.2f}")
+                c2.metric("Current Trend", f"{CURRENCY}{current_trend:.2f}")
+                c3.metric("Deviation", f"{diff_pct:.2f}%", delta=f"{diff_pct:.2f}%", delta_color="inverse")
+
+                st.divider()
+                st.write("#### 📒 Kalman Trend Strategy Backtest & Trade Log")
+
+                bt_px = pd.Series(prices, index=df_main.index).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+                bt_trend = pd.Series(active_trend_arr, index=df_main.index).astype(float).reindex(bt_px.index).ffill().bfill()
+
+                ks1, ks2, ks3, ks4 = st.columns(4)
+                with ks1:
+                    kalman_buffer_pct = st.slider("Cross buffer (%)", 0.00, 8.00, 1.25, step=0.25, key="kalman_fast_strategy_cross_buffer_pct") / 100.0
+                with ks2:
+                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 3, step=1, key="kalman_fast_strategy_confirm_bars")
+                with ks3:
+                    kalman_min_hold = st.slider("Minimum hold bars", 1, 40, 5, step=1, key="kalman_fast_strategy_min_hold")
+                with ks4:
+                    kalman_cooldown = st.slider("Cooldown after exit", 0, 30, 3, step=1, key="kalman_fast_strategy_cooldown")
+
+                use_slope_confirm = st.checkbox("Require trend slope confirmation", value=True, key="kalman_fast_strategy_slope_confirm")
+                use_atr_safety = st.checkbox("Use ATR safety exit", value=True, key="kalman_fast_strategy_atr_safety")
+                benchmark_aware_kalman = st.checkbox("Benchmark-aware Kalman optimizer", value=True, key="kalman_fast_benchmark_aware_optimizer")
+                kalman_max_dd_allowed = st.slider("Max drawdown allowed (%)", 10.0, 80.0, 35.0, step=5.0, key="kalman_fast_max_dd_allowed")
+
+                use_kalman_risk_firewall = st.checkbox("Use Kalman risk firewall", value=True, key="kalman_fast_use_risk_firewall")
+                rf1, rf2, rf3, rf4 = st.columns(4)
+                with rf1:
+                    kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_fast_trade_stop_pct")
+                with rf2:
+                    kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_fast_trail_stop_pct")
+                with rf3:
+                    kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_fast_equity_dd_stop_pct")
+                with rf4:
+                    kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_fast_firewall_cooldown")
+
+                trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
+
+                def _build_fast_kalman_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
+                    close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
+                    close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
+                    if bool(slope_confirm):
+                        entry_cond_i = close_above_i & (trend_slope >= 0)
+                        exit_cond_i = close_below_i & (trend_slope <= 0)
+                    else:
+                        entry_cond_i = close_above_i
+                        exit_cond_i = close_below_i
+                    if bool(atr_safety):
+                        atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+                        exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy_i)).fillna(False)
+                    confirm_bars = int(confirm_bars)
+                    entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+                    exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+                    sig_i = pd.Series(0.0, index=bt_px.index)
+                    in_pos_i = False
+                    bars_held_i = 0
+                    cooldown_left_i = 0
+                    for _dt in bt_px.index:
+                        if cooldown_left_i > 0:
+                            cooldown_left_i -= 1
+                        if not in_pos_i:
+                            if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
+                                in_pos_i = True
+                                bars_held_i = 0
+                                sig_i.loc[_dt] = 1.0
+                        else:
+                            bars_held_i += 1
+                            if bars_held_i >= int(min_hold_bars) and bool(exit_ready_i.loc[_dt]):
+                                in_pos_i = False
+                                cooldown_left_i = int(cooldown_bars)
+                                sig_i.loc[_dt] = 0.0
+                                bars_held_i = 0
+                            else:
+                                sig_i.loc[_dt] = 1.0
+                    return sig_i.ffill().fillna(0).clip(0, 1)
+
+                if bool(benchmark_aware_kalman):
+                    # Same benchmark-aware concept, but live-fast grid is intentionally compact to avoid slow reloads.
+                    best_pack = None
+                    bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
+                    for _buf in [0.010, 0.020, 0.030, 0.040]:
+                        for _conf in [3, 5, 7]:
+                            for _hold in [5, 10, 21]:
+                                for _cool in [3, 8, 13]:
+                                    _sig = _build_fast_kalman_signal(_buf, _conf, _hold, _cool, bool(use_slope_confirm), bool(use_atr_safety))
+                                    if bool(use_kalman_risk_firewall):
+                                        _sig = apply_kalman_risk_firewall(
+                                            bt_px, _sig, bt_trend,
+                                            max_trade_loss_pct=float(kalman_trade_stop_pct),
+                                            trail_stop_pct=float(kalman_trail_stop_pct),
+                                            equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
+                                            cooldown_bars=int(kalman_firewall_cooldown)
+                                        )
+                                    _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
+                                    _eq = _bt.get("equity_curve", pd.Series(dtype=float))
+                                    _rets = _bt.get("returns", pd.Series(dtype=float))
+                                    _tr = _bt.get("trades", pd.DataFrame())
+                                    if _eq is None or len(_eq) < 2:
+                                        continue
+                                    _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
+                                    _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
+                                    _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
+                                    _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
+                                    _sh = float(_mets.get("Sharpe Ratio", 0.0))
+                                    _dd_abs = abs(float(_dd))
+                                    _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
+                                    if _strat < bh_reference:
+                                        _score -= (bh_reference - _strat) * 0.85
+                                    if _dd_abs > float(kalman_max_dd_allowed):
+                                        _score -= ((_dd_abs - float(kalman_max_dd_allowed)) ** 2) * 2.0
+                                    if _dd_abs > 60:
+                                        _score -= 5000.0
+                                    if best_pack is None or _score > best_pack["score"]:
+                                        best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
+                    if best_pack is not None:
+                        kalman_signal = best_pack["sig"]
+                        st.info(f"Fast optimizer selected: buffer {best_pack['buffer']*100:.2f}%, confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}.")
+                    else:
+                        kalman_signal = _build_fast_kalman_signal(kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown, bool(use_slope_confirm), bool(use_atr_safety))
+                else:
+                    kalman_signal = _build_fast_kalman_signal(kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown, bool(use_slope_confirm), bool(use_atr_safety))
+
+                if bool(use_kalman_risk_firewall):
+                    kalman_signal = apply_kalman_risk_firewall(
+                        bt_px, kalman_signal, bt_trend,
+                        max_trade_loss_pct=float(kalman_trade_stop_pct),
+                        trail_stop_pct=float(kalman_trail_stop_pct),
+                        equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
+                        cooldown_bars=int(kalman_firewall_cooldown)
+                    )
+
+                kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
+                kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
+                kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
+                kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
+                k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
+                k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
+                k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
+                k_total_pnl = total_trade_pnl_return_pct(kalman_trades) if isinstance(kalman_trades, pd.DataFrame) else 0.0
+
+                km1, km2, km3, km4, km5 = st.columns(5)
+                km1.metric("Kalman Strategy Return", f"{k_strat_ret:.2f}%")
+                km2.metric("Buy & Hold", f"{k_bh_ret:.2f}%")
+                km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
+                km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
+                km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
+
+                fig_kbt = go.Figure()
+                fig_kbt.add_trace(go.Scatter(x=bt_px.index, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
+                fig_kbt.add_trace(go.Scatter(x=bt_trend.index, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
+                changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
+                buy_idx = changes[changes > 0].index
+                sell_idx = changes[changes < 0].index
+                if len(buy_idx):
+                    fig_kbt.add_trace(go.Scatter(x=buy_idx, y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
+                if len(sell_idx):
+                    fig_kbt.add_trace(go.Scatter(x=sell_idx, y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
+                fig_kbt.update_layout(title=f"Kalman Strategy: {TICKER} — {active_trend_name}", template="plotly_dark", height=560, hovermode="x unified")
+                st.plotly_chart(fig_kbt, use_container_width=True)
+
+                st.write("##### Trade Log")
+                if kalman_trades is None or kalman_trades.empty:
+                    st.info("No Kalman strategy trades generated with the current confirmation settings.")
+                else:
+                    try:
+                        kalman_trades = apply_trade_log_timestamp_display(kalman_trades)
+                        kalman_trades = kalman_trades.sort_values("Entry Date", ascending=False).reset_index(drop=True)
+                    except Exception:
+                        pass
+                    st.dataframe(kalman_trades, use_container_width=True)
+                    st.download_button(
+                        "📥 Download Kalman trade log",
+                        data=kalman_trades.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{_safe_filename_part(TICKER)}_Kalman_FastLive_TradeLog.csv" if "_safe_filename_part" in globals() else f"{TICKER}_Kalman_FastLive_TradeLog.csv",
+                        mime="text/csv",
+                        key=f"download_fast_kalman_trade_log_{TICKER}"
+                    )
+    st.stop()
+
+
 if df_main is not None:
     # Initialize Report Generator
     st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
@@ -9117,6 +9529,22 @@ with tab4:
                 help="Optimizer strongly rejects settings with drawdown worse than this. Your example -76% is too dangerous."
             )
 
+            use_kalman_risk_firewall = st.checkbox(
+                "Use Kalman risk firewall",
+                value=True,
+                key="kalman_use_risk_firewall",
+                help="Keeps the same signal logic, but adds hard loss/trailing/equity drawdown protection to reduce capital damage."
+            )
+            rf1, rf2, rf3, rf4 = st.columns(4)
+            with rf1:
+                kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
+            with rf2:
+                kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_trail_stop_pct")
+            with rf3:
+                kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_equity_dd_stop_pct")
+            with rf4:
+                kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
+
             trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
             def _build_kalman_signal_for_params(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
                 close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
@@ -9191,6 +9619,14 @@ with tab4:
                                         slope_confirm=bool(use_slope_confirm),
                                         atr_safety=bool(use_atr_safety)
                                     )
+                                    if bool(use_kalman_risk_firewall):
+                                        _sig = apply_kalman_risk_firewall(
+                                            bt_px, _sig, bt_trend,
+                                            max_trade_loss_pct=float(kalman_trade_stop_pct),
+                                            trail_stop_pct=float(kalman_trail_stop_pct),
+                                            equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
+                                            cooldown_bars=int(kalman_firewall_cooldown)
+                                        )
                                     _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
                                     _eq = _bt.get("equity_curve", pd.Series(dtype=float))
                                     _rets = _bt.get("returns", pd.Series(dtype=float))
@@ -9207,10 +9643,10 @@ with tab4:
                                     _dd_abs = abs(float(_dd))
                                     _score = (
                                         (_strat - bh_reference)
-                                        + 0.12 * _strat
-                                        + 2.5 * _sh
-                                        - 1.35 * _dd_abs
-                                        - 0.35 * max(0, _trade_n - 12)
+                                        + 0.08 * _strat
+                                        + 8.0 * _sh
+                                        - 2.20 * _dd_abs
+                                        - 0.45 * max(0, _trade_n - 10)
                                     )
                                     # Hard penalty if it badly underperforms B&H.
                                     if _strat < bh_reference:
@@ -9270,6 +9706,15 @@ with tab4:
                     slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
                 )
 
+            if bool(use_kalman_risk_firewall):
+                kalman_signal = apply_kalman_risk_firewall(
+                    bt_px, kalman_signal, bt_trend,
+                    max_trade_loss_pct=float(kalman_trade_stop_pct),
+                    trail_stop_pct=float(kalman_trail_stop_pct),
+                    equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
+                    cooldown_bars=int(kalman_firewall_cooldown)
+                )
+
             kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
             kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
@@ -9289,6 +9734,12 @@ with tab4:
 
             try:
                 st.caption(f"Chosen Kalman settings: {chosen_kalman_settings}")
+                if bool(use_kalman_risk_firewall):
+                    st.caption(
+                        f"Risk firewall ON: trade stop {kalman_trade_stop_pct:.0f}%, "
+                        f"trailing {kalman_trail_stop_pct:.0f}%, equity circuit {kalman_equity_dd_stop_pct:.0f}%, "
+                        f"cooldown {kalman_firewall_cooldown} bars."
+                    )
                 if k_strat_ret < k_bh_ret:
                     st.error(
                         f"Kalman strategy is NOT beating buy-and-hold here: {k_strat_ret:.2f}% vs B&H {k_bh_ret:.2f}%. "
@@ -9357,7 +9808,11 @@ with tab4:
                 "Total Trade PnL %": k_total_pnl,
                 "Sharpe": float(k_metrics.get("Sharpe Ratio", 0.0)),
                 "Max Drawdown %": float(k_metrics.get("Max Drawdown", 0.0))*100.0,
-                "Trend Model": active_trend_name
+                "Trend Model": active_trend_name,
+                "Risk Firewall": bool(use_kalman_risk_firewall),
+                "Trade Stop %": float(kalman_trade_stop_pct),
+                "Trailing Stop %": float(kalman_trail_stop_pct),
+                "Equity DD Circuit %": float(kalman_equity_dd_stop_pct)
             })
             safe_report_add("Kalman Strategy Chart", fig_kbt)
         except Exception as _kalman_bt_err:
