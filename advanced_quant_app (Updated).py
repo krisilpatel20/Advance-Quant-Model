@@ -1747,44 +1747,88 @@ def clean_overlapping_duplicate_trades(trades_df):
         except Exception:
             return trades_df
 
+
+def _to_ct_naive_timestamp(x, default_bar_time="16:00", assume_naive_intraday_is_ct=True):
+    """
+    Convert timestamps to Central Time, then remove tz for consistent Plotly/table display.
+
+    Critical rule for this app:
+    - Intraday/live data is already converted to CT earlier in the pipeline.
+    - If an intraday timestamp is naive, treat it as CT, not New York.
+    - Date-only daily/weekly bars are treated as Eastern close and converted to CT.
+    """
+    try:
+        if x is None:
+            return pd.NaT
+        ts = pd.Timestamp(x)
+        if pd.isna(ts):
+            return pd.NaT
+
+        eastern_tz = "America/New_York"
+        central_tz = "America/Chicago"
+
+        # Date-only rows: assume regular market close in Eastern then convert to CT.
+        if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
+            try:
+                hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
+            except Exception:
+                hh, mm = 16, 0
+            ts = ts.replace(hour=hh, minute=mm, second=0)
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.tz_localize(eastern_tz)
+            else:
+                ts = ts.tz_convert(eastern_tz)
+            return ts.tz_convert(central_tz).tz_localize(None)
+
+        # Intraday rows.
+        if getattr(ts, "tzinfo", None) is None:
+            # Already CT inside this app after live-data conversion; do NOT subtract an hour again.
+            if bool(assume_naive_intraday_is_ct):
+                return ts
+            return ts.tz_localize(eastern_tz).tz_convert(central_tz).tz_localize(None)
+
+        return ts.tz_convert(central_tz).tz_localize(None)
+    except Exception:
+        try:
+            return pd.Timestamp(x)
+        except Exception:
+            return pd.NaT
+
+
+def _ct_naive_index(idx, default_bar_time="16:00"):
+    try:
+        return pd.DatetimeIndex([_to_ct_naive_timestamp(v, default_bar_time=default_bar_time) for v in idx])
+    except Exception:
+        try:
+            return pd.to_datetime(idx)
+        except Exception:
+            return idx
+
+
+def _ct_display_str(x, default_bar_time="16:00"):
+    try:
+        ts = _to_ct_naive_timestamp(x, default_bar_time=default_bar_time)
+        if pd.isna(ts):
+            return x
+        return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+    except Exception:
+        return x
+
+
 def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
 
-    Shows all trade timestamps in Central Time (CT).
-    Intraday/live bars keep seconds. Daily/weekly/date-only rows use the
-    assumed market close time, converted from Eastern market time to Central Time.
-    Open trades show Exit Date as "Open" instead of NaT.
-
-    This does not change strategy logic, prices, equity curves, or metrics.
+    Everything displays in Central Time (CT). Intraday naive timestamps are treated
+    as already-CT because live data is converted to CT earlier. This prevents the
+    table from showing 11:30 CT while the chart hover shows 12:30/13:30.
     """
     try:
         if trades_df is None or trades_df.empty:
             return trades_df
         out = trades_df.copy()
 
-        eastern_tz = "America/New_York"
-        central_tz = "America/Chicago"
-
-        def _to_central_display(ts):
-            # Naive timestamps from Yahoo/pandas are treated as exchange/New York time.
-            # Timezone-aware Databento/UTC timestamps are converted directly to Central.
-            try:
-                if getattr(ts, "tzinfo", None) is None:
-                    ts = ts.tz_localize(eastern_tz)
-                else:
-                    ts = ts.tz_convert(central_tz)
-                    return ts.strftime("%Y-%m-%d %H:%M:%S CT")
-                ts = ts.tz_convert(central_tz)
-                return ts.strftime("%Y-%m-%d %H:%M:%S CT")
-            except Exception:
-                try:
-                    return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
-                except Exception:
-                    return ts
-
         def _format_one(x, is_exit=False, status=None):
-            # Open positions should not display NaT in the exit column.
             try:
                 if is_exit and str(status).strip().lower() == "open":
                     return "Open"
@@ -1797,17 +1841,12 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
                 xl = x.strip().lower()
                 if xl in {"open", "", "nan", "none", "nat"}:
                     return "Open" if is_exit else x
+
             try:
-                ts = pd.Timestamp(x)
+                ts = _to_ct_naive_timestamp(x, default_bar_time=default_bar_time, assume_naive_intraday_is_ct=True)
                 if pd.isna(ts):
                     return "Open" if is_exit else x
-
-                # If data is daily/weekly/date-only, assume regular market close in Eastern time.
-                if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
-                    hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
-                    ts = ts.replace(hour=hh, minute=mm, second=0)
-
-                return _to_central_display(ts)
+                return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
             except Exception:
                 return x
 
@@ -8031,6 +8070,7 @@ if bool(kalman_fast_live_mode):
                         zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
 
                 prices = df_main["Close"].astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill().values
+                kalman_chart_x = _ct_naive_index(df_main.index)
                 kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
 
                 est_adaptive = institutional_adaptive_kalman_trend(
@@ -8054,7 +8094,7 @@ if bool(kalman_fast_live_mode):
 
                 fig_kt = go.Figure()
                 fig_kt.add_trace(go.Scatter(
-                    x=df_main.index, y=prices, mode="lines",
+                    x=kalman_chart_x, y=prices, mode="lines",
                     line=dict(color="white", width=1.15),
                     opacity=0.62,
                     name="Actual Price"
@@ -8063,32 +8103,32 @@ if bool(kalman_fast_live_mode):
                 if model_mode == "Institutional Trend Rail (Default)":
                     active_trend_arr = est_rail
                     active_trend_name = "Institutional Trend Rail"
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name=active_trend_name))
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail_center, mode="lines", line=dict(color="rgba(127,219,255,0.28)", width=1.0, dash="dot"), name="Adaptive Center Reference"))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name=active_trend_name))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail_center, mode="lines", line=dict(color="rgba(127,219,255,0.28)", width=1.0, dash="dot"), name="Adaptive Center Reference"))
                 elif model_mode == "Institutional Adaptive Centerline":
                     active_trend_arr = est_adaptive
                     active_trend_name = "Institutional Adaptive Centerline"
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode="lines", line=dict(color="#7FDBFF", width=2.7), name=active_trend_name))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode="lines", line=dict(color="#7FDBFF", width=2.7), name=active_trend_name))
                 elif model_mode == "Zero-Lag EMA Hybrid":
                     active_trend_arr = est_zlema
                     active_trend_name = "Zero-Lag EMA Hybrid"
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode="lines", line=dict(color="#7FDBFF", width=2.5), name=active_trend_name))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode="lines", line=dict(color="#7FDBFF", width=2.5), name=active_trend_name))
                 elif model_mode == "Smoothed RTS (Research)":
                     active_trend_arr = est_smooth
                     active_trend_name = "Smoothed RTS Research"
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode="lines", line=dict(color="#7FDBFF", width=2.2), name=active_trend_name))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode="lines", line=dict(color="#7FDBFF", width=2.2), name=active_trend_name))
                 elif model_mode == "Standard Old":
                     active_trend_arr = est_std
                     active_trend_name = "Standard Old"
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode="lines", line=dict(color="#7FDBFF", width=2.0), name=active_trend_name))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode="lines", line=dict(color="#7FDBFF", width=2.0), name=active_trend_name))
                 else:
                     active_trend_arr = est_rail
                     active_trend_name = "Institutional Trend Rail"
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode="lines", line=dict(color="blue", dash="dash", width=1.35), name="Old Standard"))
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode="lines", line=dict(color="purple", width=1.55), name="RTS Smooth Research"))
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode="lines", line=dict(color="#00d1ff", width=1.85), name="Zero-Lag Hybrid"))
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode="lines", line=dict(color="rgba(127,219,255,0.35)", width=1.6), name="Adaptive Centerline"))
-                    fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name="Institutional Trend Rail"))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode="lines", line=dict(color="blue", dash="dash", width=1.35), name="Old Standard"))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode="lines", line=dict(color="purple", width=1.55), name="RTS Smooth Research"))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode="lines", line=dict(color="#00d1ff", width=1.85), name="Zero-Lag Hybrid"))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode="lines", line=dict(color="rgba(127,219,255,0.35)", width=1.6), name="Adaptive Centerline"))
+                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name="Institutional Trend Rail"))
 
                 current_trend = float(pd.Series(active_trend_arr).dropna().iloc[-1])
                 current_price = float(prices[-1])
@@ -8113,6 +8153,8 @@ if bool(kalman_fast_live_mode):
 
                 bt_px = pd.Series(prices, index=df_main.index).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
                 bt_trend = pd.Series(active_trend_arr, index=df_main.index).astype(float).reindex(bt_px.index).ffill().bfill()
+                bt_plot_x = _ct_naive_index(bt_px.index)
+                bt_plot_x_series = pd.Series(bt_plot_x, index=bt_px.index)
 
                 ks1, ks2, ks3, ks4 = st.columns(4)
                 with ks1:
@@ -8326,15 +8368,15 @@ if bool(kalman_fast_live_mode):
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
 
                 fig_kbt = go.Figure()
-                fig_kbt.add_trace(go.Scatter(x=bt_px.index, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
-                fig_kbt.add_trace(go.Scatter(x=bt_trend.index, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
+                fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
+                fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
                 changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
                 buy_idx = changes[changes > 0].index
                 sell_idx = changes[changes < 0].index
                 if len(buy_idx):
-                    fig_kbt.add_trace(go.Scatter(x=buy_idx, y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
+                    fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(buy_idx), y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
                 if len(sell_idx):
-                    fig_kbt.add_trace(go.Scatter(x=sell_idx, y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
+                    fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(sell_idx), y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
                 fig_kbt.update_layout(title=f"Kalman Strategy: {TICKER} — {active_trend_name}", template="plotly_dark", height=560, hovermode="x unified")
                 st.plotly_chart(fig_kbt, use_container_width=True)
 
@@ -9431,6 +9473,7 @@ with tab4:
                 zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
 
         prices = df_main['Close'].values
+        kalman_chart_x = _ct_naive_index(df_main.index)
         kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
 
         est_adaptive = institutional_adaptive_kalman_trend(
@@ -9454,34 +9497,34 @@ with tab4:
 
         fig_kt = go.Figure()
         fig_kt.add_trace(go.Scatter(
-            x=df_main.index, y=prices, mode='lines',
+            x=kalman_chart_x, y=prices, mode='lines',
             line=dict(color='white', width=1.15),
             opacity=0.62,
             name='Actual Price'
         ))
 
         if model_mode == "Institutional Trend Rail (Default)":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail_center, mode='lines', line=dict(color='rgba(127,219,255,0.28)', width=1.0, dash='dot'), name='Adaptive Center Reference'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail_center, mode='lines', line=dict(color='rgba(127,219,255,0.28)', width=1.0, dash='dot'), name='Adaptive Center Reference'))
             current_trend = est_rail[-1]
         elif model_mode == "Institutional Adaptive Centerline":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='#7FDBFF', width=2.7), name='Adaptive Kalman Centerline'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode='lines', line=dict(color='#7FDBFF', width=2.7), name='Adaptive Kalman Centerline'))
             current_trend = est_adaptive[-1]
         elif model_mode == "Zero-Lag EMA Hybrid":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=2.5), name='Zero-Lag EMA Hybrid'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=2.5), name='Zero-Lag EMA Hybrid'))
             current_trend = est_zlema[-1]
         elif model_mode == "Smoothed RTS (Research)":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode='lines', line=dict(color='purple', width=2.2), name='Smoothed RTS Research'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode='lines', line=dict(color='purple', width=2.2), name='Smoothed RTS Research'))
             current_trend = est_smooth[-1]
         elif model_mode == "Standard Old":
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode='lines', line=dict(color='blue', width=2.0), name='Old Standard Kalman'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode='lines', line=dict(color='blue', width=2.0), name='Old Standard Kalman'))
             current_trend = est_std[-1]
         else:
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_std, mode='lines', line=dict(color='blue', dash='dash', width=1.35), name='Old Standard'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_smooth, mode='lines', line=dict(color='purple', width=1.55), name='RTS Smooth Research'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=1.85), name='Zero-Lag Hybrid'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_adaptive, mode='lines', line=dict(color='rgba(127,219,255,0.35)', width=1.6), name='Adaptive Centerline'))
-            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode='lines', line=dict(color='blue', dash='dash', width=1.35), name='Old Standard'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode='lines', line=dict(color='purple', width=1.55), name='RTS Smooth Research'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=1.85), name='Zero-Lag Hybrid'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode='lines', line=dict(color='rgba(127,219,255,0.35)', width=1.6), name='Adaptive Centerline'))
+            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
             current_trend = est_rail[-1]
 
         fig_kt.update_layout(
@@ -9546,6 +9589,8 @@ with tab4:
 
             bt_px = pd.Series(prices, index=df_main.index).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
             bt_trend = pd.Series(active_trend_arr, index=df_main.index).astype(float).reindex(bt_px.index).ffill().bfill()
+            bt_plot_x = _ct_naive_index(bt_px.index)
+            bt_plot_x_series = pd.Series(bt_plot_x, index=bt_px.index)
 
             ks1, ks2, ks3, ks4 = st.columns(4)
             with ks1:
@@ -9831,17 +9876,17 @@ with tab4:
 
             # Clean visual with entries/exits
             fig_kbt = go.Figure()
-            fig_kbt.add_trace(go.Scatter(x=bt_px.index, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
-            fig_kbt.add_trace(go.Scatter(x=bt_trend.index, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
+            fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
+            fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
 
             changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
             buy_idx = changes[changes > 0].index
             sell_idx = changes[changes < 0].index
 
             if len(buy_idx):
-                fig_kbt.add_trace(go.Scatter(x=buy_idx, y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
+                fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(buy_idx), y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
             if len(sell_idx):
-                fig_kbt.add_trace(go.Scatter(x=sell_idx, y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
+                fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(sell_idx), y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
 
             fig_kbt.update_layout(
                 title=f"Kalman Strategy: {TICKER} — {active_trend_name}",
