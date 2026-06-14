@@ -535,6 +535,271 @@ def _kalman_15m_trend_rail_report(ticker):
     return fig, trades_df, latest_info
 
 
+
+# ---------- Main Kalman Trade-Log Watchlist Monitor ----------
+def _main_kalman_monitor_settings_path():
+    try:
+        return _Path.home() / ".pinehurst_main_kalman_monitor.json"
+    except Exception:
+        return _Path(".pinehurst_main_kalman_monitor.json")
+
+def _load_main_kalman_monitor_settings():
+    try:
+        p = _main_kalman_monitor_settings_path()
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_main_kalman_monitor_settings(data):
+    try:
+        p = _main_kalman_monitor_settings_path()
+        p.write_text(json.dumps(data, indent=2))
+        return True, str(p)
+    except Exception as e:
+        return False, str(e)
+
+def _main_monitor_fetch_15m(ticker, period="60d"):
+    df = yf.download(
+        str(ticker).upper(),
+        period=period,
+        interval="15m",
+        auto_adjust=True,
+        progress=False,
+        prepost=False,
+        threads=False,
+    )
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    close_col = "Close" if "Close" in df.columns else df.columns[-1]
+    px = pd.Series(df[close_col]).dropna().astype(float)
+    if len(px) < 80:
+        return None
+    try:
+        if px.index.tz is None:
+            px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
+        px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
+    except Exception:
+        pass
+
+    # Drop only if the latest 15m candle is still forming.
+    try:
+        now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
+        latest_start = pd.Timestamp(px.index[-1])
+        latest_close = latest_start + pd.Timedelta(minutes=15)
+        if latest_close > now_ct and len(px) > 2:
+            px = px.iloc[:-1]
+    except Exception:
+        if len(px) > 2:
+            px = px.iloc[:-1]
+    return px.dropna()
+
+def _build_main_kalman_trade_log_from_prices(ticker, px):
+    """
+    Watchlist engine copied from the main Institutional Trend Rail trade-log idea.
+    Risk Firewall OFF.
+    Uses the main reused optimized settings seen in the main Kalman screen:
+    buffer 3.00%, confirm 4, min-hold 55, cooldown 5.
+    """
+    ticker = str(ticker).upper()
+    px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 80:
+        return pd.DataFrame(), None
+
+    rail, center, long_state = institutional_trend_rail(
+        px,
+        fast_gain=0.34,
+        slow_gain=0.055,
+        polish_span=3,
+        atr_window=14,
+        atr_mult=1.15,
+    )
+    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
+    state_s = pd.Series(long_state, index=px.index).astype(bool)
+
+    buffer_pct = 0.0300
+    confirm_bars = 4
+    min_hold = 55
+    cooldown_bars = 5
+
+    above = ((px > rail_s * (1.0 + buffer_pct)) & state_s).astype(int)
+    below = ((px < rail_s * (1.0 - buffer_pct)) | (~state_s)).astype(int)
+
+    confirmed_buy = above.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
+    confirmed_sell = below.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
+
+    sig = pd.Series(0, index=px.index, dtype=int)
+    in_pos = False
+    hold_count = 0
+    cooldown = 0
+    entry_time = None
+    entry_price = None
+    trades = []
+
+    for dt in px.index:
+        p = float(px.loc[dt])
+        if cooldown > 0:
+            cooldown -= 1
+
+        if not in_pos:
+            if cooldown == 0 and bool(confirmed_buy.loc[dt]):
+                in_pos = True
+                hold_count = 0
+                entry_time = dt
+                entry_price = p
+                sig.loc[dt] = 1
+            else:
+                sig.loc[dt] = 0
+        else:
+            hold_count += 1
+            if hold_count >= min_hold and bool(confirmed_sell.loc[dt]):
+                exit_time = dt
+                exit_price = p
+                pnl = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
+                trades.append({
+                    "Ticker": ticker,
+                    "Side": "Long",
+                    "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S CT"),
+                    "Exit CT": pd.Timestamp(exit_time).strftime("%Y-%m-%d %H:%M:%S CT"),
+                    "Entry Price": round(float(entry_price), 2),
+                    "Exit/Current Price": round(float(exit_price), 2),
+                    "PnL (%)": round(float(pnl), 2),
+                    "Status": "Closed",
+                })
+                in_pos = False
+                cooldown = cooldown_bars
+                entry_time = None
+                entry_price = None
+                sig.loc[dt] = 0
+            else:
+                sig.loc[dt] = 1
+
+    if in_pos and entry_time is not None and entry_price is not None:
+        last_time = px.index[-1]
+        last_price = float(px.iloc[-1])
+        pnl = (last_price / entry_price - 1.0) * 100.0
+        trades.append({
+            "Ticker": ticker,
+            "Side": "Long",
+            "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S CT"),
+            "Exit CT": "Open",
+            "Entry Price": round(float(entry_price), 2),
+            "Exit/Current Price": round(float(last_price), 2),
+            "PnL (%)": round(float(pnl), 2),
+            "Status": "Open",
+        })
+
+    trades_df = pd.DataFrame(trades)
+    status = "CASH"
+    if not trades_df.empty and str(trades_df.iloc[-1].get("Status", "")).lower() == "open":
+        status = "LONG"
+
+    latest = {
+        "Ticker": ticker,
+        "Alert Signal": "NO NEW ALERT",
+        "Trade Position": status,
+        "Price": round(float(px.iloc[-1]), 2),
+        "Candle Close CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
+        "Source": "Main Kalman Trade-Log Watchlist",
+    }
+    return trades_df, latest
+
+def _main_kalman_watchlist_ledger_path():
+    try:
+        return _Path.home() / ".pinehurst_main_kalman_watchlist_ledger.json"
+    except Exception:
+        return _Path(".pinehurst_main_kalman_watchlist_ledger.json")
+
+def _load_main_kalman_watchlist_ledger():
+    try:
+        p = _main_kalman_watchlist_ledger_path()
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_main_kalman_watchlist_ledger(data):
+    try:
+        _main_kalman_watchlist_ledger_path().write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True):
+    symbols = _normalize_watchlist(raw_watchlist)
+    ledger = _load_main_kalman_watchlist_ledger()
+    rows = []
+
+    for sym in symbols[:12]:
+        try:
+            px = _main_monitor_fetch_15m(sym, period="60d")
+            if px is None or len(px) < 80:
+                rows.append({
+                    "Ticker": sym,
+                    "Alert Signal": "NO DATA",
+                    "Trade Position": "UNKNOWN",
+                    "Price": None,
+                    "Candle Close CT": "",
+                    "Source": "Not enough 15m data",
+                })
+                continue
+
+            trades_df, row = _build_main_kalman_trade_log_from_prices(sym, px)
+
+            # Alert from latest main trade-log row only.
+            if trades_df is not None and not trades_df.empty:
+                last = trades_df.iloc[-1]
+                status = str(last.get("Status", ""))
+                side = str(last.get("Side", "Long"))
+                event_time = str(last.get("Entry CT", ""))
+                signal = "BUY" if status.lower() == "open" else "SELL"
+                if status.lower() != "open":
+                    event_time = str(last.get("Exit CT", event_time))
+
+                row["Alert Signal"] = "NO NEW ALERT"
+                ledger_key = f"{sym}|{signal}|{event_time}|{status}|{last.get('Entry Price')}|{last.get('Exit/Current Price')}"
+                if ledger.get(sym) != ledger_key:
+                    # Fresh change found
+                    row["Alert Signal"] = signal
+                    if send_telegram:
+                        msg = (
+                            "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
+                            f"Ticker: {sym}\n"
+                            f"Signal: {signal}\n"
+                            f"Trade Position: {row.get('Trade Position')}\n"
+                            f"Price: {row.get('Price')}\n"
+                            f"Event Time: {event_time}\n"
+                            "Source: Main Kalman Trade-Log Watchlist\n"
+                            "Action: Notification only — no IBKR order sent."
+                        )
+                        ok, resp = send_telegram_alert(token, chat_id, msg)
+                        row["Source"] = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
+                    ledger[sym] = ledger_key
+                    _save_main_kalman_watchlist_ledger(ledger)
+                else:
+                    row["Source"] = "Already synced"
+
+            rows.append(row)
+        except Exception as e:
+            rows.append({
+                "Ticker": sym,
+                "Alert Signal": "ERROR",
+                "Trade Position": "UNKNOWN",
+                "Price": None,
+                "Candle Close CT": "",
+                "Source": str(e)[:120],
+            })
+
+    df_rows = pd.DataFrame(rows)
+    if show_table:
+        st.dataframe(df_rows, use_container_width=True, hide_index=True)
+    return df_rows
+# --------------------------------------------------------
+
+
 # ---------- Telegram Alert Helpers ----------
 def send_telegram_alert(bot_token: str, chat_id: str, message: str):
     """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
@@ -7382,7 +7647,122 @@ with st.sidebar:
             st.error(f"Could not save Telegram settings: {_save_msg}")
 
     st.divider()
-    st.subheader("Kalman 15m Auto Alert Scanner")
+    st.subheader("Main Kalman Watchlist Monitor")
+    _mon_saved = _load_main_kalman_monitor_settings()
+    main_kalman_monitor_watchlist = st.text_area(
+        "Stocks to monitor with Main Kalman Trade-Log model",
+        value=_mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL"),
+        height=70,
+        help="Add 3-4 tickers for best speed. This uses main-style Institutional Trend Rail trade-log logic."
+    )
+    main_kalman_monitor_on = st.checkbox(
+        "Enable Main Kalman Watchlist Auto Telegram",
+        value=bool(_mon_saved.get("enabled", False)),
+        help="Sends Telegram when the watchlist main trade-log state changes."
+    )
+    main_kalman_monitor_refresh = st.checkbox(
+        "Auto-refresh Main Kalman Monitor every 60 seconds",
+        value=bool(_mon_saved.get("refresh", False)),
+        help="Keep the app running. This refreshes the page so stocks can be monitored."
+    )
+    if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
+        _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
+            "watchlist": str(main_kalman_monitor_watchlist).strip(),
+            "enabled": bool(main_kalman_monitor_on),
+            "refresh": bool(main_kalman_monitor_refresh),
+        })
+        if _ok_mon:
+            st.success("Main Kalman monitor settings saved.")
+        else:
+            st.error(f"Could not save monitor settings: {_msg_mon}")
+
+    if st.button("Run Main Kalman Monitor Now", use_container_width=True):
+        _main_mon_rows_manual = run_main_kalman_watchlist_monitor(
+            main_kalman_monitor_watchlist,
+            send_telegram=bool(tg_alerts_on and main_kalman_monitor_on),
+            token=tg_bot_token,
+            chat_id=tg_chat_id,
+            show_table=True,
+        )
+
+        st.markdown("#### Open / Closed Watchlist Status")
+        try:
+            _mon_df_manual = pd.DataFrame(_main_mon_rows_manual)
+            if not _mon_df_manual.empty and "Trade Position" in _mon_df_manual.columns:
+                _open_df_manual = _mon_df_manual[_mon_df_manual["Trade Position"].astype(str).str.upper().eq("LONG")].copy()
+                _closed_df_manual = _mon_df_manual[_mon_df_manual["Trade Position"].astype(str).str.upper().ne("LONG")].copy()
+                c_open_m, c_closed_m = st.columns(2)
+                with c_open_m:
+                    st.metric("Open / Long", int(len(_open_df_manual)))
+                    if len(_open_df_manual):
+                        st.dataframe(_open_df_manual[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _open_df_manual.columns]], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No open Long positions.")
+                with c_closed_m:
+                    st.metric("Closed / Cash", int(len(_closed_df_manual)))
+                    if len(_closed_df_manual):
+                        st.dataframe(_closed_df_manual[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _closed_df_manual.columns]], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No closed/cash tickers.")
+        except Exception as _e:
+            st.caption(f"Open/Closed status unavailable: {_e}")
+
+    if bool(main_kalman_monitor_on):
+        st.caption("Main Kalman Watchlist Monitor is active. It follows main-style Institutional Trend Rail trade-log changes.")
+        _main_mon_rows = run_main_kalman_watchlist_monitor(
+            main_kalman_monitor_watchlist,
+            send_telegram=bool(tg_alerts_on),
+            token=tg_bot_token,
+            chat_id=tg_chat_id,
+            show_table=True,
+        )
+
+        st.markdown("#### Open / Closed Watchlist Status")
+        try:
+            _mon_df = pd.DataFrame(_main_mon_rows)
+            if not _mon_df.empty:
+                _pos_col = "Trade Position" if "Trade Position" in _mon_df.columns else None
+                if _pos_col:
+                    _open_df = _mon_df[_mon_df[_pos_col].astype(str).str.upper().eq("LONG")].copy()
+                    _closed_df = _mon_df[_mon_df[_pos_col].astype(str).str.upper().ne("LONG")].copy()
+
+                    c_open, c_closed = st.columns(2)
+                    with c_open:
+                        st.metric("Open / Long", int(len(_open_df)))
+                        if len(_open_df):
+                            st.dataframe(
+                                _open_df[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _open_df.columns]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        else:
+                            st.caption("No open Long positions.")
+                    with c_closed:
+                        st.metric("Closed / Cash", int(len(_closed_df)))
+                        if len(_closed_df):
+                            st.dataframe(
+                                _closed_df[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _closed_df.columns]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        else:
+                            st.caption("No closed/cash tickers.")
+                else:
+                    st.caption("Trade Position column not available yet.")
+            else:
+                st.caption("No monitor rows yet.")
+        except Exception as _e:
+            st.caption(f"Open/Closed status unavailable: {_e}")
+
+    if bool(main_kalman_monitor_on and main_kalman_monitor_refresh):
+        st.components.v1.html(
+            "<script>setTimeout(function(){ window.parent.location.reload(); }, 60000);</script>",
+            height=0,
+        )
+
+
+    st.divider()
+    st.subheader("Disabled Separate 15m Scanner")
     st.info("This scanner is copied from the main BUY/SELL trade log. NO NEW ALERT means no fresh new row; Trade Position still shows LONG if the main log has an open Long.")
     kalman_15m_watchlist = st.text_area(
         "Kalman 15m Watchlist",
