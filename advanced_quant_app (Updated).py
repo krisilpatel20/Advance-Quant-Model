@@ -641,6 +641,19 @@ def render_pinehurst_clean_white_green_branding():
         """, unsafe_allow_html=True)
 
         with st.sidebar:
+
+            # Kalman Risk Firewall default OFF everywhere.
+
+            try:
+
+                if "kalman_use_risk_firewall" not in st.session_state:
+
+                    st.session_state["kalman_use_risk_firewall"] = False
+
+            except Exception:
+
+                pass
+
             st.markdown(f"""
             <div class="pinehurst-sidebar-logo">
                 <img src="{logo_uri}" alt="Pinehurst Capital logo" />
@@ -13487,7 +13500,7 @@ with tab7:
                     "Precise intraday times for old trades",
                     value=True,
                     key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
-                    help="Keeps the option ON by default. For speed, exact mapping only runs when you click the button below."
+                    help="Keeps the option OFF by default. For speed, exact mapping only runs when you click the button below."
                 )
                 regime_precise_time_rows = st.number_input(
                     "Precise-time rows to process",
