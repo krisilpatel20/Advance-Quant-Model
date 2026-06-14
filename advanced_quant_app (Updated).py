@@ -114,6 +114,102 @@ def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, la
     except Exception:
         return None
 
+
+
+def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None):
+    """Show the exact main Kalman trade-log status back in Thesis Parameters."""
+    try:
+        row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
+        row["Source"] = "Main Institutional Trend Rail Graph + Main Kalman Trade Log"
+        st.session_state[f"main_kalman_verified_{str(ticker).upper()}"] = row
+
+        slot = globals().get("main_kalman_verify_slot", None)
+        if slot is not None:
+            with slot.container():
+                st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
+        return row
+    except Exception as e:
+        try:
+            slot = globals().get("main_kalman_verify_slot", None)
+            if slot is not None:
+                slot.warning(f"Main Kalman verify not available yet: {e}")
+        except Exception:
+            pass
+        return None
+
+
+def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, token="", chat_id="", enabled=False):
+    """
+    Send Telegram only from the main Kalman trade log.
+    No separate scanner logic. No separate 15m helper logic.
+    """
+    try:
+        if not enabled:
+            return False, "Telegram main-log alerts OFF."
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return False, "No main Kalman trade row."
+
+        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
+        last = t.iloc[-1]
+        row_txt = " ".join([str(x) for x in last.values]).upper()
+
+        is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
+        signal = "BUY" if is_open else "SELL"
+
+        # Pull event time from the visible main trade log row.
+        event_time = ""
+        for c in ["Entry CT", "Exit CT", "Entry Time", "Exit Time", "Entry", "Exit"]:
+            if c in t.columns:
+                val = str(last.get(c, ""))
+                if val and val.lower() != "nan":
+                    event_time = val
+                    # For closed trade, prefer exit time if available.
+                    if signal == "SELL" and "Exit" in c:
+                        break
+                    if signal == "BUY" and "Entry" in c:
+                        break
+
+        if not event_time:
+            event_time = str(pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"))
+
+        px = latest_price
+        for c in ["Current Price", "Current", "Exit Price", "Entry Price", "Price", "Close"]:
+            if c in t.columns:
+                try:
+                    v = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
+                    if pd.notna(v):
+                        px = float(v)
+                        break
+                except Exception:
+                    pass
+
+        px_txt = "N/A" if px is None else f"{float(px):.2f}"
+
+        ledger = _load_kalman_alert_ledger()
+        ledger_key = f"{ticker}|MAIN_KALMAN_TRADE_LOG|{signal}|{event_time}|{px_txt}"
+        if ledger.get(str(ticker).upper()) == ledger_key:
+            return True, "Already sent/synced."
+
+        msg = (
+            "PINEHURST MAIN KALMAN ALERT\n"
+            f"Ticker: {str(ticker).upper()}\n"
+            f"Signal: {signal}\n"
+            f"Price: {px_txt}\n"
+            f"Time: {event_time}\n"
+            "Source: Main Institutional Trend Rail Graph + Main Kalman Trade Log\n"
+            "Action: Notification only — no IBKR order sent."
+        )
+
+        ok, resp = send_telegram_alert(token, chat_id, msg)
+        if ok:
+            ledger[str(ticker).upper()] = ledger_key
+            _save_kalman_alert_ledger(ledger)
+            return True, "Sent."
+        return False, resp
+    except Exception as e:
+        return False, str(e)
+
+
 def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
     """Copy main BUY/SELL trade-log state into scanner row. No separate signal math."""
     try:
@@ -437,48 +533,6 @@ def _kalman_15m_trend_rail_report(ticker):
         "Latest Completed Candle CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
     }
     return fig, trades_df, latest_info
-
-
-def _render_primary_kalman_15m_panel(default_ticker=None):
-    """Render Institutional Trend Rail 15m graph + trade log in the primary Kalman tab."""
-    try:
-        # Always use main thesis ticker. No separate ticker box here.
-        _ticker = str(default_ticker or globals().get("TICKER", "AAPL")).strip().upper()
-        st.markdown("### 📈 Kalman 15m Institutional Trend Rail — Live Graph + Trade Log")
-        st.caption(f"Main Thesis Ticker: {_ticker} • Completed 15m candles only • Risk Firewall OFF")
-
-        _fig, _trades, _info = _kalman_15m_trend_rail_report(_ticker)
-        if _fig is None:
-            st.warning(f"Not enough 15m data yet for {_ticker}.")
-            return
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Main Ticker", _info.get("Ticker", _ticker))
-        m2.metric("Latest Position", _info.get("Latest Position", "N/A"))
-        m3.metric("Latest Price", _info.get("Latest Price", "N/A"))
-        st.caption(f"Latest completed candle: {_info.get('Latest Completed Candle CT', 'N/A')}")
-
-        # Graph is tied to main thesis ticker.
-        st.plotly_chart(_fig, use_container_width=True)
-
-        # Trade log is also tied to the same main thesis ticker.
-        st.markdown(f"#### 📒 15m Trade Log — {_ticker}")
-        if _trades is not None and len(_trades) > 0:
-            st.dataframe(_clean_trade_log_numbers(_trades), use_container_width=True, hide_index=True)
-            try:
-                st.download_button(
-                    "Download 15m Trade Log CSV",
-                    _clean_trade_log_numbers(_trades).to_csv(index=False).encode("utf-8"),
-                    file_name=f"{_ticker}_kalman_15m_trade_log.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            except Exception:
-                pass
-        else:
-            st.info(f"No completed BUY/SELL trades for {_ticker} in the recent 15m window.")
-    except Exception as e:
-        st.warning(f"Primary Kalman 15m panel could not load: {e}")
 
 
 # ---------- Telegram Alert Helpers ----------
@@ -7123,6 +7177,11 @@ with st.sidebar:
     PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
+
+    st.divider()
+    st.subheader("✅ Main Kalman Signal Verify")
+    main_kalman_verify_slot = st.empty()
+    main_kalman_verify_slot.info("Load the Kalman Filter tab to sync the main trade-log signal here.")
     
     # DEBUG: Temporary visualization to prove logic
     with st.expander("🛠️ Debug Info (Remove Later)", expanded=True):
@@ -7304,7 +7363,7 @@ with st.sidebar:
     auto_kalman_alerts_on = st.checkbox(
         "Auto-alert Kalman Live BUY/SELL",
         value=bool(_tg_saved.get("auto_kalman", False)),
-        help="Saved locally. Sends Telegram once when the Kalman live decision changes to BUY or SELL. Notification only."
+        help="Saved locally. Sends Telegram only from the Main Institutional Trend Rail trade log. Notification only."
     )
 
     if st.button("Save Telegram Settings on This Mac", use_container_width=True):
@@ -7332,9 +7391,9 @@ with st.sidebar:
         help="Use 3-4 tickers for best speed. Example: AAPL, PLTR, RKLB, QBTS"
     )
     auto_kalman_15m_watchlist_on = st.checkbox(
-        "Auto-alert Kalman 15m Watchlist",
+        "Auto-alert from Main Kalman Trade Log",
         value=bool(_tg_saved.get("auto_kalman_15m_watchlist", False)),
-        help="Scans selected tickers using main Kalman trade-log-style Institutional Trend Rail on completed 15m candles and sends Telegram only on fresh BUY/SELL transitions."
+        help="Sends Telegram from the Main Buy/Sell Graph + Main Kalman Trade Log only. No separate scanner logic."
     )
     auto_refresh_15m_on = st.checkbox(
         "Auto-refresh scanner every 60 seconds",
@@ -7384,7 +7443,7 @@ with st.sidebar:
         )
 
     st.divider()
-    st.info("Separate 15m scanner graph/trade log is disabled. Use the main Kalman Filter tab graph + trade log as the only source of truth.")
+    st.info("Separate 15m scanner graph/trade log is deleted. Use only the main Kalman Strategy graph + Main Kalman Trade Log.")
 
 
     st.subheader("Manual Signal Alert")
@@ -8967,8 +9026,6 @@ if bool(kalman_fast_live_mode):
         else:
             st.write("### Kalman Filter Analysis — Fast Live Mode")
             st.caption("Only this tab is running. Heavy GARCH/Markov/scan tabs are skipped to make 5m/15m live work load faster.")
-            _render_primary_kalman_15m_panel(default_ticker=TICKER)
-            st.divider()
 
 
             kf_mode = st.radio(
@@ -9301,6 +9358,29 @@ if bool(kalman_fast_live_mode):
                 kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
                 kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
                 kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
+                try:
+                    _update_thesis_main_kalman_verify(
+                        TICKER,
+                        kalman_trades,
+                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
+                    )
+                except Exception:
+                    pass
+                try:
+                    if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
+                        _ok_main_tg, _resp_main_tg = _telegram_from_main_kalman_trade_log(
+                            TICKER,
+                            kalman_trades,
+                            latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                            token=tg_bot_token,
+                            chat_id=tg_chat_id,
+                            enabled=True,
+                        )
+                        if _ok_main_tg and _resp_main_tg == "Sent.":
+                            st.success(f"📲 Telegram sent from Main Kalman Trade Log: {TICKER}")
+                except Exception as _e:
+                    st.warning(f"Main Kalman Telegram alert skipped: {_e}")
                 k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
                 k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
                 k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
@@ -9312,6 +9392,7 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
+                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only.")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
@@ -9326,7 +9407,7 @@ if bool(kalman_fast_live_mode):
                 fig_kbt.update_layout(title=f"Kalman Strategy: {TICKER} — {active_trend_name}", template="plotly_dark", height=560, hovermode="x unified")
                 st.plotly_chart(fig_kbt, use_container_width=True)
 
-                st.write("##### Trade Log")
+                st.write("##### Main Kalman Trade Log — Source of Truth")
                 if kalman_trades is None or kalman_trades.empty:
                     st.info("No Kalman strategy trades generated with the current confirmation settings.")
                 else:
@@ -10339,8 +10420,6 @@ with tab4:
         st.warning("Please load a ticker to view Kalman Filter dynamics.")
     else:
         st.write("### Kalman Filter Analysis")
-        _render_primary_kalman_15m_panel(default_ticker=TICKER)
-        st.divider()
     # --- MODEL VERDICT BANNER ---
     if trend_diff > 0.03: st.success(f"🎯 **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend. Structural uptrend intact.")
     elif trend_diff < -0.03: st.error(f"🎯 **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend. Structural breakdown in progress.")
@@ -10786,6 +10865,29 @@ with tab4:
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
             kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
             kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
+            try:
+                _update_thesis_main_kalman_verify(
+                    TICKER,
+                    kalman_trades,
+                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                    latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
+                )
+            except Exception:
+                pass
+            try:
+                if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
+                    _ok_main_tg, _resp_main_tg = _telegram_from_main_kalman_trade_log(
+                        TICKER,
+                        kalman_trades,
+                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                        token=tg_bot_token,
+                        chat_id=tg_chat_id,
+                        enabled=True,
+                    )
+                    if _ok_main_tg and _resp_main_tg == "Sent.":
+                        st.success(f"📲 Telegram sent from Main Kalman Trade Log: {TICKER}")
+            except Exception as _e:
+                st.warning(f"Main Kalman Telegram alert skipped: {_e}")
 
             try:
                 _save_main_kalman_status_to_session(
@@ -11002,7 +11104,7 @@ with tab4:
             )
             st.plotly_chart(fig_kbt, use_container_width=True)
 
-            st.write("##### Trade Log")
+            st.write("##### Main Kalman Trade Log — Source of Truth")
             if kalman_trades is None or kalman_trades.empty:
                 st.info("No Kalman strategy trades generated with the current confirmation settings.")
             else:
