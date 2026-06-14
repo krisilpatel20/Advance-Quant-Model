@@ -27,6 +27,15 @@ import os
 from email.message import EmailMessage
 import os
 
+# Streamlit runs scripts in a ScriptRunner thread. ib_insync/eventkit expects
+# an asyncio event loop to exist in the current thread at import time.
+# Create one safely before importing ib_insync.
+import asyncio
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 
 # Databento is optional and lazy-loaded only when the user clicks the pull button.
 # This prevents Databento/package/network issues from slowing or blocking the app load.
