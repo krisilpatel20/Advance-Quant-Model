@@ -86,7 +86,7 @@ def _clean_trade_log_numbers(df):
             else:
                 # Try converting object columns that are numeric-looking.
                 converted = pd.to_numeric(out[c], errors="coerce")
-                if converted.notna().sum() >= max(1, int(len(out) * 0.75)):
+                if converted.notna().sum() >= max(1, int(len(out) * 0.50)):
                     out[c] = converted.round(2)
         return out
     except Exception:
@@ -169,10 +169,12 @@ def _fetch_15m_completed_bars(ticker, period="5d"):
 
 def _kalman_15m_signal_from_prices(px):
     """
-    Main-trade-log-style 15m Kalman signal.
+    Scanner signal aligned to main Kalman 15m trade-log behavior.
 
-    Uses Institutional Trend Rail as the base trend, then applies the same kind of
-    confirmation/min-hold/cooldown logic used by the main Kalman trade log.
+    Key fix:
+    - Alert Signal = only fresh BUY/SELL transition.
+    - Trade Position = current open trade state.
+    So if DELL has an open Long, scanner shows LONG even when there is NO NEW ALERT.
     Risk Firewall stays OFF.
     """
     rail, center, long_state = institutional_trend_rail(
@@ -186,11 +188,11 @@ def _kalman_15m_signal_from_prices(px):
     rail_s = pd.Series(rail, index=px.index).ffill().bfill()
     state_s = pd.Series(long_state, index=px.index).astype(bool)
 
-    # Main style defaults from the Kalman strategy display.
-    buffer_pct = 0.03
-    confirm_bars = 4
-    min_hold = 55
-    cooldown_bars = 5
+    # Main Kalman-style defaults; same family as the primary graph/trade-log logic.
+    buffer_pct = 0.0125
+    confirm_bars = 3
+    min_hold = 5
+    cooldown_bars = 3
 
     above = ((px > rail_s * (1.0 + buffer_pct)) & state_s).astype(int)
     below = ((px < rail_s * (1.0 - buffer_pct)) | (~state_s)).astype(int)
@@ -223,10 +225,13 @@ def _kalman_15m_signal_from_prices(px):
             else:
                 sig.loc[dt] = 1
 
+    changes = sig.diff().fillna(sig.iloc[0])
     latest = int(sig.iloc[-1])
     prev = int(sig.iloc[-2]) if len(sig) >= 2 else latest
-    alert_signal = "BUY" if latest == 1 and prev == 0 else ("SELL" if latest == 0 and prev == 1 else "NO NEW ALERT")
-    return alert_signal, float(px.iloc[-1]), px.index[-1], prev, latest
+    alert_signal = "BUY" if float(changes.iloc[-1]) > 0 else ("SELL" if float(changes.iloc[-1]) < 0 else "NO NEW ALERT")
+    trade_position = "LONG" if latest == 1 else "CASH"
+
+    return alert_signal, float(px.iloc[-1]), px.index[-1], prev, latest, trade_position
 
 def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, show_table=True):
     """Scan 3-4 tickers on 15m completed bars and send Telegram only on fresh BUY/SELL transitions."""
@@ -251,7 +256,7 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
                 rows.append({"Ticker": sym, "Alert Signal": "NO DATA", "Price": None, "Candle Close CT": "", "Alert": "No"})
                 continue
 
-            sig, price, candle_time, prev_state, latest_state = _kalman_15m_signal_from_prices(px)
+            sig, price, candle_time, prev_state, latest_state, trade_position = _kalman_15m_signal_from_prices(px)
             candle_start = pd.Timestamp(candle_time)
             candle_close = candle_start + pd.Timedelta(minutes=15)
             candle_txt = candle_close.strftime("%Y-%m-%d %I:%M %p CT")
@@ -283,7 +288,7 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
             rows.append({
                 "Ticker": sym,
                 "Alert Signal": sig,
-                "Rail Position": "LONG" if latest_state == 1 else "CASH",
+                "Trade Position": trade_position,
                 "Price": round(price, 2),
                 "Candle Close CT": candle_txt,
                 "Alert": alert_status,
@@ -7266,7 +7271,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Kalman 15m Auto Alert Scanner")
-    st.info("This scanner follows the main Kalman trade-log-style signal on 15m completed candles: Institutional Trend Rail + confirmation/min-hold/cooldown. Risk Firewall is OFF.")
+    st.info("This scanner follows the main Kalman 15m trade-log-style position. NO NEW ALERT means no fresh transition; Trade Position still shows LONG if a trade is open. Risk Firewall is OFF.")
     kalman_15m_watchlist = st.text_area(
         "Kalman 15m Watchlist",
         value=_tg_saved.get("kalman_15m_watchlist", "AAPL, PLTR, RKLB, QBTS"),
