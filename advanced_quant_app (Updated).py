@@ -8763,6 +8763,58 @@ if bool(kalman_fast_live_mode):
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
                 changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
+            # ✅ True automatic Telegram alert for Kalman Full Tab
+            try:
+                if bool(tg_alerts_on and auto_kalman_alerts_on) and len(changes) > 0:
+                    _latest_change = float(changes.iloc[-1])
+                    if _latest_change > 0 or _latest_change < 0:
+                        _sig_txt = "BUY" if _latest_change > 0 else "SELL"
+                        _last_time = bt_plot_x_series.iloc[-1] if len(bt_plot_x_series) else bt_px.index[-1]
+                        _last_price = float(bt_px.iloc[-1])
+                        _alert_key = f"KALMAN_FULL::{TICKER}::{_sig_txt}::{_last_time}"
+                        _msg = (
+                            "PINEHURST KALMAN ALERT\n"
+                            f"Ticker: {TICKER}\n"
+                            f"Signal: {_sig_txt}\n"
+                            f"Price: {_last_price:.2f}\n"
+                            f"Time: {_last_time}\n"
+                            f"Strategy: Kalman Filter Tab\n"
+                            "Reason: Latest confirmed Kalman signal changed.\n"
+                            "Action: Notification only — no IBKR order sent."
+                        )
+                        _ok, _resp = telegram_alert_once(_alert_key, tg_bot_token, tg_chat_id, _msg)
+                        if _ok:
+                            st.success(f"📲 Auto Telegram alert sent: {TICKER} {_sig_txt}")
+                        else:
+                            st.warning(f"Telegram auto alert failed: {_resp}")
+            except Exception as _e:
+                st.warning(f"Kalman auto alert skipped: {_e}")
+                # ✅ True automatic Telegram alert for Kalman Fast Live
+                try:
+                    if bool(tg_alerts_on and auto_kalman_alerts_on) and len(changes) > 0:
+                        _latest_change = float(changes.iloc[-1])
+                        if _latest_change > 0 or _latest_change < 0:
+                            _sig_txt = "BUY" if _latest_change > 0 else "SELL"
+                            _last_time = bt_plot_x_series.iloc[-1] if len(bt_plot_x_series) else bt_px.index[-1]
+                            _last_price = float(bt_px.iloc[-1])
+                            _alert_key = f"KALMAN_FAST_LIVE::{TICKER}::{_sig_txt}::{_last_time}"
+                            _msg = (
+                                "PINEHURST KALMAN LIVE ALERT\n"
+                                f"Ticker: {TICKER}\n"
+                                f"Signal: {_sig_txt}\n"
+                                f"Price: {_last_price:.2f}\n"
+                                f"Time: {_last_time}\n"
+                                f"Strategy: Kalman Fast Live\n"
+                                "Reason: Latest confirmed Kalman signal changed.\n"
+                                "Action: Notification only — no IBKR order sent."
+                            )
+                            _ok, _resp = telegram_alert_once(_alert_key, tg_bot_token, tg_chat_id, _msg)
+                            if _ok:
+                                st.success(f"📲 Auto Telegram alert sent: {TICKER} {_sig_txt}")
+                            else:
+                                st.warning(f"Telegram auto alert failed: {_resp}")
+                except Exception as _e:
+                    st.warning(f"Kalman auto alert skipped: {_e}")
                 buy_idx = changes[changes > 0].index
                 sell_idx = changes[changes < 0].index
                 if len(buy_idx):
@@ -19548,16 +19600,4 @@ st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
 
 
-
-# Auto Telegram alert hook for Kalman live decision.
-try:
-    maybe_send_kalman_live_telegram_alert(
-        tg_alerts_on=bool(tg_alerts_on and auto_kalman_alerts_on),
-        tg_bot_token=tg_bot_token,
-        tg_chat_id=tg_chat_id,
-        strategy_hint="Kalman Live Decision",
-        reason_hint="Kalman live BUY/SELL condition detected by the app.",
-    )
-except Exception:
-    pass
 
