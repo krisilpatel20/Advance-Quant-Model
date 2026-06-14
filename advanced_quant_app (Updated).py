@@ -315,10 +315,14 @@ def _kalman_15m_signal_from_prices(px):
     return alert_signal, float(px.iloc[-1]), px.index[-1], prev, latest, trade_position
 
 
+
 def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, show_table=True):
     """
-    Scanner/thesis table mirrors the main BUY/SELL trade-log state.
-    It does not run a separate signal that can disagree with the main graph/trade log.
+    Scanner/thesis table is now ONLY a mirror of visible main Kalman trade-log state.
+    It does not calculate CASH/SELL by itself anymore.
+
+    If the main Kalman tab has not saved a ticker's status yet, it shows SYNC REQUIRED
+    instead of giving a wrong CASH reading.
     """
     rows = []
     symbols = _normalize_watchlist(watchlist)
@@ -326,6 +330,40 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
         if show_table:
             st.warning("Add at least one ticker to the Kalman 15m watchlist.")
         return rows
+
+    for sym in symbols[:12]:
+        try:
+            key = f"main_kalman_status_{sym}"
+            if key in st.session_state:
+                row = dict(st.session_state[key])
+                row["Alert"] = "Copied from main Kalman trade log"
+            else:
+                row = {
+                    "Ticker": sym,
+                    "Alert Signal": "SYNC REQUIRED",
+                    "Trade Position": "OPEN MAIN KALMAN TAB",
+                    "Price": None,
+                    "Candle Close CT": "",
+                    "Alert": "No scanner calculation used. Open/load this ticker in Main Kalman tab to sync exact trade-log state.",
+                }
+            rows.append(row)
+        except Exception as e:
+            rows.append({
+                "Ticker": sym,
+                "Alert Signal": "ERROR",
+                "Trade Position": "UNKNOWN",
+                "Price": None,
+                "Candle Close CT": "",
+                "Alert": str(e)[:120],
+            })
+
+    if show_table:
+        try:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception:
+            st.write(rows)
+    return rows
+
 
     ledger = _load_kalman_alert_ledger()
 
@@ -11070,6 +11108,19 @@ with tab4:
                 st.plotly_chart(_fig_primary, use_container_width=True)
 
                 st.markdown(f"### 📒 Main Kalman Trade Log — {TICKER}")
+                try:
+                    _main_status_row = _save_main_kalman_status_to_session(
+                        TICKER,
+                        kalman_trades,
+                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                        latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
+                    )
+                    if _main_status_row:
+                        st.markdown("#### ✅ Main Kalman Current Status")
+                        st.dataframe(pd.DataFrame([_main_status_row]), use_container_width=True, hide_index=True)
+                except Exception:
+                    pass
+
                 if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty:
                     st.dataframe(_clean_trade_log_numbers(kalman_trades), use_container_width=True, hide_index=True)
                     try:
