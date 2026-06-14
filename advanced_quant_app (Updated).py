@@ -599,10 +599,17 @@ def _main_monitor_fetch_15m(ticker, period="60d"):
 
 def _build_main_kalman_trade_log_from_prices(ticker, px):
     """
-    Watchlist engine copied from the main Institutional Trend Rail trade-log idea.
-    Risk Firewall OFF.
-    Uses the main reused optimized settings seen in the main Kalman screen:
-    buffer 3.00%, confirm 4, min-hold 55, cooldown 5.
+    Watchlist version of the MAIN Kalman trade-log engine.
+
+    This now mirrors the main Kalman screen logic:
+    - Institutional Trend Rail as active trend
+    - buffer 3.00%
+    - confirm bars 4
+    - minimum hold 55
+    - cooldown 5
+    - slope confirmation ON
+    - ATR safety exit ON
+    - risk firewall OFF
     """
     ticker = str(ticker).upper()
     px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
@@ -617,45 +624,55 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
         atr_window=14,
         atr_mult=1.15,
     )
-    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
-    state_s = pd.Series(long_state, index=px.index).astype(bool)
+    bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
 
     buffer_pct = 0.0300
     confirm_bars = 4
-    min_hold = 55
+    min_hold_bars = 55
     cooldown_bars = 5
 
-    above = ((px > rail_s * (1.0 + buffer_pct)) & state_s).astype(int)
-    below = ((px < rail_s * (1.0 - buffer_pct)) | (~state_s)).astype(int)
+    trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
 
-    confirmed_buy = above.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
-    confirmed_sell = below.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
+    close_above = px > bt_trend * (1.0 + buffer_pct)
+    close_below = px < bt_trend * (1.0 - buffer_pct)
 
-    sig = pd.Series(0, index=px.index, dtype=int)
+    entry_cond = close_above & (trend_slope >= 0)
+    exit_cond = close_below & (trend_slope <= 0)
+
+    # Main Kalman ATR safety exit.
+    atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+    safety_exit = px < (bt_trend - 1.25 * atr_proxy)
+    exit_cond = exit_cond | safety_exit.fillna(False)
+
+    entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+    exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+
+    sig = pd.Series(0.0, index=px.index)
     in_pos = False
-    hold_count = 0
-    cooldown = 0
+    bars_held = 0
+    cooldown_left = 0
     entry_time = None
     entry_price = None
     trades = []
 
     for dt in px.index:
         p = float(px.loc[dt])
-        if cooldown > 0:
-            cooldown -= 1
+
+        if cooldown_left > 0:
+            cooldown_left -= 1
 
         if not in_pos:
-            if cooldown == 0 and bool(confirmed_buy.loc[dt]):
+            if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
                 in_pos = True
-                hold_count = 0
+                bars_held = 0
                 entry_time = dt
                 entry_price = p
-                sig.loc[dt] = 1
+                sig.loc[dt] = 1.0
             else:
-                sig.loc[dt] = 0
+                sig.loc[dt] = 0.0
         else:
-            hold_count += 1
-            if hold_count >= min_hold and bool(confirmed_sell.loc[dt]):
+            bars_held += 1
+            if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
                 exit_time = dt
                 exit_price = p
                 pnl = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
@@ -670,12 +687,13 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
                     "Status": "Closed",
                 })
                 in_pos = False
-                cooldown = cooldown_bars
+                cooldown_left = cooldown_bars
+                bars_held = 0
                 entry_time = None
                 entry_price = None
-                sig.loc[dt] = 0
+                sig.loc[dt] = 0.0
             else:
-                sig.loc[dt] = 1
+                sig.loc[dt] = 1.0
 
     if in_pos and entry_time is not None and entry_price is not None:
         last_time = px.index[-1]
@@ -729,6 +747,14 @@ def _save_main_kalman_watchlist_ledger(data):
         pass
 
 def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True):
+    """
+    Watchlist monitor ONLY.
+
+    Important behavior:
+    - Main Ticker does NOT trigger Telegram.
+    - First scan only baselines/syncs current state, no Telegram.
+    - Telegram sends only when a watched ticker's latest trade-log state changes after baseline.
+    """
     symbols = _normalize_watchlist(raw_watchlist)
     ledger = _load_main_kalman_watchlist_ledger()
     rows = []
@@ -749,20 +775,29 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
 
             trades_df, row = _build_main_kalman_trade_log_from_prices(sym, px)
 
-            # Alert from latest main trade-log row only.
             if trades_df is not None and not trades_df.empty:
                 last = trades_df.iloc[-1]
                 status = str(last.get("Status", ""))
-                side = str(last.get("Side", "Long"))
                 event_time = str(last.get("Entry CT", ""))
                 signal = "BUY" if status.lower() == "open" else "SELL"
                 if status.lower() != "open":
                     event_time = str(last.get("Exit CT", event_time))
 
                 row["Alert Signal"] = "NO NEW ALERT"
-                ledger_key = f"{sym}|{signal}|{event_time}|{status}|{last.get('Entry Price')}|{last.get('Exit/Current Price')}"
-                if ledger.get(sym) != ledger_key:
-                    # Fresh change found
+
+                state_key = (
+                    f"{sym}|{signal}|{event_time}|{status}|"
+                    f"{last.get('Entry Price')}|{last.get('Exit/Current Price')}"
+                )
+
+                # FIRST TIME: baseline only, no Telegram. This prevents old DELL/NBIS open trades
+                # from sending just because you typed the ticker or rebooted the app.
+                if sym not in ledger:
+                    ledger[sym] = state_key
+                    _save_main_kalman_watchlist_ledger(ledger)
+                    row["Source"] = "Baseline synced — no alert sent"
+                elif ledger.get(sym) != state_key:
+                    # Real fresh change after baseline.
                     row["Alert Signal"] = signal
                     if send_telegram:
                         msg = (
@@ -772,15 +807,34 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                             f"Trade Position: {row.get('Trade Position')}\n"
                             f"Price: {row.get('Price')}\n"
                             f"Event Time: {event_time}\n"
-                            "Source: Main Kalman Trade-Log Watchlist\n"
+                            "Source: Main Kalman Watchlist Monitor\n"
                             "Action: Notification only — no IBKR order sent."
                         )
                         ok, resp = send_telegram_alert(token, chat_id, msg)
                         row["Source"] = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
-                    ledger[sym] = ledger_key
+                    else:
+                        row["Source"] = "Signal changed — Telegram OFF"
+                    ledger[sym] = state_key
                     _save_main_kalman_watchlist_ledger(ledger)
                 else:
-                    row["Source"] = "Already synced"
+                    row["Source"] = "No change since last scan"
+
+            else:
+                # No trade history = cash baseline
+                state_key = f"{sym}|CASH|NO_TRADES"
+                row["Alert Signal"] = "NO NEW ALERT"
+                row["Trade Position"] = "CASH"
+                if sym not in ledger:
+                    ledger[sym] = state_key
+                    _save_main_kalman_watchlist_ledger(ledger)
+                    row["Source"] = "Baseline synced — no alert sent"
+                elif ledger.get(sym) != state_key:
+                    row["Alert Signal"] = "SELL"
+                    row["Source"] = "Moved to CASH"
+                    ledger[sym] = state_key
+                    _save_main_kalman_watchlist_ledger(ledger)
+                else:
+                    row["Source"] = "No change since last scan"
 
             rows.append(row)
         except Exception as e:
@@ -797,6 +851,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
     if show_table:
         st.dataframe(df_rows, use_container_width=True, hide_index=True)
     return df_rows
+
 # --------------------------------------------------------
 
 
@@ -7648,6 +7703,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
+    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF.")
     _mon_saved = _load_main_kalman_monitor_settings()
     main_kalman_monitor_watchlist = st.text_area(
         "Stocks to monitor with Main Kalman Trade-Log model",
@@ -7658,7 +7714,7 @@ with st.sidebar:
     main_kalman_monitor_on = st.checkbox(
         "Enable Main Kalman Watchlist Auto Telegram",
         value=bool(_mon_saved.get("enabled", False)),
-        help="Sends Telegram when the watchlist main trade-log state changes."
+        help="Only watchlist tickers send Telegram. Main Ticker is view-only. First scan baselines current state; alerts only after a future change."
     )
     main_kalman_monitor_refresh = st.checkbox(
         "Auto-refresh Main Kalman Monitor every 60 seconds",
@@ -7675,6 +7731,13 @@ with st.sidebar:
             st.success("Main Kalman monitor settings saved.")
         else:
             st.error(f"Could not save monitor settings: {_msg_mon}")
+
+    if st.button("Reset/Baseline Watchlist Alerts Now", use_container_width=True):
+        try:
+            _save_main_kalman_watchlist_ledger({})
+            st.success("Watchlist alert baseline cleared. Next scan will sync current states without sending alerts.")
+        except Exception as _e:
+            st.error(f"Could not reset baseline: {_e}")
 
     if st.button("Run Main Kalman Monitor Now", use_container_width=True):
         _main_mon_rows_manual = run_main_kalman_watchlist_monitor(
@@ -9747,20 +9810,6 @@ if bool(kalman_fast_live_mode):
                     )
                 except Exception:
                     pass
-                try:
-                    if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
-                        _ok_main_tg, _resp_main_tg = _telegram_from_main_kalman_trade_log(
-                            TICKER,
-                            kalman_trades,
-                            latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                            token=tg_bot_token,
-                            chat_id=tg_chat_id,
-                            enabled=True,
-                        )
-                        if _ok_main_tg and _resp_main_tg == "Sent.":
-                            st.success(f"📲 Telegram sent from Main Kalman Trade Log: {TICKER}")
-                except Exception as _e:
-                    st.warning(f"Main Kalman Telegram alert skipped: {_e}")
                 k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
                 k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
                 k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
@@ -11254,20 +11303,6 @@ with tab4:
                 )
             except Exception:
                 pass
-            try:
-                if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
-                    _ok_main_tg, _resp_main_tg = _telegram_from_main_kalman_trade_log(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        token=tg_bot_token,
-                        chat_id=tg_chat_id,
-                        enabled=True,
-                    )
-                    if _ok_main_tg and _resp_main_tg == "Sent.":
-                        st.success(f"📲 Telegram sent from Main Kalman Trade Log: {TICKER}")
-            except Exception as _e:
-                st.warning(f"Main Kalman Telegram alert skipped: {_e}")
 
             try:
                 _save_main_kalman_status_to_session(
