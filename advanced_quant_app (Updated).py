@@ -318,181 +318,22 @@ def _kalman_15m_signal_from_prices(px):
 
 def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, show_table=True):
     """
-    Scanner/thesis table is now ONLY a mirror of visible main Kalman trade-log state.
-    It does not calculate CASH/SELL by itself anymore.
-
-    If the main Kalman tab has not saved a ticker's status yet, it shows SYNC REQUIRED
-    instead of giving a wrong CASH reading.
+    Separate 15m scanner calculations are disabled.
+    Main Kalman Trade Log is the only source of truth.
     """
+    symbols = _normalize_watchlist(watchlist)
     rows = []
-    symbols = _normalize_watchlist(watchlist)
-    if not symbols:
-        if show_table:
-            st.warning("Add at least one ticker to the Kalman 15m watchlist.")
-        return rows
-
     for sym in symbols[:12]:
-        try:
-            key = f"main_kalman_status_{sym}"
-            if key in st.session_state:
-                row = dict(st.session_state[key])
-                row["Alert"] = "Copied from main Kalman trade log"
-            else:
-                row = {
-                    "Ticker": sym,
-                    "Alert Signal": "SYNC REQUIRED",
-                    "Trade Position": "OPEN MAIN KALMAN TAB",
-                    "Price": None,
-                    "Candle Close CT": "",
-                    "Alert": "No scanner calculation used. Open/load this ticker in Main Kalman tab to sync exact trade-log state.",
-                }
-            rows.append(row)
-        except Exception as e:
-            rows.append({
-                "Ticker": sym,
-                "Alert Signal": "ERROR",
-                "Trade Position": "UNKNOWN",
-                "Price": None,
-                "Candle Close CT": "",
-                "Alert": str(e)[:120],
-            })
-
+        rows.append({
+            "Ticker": sym,
+            "Status": "USE MAIN KALMAN TAB",
+            "Source": "Main Buy/Sell Graph + Main Trade Log only",
+            "Note": "Separate 15m scanner disabled to avoid mismatched signals."
+        })
     if show_table:
-        try:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        except Exception:
-            st.write(rows)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     return rows
 
-
-    ledger = _load_kalman_alert_ledger()
-
-    for sym in symbols[:12]:
-        try:
-            fig, trades_df, info = _kalman_15m_trend_rail_report(sym)
-            latest_price = None
-            latest_time = ""
-            if isinstance(info, dict):
-                latest_price = info.get("Latest Price")
-                latest_time = info.get("Latest Completed Candle CT", "")
-
-            # First priority: copy the exact status saved from the visible Main Kalman Trade Log.
-            # This prevents sidebar/thesis scanner from disagreeing with the main BUY/SELL table.
-            _main_key = f"main_kalman_status_{sym}"
-            if _main_key in st.session_state:
-                row = dict(st.session_state[_main_key])
-                row["Alert"] = "Copied from visible main Kalman trade log"
-            else:
-                row = _status_from_main_trade_log(sym, trades_df, latest_price=latest_price, latest_time=latest_time)
-                row["Alert"] = "Load the main Kalman tab once to sync exact main trade-log state"
-
-            if tg_on and trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                t = _clean_trade_log_numbers(trades_df).copy()
-                last = t.iloc[-1]
-                row_txt = " ".join([str(x) for x in last.values]).upper()
-                is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
-                sig = "BUY" if is_open else "SELL"
-
-                event_time = ""
-                for c in ["Entry CT", "Exit CT", "Entry Time", "Exit Time"]:
-                    if c in t.columns:
-                        val = str(last.get(c, ""))
-                        if val and val.lower() != "nan":
-                            event_time = val
-                            break
-                if not event_time:
-                    event_time = str(latest_time)
-
-                ledger_key = f"{sym}|MAIN_TRADE_LOG|{sig}|{event_time}"
-                if ledger.get(sym) != ledger_key:
-                    # Sync the event so reboot does not spam old alerts.
-                    ledger[sym] = ledger_key
-                    _save_kalman_alert_ledger(ledger)
-                    row["Alert"] = "Synced from main trade log"
-                else:
-                    row["Alert"] = "Already synced"
-
-            rows.append(row)
-        except Exception as e:
-            rows.append({
-                "Ticker": sym,
-                "Alert Signal": "ERROR",
-                "Trade Position": "UNKNOWN",
-                "Price": None,
-                "Candle Close CT": "",
-                "Alert": str(e)[:120],
-            })
-
-    if show_table:
-        try:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        except Exception:
-            st.write(rows)
-    return rows
-
-
-    symbols = _normalize_watchlist(watchlist)
-    if not symbols:
-        if show_table:
-            st.warning("Add at least one ticker to the Kalman 15m watchlist.")
-        return rows
-
-    ledger = _load_kalman_alert_ledger()
-
-    for sym in symbols[:12]:
-        try:
-            px = _fetch_15m_completed_bars(sym, period="5d")
-            if px is None or len(px) < 60:
-                rows.append({"Ticker": sym, "Alert Signal": "NO DATA", "Price": None, "Candle Close CT": "", "Alert": "No"})
-                continue
-
-            sig, price, candle_time, prev_state, latest_state, trade_position = _kalman_15m_signal_from_prices(px)
-            candle_start = pd.Timestamp(candle_time)
-            candle_close = candle_start + pd.Timedelta(minutes=15)
-            candle_txt = candle_close.strftime("%Y-%m-%d %I:%M %p CT")
-            alert_status = "No"
-
-            if sig in ["BUY", "SELL"]:
-                ledger_key = f"{sym}|15m|{sig}|{candle_txt}"
-                if ledger.get(sym) != ledger_key:
-                    msg = (
-                        "PINEHURST KALMAN 15M ALERT\n"
-                        f"Ticker: {sym}\n"
-                        f"Signal: {sig}\n"
-                        f"Price: {price:.2f}\n"
-                        f"Candle close: {candle_txt}\n"
-                        "Strategy: Main Kalman Trade-Log Style / Institutional Trend Rail / 15m\n"
-                        "Reason: Main Kalman 15m trade-log-style signal changed on the latest completed 15m candle.\n"
-                        "Action: Notification only — no IBKR order sent."
-                    )
-                    ok, resp = send_telegram_alert(token, chat_id, msg)
-                    if ok:
-                        ledger[sym] = ledger_key
-                        _save_kalman_alert_ledger(ledger)
-                        alert_status = "Sent"
-                    else:
-                        alert_status = f"Failed: {str(resp)[:90]}"
-                else:
-                    alert_status = "Already sent"
-
-            rows.append({
-                "Ticker": sym,
-                "Alert Signal": sig,
-                "Trade Position": trade_position,
-                "Price": round(price, 2),
-                "Candle Close CT": candle_txt,
-                "Alert": alert_status,
-            })
-        except Exception as e:
-            rows.append({"Ticker": sym, "Alert Signal": "ERROR", "Price": None, "Candle Close CT": "", "Alert": str(e)[:120]})
-
-    if show_table:
-        try:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        except Exception:
-            st.write(rows)
-    return rows
-# ---------------------------------------------------------
 
 
 def _kalman_15m_trend_rail_report(ticker):
@@ -7531,23 +7372,10 @@ with st.sidebar:
             st.error(f"Could not save scanner settings: {_e}")
 
     if st.button("Scan Kalman 15m Watchlist Now", use_container_width=True):
-        run_kalman_15m_watchlist_telegram_scan(
-            kalman_15m_watchlist,
-            bool(tg_alerts_on and auto_kalman_15m_watchlist_on),
-            tg_bot_token,
-            tg_chat_id,
-            show_table=True,
-        )
+        st.info("Open the Kalman Filter tab. The scanner table is now shown there after the real main trade log loads.")
 
     if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
-        st.caption("Auto scanner is active. This is the main Kalman trade-log-style Institutional Trend Rail alert scanner, not the main optimized Kalman trade-log position. It uses completed 15m candles only.")
-        run_kalman_15m_watchlist_telegram_scan(
-            kalman_15m_watchlist,
-            True,
-            tg_bot_token,
-            tg_chat_id,
-            show_table=True,
-        )
+        st.caption("Separate auto scanner table is disabled. Use the status directly under Main Kalman Trade Log.")
 
     if bool(auto_refresh_15m_on and tg_alerts_on and auto_kalman_15m_watchlist_on):
         st.components.v1.html(
@@ -7556,23 +7384,7 @@ with st.sidebar:
         )
 
     st.divider()
-    st.subheader("Kalman 15m Graph + Trade Log")
-    _wl_symbols = _normalize_watchlist(kalman_15m_watchlist)
-    if _wl_symbols:
-        kalman_graph_ticker = st.selectbox("Graph / Trade Log Ticker", _wl_symbols, index=0)
-        if st.button("Show Kalman 15m Graph + Trade Log", use_container_width=True):
-            _fig, _trades, _info = _kalman_15m_trend_rail_report(kalman_graph_ticker)
-            if _fig is None:
-                st.warning("Not enough 15m data yet for this ticker.")
-            else:
-                st.write(_info)
-                st.plotly_chart(_fig, use_container_width=True)
-                if _trades is not None and len(_trades) > 0:
-                    st.dataframe(_clean_trade_log_numbers(_trades), use_container_width=True, hide_index=True)
-                else:
-                    st.info("No completed BUY/SELL trades in the recent 15m window.")
-    else:
-        st.caption("Add tickers to the Kalman 15m Watchlist to view graph and trade log.")
+    st.info("Separate 15m scanner graph/trade log is disabled. Use the main Kalman Filter tab graph + trade log as the only source of truth.")
 
 
     st.subheader("Manual Signal Alert")
@@ -11148,6 +10960,33 @@ with tab4:
                     st.info("No Kalman trades generated for this selected window/settings.")
             except Exception as _e:
                 st.warning(f"Main Kalman graph/trade log could not render: {_e}")
+
+                st.markdown("### ✅ Main Trade-Log Status / Telegram Source")
+                try:
+                    _main_status = _status_from_main_trade_log(
+                        TICKER,
+                        kalman_trades,
+                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                        latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
+                    )
+                    _main_status["Alert"] = "Source of truth: Main Buy/Sell Graph + Main Kalman Trade Log only"
+                    st.dataframe(pd.DataFrame([_main_status]), use_container_width=True, hide_index=True)
+
+                    # Telegram sync from exact main trade log only.
+                    if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
+                        _row_txt = " ".join([str(x) for x in kalman_trades.iloc[-1].values]).upper() if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty else ""
+                        _is_open = ("OPEN" in _row_txt) and ("CLOSED" not in _row_txt)
+                        _sig = "BUY" if _is_open else "SELL"
+                        _event_time = str(_main_status.get("Candle Close CT", ""))
+                        _ledger = _load_kalman_alert_ledger()
+                        _key = f"{TICKER}|MAIN_LOG_EXACT|{_sig}|{_event_time}|{_main_status.get('Trade Position')}"
+                        if _ledger.get(TICKER) != _key and _main_status.get("Trade Position") in ["LONG", "CASH"]:
+                            # Mark as synced so it does not spam on reload. Future fresh changes get a new key.
+                            _ledger[TICKER] = _key
+                            _save_kalman_alert_ledger(_ledger)
+                            st.caption("Telegram ledger synced from exact main trade log.")
+                except Exception as _e:
+                    st.warning(f"Could not create synced thesis status from main trade log: {_e}")
 
             if len(buy_idx):
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(buy_idx), y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
