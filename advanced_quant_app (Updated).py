@@ -6581,52 +6581,6 @@ with st.sidebar:
         st.success("Fast mode ON: heavy models skipped. Go straight to ⚡ 0.5% Live Capture.")
 
     st.divider()
-    st.header("🔌 IBKR Paper Bridge")
-    st.caption("Safe read-only connection test. No orders are sent from this panel.")
-
-    ibkr_enable_panel = st.toggle(
-        "Show IBKR connection panel",
-        value=True,
-        help="Uses TWS/IB Gateway Paper API. Keep TWS Paper open on port 7497."
-    )
-
-    if ibkr_enable_panel:
-        ibkr_host = st.text_input("IBKR Host", value="127.0.0.1", key="ibkr_host")
-        ibkr_port = st.number_input("IBKR Paper Port", min_value=1, max_value=9999, value=7497, step=1, key="ibkr_port")
-        ibkr_client_id = st.number_input("IBKR Client ID", min_value=1, max_value=999999, value=101, step=1, key="ibkr_client_id")
-
-        st.info("Paper default: Host 127.0.0.1 | Port 7497 | Client ID 101. Keep TWS Paper open.")
-        if not IBKR_AVAILABLE:
-            st.warning("ib_insync is not available inside this app environment. Install it with: python3 -m pip install ib_insync")
-
-        if st.button("Test IBKR Paper Connection", use_container_width=True, key="test_ibkr_connection_button"):
-            result = ibkr_readonly_status(ibkr_host, int(ibkr_port), int(ibkr_client_id))
-            st.session_state["ibkr_last_connection_result"] = result
-
-        result = st.session_state.get("ibkr_last_connection_result", None)
-        if result is not None:
-            if result.get("ok"):
-                st.success("✅ IBKR Paper connected safely in read-only mode.")
-                st.write("Accounts:", result.get("accounts", []))
-
-                pos_df = result.get("positions", pd.DataFrame())
-                if isinstance(pos_df, pd.DataFrame) and not pos_df.empty:
-                    st.write("Positions")
-                    st.dataframe(pos_df, use_container_width=True)
-                else:
-                    st.caption("No open positions found.")
-
-                summary_df = result.get("summary", pd.DataFrame())
-                if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
-                    show_tags = ["NetLiquidation", "TotalCashValue", "AvailableFunds", "BuyingPower", "EquityWithLoanValue"]
-                    small_summary = summary_df[summary_df["Tag"].isin(show_tags)].copy()
-                    if not small_summary.empty:
-                        st.write("Account Summary")
-                        st.dataframe(small_summary, use_container_width=True)
-            else:
-                st.error(f"❌ IBKR connection failed: {result.get('error', 'Unknown error')}")
-
-    st.divider()
     st.header("⚡ Live Decision Mode")
     live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support. Ignored when Fast intraday-only startup is ON.")
     if live_mode:
@@ -6643,6 +6597,55 @@ with st.sidebar:
     else:
         data_interval = '1d'
         kalman_fast_live_mode = False
+
+    st.divider()
+    show_ibkr_bridge = st.checkbox("Show IBKR Paper Bridge", value=False, help="Keep this OFF unless you are testing/using IBKR Paper. No connection is attempted while OFF.")
+    if show_ibkr_bridge:
+        st.header("🔌 IBKR Paper Bridge")
+        st.caption("Safe read-only connection test. No orders are sent from this panel.")
+
+        ibkr_enable_panel = st.toggle(
+            "Show IBKR connection panel",
+            value=True,
+            help="Uses TWS/IB Gateway Paper API. Keep TWS Paper open on port 7497."
+        )
+
+        if ibkr_enable_panel:
+            ibkr_host = st.text_input("IBKR Host", value="127.0.0.1", key="ibkr_host")
+            ibkr_port = st.number_input("IBKR Paper Port", min_value=1, max_value=9999, value=7497, step=1, key="ibkr_port")
+            ibkr_client_id = st.number_input("IBKR Client ID", min_value=1, max_value=999999, value=101, step=1, key="ibkr_client_id")
+
+            st.info("Paper default: Host 127.0.0.1 | Port 7497 | Client ID 101. Keep TWS Paper open.")
+            if not IBKR_AVAILABLE:
+                st.warning("ib_insync is not available inside this app environment. Install it with: python3 -m pip install ib_insync")
+
+            if st.button("Test IBKR Paper Connection", use_container_width=True, key="test_ibkr_connection_button"):
+                result = ibkr_readonly_status(ibkr_host, int(ibkr_port), int(ibkr_client_id))
+                st.session_state["ibkr_last_connection_result"] = result
+
+            result = st.session_state.get("ibkr_last_connection_result", None)
+            if result is not None:
+                if result.get("ok"):
+                    st.success("✅ IBKR Paper connected safely in read-only mode.")
+                    st.write("Accounts:", result.get("accounts", []))
+
+                    pos_df = result.get("positions", pd.DataFrame())
+                    if isinstance(pos_df, pd.DataFrame) and not pos_df.empty:
+                        st.write("Positions")
+                        st.dataframe(pos_df, use_container_width=True)
+                    else:
+                        st.caption("No open positions found.")
+
+                    summary_df = result.get("summary", pd.DataFrame())
+                    if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
+                        show_tags = ["NetLiquidation", "TotalCashValue", "AvailableFunds", "BuyingPower", "EquityWithLoanValue"]
+                        small_summary = summary_df[summary_df["Tag"].isin(show_tags)].copy()
+                        if not small_summary.empty:
+                            st.write("Account Summary")
+                            st.dataframe(small_summary, use_container_width=True)
+                else:
+                    st.error(f"❌ IBKR connection failed: {result.get('error', 'Unknown error')}")
+
 
     st.divider()
     st.header("🔔 Live Buy/Sell Alerts")
