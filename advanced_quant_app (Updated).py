@@ -22,6 +22,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import json
+import urllib.request
+import urllib.error
 import smtplib
 import os
 from email.message import EmailMessage
@@ -38,12 +40,13 @@ except RuntimeError:
 
 # ---------- Telegram Alert Helpers ----------
 def send_telegram_alert(bot_token: str, chat_id: str, message: str):
-    """Send a Telegram message. Returns (ok, response_text)."""
+    """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
     try:
         bot_token = str(bot_token).strip()
         chat_id = str(chat_id).strip()
         if not bot_token or not chat_id:
             return False, "Missing bot token or chat ID."
+
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
@@ -51,8 +54,20 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        r = requests.post(url, json=payload, timeout=12)
-        return bool(r.ok), r.text
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return True, body
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return False, body
     except Exception as e:
         return False, str(e)
 
