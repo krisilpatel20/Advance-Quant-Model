@@ -103,6 +103,17 @@ def _clean_trade_log_numbers(df):
 
 
 
+
+def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, latest_time=None):
+    """Save visible main Kalman trade-log status so sidebar/scanner mirrors it."""
+    try:
+        row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
+        key = f"main_kalman_status_{str(ticker).upper()}"
+        st.session_state[key] = row
+        return row
+    except Exception:
+        return None
+
 def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
     """Copy main BUY/SELL trade-log state into scanner row. No separate signal math."""
     try:
@@ -151,7 +162,7 @@ def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_tim
             "Trade Position": "LONG" if is_long else "CASH",
             "Price": round(float(px), 2) if px is not None and str(px) != "" else None,
             "Candle Close CT": str(tm) if tm is not None else "",
-            "Alert": "Copied from main trade log",
+            "Alert": "Copied from visible main Kalman trade log",
         }
     except Exception as e:
         return {
@@ -327,7 +338,15 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
                 latest_price = info.get("Latest Price")
                 latest_time = info.get("Latest Completed Candle CT", "")
 
-            row = _status_from_main_trade_log(sym, trades_df, latest_price=latest_price, latest_time=latest_time)
+            # First priority: copy the exact status saved from the visible Main Kalman Trade Log.
+            # This prevents sidebar/thesis scanner from disagreeing with the main BUY/SELL table.
+            _main_key = f"main_kalman_status_{sym}"
+            if _main_key in st.session_state:
+                row = dict(st.session_state[_main_key])
+                row["Alert"] = "Copied from visible main Kalman trade log"
+            else:
+                row = _status_from_main_trade_log(sym, trades_df, latest_price=latest_price, latest_time=latest_time)
+                row["Alert"] = "Load the main Kalman tab once to sync exact main trade-log state"
 
             if tg_on and trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
                 t = _clean_trade_log_numbers(trades_df).copy()
@@ -10918,6 +10937,16 @@ with tab4:
             kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
             kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
 
+            try:
+                _save_main_kalman_status_to_session(
+                    TICKER,
+                    kalman_trades,
+                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                    latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
+                )
+            except Exception:
+                pass
+
             k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
             k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
             k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
@@ -11043,6 +11072,16 @@ with tab4:
                 st.markdown(f"### 📒 Main Kalman Trade Log — {TICKER}")
                 if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty:
                     st.dataframe(_clean_trade_log_numbers(kalman_trades), use_container_width=True, hide_index=True)
+                    try:
+                        _save_main_kalman_status_to_session(
+                            TICKER,
+                            kalman_trades,
+                            latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                            latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
+                        )
+                    except Exception:
+                        pass
+
                     try:
                         st.download_button(
                             "Download Main Kalman Trade Log CSV",
