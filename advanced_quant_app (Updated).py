@@ -130,9 +130,19 @@ def _fetch_15m_completed_bars(ticker, period="5d"):
     except Exception:
         pass
 
-    # Drop latest bar because it may still be forming.
-    if len(px) > 2:
-        px = px.iloc[:-1]
+    # Drop latest bar ONLY if that 15m candle is still forming.
+    # yfinance labels intraday bars by candle START time.
+    # Example: 2:30 PM CT bar closes at 2:45 PM CT.
+    try:
+        now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
+        latest_start = pd.Timestamp(px.index[-1])
+        latest_close = latest_start + pd.Timedelta(minutes=15)
+        if latest_close > now_ct and len(px) > 2:
+            px = px.iloc[:-1]
+    except Exception:
+        # Safety fallback: if time comparison fails, stay conservative.
+        if len(px) > 2:
+            px = px.iloc[:-1]
 
     return px.dropna()
 
@@ -152,20 +162,12 @@ def _kalman_15m_signal_from_prices(px):
     rail_s = pd.Series(rail, index=px.index).ffill().bfill()
     state_s = pd.Series(long_state, index=px.index).astype(bool)
 
-    # Position only when price is above the trend rail and rail state is bullish.
-    raw_signal = ((px > rail_s) & state_s).astype(int)
-    safe_signal = apply_kalman_risk_firewall(
-        px,
-        raw_signal,
-        rail_s,
-        max_trade_loss_pct=8.0,
-        trail_stop_pct=10.0,
-        equity_dd_stop_pct=20.0,
-        cooldown_bars=4,
-    ).astype(int)
+    # Auto 15m alerts use Institutional Trend Rail ONLY.
+    # No Kalman Risk Firewall overlay here, because the user wants the pure rail signal.
+    rail_signal = ((px > rail_s) & state_s).astype(int)
 
-    latest = int(safe_signal.iloc[-1])
-    prev = int(safe_signal.iloc[-2]) if len(safe_signal) >= 2 else latest
+    latest = int(rail_signal.iloc[-1])
+    prev = int(rail_signal.iloc[-2]) if len(rail_signal) >= 2 else latest
     latest_signal = "BUY" if latest == 1 and prev == 0 else ("SELL" if latest == 0 and prev == 1 else "HOLD")
     return latest_signal, float(px.iloc[-1]), px.index[-1], prev, latest
 
@@ -189,11 +191,13 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
         try:
             px = _fetch_15m_completed_bars(sym, period="5d")
             if px is None or len(px) < 60:
-                rows.append({"Ticker": sym, "Signal": "NO DATA", "Price": None, "Candle CT": "", "Alert": "No"})
+                rows.append({"Ticker": sym, "Signal": "NO DATA", "Price": None, "Candle Close CT": "", "Alert": "No"})
                 continue
 
             sig, price, candle_time, prev_state, latest_state = _kalman_15m_signal_from_prices(px)
-            candle_txt = pd.Timestamp(candle_time).strftime("%Y-%m-%d %I:%M %p CT")
+            candle_start = pd.Timestamp(candle_time)
+            candle_close = candle_start + pd.Timedelta(minutes=15)
+            candle_txt = candle_close.strftime("%Y-%m-%d %I:%M %p CT")
             alert_status = "No"
 
             if sig in ["BUY", "SELL"]:
@@ -204,9 +208,9 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
                         f"Ticker: {sym}\n"
                         f"Signal: {sig}\n"
                         f"Price: {price:.2f}\n"
-                        f"Candle closed: {candle_txt}\n"
-                        "Strategy: Kalman Live Decision / 15m completed candle\n"
-                        "Reason: Signal changed on the latest completed 15m candle.\n"
+                        f"Candle close: {candle_txt}\n"
+                        "Strategy: Institutional Trend Rail / 15m completed candle\n"
+                        "Reason: Institutional Trend Rail signal changed on the latest completed 15m candle.\n"
                         "Action: Notification only — no IBKR order sent."
                     )
                     ok, resp = send_telegram_alert(token, chat_id, msg)
@@ -224,11 +228,11 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
                 "Signal": sig,
                 "Position": "LONG" if latest_state == 1 else "CASH",
                 "Price": round(price, 2),
-                "Candle CT": candle_txt,
+                "Candle Close CT": candle_txt,
                 "Alert": alert_status,
             })
         except Exception as e:
-            rows.append({"Ticker": sym, "Signal": "ERROR", "Price": None, "Candle CT": "", "Alert": str(e)[:120]})
+            rows.append({"Ticker": sym, "Signal": "ERROR", "Price": None, "Candle Close CT": "", "Alert": str(e)[:120]})
 
     if show_table:
         try:
@@ -8841,7 +8845,7 @@ if bool(kalman_fast_live_mode):
                 )
                 kalman_max_dd_allowed = st.slider("Max drawdown allowed (%)", 10.0, 80.0, 35.0, step=5.0, key="kalman_max_dd_allowed")
 
-                use_kalman_risk_firewall = st.checkbox("Use Kalman risk firewall", value=True, key="kalman_use_risk_firewall")
+                use_kalman_risk_firewall = st.checkbox("Use Kalman risk firewall", value=False, key="kalman_use_risk_firewall")
                 rf1, rf2, rf3, rf4 = st.columns(4)
                 with rf1:
                     kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
@@ -10361,7 +10365,7 @@ with tab4:
 
             use_kalman_risk_firewall = st.checkbox(
                 "Use Kalman risk firewall",
-                value=True,
+                value=False,
                 key="kalman_use_risk_firewall",
                 help="Keeps the same signal logic, but adds hard loss/trailing/equity drawdown protection to reduce capital damage."
             )
