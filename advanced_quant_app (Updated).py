@@ -24,6 +24,7 @@ from pathlib import Path
 import json
 import urllib.request
 import urllib.error
+from pathlib import Path as _Path
 import smtplib
 import os
 from email.message import EmailMessage
@@ -37,6 +38,38 @@ try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+# ---------- Local Telegram Settings Persistence ----------
+def _telegram_settings_path():
+    try:
+        return _Path.home() / ".pinehurst_quant_telegram.json"
+    except Exception:
+        return _Path(".pinehurst_quant_telegram.json")
+
+def load_telegram_settings():
+    try:
+        p = _telegram_settings_path()
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+def save_telegram_settings(bot_token: str, chat_id: str, enabled: bool, auto_kalman: bool):
+    try:
+        p = _telegram_settings_path()
+        data = {
+            "bot_token": str(bot_token).strip(),
+            "chat_id": str(chat_id).strip(),
+            "enabled": bool(enabled),
+            "auto_kalman": bool(auto_kalman),
+        }
+        p.write_text(json.dumps(data, indent=2))
+        return True, str(p)
+    except Exception as e:
+        return False, str(e)
+# --------------------------------------------------------
 
 # ---------- Telegram Alert Helpers ----------
 def send_telegram_alert(bot_token: str, chat_id: str, message: str):
@@ -6798,21 +6831,23 @@ with st.sidebar:
 
     st.divider()
     st.header("📲 Telegram Signal Alerts")
+    _tg_saved = load_telegram_settings()
+
     tg_alerts_on = st.checkbox(
         "Enable Telegram Alerts",
-        value=False,
-        help="OFF by default. Turn ON only when you want BUY/SELL notifications sent to Telegram."
+        value=bool(_tg_saved.get("enabled", False)),
+        help="Saved locally. Turn ON when you want BUY/SELL notifications sent to Telegram."
     )
     tg_bot_token = st.text_input(
         "Telegram Bot Token",
-        value=st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else "",
+        value=_tg_saved.get("bot_token", st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else ""),
         type="password",
-        help="Paste BotFather token here, or store it in Streamlit secrets as TELEGRAM_BOT_TOKEN."
+        help="Paste BotFather token here. You can save it locally below so you do not retype it."
     )
     tg_chat_id = st.text_input(
         "Telegram Chat ID",
-        value=st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else "",
-        help="Paste your Telegram chat ID here, or store it in Streamlit secrets as TELEGRAM_CHAT_ID."
+        value=_tg_saved.get("chat_id", st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else ""),
+        help="Paste your Telegram chat ID here. You can save it locally below so you do not retype it."
     )
 
     if st.button("Send Test Telegram Alert", use_container_width=True):
@@ -6831,9 +6866,16 @@ with st.sidebar:
 
     auto_kalman_alerts_on = st.checkbox(
         "Auto-alert Kalman Live BUY/SELL",
-        value=False,
-        help="Sends Telegram once when the Kalman live decision changes to BUY or SELL. Notification only."
+        value=bool(_tg_saved.get("auto_kalman", False)),
+        help="Saved locally. Sends Telegram once when the Kalman live decision changes to BUY or SELL. Notification only."
     )
+
+    if st.button("Save Telegram Settings on This Mac", use_container_width=True):
+        _ok_save, _save_msg = save_telegram_settings(tg_bot_token, tg_chat_id, tg_alerts_on, auto_kalman_alerts_on)
+        if _ok_save:
+            st.success("Telegram settings saved on this Mac. Refresh will keep them.")
+        else:
+            st.error(f"Could not save Telegram settings: {_save_msg}")
 
 
     st.subheader("Manual Signal Alert")
