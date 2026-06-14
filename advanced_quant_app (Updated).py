@@ -242,6 +242,109 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
     return rows
 # ---------------------------------------------------------
 
+
+def _kalman_15m_trend_rail_report(ticker):
+    """Create Institutional Trend Rail 15m chart + trade log using completed 15m candles only."""
+    px = _fetch_15m_completed_bars(ticker, period="5d")
+    if px is None or len(px) < 60:
+        return None, pd.DataFrame(), None
+
+    rail, center, long_state = institutional_trend_rail(
+        px,
+        fast_gain=0.34,
+        slow_gain=0.055,
+        polish_span=3,
+        atr_window=14,
+        atr_mult=1.15,
+    )
+    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
+    state_s = pd.Series(long_state, index=px.index).astype(bool)
+    signal = ((px > rail_s) & state_s).astype(int)
+    changes = signal.diff().fillna(signal.iloc[0])
+
+    buys = changes[changes > 0].index
+    sells = changes[changes < 0].index
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=px.index, y=px.values, mode="lines", name="Price"))
+    fig.add_trace(go.Scatter(x=rail_s.index, y=rail_s.values, mode="lines", name="Institutional Trend Rail"))
+
+    if len(buys) > 0:
+        fig.add_trace(go.Scatter(
+            x=buys,
+            y=px.loc[buys],
+            mode="markers",
+            name="BUY",
+            marker=dict(symbol="triangle-up", size=12),
+        ))
+    if len(sells) > 0:
+        fig.add_trace(go.Scatter(
+            x=sells,
+            y=px.loc[sells],
+            mode="markers",
+            name="SELL",
+            marker=dict(symbol="triangle-down", size=12),
+        ))
+
+    fig.update_layout(
+        title=f"{ticker.upper()} — Kalman 15m Institutional Trend Rail",
+        xaxis_title="CT time",
+        yaxis_title="Price",
+        height=520,
+        hovermode="x unified",
+        margin=dict(l=20, r=20, t=55, b=35),
+    )
+
+    trades = []
+    in_trade = False
+    entry_time = None
+    entry_price = None
+
+    for dt in px.index:
+        ch = float(changes.loc[dt])
+        if ch > 0 and not in_trade:
+            in_trade = True
+            entry_time = dt
+            entry_price = float(px.loc[dt])
+        elif ch < 0 and in_trade:
+            exit_time = dt
+            exit_price = float(px.loc[dt])
+            ret = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
+            trades.append({
+                "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %I:%M %p CT"),
+                "Entry Price": round(entry_price, 2),
+                "Exit CT": pd.Timestamp(exit_time).strftime("%Y-%m-%d %I:%M %p CT"),
+                "Exit Price": round(exit_price, 2),
+                "Trade Return %": round(ret, 2),
+                "Status": "Closed",
+            })
+            in_trade = False
+            entry_time = None
+            entry_price = None
+
+    if in_trade and entry_time is not None:
+        last_time = px.index[-1]
+        last_price = float(px.iloc[-1])
+        ret = (last_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
+        trades.append({
+            "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %I:%M %p CT"),
+            "Entry Price": round(entry_price, 2),
+            "Exit CT": "",
+            "Exit Price": "",
+            "Trade Return %": round(ret, 2),
+            "Status": "Open",
+        })
+
+    trades_df = pd.DataFrame(trades)
+    latest_signal = "LONG" if int(signal.iloc[-1]) == 1 else "CASH"
+    latest_info = {
+        "Ticker": ticker.upper(),
+        "Latest Position": latest_signal,
+        "Latest Price": round(float(px.iloc[-1]), 2),
+        "Latest Completed Candle CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
+    }
+    return fig, trades_df, latest_info
+
 # ---------- Telegram Alert Helpers ----------
 def send_telegram_alert(bot_token: str, chat_id: str, message: str):
     """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
@@ -7118,6 +7221,25 @@ with st.sidebar:
             "<script>setTimeout(function(){ window.parent.location.reload(); }, 60000);</script>",
             height=0,
         )
+
+    st.divider()
+    st.subheader("Kalman 15m Graph + Trade Log")
+    _wl_symbols = _normalize_watchlist(kalman_15m_watchlist)
+    if _wl_symbols:
+        kalman_graph_ticker = st.selectbox("Graph / Trade Log Ticker", _wl_symbols, index=0)
+        if st.button("Show Kalman 15m Graph + Trade Log", use_container_width=True):
+            _fig, _trades, _info = _kalman_15m_trend_rail_report(kalman_graph_ticker)
+            if _fig is None:
+                st.warning("Not enough 15m data yet for this ticker.")
+            else:
+                st.write(_info)
+                st.plotly_chart(_fig, use_container_width=True)
+                if _trades is not None and len(_trades) > 0:
+                    st.dataframe(_trades, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No completed BUY/SELL trades in the recent 15m window.")
+    else:
+        st.caption("Add tickers to the Kalman 15m Watchlist to view graph and trade log.")
 
 
     st.subheader("Manual Signal Alert")
