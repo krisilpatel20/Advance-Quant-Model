@@ -56,6 +56,18 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+# Try importing IBKR connection library
+try:
+    from ib_insync import IB, Stock, MarketOrder, LimitOrder
+    IBKR_AVAILABLE = True
+except ImportError:
+    IB = None
+    Stock = None
+    MarketOrder = None
+    LimitOrder = None
+    IBKR_AVAILABLE = False
+
+
 
 # Statsmodels Diagnostic Imports
 
@@ -5528,6 +5540,92 @@ def _market_close_realtime_daily_patch(ticker: str, daily_df: pd.DataFrame) -> p
 
 
 @st.cache_data(ttl=60) # Cache live data for 1 minute
+
+# ==========================================
+# IBKR READ-ONLY BRIDGE HELPERS
+# ==========================================
+def ibkr_readonly_status(host="127.0.0.1", port=7497, client_id=101):
+    """
+    Safe IBKR read-only connection test.
+    No orders. No execution. Only connects, reads accounts/positions/account summary,
+    then disconnects.
+    """
+    if not IBKR_AVAILABLE:
+        return {
+            "ok": False,
+            "error": "ib_insync is not installed in this Python environment. Run: python3 -m pip install ib_insync",
+            "accounts": [],
+            "positions": pd.DataFrame(),
+            "summary": pd.DataFrame()
+        }
+
+    ib = IB()
+    try:
+        ib.connect(str(host), int(port), clientId=int(client_id), readonly=True, timeout=8)
+        accounts = ib.managedAccounts()
+
+        summary_rows = []
+        try:
+            summary = ib.accountSummary()
+            for row in summary:
+                try:
+                    summary_rows.append({
+                        "Account": row.account,
+                        "Tag": row.tag,
+                        "Value": row.value,
+                        "Currency": row.currency
+                    })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        summary_df = pd.DataFrame(summary_rows)
+
+        pos_rows = []
+        try:
+            positions = ib.positions()
+            for p in positions:
+                try:
+                    con = p.contract
+                    pos_rows.append({
+                        "Account": p.account,
+                        "Symbol": getattr(con, "symbol", ""),
+                        "SecType": getattr(con, "secType", ""),
+                        "Exchange": getattr(con, "exchange", ""),
+                        "Currency": getattr(con, "currency", ""),
+                        "Position": float(p.position),
+                        "Avg Cost": float(p.avgCost)
+                    })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        pos_df = pd.DataFrame(pos_rows)
+
+        ib.disconnect()
+        return {
+            "ok": True,
+            "error": "",
+            "accounts": accounts,
+            "positions": pos_df,
+            "summary": summary_df
+        }
+    except Exception as e:
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "error": str(e),
+            "accounts": [],
+            "positions": pd.DataFrame(),
+            "summary": pd.DataFrame()
+        }
+
+
+
 def load_data(ticker, start, end, interval='1d'):
     try:
         # yfinance's `end` date is EXCLUSIVE for daily bars. If the user selects
@@ -6472,6 +6570,52 @@ with st.sidebar:
     )
     if fast_intraday_mode:
         st.success("Fast mode ON: heavy models skipped. Go straight to ⚡ 0.5% Live Capture.")
+
+    st.divider()
+    st.header("🔌 IBKR Paper Bridge")
+    st.caption("Safe read-only connection test. No orders are sent from this panel.")
+
+    ibkr_enable_panel = st.toggle(
+        "Show IBKR connection panel",
+        value=True,
+        help="Uses TWS/IB Gateway Paper API. Keep TWS Paper open on port 7497."
+    )
+
+    if ibkr_enable_panel:
+        ibkr_host = st.text_input("IBKR Host", value="127.0.0.1", key="ibkr_host")
+        ibkr_port = st.number_input("IBKR Paper Port", min_value=1, max_value=9999, value=7497, step=1, key="ibkr_port")
+        ibkr_client_id = st.number_input("IBKR Client ID", min_value=1, max_value=999999, value=101, step=1, key="ibkr_client_id")
+
+        st.info("Paper default: Host 127.0.0.1 | Port 7497 | Client ID 101. Keep TWS Paper open.")
+        if not IBKR_AVAILABLE:
+            st.warning("ib_insync is not available inside this app environment. Install it with: python3 -m pip install ib_insync")
+
+        if st.button("Test IBKR Paper Connection", use_container_width=True, key="test_ibkr_connection_button"):
+            result = ibkr_readonly_status(ibkr_host, int(ibkr_port), int(ibkr_client_id))
+            st.session_state["ibkr_last_connection_result"] = result
+
+        result = st.session_state.get("ibkr_last_connection_result", None)
+        if result is not None:
+            if result.get("ok"):
+                st.success("✅ IBKR Paper connected safely in read-only mode.")
+                st.write("Accounts:", result.get("accounts", []))
+
+                pos_df = result.get("positions", pd.DataFrame())
+                if isinstance(pos_df, pd.DataFrame) and not pos_df.empty:
+                    st.write("Positions")
+                    st.dataframe(pos_df, use_container_width=True)
+                else:
+                    st.caption("No open positions found.")
+
+                summary_df = result.get("summary", pd.DataFrame())
+                if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
+                    show_tags = ["NetLiquidation", "TotalCashValue", "AvailableFunds", "BuyingPower", "EquityWithLoanValue"]
+                    small_summary = summary_df[summary_df["Tag"].isin(show_tags)].copy()
+                    if not small_summary.empty:
+                        st.write("Account Summary")
+                        st.dataframe(small_summary, use_container_width=True)
+            else:
+                st.error(f"❌ IBKR connection failed: {result.get('error', 'Unknown error')}")
 
     st.divider()
     st.header("⚡ Live Decision Mode")
