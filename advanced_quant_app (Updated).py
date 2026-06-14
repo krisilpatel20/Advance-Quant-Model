@@ -345,6 +345,49 @@ def _kalman_15m_trend_rail_report(ticker):
     }
     return fig, trades_df, latest_info
 
+
+def _render_primary_kalman_15m_panel(default_ticker=None):
+    """Render Institutional Trend Rail 15m graph + trade log in the primary Kalman tab."""
+    try:
+        # Always use main thesis ticker. No separate ticker box here.
+        _ticker = str(default_ticker or globals().get("TICKER", "AAPL")).strip().upper()
+        st.markdown("### 📈 Kalman 15m Institutional Trend Rail — Live Graph + Trade Log")
+        st.caption(f"Main Thesis Ticker: {_ticker} • Completed 15m candles only • Risk Firewall OFF")
+
+        _fig, _trades, _info = _kalman_15m_trend_rail_report(_ticker)
+        if _fig is None:
+            st.warning(f"Not enough 15m data yet for {_ticker}.")
+            return
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Main Ticker", _info.get("Ticker", _ticker))
+        m2.metric("Latest Position", _info.get("Latest Position", "N/A"))
+        m3.metric("Latest Price", _info.get("Latest Price", "N/A"))
+        st.caption(f"Latest completed candle: {_info.get('Latest Completed Candle CT', 'N/A')}")
+
+        # Graph is tied to main thesis ticker.
+        st.plotly_chart(_fig, use_container_width=True)
+
+        # Trade log is also tied to the same main thesis ticker.
+        st.markdown(f"#### 📒 15m Trade Log — {_ticker}")
+        if _trades is not None and len(_trades) > 0:
+            st.dataframe(_trades, use_container_width=True, hide_index=True)
+            try:
+                st.download_button(
+                    "Download 15m Trade Log CSV",
+                    _trades.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{_ticker}_kalman_15m_trade_log.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
+        else:
+            st.info(f"No completed BUY/SELL trades for {_ticker} in the recent 15m window.")
+    except Exception as e:
+        st.warning(f"Primary Kalman 15m panel could not load: {e}")
+
+
 # ---------- Telegram Alert Helpers ----------
 def send_telegram_alert(bot_token: str, chat_id: str, message: str):
     """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
@@ -8822,6 +8865,9 @@ if bool(kalman_fast_live_mode):
         else:
             st.write("### Kalman Filter Analysis — Fast Live Mode")
             st.caption("Only this tab is running. Heavy GARCH/Markov/scan tabs are skipped to make 5m/15m live work load faster.")
+            _render_primary_kalman_15m_panel(default_ticker=TICKER)
+            st.divider()
+
 
             kf_mode = st.radio(
                 "Analysis Mode",
@@ -9164,6 +9210,78 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
+
+            # ✅ Primary normal-mode Kalman graph + trade log directly under metrics.
+            # This is the main Kalman screen display, not Thesis Parameters and not the Telegram sidebar.
+            try:
+                _primary_changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
+                _primary_buy_idx = _primary_changes[_primary_changes > 0].index
+                _primary_sell_idx = _primary_changes[_primary_changes < 0].index
+
+                st.markdown("### 📈 Main Kalman Graph + BUY/SELL Signals")
+                _fig_primary = go.Figure()
+                _fig_primary.add_trace(go.Scatter(
+                    x=bt_plot_x,
+                    y=bt_px,
+                    mode="lines",
+                    name=f"{TICKER} Price",
+                    line=dict(color="white", width=1.2),
+                    opacity=0.65,
+                ))
+                _fig_primary.add_trace(go.Scatter(
+                    x=bt_plot_x,
+                    y=bt_trend,
+                    mode="lines",
+                    name=active_trend_name,
+                    line=dict(color="#7FDBFF", width=2.6),
+                ))
+
+                if len(_primary_buy_idx):
+                    _fig_primary.add_trace(go.Scatter(
+                        x=bt_plot_x_series.reindex(_primary_buy_idx),
+                        y=bt_px.reindex(_primary_buy_idx),
+                        mode="markers",
+                        name="BUY",
+                        marker=dict(symbol="triangle-up", size=13, color="lime"),
+                    ))
+                if len(_primary_sell_idx):
+                    _fig_primary.add_trace(go.Scatter(
+                        x=bt_plot_x_series.reindex(_primary_sell_idx),
+                        y=bt_px.reindex(_primary_sell_idx),
+                        mode="markers",
+                        name="SELL",
+                        marker=dict(symbol="triangle-down", size=13, color="red"),
+                    ))
+
+                _fig_primary.update_layout(
+                    title=f"Main Kalman Strategy Graph: {TICKER} — {active_trend_name}",
+                    template="plotly_dark",
+                    height=620,
+                    hovermode="x unified",
+                    xaxis_title="Time",
+                    yaxis_title="Price",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=20, r=20, t=65, b=35),
+                )
+                st.plotly_chart(_fig_primary, use_container_width=True)
+
+                st.markdown(f"### 📒 Main Kalman Trade Log — {TICKER}")
+                if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty:
+                    st.dataframe(kalman_trades, use_container_width=True, hide_index=True)
+                    try:
+                        st.download_button(
+                            "Download Main Kalman Trade Log CSV",
+                            kalman_trades.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{TICKER}_main_kalman_trade_log.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    st.info("No Kalman trades generated for this selected window/settings.")
+            except Exception as _e:
+                st.warning(f"Main Kalman graph/trade log could not render: {_e}")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
@@ -10243,6 +10361,8 @@ with tab4:
         st.warning("Please load a ticker to view Kalman Filter dynamics.")
     else:
         st.write("### Kalman Filter Analysis")
+        _render_primary_kalman_15m_panel(default_ticker=TICKER)
+        st.divider()
     # --- MODEL VERDICT BANNER ---
     if trend_diff > 0.03: st.success(f"🎯 **MODEL VERDICT**: Price is **{trend_diff:.1%} ABOVE** the Kalman Trend. Structural uptrend intact.")
     elif trend_diff < -0.03: st.error(f"🎯 **MODEL VERDICT**: Price is **{abs(trend_diff):.1%} BELOW** the Kalman Trend. Structural breakdown in progress.")
@@ -10700,6 +10820,78 @@ with tab4:
             km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
             km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
             km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
+
+            # ✅ Primary normal-mode Kalman graph + trade log directly under metrics.
+            # This is the main Kalman screen display, not Thesis Parameters and not the Telegram sidebar.
+            try:
+                _primary_changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
+                _primary_buy_idx = _primary_changes[_primary_changes > 0].index
+                _primary_sell_idx = _primary_changes[_primary_changes < 0].index
+
+                st.markdown("### 📈 Main Kalman Graph + BUY/SELL Signals")
+                _fig_primary = go.Figure()
+                _fig_primary.add_trace(go.Scatter(
+                    x=bt_plot_x,
+                    y=bt_px,
+                    mode="lines",
+                    name=f"{TICKER} Price",
+                    line=dict(color="white", width=1.2),
+                    opacity=0.65,
+                ))
+                _fig_primary.add_trace(go.Scatter(
+                    x=bt_plot_x,
+                    y=bt_trend,
+                    mode="lines",
+                    name=active_trend_name,
+                    line=dict(color="#7FDBFF", width=2.6),
+                ))
+
+                if len(_primary_buy_idx):
+                    _fig_primary.add_trace(go.Scatter(
+                        x=bt_plot_x_series.reindex(_primary_buy_idx),
+                        y=bt_px.reindex(_primary_buy_idx),
+                        mode="markers",
+                        name="BUY",
+                        marker=dict(symbol="triangle-up", size=13, color="lime"),
+                    ))
+                if len(_primary_sell_idx):
+                    _fig_primary.add_trace(go.Scatter(
+                        x=bt_plot_x_series.reindex(_primary_sell_idx),
+                        y=bt_px.reindex(_primary_sell_idx),
+                        mode="markers",
+                        name="SELL",
+                        marker=dict(symbol="triangle-down", size=13, color="red"),
+                    ))
+
+                _fig_primary.update_layout(
+                    title=f"Main Kalman Strategy Graph: {TICKER} — {active_trend_name}",
+                    template="plotly_dark",
+                    height=620,
+                    hovermode="x unified",
+                    xaxis_title="Time",
+                    yaxis_title="Price",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=20, r=20, t=65, b=35),
+                )
+                st.plotly_chart(_fig_primary, use_container_width=True)
+
+                st.markdown(f"### 📒 Main Kalman Trade Log — {TICKER}")
+                if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty:
+                    st.dataframe(kalman_trades, use_container_width=True, hide_index=True)
+                    try:
+                        st.download_button(
+                            "Download Main Kalman Trade Log CSV",
+                            kalman_trades.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{TICKER}_main_kalman_trade_log.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    st.info("No Kalman trades generated for this selected window/settings.")
+            except Exception as _e:
+                st.warning(f"Main Kalman graph/trade log could not render: {_e}")
 
             try:
                 st.caption(f"Chosen Kalman settings: {chosen_kalman_settings}")
