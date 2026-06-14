@@ -36,6 +36,42 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
+# ---------- Telegram Alert Helpers ----------
+def send_telegram_alert(bot_token: str, chat_id: str, message: str):
+    """Send a Telegram message. Returns (ok, response_text)."""
+    try:
+        bot_token = str(bot_token).strip()
+        chat_id = str(chat_id).strip()
+        if not bot_token or not chat_id:
+            return False, "Missing bot token or chat ID."
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, json=payload, timeout=12)
+        return bool(r.ok), r.text
+    except Exception as e:
+        return False, str(e)
+
+
+def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: str):
+    """Prevent repeated alerts on Streamlit reruns."""
+    try:
+        sent = st.session_state.setdefault("_telegram_alerts_sent", set())
+        if alert_key in sent:
+            return True, "Already sent this alert."
+        ok, resp = send_telegram_alert(bot_token, chat_id, message)
+        if ok:
+            sent.add(alert_key)
+        return ok, resp
+    except Exception as e:
+        return False, str(e)
+# -------------------------------------------
+
+
 
 # Databento is optional and lazy-loaded only when the user clicks the pull button.
 # This prevents Databento/package/network issues from slowing or blocking the app load.
@@ -6649,6 +6685,40 @@ with st.sidebar:
 
     st.divider()
     st.header("🔔 Live Buy/Sell Alerts")
+
+    st.divider()
+    st.header("📲 Telegram Signal Alerts")
+    tg_alerts_on = st.checkbox(
+        "Enable Telegram Alerts",
+        value=False,
+        help="OFF by default. Turn ON only when you want BUY/SELL notifications sent to Telegram."
+    )
+    tg_bot_token = st.text_input(
+        "Telegram Bot Token",
+        value=st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else "",
+        type="password",
+        help="Paste BotFather token here, or store it in Streamlit secrets as TELEGRAM_BOT_TOKEN."
+    )
+    tg_chat_id = st.text_input(
+        "Telegram Chat ID",
+        value=st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else "",
+        help="Paste your Telegram chat ID here, or store it in Streamlit secrets as TELEGRAM_CHAT_ID."
+    )
+
+    if st.button("Send Test Telegram Alert", use_container_width=True):
+        test_msg = (
+            "PINEHURST QUANT TEST ALERT\n"
+            "Status: Telegram alerts are connected.\n"
+            "Mode: Notification only — no order sent."
+        )
+        ok, resp = send_telegram_alert(tg_bot_token, tg_chat_id, test_msg)
+        if ok:
+            st.success("Telegram test alert sent.")
+        else:
+            st.error(f"Telegram test failed: {resp}")
+
+    st.caption("Alerts are notification-only. No IBKR order is sent from Telegram alerts.")
+
     alert_enabled = st.toggle(
         "Enable live signal alerts",
         value=False,
