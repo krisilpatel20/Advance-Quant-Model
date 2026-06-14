@@ -87,6 +87,101 @@ def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: s
 # -------------------------------------------
 
 
+# ---------- Auto Kalman Telegram Alert Helper ----------
+def maybe_send_kalman_live_telegram_alert(
+    tg_alerts_on: bool,
+    tg_bot_token: str,
+    tg_chat_id: str,
+    symbol_hint=None,
+    signal_hint=None,
+    price_hint=None,
+    strategy_hint="Kalman Live Decision",
+    reason_hint="Kalman live signal changed.",
+):
+    """Send one Telegram alert when Kalman live BUY/SELL signal changes. Notification only."""
+    try:
+        if not tg_alerts_on:
+            return
+
+        # Try to infer values from explicit hints first, then from globals.
+        g = globals()
+
+        ticker = symbol_hint
+        if ticker is None:
+            for k in ["ticker", "symbol", "selected_ticker", "kalman_ticker", "live_ticker", "asset"]:
+                v = g.get(k)
+                if isinstance(v, str) and v.strip():
+                    ticker = v.strip().upper()
+                    break
+        if ticker is None:
+            ticker = "UNKNOWN"
+
+        signal = signal_hint
+        if signal is None:
+            for k in [
+                "kalman_live_signal",
+                "live_signal",
+                "latest_signal",
+                "current_signal",
+                "signal",
+                "decision",
+                "trade_signal",
+            ]:
+                v = g.get(k)
+                if isinstance(v, str) and v.strip():
+                    signal = v.strip().upper()
+                    break
+
+        if signal is None:
+            return
+
+        signal_upper = str(signal).strip().upper()
+        if "BUY" in signal_upper:
+            clean_signal = "BUY"
+        elif "SELL" in signal_upper or "EXIT" in signal_upper:
+            clean_signal = "SELL"
+        else:
+            return
+
+        price = price_hint
+        if price is None:
+            for k in ["latest_price", "current_price", "live_price", "last_price", "price", "close"]:
+                v = g.get(k)
+                try:
+                    if v is not None:
+                        price = float(v)
+                        break
+                except Exception:
+                    pass
+
+        price_txt = "N/A" if price is None else f"{float(price):.2f}"
+
+        now_ct = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
+        key = f"KALMAN_LIVE::{ticker}::{clean_signal}::{price_txt}"
+
+        msg = (
+            "PINEHURST KALMAN LIVE ALERT\n"
+            f"Ticker: {ticker}\n"
+            f"Signal: {clean_signal}\n"
+            f"Price: {price_txt}\n"
+            f"Time: {now_ct}\n"
+            f"Strategy: {strategy_hint}\n"
+            f"Reason: {reason_hint}\n"
+            "Action: Notification only — no IBKR order sent."
+        )
+
+        ok, resp = telegram_alert_once(key, tg_bot_token, tg_chat_id, msg)
+        if ok:
+            st.toast(f"Telegram Kalman alert sent: {ticker} {clean_signal}", icon="📲")
+        else:
+            st.warning(f"Telegram Kalman alert failed: {resp}")
+
+    except Exception as e:
+        st.warning(f"Telegram Kalman alert skipped: {e}")
+# ------------------------------------------------------
+
+
+
 
 # Databento is optional and lazy-loaded only when the user clicks the pull button.
 # This prevents Databento/package/network issues from slowing or blocking the app load.
@@ -6733,6 +6828,41 @@ with st.sidebar:
             st.error(f"Telegram test failed: {resp}")
 
     st.caption("Alerts are notification-only. No IBKR order is sent from Telegram alerts.")
+
+    auto_kalman_alerts_on = st.checkbox(
+        "Auto-alert Kalman Live BUY/SELL",
+        value=False,
+        help="Sends Telegram once when the Kalman live decision changes to BUY or SELL. Notification only."
+    )
+
+
+    st.subheader("Manual Signal Alert")
+    manual_alert_ticker = st.text_input("Alert Ticker", value="AAPL")
+    manual_alert_signal = st.selectbox("Alert Signal", ["BUY", "SELL", "HOLD / WATCH"], index=0)
+    manual_alert_price = st.text_input("Alert Price", value="")
+    manual_alert_strategy = st.text_input("Alert Strategy", value="Kalman / Live Decision")
+    manual_alert_reason = st.text_area(
+        "Alert Reason",
+        value="Model signal confirmed. Review chart before taking action.",
+        height=80,
+    )
+
+    if st.button("Send Manual Signal Alert", use_container_width=True):
+        manual_msg = (
+            "PINEHURST QUANT ALERT\n"
+            f"Ticker: {manual_alert_ticker}\n"
+            f"Signal: {manual_alert_signal}\n"
+            f"Price: {manual_alert_price if manual_alert_price else 'N/A'}\n"
+            f"Strategy: {manual_alert_strategy}\n"
+            f"Reason: {manual_alert_reason}\n"
+            "Action: Notification only — no order sent."
+        )
+        ok, resp = send_telegram_alert(tg_bot_token, tg_chat_id, manual_msg)
+        if ok:
+            st.success("Manual signal alert sent to Telegram.")
+        else:
+            st.error(f"Manual signal alert failed: {resp}")
+
 
     alert_enabled = st.toggle(
         "Enable live signal alerts",
@@ -19416,3 +19546,18 @@ except Exception as e:
 
 st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
+
+
+
+# Auto Telegram alert hook for Kalman live decision.
+try:
+    maybe_send_kalman_live_telegram_alert(
+        tg_alerts_on=bool(tg_alerts_on and auto_kalman_alerts_on),
+        tg_bot_token=tg_bot_token,
+        tg_chat_id=tg_chat_id,
+        strategy_hint="Kalman Live Decision",
+        reason_hint="Kalman live BUY/SELL condition detected by the app.",
+    )
+except Exception:
+    pass
+
