@@ -56,15 +56,24 @@ def load_telegram_settings():
         pass
     return {}
 
-def save_telegram_settings(bot_token: str, chat_id: str, enabled: bool, auto_kalman: bool):
+def save_telegram_settings(bot_token: str, chat_id: str, enabled: bool, auto_kalman: bool, **extra):
     try:
         p = _telegram_settings_path()
-        data = {
+        data = load_telegram_settings()
+        data.update({
             "bot_token": str(bot_token).strip(),
             "chat_id": str(chat_id).strip(),
             "enabled": bool(enabled),
             "auto_kalman": bool(auto_kalman),
-        }
+        })
+        for k, v in extra.items():
+            try:
+                if isinstance(v, (str, int, float, bool)) or v is None:
+                    data[k] = v
+                else:
+                    data[k] = str(v)
+            except Exception:
+                pass
         p.write_text(json.dumps(data, indent=2))
         return True, str(p)
     except Exception as e:
@@ -92,6 +101,67 @@ def _clean_trade_log_numbers(df):
     except Exception:
         return df
 
+
+
+def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
+    """Copy main BUY/SELL trade-log state into scanner row. No separate signal math."""
+    try:
+        tkr = str(ticker).upper()
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return {
+                "Ticker": tkr,
+                "Alert Signal": "NO NEW ALERT",
+                "Trade Position": "CASH",
+                "Price": round(float(latest_price), 2) if latest_price is not None else None,
+                "Candle Close CT": str(latest_time) if latest_time is not None else "",
+                "Alert": "No trade log row",
+            }
+
+        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
+        last = t.iloc[-1]
+        row_txt = " ".join([str(x) for x in last.values]).upper()
+        is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
+        is_long = ("LONG" in row_txt) or is_open
+
+        px = latest_price
+        for c in ["Current Price", "Exit Price", "Exit", "Last Price", "Price"]:
+            if c in t.columns:
+                try:
+                    v = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
+                    if pd.notna(v):
+                        px = float(v)
+                        break
+                except Exception:
+                    pass
+
+        tm = latest_time
+        for c in ["Entry CT", "Entry Time", "Entry", "Date", "Time"]:
+            if c in t.columns:
+                try:
+                    val = str(last[c])
+                    if val and val.lower() != "nan":
+                        tm = val
+                        break
+                except Exception:
+                    pass
+
+        return {
+            "Ticker": tkr,
+            "Alert Signal": "NO NEW ALERT",
+            "Trade Position": "LONG" if is_long else "CASH",
+            "Price": round(float(px), 2) if px is not None and str(px) != "" else None,
+            "Candle Close CT": str(tm) if tm is not None else "",
+            "Alert": "Copied from main trade log",
+        }
+    except Exception as e:
+        return {
+            "Ticker": str(ticker).upper(),
+            "Alert Signal": "ERROR",
+            "Trade Position": "UNKNOWN",
+            "Price": None,
+            "Candle Close CT": "",
+            "Alert": str(e)[:120],
+        }
 
 # ---------- Kalman 15m Watchlist Telegram Scanner ----------
 def _kalman_alert_ledger_path():
@@ -233,13 +303,76 @@ def _kalman_15m_signal_from_prices(px):
 
     return alert_signal, float(px.iloc[-1]), px.index[-1], prev, latest, trade_position
 
+
 def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, show_table=True):
-    """Scan 3-4 tickers on 15m completed bars and send Telegram only on fresh BUY/SELL transitions."""
+    """
+    Scanner/thesis table mirrors the main BUY/SELL trade-log state.
+    It does not run a separate signal that can disagree with the main graph/trade log.
+    """
     rows = []
-    if not tg_on:
+    symbols = _normalize_watchlist(watchlist)
+    if not symbols:
         if show_table:
-            st.info("Telegram alerts are OFF. Turn on Enable Telegram Alerts and Auto-alert Kalman 15m Watchlist.")
+            st.warning("Add at least one ticker to the Kalman 15m watchlist.")
         return rows
+
+    ledger = _load_kalman_alert_ledger()
+
+    for sym in symbols[:12]:
+        try:
+            fig, trades_df, info = _kalman_15m_trend_rail_report(sym)
+            latest_price = None
+            latest_time = ""
+            if isinstance(info, dict):
+                latest_price = info.get("Latest Price")
+                latest_time = info.get("Latest Completed Candle CT", "")
+
+            row = _status_from_main_trade_log(sym, trades_df, latest_price=latest_price, latest_time=latest_time)
+
+            if tg_on and trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                t = _clean_trade_log_numbers(trades_df).copy()
+                last = t.iloc[-1]
+                row_txt = " ".join([str(x) for x in last.values]).upper()
+                is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
+                sig = "BUY" if is_open else "SELL"
+
+                event_time = ""
+                for c in ["Entry CT", "Exit CT", "Entry Time", "Exit Time"]:
+                    if c in t.columns:
+                        val = str(last.get(c, ""))
+                        if val and val.lower() != "nan":
+                            event_time = val
+                            break
+                if not event_time:
+                    event_time = str(latest_time)
+
+                ledger_key = f"{sym}|MAIN_TRADE_LOG|{sig}|{event_time}"
+                if ledger.get(sym) != ledger_key:
+                    # Sync the event so reboot does not spam old alerts.
+                    ledger[sym] = ledger_key
+                    _save_kalman_alert_ledger(ledger)
+                    row["Alert"] = "Synced from main trade log"
+                else:
+                    row["Alert"] = "Already synced"
+
+            rows.append(row)
+        except Exception as e:
+            rows.append({
+                "Ticker": sym,
+                "Alert Signal": "ERROR",
+                "Trade Position": "UNKNOWN",
+                "Price": None,
+                "Candle Close CT": "",
+                "Alert": str(e)[:120],
+            })
+
+    if show_table:
+        try:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception:
+            st.write(rows)
+    return rows
+
 
     symbols = _normalize_watchlist(watchlist)
     if not symbols:
@@ -7223,6 +7356,20 @@ with st.sidebar:
 
     st.divider()
     st.header("📲 Telegram Signal Alerts")
+    with st.expander("Keep Telegram settings after Streamlit Cloud reboot", expanded=False):
+        st.markdown("""
+        **Local Mac:** this app auto-saves settings to a local file.
+
+        **Streamlit Cloud/personal website:** app files can reset after reboot/redeploy.  
+        Put these in **App settings → Secrets**:
+
+        ```toml
+        TELEGRAM_BOT_TOKEN = "your_bot_token"
+        TELEGRAM_CHAT_ID = "your_chat_id"
+        ```
+
+        Then the app will prefill them even after cloud reboot.
+        """)
     _tg_saved = load_telegram_settings()
 
     tg_alerts_on = st.checkbox(
@@ -7263,7 +7410,15 @@ with st.sidebar:
     )
 
     if st.button("Save Telegram Settings on This Mac", use_container_width=True):
-        _ok_save, _save_msg = save_telegram_settings(tg_bot_token, tg_chat_id, tg_alerts_on, auto_kalman_alerts_on)
+        _ok_save, _save_msg = save_telegram_settings(
+            tg_bot_token,
+            tg_chat_id,
+            tg_alerts_on,
+            auto_kalman_alerts_on,
+            kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
+            auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", False))),
+            auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", False))),
+        )
         if _ok_save:
             st.success("Telegram settings saved on this Mac. Refresh will keep them.")
         else:
@@ -7271,7 +7426,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Kalman 15m Auto Alert Scanner")
-    st.info("This scanner follows the main Kalman 15m trade-log-style position. NO NEW ALERT means no fresh transition; Trade Position still shows LONG if a trade is open. Risk Firewall is OFF.")
+    st.info("This scanner is copied from the main BUY/SELL trade log. NO NEW ALERT means no fresh new row; Trade Position still shows LONG if the main log has an open Long.")
     kalman_15m_watchlist = st.text_area(
         "Kalman 15m Watchlist",
         value=_tg_saved.get("kalman_15m_watchlist", "AAPL, PLTR, RKLB, QBTS"),
@@ -7288,6 +7443,21 @@ with st.sidebar:
         value=bool(_tg_saved.get("auto_refresh_15m", False)),
         help="Keeps the Streamlit page refreshing so the scanner can check for new 15m signals."
     )
+
+    # Auto-save Telegram/scanner settings on every rerun so refresh/reboot does not wipe fields.
+    try:
+        save_telegram_settings(
+            tg_bot_token,
+            tg_chat_id,
+            tg_alerts_on,
+            auto_kalman_alerts_on,
+            kalman_15m_watchlist=str(kalman_15m_watchlist).strip(),
+            auto_kalman_15m_watchlist=bool(auto_kalman_15m_watchlist_on),
+            auto_refresh_15m=bool(auto_refresh_15m_on),
+        )
+        st.caption(f"Settings auto-saved locally: {_telegram_settings_path()}")
+    except Exception as _e:
+        st.caption(f"Settings auto-save skipped: {_e}")
 
     if st.button("Save 15m Scanner Settings", use_container_width=True):
         _tg_saved["bot_token"] = str(tg_bot_token).strip()
