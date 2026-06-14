@@ -71,6 +71,173 @@ def save_telegram_settings(bot_token: str, chat_id: str, enabled: bool, auto_kal
         return False, str(e)
 # --------------------------------------------------------
 
+
+# ---------- Kalman 15m Watchlist Telegram Scanner ----------
+def _kalman_alert_ledger_path():
+    try:
+        return _Path.home() / ".pinehurst_kalman_15m_alert_ledger.json"
+    except Exception:
+        return _Path(".pinehurst_kalman_15m_alert_ledger.json")
+
+def _load_kalman_alert_ledger():
+    try:
+        p = _kalman_alert_ledger_path()
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_kalman_alert_ledger(data):
+    try:
+        _kalman_alert_ledger_path().write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+def _normalize_watchlist(raw):
+    try:
+        return [x.strip().upper() for x in str(raw).replace("\n", ",").split(",") if x.strip()]
+    except Exception:
+        return []
+
+def _fetch_15m_completed_bars(ticker, period="5d"):
+    """Fetch 15m bars and drop the currently-forming bar to avoid repaint-like alerts."""
+    df = yf.download(
+        ticker,
+        period=period,
+        interval="15m",
+        progress=False,
+        auto_adjust=True,
+        prepost=False,
+        threads=False,
+    )
+    if df is None or len(df) < 60:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    close_col = "Close" if "Close" in df.columns else df.columns[-1]
+    px = pd.Series(df[close_col]).dropna().astype(float)
+    if len(px) < 60:
+        return None
+
+    # yfinance intraday is normally US/Eastern. Convert to CT, then remove tz for display.
+    try:
+        if px.index.tz is None:
+            px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
+        px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
+    except Exception:
+        pass
+
+    # Drop latest bar because it may still be forming.
+    if len(px) > 2:
+        px = px.iloc[:-1]
+
+    return px.dropna()
+
+def _kalman_15m_signal_from_prices(px):
+    """
+    Causal Kalman 15m signal based on the same institutional rail concept used in the Kalman tab.
+    Returns latest signal, latest price, latest candle time, and prior signal.
+    """
+    rail, center, long_state = institutional_trend_rail(
+        px,
+        fast_gain=0.34,
+        slow_gain=0.055,
+        polish_span=3,
+        atr_window=14,
+        atr_mult=1.15,
+    )
+    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
+    state_s = pd.Series(long_state, index=px.index).astype(bool)
+
+    # Position only when price is above the trend rail and rail state is bullish.
+    raw_signal = ((px > rail_s) & state_s).astype(int)
+    safe_signal = apply_kalman_risk_firewall(
+        px,
+        raw_signal,
+        rail_s,
+        max_trade_loss_pct=8.0,
+        trail_stop_pct=10.0,
+        equity_dd_stop_pct=20.0,
+        cooldown_bars=4,
+    ).astype(int)
+
+    latest = int(safe_signal.iloc[-1])
+    prev = int(safe_signal.iloc[-2]) if len(safe_signal) >= 2 else latest
+    latest_signal = "BUY" if latest == 1 and prev == 0 else ("SELL" if latest == 0 and prev == 1 else "HOLD")
+    return latest_signal, float(px.iloc[-1]), px.index[-1], prev, latest
+
+def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, show_table=True):
+    """Scan 3-4 tickers on 15m completed bars and send Telegram only on fresh BUY/SELL transitions."""
+    rows = []
+    if not tg_on:
+        if show_table:
+            st.info("Telegram alerts are OFF. Turn on Enable Telegram Alerts and Auto-alert Kalman 15m Watchlist.")
+        return rows
+
+    symbols = _normalize_watchlist(watchlist)
+    if not symbols:
+        if show_table:
+            st.warning("Add at least one ticker to the Kalman 15m watchlist.")
+        return rows
+
+    ledger = _load_kalman_alert_ledger()
+
+    for sym in symbols[:12]:
+        try:
+            px = _fetch_15m_completed_bars(sym, period="5d")
+            if px is None or len(px) < 60:
+                rows.append({"Ticker": sym, "Signal": "NO DATA", "Price": None, "Candle CT": "", "Alert": "No"})
+                continue
+
+            sig, price, candle_time, prev_state, latest_state = _kalman_15m_signal_from_prices(px)
+            candle_txt = pd.Timestamp(candle_time).strftime("%Y-%m-%d %I:%M %p CT")
+            alert_status = "No"
+
+            if sig in ["BUY", "SELL"]:
+                ledger_key = f"{sym}|15m|{sig}|{candle_txt}"
+                if ledger.get(sym) != ledger_key:
+                    msg = (
+                        "PINEHURST KALMAN 15M ALERT\n"
+                        f"Ticker: {sym}\n"
+                        f"Signal: {sig}\n"
+                        f"Price: {price:.2f}\n"
+                        f"Candle closed: {candle_txt}\n"
+                        "Strategy: Kalman Live Decision / 15m completed candle\n"
+                        "Reason: Signal changed on the latest completed 15m candle.\n"
+                        "Action: Notification only — no IBKR order sent."
+                    )
+                    ok, resp = send_telegram_alert(token, chat_id, msg)
+                    if ok:
+                        ledger[sym] = ledger_key
+                        _save_kalman_alert_ledger(ledger)
+                        alert_status = "Sent"
+                    else:
+                        alert_status = f"Failed: {str(resp)[:90]}"
+                else:
+                    alert_status = "Already sent"
+
+            rows.append({
+                "Ticker": sym,
+                "Signal": sig,
+                "Position": "LONG" if latest_state == 1 else "CASH",
+                "Price": round(price, 2),
+                "Candle CT": candle_txt,
+                "Alert": alert_status,
+            })
+        except Exception as e:
+            rows.append({"Ticker": sym, "Signal": "ERROR", "Price": None, "Candle CT": "", "Alert": str(e)[:120]})
+
+    if show_table:
+        try:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception:
+            st.write(rows)
+    return rows
+# ---------------------------------------------------------
+
 # ---------- Telegram Alert Helpers ----------
 def send_telegram_alert(bot_token: str, chat_id: str, message: str):
     """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
@@ -6876,6 +7043,64 @@ with st.sidebar:
             st.success("Telegram settings saved on this Mac. Refresh will keep them.")
         else:
             st.error(f"Could not save Telegram settings: {_save_msg}")
+
+    st.divider()
+    st.subheader("Kalman 15m Auto Alert Scanner")
+    kalman_15m_watchlist = st.text_area(
+        "Kalman 15m Watchlist",
+        value=_tg_saved.get("kalman_15m_watchlist", "AAPL, PLTR, RKLB, QBTS"),
+        height=70,
+        help="Use 3-4 tickers for best speed. Example: AAPL, PLTR, RKLB, QBTS"
+    )
+    auto_kalman_15m_watchlist_on = st.checkbox(
+        "Auto-alert Kalman 15m Watchlist",
+        value=bool(_tg_saved.get("auto_kalman_15m_watchlist", False)),
+        help="Scans selected tickers on completed 15m candles and sends Telegram BUY/SELL alerts once."
+    )
+    auto_refresh_15m_on = st.checkbox(
+        "Auto-refresh scanner every 60 seconds",
+        value=bool(_tg_saved.get("auto_refresh_15m", False)),
+        help="Keeps the Streamlit page refreshing so the scanner can check for new 15m signals."
+    )
+
+    if st.button("Save 15m Scanner Settings", use_container_width=True):
+        _tg_saved["bot_token"] = str(tg_bot_token).strip()
+        _tg_saved["chat_id"] = str(tg_chat_id).strip()
+        _tg_saved["enabled"] = bool(tg_alerts_on)
+        _tg_saved["auto_kalman"] = bool(auto_kalman_alerts_on)
+        _tg_saved["kalman_15m_watchlist"] = str(kalman_15m_watchlist).strip()
+        _tg_saved["auto_kalman_15m_watchlist"] = bool(auto_kalman_15m_watchlist_on)
+        _tg_saved["auto_refresh_15m"] = bool(auto_refresh_15m_on)
+        try:
+            _telegram_settings_path().write_text(json.dumps(_tg_saved, indent=2))
+            st.success("Kalman 15m scanner settings saved.")
+        except Exception as _e:
+            st.error(f"Could not save scanner settings: {_e}")
+
+    if st.button("Scan Kalman 15m Watchlist Now", use_container_width=True):
+        run_kalman_15m_watchlist_telegram_scan(
+            kalman_15m_watchlist,
+            bool(tg_alerts_on and auto_kalman_15m_watchlist_on),
+            tg_bot_token,
+            tg_chat_id,
+            show_table=True,
+        )
+
+    if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
+        st.caption("Auto scanner is active. It uses completed 15m candles only.")
+        run_kalman_15m_watchlist_telegram_scan(
+            kalman_15m_watchlist,
+            True,
+            tg_bot_token,
+            tg_chat_id,
+            show_table=True,
+        )
+
+    if bool(auto_refresh_15m_on and tg_alerts_on and auto_kalman_15m_watchlist_on):
+        st.components.v1.html(
+            "<script>setTimeout(function(){ window.parent.location.reload(); }, 60000);</script>",
+            height=0,
+        )
 
 
     st.subheader("Manual Signal Alert")
