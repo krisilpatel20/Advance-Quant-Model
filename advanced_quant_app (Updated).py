@@ -494,7 +494,7 @@ def _kalman_15m_signal_from_prices(px):
         slow_gain=0.055,
         polish_span=3,
         atr_window=14,
-        atr_mult=1.15,
+        atr_mult=1.35,
     )
     rail_s = pd.Series(rail, index=px.index).ffill().bfill()
     state_s = pd.Series(long_state, index=px.index).astype(bool)
@@ -578,7 +578,7 @@ def _kalman_15m_trend_rail_report(ticker):
         slow_gain=0.055,
         polish_span=3,
         atr_window=14,
-        atr_mult=1.15,
+        atr_mult=1.35,
     )
     rail_s = pd.Series(rail, index=px.index).ffill().bfill()
     state_s = pd.Series(long_state, index=px.index).astype(bool)
@@ -1816,7 +1816,7 @@ def zero_lag_ema_trend(prices, span=10):
         return pd.Series(prices).ewm(span=max(2, int(span)), adjust=False).mean().values
 
 
-def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_span=3, atr_window=14, atr_mult=1.15):
+def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_span=3, atr_window=14, atr_mult=1.35):
     """
     Directional trend rail for the Kalman tab.
 
@@ -7758,6 +7758,7 @@ with st.sidebar:
     PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
+    st.success("Live Mode default: ON | Default timeframe: 15m | Institutional Trend Rail ATR multiplier: 1.35")
 
     st.divider()
     st.subheader("✅ Main Kalman Signal Verify")
@@ -7964,7 +7965,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF. Non-repainting ledger keeps saved OPEN until a valid future SELL after entry.")
+    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF.")
     _mon_saved = _load_main_kalman_monitor_settings()
     main_kalman_monitor_watchlist = st.text_area(
         "Stocks to monitor with Main Kalman Trade-Log model",
