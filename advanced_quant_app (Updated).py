@@ -610,6 +610,7 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     - slope confirmation ON
     - ATR safety exit ON
     - risk firewall OFF
+    - Trend Rail ATR multiplier 1.35
     """
     ticker = str(ticker).upper()
     px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
@@ -622,7 +623,7 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
         slow_gain=0.055,
         polish_span=3,
         atr_window=14,
-        atr_mult=1.15,
+        atr_mult=1.35,
     )
     bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
 
@@ -746,97 +747,223 @@ def _save_main_kalman_watchlist_ledger(data):
     except Exception:
         pass
 
+def _parse_ct_time_safe(x):
+    try:
+        s = str(x).replace(" CT", "").strip()
+        if not s or s.lower() == "open" or s.lower() == "nan":
+            return None
+        return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        return None
+
+def _candidate_from_main_watchlist_trades(sym, trades_df, row):
+    """Convert recalculated trade log into a candidate state. Candidate is NOT truth."""
+    sym = str(sym).upper()
+    if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+        return {
+            "position": "CASH",
+            "signal": "NONE",
+            "entry_time": "",
+            "exit_time": "",
+            "event_time": "",
+            "price": row.get("Price") if isinstance(row, dict) else None,
+            "state_key": f"{sym}|CASH|NO_TRADES",
+            "raw_status": "NO_TRADES",
+        }
+
+    last = trades_df.iloc[-1]
+    status = str(last.get("Status", "")).upper()
+    entry_time = str(last.get("Entry CT", ""))
+    exit_time = str(last.get("Exit CT", ""))
+    price = row.get("Price") if isinstance(row, dict) else None
+
+    if status == "OPEN":
+        position = "LONG"
+        signal = "BUY"
+        event_time = entry_time
+    else:
+        position = "CASH"
+        signal = "SELL"
+        event_time = exit_time if exit_time and exit_time.upper() != "OPEN" else entry_time
+
+    state_key = f"{sym}|{signal}|{event_time}|{status}|{last.get('Entry Price')}|{last.get('Exit/Current Price')}"
+    return {
+        "position": position,
+        "signal": signal,
+        "entry_time": entry_time,
+        "exit_time": exit_time,
+        "event_time": event_time,
+        "price": price,
+        "state_key": state_key,
+        "raw_status": status,
+        "entry_price": last.get("Entry Price", None),
+        "exit_current_price": last.get("Exit/Current Price", None),
+        "pnl_pct": last.get("PnL (%)", None),
+    }
+
 def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True):
     """
-    Watchlist monitor ONLY.
+    Non-repainting watchlist monitor.
 
-    Important behavior:
-    - Main Ticker does NOT trigger Telegram.
-    - First scan only baselines/syncs current state, no Telegram.
-    - Telegram sends only when a watched ticker's latest trade-log state changes after baseline.
+    Main Ticker is view-only.
+    First scan baselines current state without Telegram.
+    After baseline, saved ledger is truth.
+    If recalculated backtest loses an open trade, ledger keeps it open.
+    A LONG closes only when a future SELL/closed event occurs after saved entry time.
     """
     symbols = _normalize_watchlist(raw_watchlist)
     ledger = _load_main_kalman_watchlist_ledger()
     rows = []
 
     for sym in symbols[:12]:
+        sym = str(sym).upper()
         try:
             px = _main_monitor_fetch_15m(sym, period="60d")
             if px is None or len(px) < 80:
-                rows.append({
-                    "Ticker": sym,
-                    "Alert Signal": "NO DATA",
-                    "Trade Position": "UNKNOWN",
-                    "Price": None,
-                    "Candle Close CT": "",
-                    "Source": "Not enough 15m data",
-                })
+                saved = ledger.get(sym)
+                if isinstance(saved, dict):
+                    rows.append({
+                        "Ticker": sym,
+                        "Alert Signal": "NO DATA",
+                        "Trade Position": saved.get("position", "UNKNOWN"),
+                        "Price": saved.get("price", None),
+                        "Candle Close CT": saved.get("last_scan_ct", ""),
+                        "Ledger Note": "Using saved ledger; no fresh data",
+                    })
+                else:
+                    rows.append({
+                        "Ticker": sym,
+                        "Alert Signal": "NO DATA",
+                        "Trade Position": "UNKNOWN",
+                        "Price": None,
+                        "Candle Close CT": "",
+                        "Ledger Note": "Not enough 15m data",
+                    })
                 continue
 
-            trades_df, row = _build_main_kalman_trade_log_from_prices(sym, px)
+            trades_df, raw_row = _build_main_kalman_trade_log_from_prices(sym, px)
+            cand = _candidate_from_main_watchlist_trades(sym, trades_df, raw_row or {})
+            now_ct_txt = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
+            candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
+            alert_signal = "NO NEW ALERT"
+            note = "No change since last scan"
 
-            if trades_df is not None and not trades_df.empty:
-                last = trades_df.iloc[-1]
-                status = str(last.get("Status", ""))
-                event_time = str(last.get("Entry CT", ""))
-                signal = "BUY" if status.lower() == "open" else "SELL"
-                if status.lower() != "open":
-                    event_time = str(last.get("Exit CT", event_time))
+            saved = ledger.get(sym)
+            if saved is not None and not isinstance(saved, dict):
+                saved = None
 
-                row["Alert Signal"] = "NO NEW ALERT"
-
-                state_key = (
-                    f"{sym}|{signal}|{event_time}|{status}|"
-                    f"{last.get('Entry Price')}|{last.get('Exit/Current Price')}"
-                )
-
-                # FIRST TIME: baseline only, no Telegram. This prevents old DELL/NBIS open trades
-                # from sending just because you typed the ticker or rebooted the app.
-                if sym not in ledger:
-                    ledger[sym] = state_key
-                    _save_main_kalman_watchlist_ledger(ledger)
-                    row["Source"] = "Baseline synced — no alert sent"
-                elif ledger.get(sym) != state_key:
-                    # Real fresh change after baseline.
-                    row["Alert Signal"] = signal
-                    if send_telegram:
-                        msg = (
-                            "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
-                            f"Ticker: {sym}\n"
-                            f"Signal: {signal}\n"
-                            f"Trade Position: {row.get('Trade Position')}\n"
-                            f"Price: {row.get('Price')}\n"
-                            f"Event Time: {event_time}\n"
-                            "Source: Main Kalman Watchlist Monitor\n"
-                            "Action: Notification only — no IBKR order sent."
-                        )
-                        ok, resp = send_telegram_alert(token, chat_id, msg)
-                        row["Source"] = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
-                    else:
-                        row["Source"] = "Signal changed — Telegram OFF"
-                    ledger[sym] = state_key
-                    _save_main_kalman_watchlist_ledger(ledger)
-                else:
-                    row["Source"] = "No change since last scan"
-
+            if saved is None:
+                saved = {
+                    "ticker": sym,
+                    "position": cand["position"],
+                    "entry_time": cand.get("entry_time", ""),
+                    "exit_time": cand.get("exit_time", ""),
+                    "event_time": cand.get("event_time", ""),
+                    "state_key": cand.get("state_key", ""),
+                    "price": cand.get("price", None),
+                    "entry_price": cand.get("entry_price", None),
+                    "exit_current_price": cand.get("exit_current_price", None),
+                    "pnl_pct": cand.get("pnl_pct", None),
+                    "last_scan_ct": now_ct_txt,
+                }
+                ledger[sym] = saved
+                _save_main_kalman_watchlist_ledger(ledger)
+                note = "Baseline synced — no alert sent"
             else:
-                # No trade history = cash baseline
-                state_key = f"{sym}|CASH|NO_TRADES"
-                row["Alert Signal"] = "NO NEW ALERT"
-                row["Trade Position"] = "CASH"
-                if sym not in ledger:
-                    ledger[sym] = state_key
-                    _save_main_kalman_watchlist_ledger(ledger)
-                    row["Source"] = "Baseline synced — no alert sent"
-                elif ledger.get(sym) != state_key:
-                    row["Alert Signal"] = "SELL"
-                    row["Source"] = "Moved to CASH"
-                    ledger[sym] = state_key
-                    _save_main_kalman_watchlist_ledger(ledger)
-                else:
-                    row["Source"] = "No change since last scan"
+                saved_pos = str(saved.get("position", "CASH")).upper()
+                cand_pos = str(cand.get("position", "CASH")).upper()
 
-            rows.append(row)
+                saved_entry_dt = _parse_ct_time_safe(saved.get("entry_time", ""))
+                cand_entry_dt = _parse_ct_time_safe(cand.get("entry_time", ""))
+                cand_exit_dt = _parse_ct_time_safe(cand.get("exit_time", ""))
+
+                if saved_pos == "LONG":
+                    valid_future_close = (
+                        cand_pos == "CASH"
+                        and cand_exit_dt is not None
+                        and saved_entry_dt is not None
+                        and cand_exit_dt > saved_entry_dt
+                    )
+
+                    if valid_future_close:
+                        alert_signal = "SELL"
+                        saved.update({
+                            "position": "CASH",
+                            "exit_time": cand.get("exit_time", ""),
+                            "event_time": cand.get("event_time", ""),
+                            "state_key": cand.get("state_key", ""),
+                            "price": cand.get("price", saved.get("price")),
+                            "exit_current_price": cand.get("exit_current_price", None),
+                            "pnl_pct": cand.get("pnl_pct", None),
+                            "last_scan_ct": now_ct_txt,
+                        })
+                        note = "Valid future SELL confirmed — ledger closed"
+                    else:
+                        saved.update({
+                            "price": cand.get("price", saved.get("price")),
+                            "exit_current_price": cand.get("exit_current_price", saved.get("exit_current_price")),
+                            "pnl_pct": cand.get("pnl_pct", saved.get("pnl_pct")),
+                            "last_scan_ct": now_ct_txt,
+                        })
+                        note = "Ledger kept OPEN; recalculation close ignored"
+                else:
+                    saved_event_dt = _parse_ct_time_safe(saved.get("event_time", "")) or _parse_ct_time_safe(saved.get("exit_time", ""))
+                    valid_new_buy = cand_pos == "LONG" and cand_entry_dt is not None
+                    if saved_event_dt is not None and cand_entry_dt is not None:
+                        valid_new_buy = valid_new_buy and cand_entry_dt > saved_event_dt
+
+                    if valid_new_buy:
+                        alert_signal = "BUY"
+                        saved.update({
+                            "position": "LONG",
+                            "entry_time": cand.get("entry_time", ""),
+                            "exit_time": "Open",
+                            "event_time": cand.get("event_time", ""),
+                            "state_key": cand.get("state_key", ""),
+                            "price": cand.get("price", None),
+                            "entry_price": cand.get("entry_price", None),
+                            "exit_current_price": cand.get("exit_current_price", None),
+                            "pnl_pct": cand.get("pnl_pct", None),
+                            "last_scan_ct": now_ct_txt,
+                        })
+                        note = "Valid new BUY confirmed — ledger opened"
+                    else:
+                        saved.update({
+                            "price": cand.get("price", saved.get("price")),
+                            "last_scan_ct": now_ct_txt,
+                        })
+                        note = "Ledger remains CASH"
+
+                ledger[sym] = saved
+                _save_main_kalman_watchlist_ledger(ledger)
+
+                if alert_signal in ["BUY", "SELL"] and send_telegram:
+                    msg = (
+                        "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
+                        f"Ticker: {sym}\n"
+                        f"Signal: {alert_signal}\n"
+                        f"Trade Position: {saved.get('position')}\n"
+                        f"Price: {saved.get('price')}\n"
+                        f"Event Time: {saved.get('event_time')}\n"
+                        "Source: Non-repainting Main Kalman Watchlist Ledger\n"
+                        "Action: Notification only — no IBKR order sent."
+                    )
+                    ok, resp = send_telegram_alert(token, chat_id, msg)
+                    note = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
+
+            rows.append({
+                "Ticker": sym,
+                "Alert Signal": alert_signal,
+                "Trade Position": saved.get("position", "UNKNOWN"),
+                "Price": round(float(saved.get("price")), 2) if saved.get("price") is not None else None,
+                "Candle Close CT": candle_ct,
+                "Entry CT": saved.get("entry_time", ""),
+                "Exit CT": saved.get("exit_time", ""),
+                "Entry Price": saved.get("entry_price", None),
+                "Current/Exit Price": saved.get("exit_current_price", None),
+                "PnL (%)": saved.get("pnl_pct", None),
+                "Ledger Note": note,
+            })
         except Exception as e:
             rows.append({
                 "Ticker": sym,
@@ -844,7 +971,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 "Trade Position": "UNKNOWN",
                 "Price": None,
                 "Candle Close CT": "",
-                "Source": str(e)[:120],
+                "Ledger Note": str(e)[:120],
             })
 
     df_rows = pd.DataFrame(rows)
@@ -7703,7 +7830,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF.")
+    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF. Non-repainting ledger keeps saved OPEN until a valid future SELL after entry.")
     _mon_saved = _load_main_kalman_monitor_settings()
     main_kalman_monitor_watchlist = st.text_area(
         "Stocks to monitor with Main Kalman Trade-Log model",
@@ -7738,6 +7865,34 @@ with st.sidebar:
             st.success("Watchlist alert baseline cleared. Next scan will sync current states without sending alerts.")
         except Exception as _e:
             st.error(f"Could not reset baseline: {_e}")
+
+    with st.expander("Manual ledger correction", expanded=False):
+        st.caption("Use only if the main trade log already showed an open position and a refresh wrongly removed it.")
+        _ov_ticker = st.text_input("Override ticker", value="DELL").upper()
+        _ov_entry = st.text_input("Open entry time CT", value="2026-06-11 14:30:00 CT")
+        _ov_entry_price = st.number_input("Open entry price", value=391.75, step=0.01)
+        _ov_current_price = st.number_input("Current price", value=395.58, step=0.01)
+        if st.button("Force ledger to OPEN/LONG", use_container_width=True):
+            try:
+                _ledger = _load_main_kalman_watchlist_ledger()
+                _pnl = ((_ov_current_price / _ov_entry_price) - 1.0) * 100.0 if _ov_entry_price else 0.0
+                _ledger[_ov_ticker] = {
+                    "ticker": _ov_ticker,
+                    "position": "LONG",
+                    "entry_time": _ov_entry,
+                    "exit_time": "Open",
+                    "event_time": _ov_entry,
+                    "state_key": f"{_ov_ticker}|BUY|{_ov_entry}|OPEN|{_ov_entry_price}|{_ov_current_price}",
+                    "price": round(float(_ov_current_price), 2),
+                    "entry_price": round(float(_ov_entry_price), 2),
+                    "exit_current_price": round(float(_ov_current_price), 2),
+                    "pnl_pct": round(float(_pnl), 2),
+                    "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                }
+                _save_main_kalman_watchlist_ledger(_ledger)
+                st.success(f"{_ov_ticker} ledger forced to OPEN/LONG. Future valid SELL only will close it.")
+            except Exception as _e:
+                st.error(f"Override failed: {_e}")
 
     if st.button("Run Main Kalman Monitor Now", use_container_width=True):
         _main_mon_rows_manual = run_main_kalman_watchlist_monitor(
