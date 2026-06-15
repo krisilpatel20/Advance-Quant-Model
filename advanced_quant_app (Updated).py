@@ -553,7 +553,7 @@ def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, sho
     """
     symbols = _normalize_watchlist(watchlist)
     rows = []
-    for sym in symbols[:12]:
+    for sym in symbols:
         rows.append({
             "Ticker": sym,
             "Status": "USE MAIN KALMAN TAB",
@@ -935,7 +935,7 @@ def _candidate_from_main_watchlist_trades(sym, trades_df, row):
         "pnl_pct": last.get("PnL (%)", None),
     }
 
-def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True):
+def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50):
     """
     Non-repainting watchlist monitor.
 
@@ -946,10 +946,16 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
     A LONG closes only when a future SELL/closed event occurs after saved entry time.
     """
     symbols = _normalize_watchlist(raw_watchlist)
+    try:
+        max_stocks = int(max_stocks)
+    except Exception:
+        max_stocks = 50
+    if max_stocks > 0:
+        symbols = symbols[:max_stocks]
     ledger = _load_main_kalman_watchlist_ledger()
     rows = []
 
-    for sym in symbols[:12]:
+    for sym in symbols:
         sym = str(sym).upper()
         try:
             px = _main_monitor_fetch_15m(sym, period="60d")
@@ -7910,12 +7916,19 @@ with st.sidebar:
         Then the app will prefill them even after cloud reboot.
         """)
     _tg_saved = load_telegram_settings()
+    try:
+        _tg_saved["enabled"] = True
+        _tg_saved["auto_kalman"] = True
+    except Exception:
+        pass
 
     tg_alerts_on = st.checkbox(
         "Enable Telegram Alerts",
-        value=bool(_tg_saved.get("enabled", True)),
-        help="Saved locally. Turn ON when you want BUY/SELL notifications sent to Telegram."
+        value=True,
+        help="Always ON by default so Telegram notifications are active after refresh/reboot."
     )
+    # Force ON so refresh/reboot or an old saved file cannot silently disable Telegram alerts.
+    tg_alerts_on = True
     tg_bot_token = st.text_input(
         "Telegram Bot Token",
         value=_tg_saved.get("bot_token", st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else ""),
@@ -7952,14 +7965,14 @@ with st.sidebar:
         _ok_save, _save_msg = save_telegram_settings(
             tg_bot_token,
             tg_chat_id,
-            tg_alerts_on,
+            True,
             True,
             kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
             auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", False))),
             auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", False))),
         )
         if _ok_save:
-            st.success("Telegram settings saved on this Mac. Refresh will keep them.")
+            st.success("Telegram settings saved on this Mac. Enable Telegram Alerts will stay ON after refresh/reboot.")
         else:
             st.error(f"Could not save Telegram settings: {_save_msg}")
 
@@ -7968,7 +7981,7 @@ with st.sidebar:
         save_telegram_settings(
             tg_bot_token,
             tg_chat_id,
-            tg_alerts_on,
+            True,
             True,
             kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
             auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", True))),
@@ -7979,7 +7992,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF. Watchlist auto-saves exactly as you edit it and stays locked after refresh/reboot. Auto-refresh is OFF by default.")
+    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF. Watchlist auto-saves exactly as you edit it and stays locked after refresh/reboot. All tickers are monitored up to the Max stocks setting. Auto-refresh is OFF by default.")
     _mon_saved = _load_main_kalman_monitor_settings()
     main_kalman_monitor_watchlist = st.text_area(
         "Stocks to monitor with Main Kalman Trade-Log model",
@@ -7988,10 +8001,20 @@ with st.sidebar:
         help="Add/delete tickers here. Whatever is in this box auto-saves and stays locked after refresh/reboot until you change it again."
     )
 
+    main_kalman_monitor_max_stocks = st.number_input(
+        "Max stocks to monitor",
+        min_value=1,
+        max_value=200,
+        value=int(_mon_saved.get("max_stocks", 50) or 50),
+        step=1,
+        help="Higher number checks more tickers but can load slower. Default 50. Increase this if you want more symbols shown in open/closed status and trade-log monitor."
+    )
+
     # Auto-lock current watchlist on every rerun so refresh/reboot keeps your latest edits.
     try:
         _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
             "enabled": True,
             "refresh": False,
         })
@@ -8011,6 +8034,7 @@ with st.sidebar:
     if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
         _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
             "enabled": True,
             "refresh": False,
         })
@@ -8023,6 +8047,7 @@ with st.sidebar:
     try:
         _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
             "enabled": True,
             "refresh": False,
         })
@@ -8071,6 +8096,7 @@ with st.sidebar:
             token=tg_bot_token,
             chat_id=tg_chat_id,
             show_table=True,
+            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
         )
 
         st.markdown("#### Open / Closed Watchlist Status")
@@ -8103,6 +8129,7 @@ with st.sidebar:
             token=tg_bot_token,
             chat_id=tg_chat_id,
             show_table=True,
+            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
         )
 
         st.markdown("#### Open / Closed Watchlist Status")
