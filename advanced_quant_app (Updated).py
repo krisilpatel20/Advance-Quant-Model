@@ -116,6 +116,140 @@ def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, la
 
 
 
+
+def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest_price=None):
+    """
+    Sync watchlist ledger from the visible MAIN Kalman Trade Log.
+    This fixes cases where main trade log says Open/Long but Thesis Parameters shows CASH.
+    """
+    try:
+        sym = str(ticker).upper()
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return None
+
+        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
+        last = t.iloc[-1]
+        row_txt = " ".join([str(x) for x in last.values]).upper()
+
+        is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
+        position = "LONG" if is_open else "CASH"
+
+        entry_time = ""
+        exit_time = "Open" if is_open else ""
+        entry_price = None
+        current_price = latest_price
+        pnl_pct = None
+
+        for c in ["Entry CT", "Entry Time", "Entry"]:
+            if c in t.columns:
+                v = str(last.get(c, ""))
+                if v and v.lower() != "nan":
+                    entry_time = v
+                    break
+
+        for c in ["Exit CT", "Exit Time", "Exit"]:
+            if c in t.columns:
+                v = str(last.get(c, ""))
+                if v and v.lower() != "nan":
+                    exit_time = v
+                    break
+
+        for c in ["Entry Price", "Entry"]:
+            if c in t.columns:
+                try:
+                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
+                    if pd.notna(vv):
+                        entry_price = round(float(vv), 2)
+                        break
+                except Exception:
+                    pass
+
+        for c in ["Current Price", "Current", "Exit/Current Price", "Exit Price", "Exit", "Price", "Close"]:
+            if c in t.columns:
+                try:
+                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
+                    if pd.notna(vv):
+                        current_price = round(float(vv), 2)
+                        break
+                except Exception:
+                    pass
+
+        # Last fallback: pick last reasonable numeric value as current price.
+        if current_price is None:
+            try:
+                nums = []
+                for v in list(last.values):
+                    vv = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+                    if pd.notna(vv) and 1 < float(vv) < 100000:
+                        nums.append(float(vv))
+                if nums:
+                    current_price = round(float(nums[-1]), 2)
+            except Exception:
+                pass
+
+        for c in ["PnL (%)", "Return (%)", "Return", "Trade Return", "Pnl", "PnL"]:
+            if c in t.columns:
+                try:
+                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
+                    if pd.notna(vv):
+                        pnl_pct = round(float(vv), 2)
+                        break
+                except Exception:
+                    pass
+
+        if pnl_pct is None and entry_price and current_price:
+            try:
+                pnl_pct = round(((float(current_price) / float(entry_price)) - 1.0) * 100.0, 2)
+            except Exception:
+                pnl_pct = None
+
+        event_time = entry_time if is_open else (exit_time or entry_time)
+        state_key = f"{sym}|VISIBLE_MAIN|{'BUY' if is_open else 'SELL'}|{event_time}|{position}|{entry_price}|{current_price}"
+
+        ledger = _load_main_kalman_watchlist_ledger()
+        old = ledger.get(sym, {})
+        # Visible main trade log has priority. If it says OPEN, force ledger LONG.
+        ledger[sym] = {
+            "ticker": sym,
+            "position": position,
+            "entry_time": entry_time,
+            "exit_time": "Open" if is_open else exit_time,
+            "event_time": event_time,
+            "state_key": state_key,
+            "price": current_price,
+            "entry_price": entry_price,
+            "exit_current_price": current_price,
+            "pnl_pct": pnl_pct,
+            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+            "source": "Synced from visible Main Kalman Trade Log",
+        }
+        _save_main_kalman_watchlist_ledger(ledger)
+
+        row = {
+            "Ticker": sym,
+            "Alert Signal": "NO NEW ALERT",
+            "Trade Position": position,
+            "Price": current_price,
+            "Entry CT": entry_time,
+            "Exit CT": "Open" if is_open else exit_time,
+            "PnL (%)": pnl_pct,
+            "Source": "Visible Main Kalman Trade Log",
+        }
+
+        # Update sidebar verify placeholder if available.
+        try:
+            slot = globals().get("main_kalman_verify_slot", None)
+            if slot is not None:
+                with slot.container():
+                    st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+
+        return row
+    except Exception as e:
+        return None
+
+
 def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None):
     """Show the exact main Kalman trade-log status back in Thesis Parameters."""
     try:
@@ -962,7 +1096,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 "Entry Price": saved.get("entry_price", None),
                 "Current/Exit Price": saved.get("exit_current_price", None),
                 "PnL (%)": saved.get("pnl_pct", None),
-                "Ledger Note": note,
+                "Ledger Note": saved.get("source", note) if isinstance(saved, dict) else note,
             })
         except Exception as e:
             rows.append({
@@ -9957,6 +10091,14 @@ if bool(kalman_fast_live_mode):
                 kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
                 kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
                 try:
+                    _sync_watchlist_ledger_from_visible_main_trade_log(
+                        TICKER,
+                        kalman_trades,
+                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                    )
+                except Exception:
+                    pass
+                try:
                     _update_thesis_main_kalman_verify(
                         TICKER,
                         kalman_trades,
@@ -11449,6 +11591,14 @@ with tab4:
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
             kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
             kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
+            try:
+                _sync_watchlist_ledger_from_visible_main_trade_log(
+                    TICKER,
+                    kalman_trades,
+                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                )
+            except Exception:
+                pass
             try:
                 _update_thesis_main_kalman_verify(
                     TICKER,
