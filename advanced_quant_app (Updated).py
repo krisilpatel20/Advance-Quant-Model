@@ -7758,7 +7758,7 @@ with st.sidebar:
     PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
-    st.success("Live Mode default: ON | Default timeframe: 15m | Institutional Trend Rail ATR multiplier: 1.35")
+    st.success("Live Mode default: ON with 15m. Use Enable Live Data toggle to turn OFF when needed. Institutional Trend Rail ATR multiplier: 1.35")
 
     st.divider()
     st.subheader("✅ Main Kalman Signal Verify")
@@ -7825,9 +7825,9 @@ with st.sidebar:
 
     st.divider()
     st.header("⚡ Live Decision Mode")
-    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support. Ignored when Fast intraday-only startup is ON.")
+    live_mode = st.toggle("Enable Live Data", value=True, help="Default ON with 15m. Turn OFF when you want normal historical/daily mode. Ignored when Fast intraday-only startup is ON.")
     if live_mode:
-        data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
+        data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=2)
         st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
         kalman_fast_live_mode = st.toggle(
             "Kalman-only fast live mode",
@@ -7913,7 +7913,7 @@ with st.sidebar:
 
     tg_alerts_on = st.checkbox(
         "Enable Telegram Alerts",
-        value=bool(_tg_saved.get("enabled", False)),
+        value=bool(_tg_saved.get("enabled", True)),
         help="Saved locally. Turn ON when you want BUY/SELL notifications sent to Telegram."
     )
     tg_bot_token = st.text_input(
@@ -7944,7 +7944,7 @@ with st.sidebar:
 
     auto_kalman_alerts_on = st.checkbox(
         "Auto-alert Kalman Live BUY/SELL",
-        value=bool(_tg_saved.get("auto_kalman", False)),
+        value=bool(_tg_saved.get("auto_kalman", True)),
         help="Saved locally. Sends Telegram only from the Main Institutional Trend Rail trade log. Notification only."
     )
 
@@ -7963,6 +7963,20 @@ with st.sidebar:
         else:
             st.error(f"Could not save Telegram settings: {_save_msg}")
 
+    # Auto-save Telegram settings on each rerun so reboot keeps the selected options.
+    try:
+        save_telegram_settings(
+            tg_bot_token,
+            tg_chat_id,
+            tg_alerts_on,
+            auto_kalman_alerts_on,
+            kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
+            auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", True))),
+            auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", True))),
+        )
+    except Exception:
+        pass
+
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
     st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF.")
@@ -7975,12 +7989,12 @@ with st.sidebar:
     )
     main_kalman_monitor_on = st.checkbox(
         "Enable Main Kalman Watchlist Auto Telegram",
-        value=bool(_mon_saved.get("enabled", False)),
+        value=bool(_mon_saved.get("enabled", True)),
         help="Only watchlist tickers send Telegram. Main Ticker is view-only. First scan baselines current state; alerts only after a future change."
     )
     main_kalman_monitor_refresh = st.checkbox(
         "Auto-refresh Main Kalman Monitor every 60 seconds",
-        value=bool(_mon_saved.get("refresh", False)),
+        value=bool(_mon_saved.get("refresh", True)),
         help="Keep the app running. This refreshes the page so stocks can be monitored."
     )
     if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
@@ -7993,6 +8007,16 @@ with st.sidebar:
             st.success("Main Kalman monitor settings saved.")
         else:
             st.error(f"Could not save monitor settings: {_msg_mon}")
+
+    # Auto-save Main Kalman Monitor settings on each rerun so reboot keeps selected options.
+    try:
+        _save_main_kalman_monitor_settings({
+            "watchlist": str(main_kalman_monitor_watchlist).strip(),
+            "enabled": bool(main_kalman_monitor_on),
+            "refresh": bool(main_kalman_monitor_refresh),
+        })
+    except Exception:
+        pass
 
     if st.button("Reset/Baseline Watchlist Alerts Now", use_container_width=True):
         try:
@@ -8114,97 +8138,6 @@ with st.sidebar:
         )
 
 
-    st.divider()
-    st.subheader("Disabled Separate 15m Scanner")
-    st.info("This scanner is copied from the main BUY/SELL trade log. NO NEW ALERT means no fresh new row; Trade Position still shows LONG if the main log has an open Long.")
-    kalman_15m_watchlist = st.text_area(
-        "Kalman 15m Watchlist",
-        value=_tg_saved.get("kalman_15m_watchlist", "AAPL, PLTR, RKLB, QBTS"),
-        height=70,
-        help="Use 3-4 tickers for best speed. Example: AAPL, PLTR, RKLB, QBTS"
-    )
-    auto_kalman_15m_watchlist_on = st.checkbox(
-        "Auto-alert from Main Kalman Trade Log",
-        value=bool(_tg_saved.get("auto_kalman_15m_watchlist", False)),
-        help="Sends Telegram from the Main Buy/Sell Graph + Main Kalman Trade Log only. No separate scanner logic."
-    )
-    auto_refresh_15m_on = st.checkbox(
-        "Auto-refresh scanner every 60 seconds",
-        value=bool(_tg_saved.get("auto_refresh_15m", False)),
-        help="Keeps the Streamlit page refreshing so the scanner can check for new 15m signals."
-    )
-
-    # Auto-save Telegram/scanner settings on every rerun so refresh/reboot does not wipe fields.
-    try:
-        save_telegram_settings(
-            tg_bot_token,
-            tg_chat_id,
-            tg_alerts_on,
-            auto_kalman_alerts_on,
-            kalman_15m_watchlist=str(kalman_15m_watchlist).strip(),
-            auto_kalman_15m_watchlist=bool(auto_kalman_15m_watchlist_on),
-            auto_refresh_15m=bool(auto_refresh_15m_on),
-        )
-        st.caption(f"Settings auto-saved locally: {_telegram_settings_path()}")
-    except Exception as _e:
-        st.caption(f"Settings auto-save skipped: {_e}")
-
-    if st.button("Save 15m Scanner Settings", use_container_width=True):
-        _tg_saved["bot_token"] = str(tg_bot_token).strip()
-        _tg_saved["chat_id"] = str(tg_chat_id).strip()
-        _tg_saved["enabled"] = bool(tg_alerts_on)
-        _tg_saved["auto_kalman"] = bool(auto_kalman_alerts_on)
-        _tg_saved["kalman_15m_watchlist"] = str(kalman_15m_watchlist).strip()
-        _tg_saved["auto_kalman_15m_watchlist"] = bool(auto_kalman_15m_watchlist_on)
-        _tg_saved["auto_refresh_15m"] = bool(auto_refresh_15m_on)
-        try:
-            _telegram_settings_path().write_text(json.dumps(_tg_saved, indent=2))
-            st.success("Kalman 15m scanner settings saved.")
-        except Exception as _e:
-            st.error(f"Could not save scanner settings: {_e}")
-
-    if st.button("Scan Kalman 15m Watchlist Now", use_container_width=True):
-        st.info("Open the Kalman Filter tab. The scanner table is now shown there after the real main trade log loads.")
-
-    if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
-        st.caption("Separate auto scanner table is disabled. Use the status directly under Main Kalman Trade Log.")
-
-    if bool(auto_refresh_15m_on and tg_alerts_on and auto_kalman_15m_watchlist_on):
-        st.components.v1.html(
-            "<script>setTimeout(function(){ window.parent.location.reload(); }, 60000);</script>",
-            height=0,
-        )
-
-    st.divider()
-    st.info("Separate 15m scanner graph/trade log is deleted. Use only the main Kalman Strategy graph + Main Kalman Trade Log.")
-
-
-    st.subheader("Manual Signal Alert")
-    manual_alert_ticker = st.text_input("Alert Ticker", value="AAPL")
-    manual_alert_signal = st.selectbox("Alert Signal", ["BUY", "SELL", "HOLD / WATCH"], index=0)
-    manual_alert_price = st.text_input("Alert Price", value="")
-    manual_alert_strategy = st.text_input("Alert Strategy", value="Kalman / Live Decision")
-    manual_alert_reason = st.text_area(
-        "Alert Reason",
-        value="Model signal confirmed. Review chart before taking action.",
-        height=80,
-    )
-
-    if st.button("Send Manual Signal Alert", use_container_width=True):
-        manual_msg = (
-            "PINEHURST QUANT ALERT\n"
-            f"Ticker: {manual_alert_ticker}\n"
-            f"Signal: {manual_alert_signal}\n"
-            f"Price: {manual_alert_price if manual_alert_price else 'N/A'}\n"
-            f"Strategy: {manual_alert_strategy}\n"
-            f"Reason: {manual_alert_reason}\n"
-            "Action: Notification only — no order sent."
-        )
-        ok, resp = send_telegram_alert(tg_bot_token, tg_chat_id, manual_msg)
-        if ok:
-            st.success("Manual signal alert sent to Telegram.")
-        else:
-            st.error(f"Manual signal alert failed: {resp}")
 
 
     alert_enabled = st.toggle(
