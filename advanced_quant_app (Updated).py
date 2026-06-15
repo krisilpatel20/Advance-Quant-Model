@@ -935,12 +935,29 @@ def _candidate_from_main_watchlist_trades(sym, trades_df, row):
         "pnl_pct": last.get("PnL (%)", None),
     }
 
+def _parse_watchlist_ct_time(x):
+    try:
+        s = str(x).replace(" CT", "").strip()
+        if not s or s.lower() in ["open", "nan", "none"]:
+            return None
+        v = pd.to_datetime(s, errors="coerce")
+        if pd.isna(v):
+            return None
+        return v
+    except Exception:
+        return None
+
 def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50):
     """
-    Main Kalman Watchlist Monitor.
-    Current main-style model state is source of truth.
-    First scan baselines. Future state changes send Telegram.
+    Main Kalman Watchlist Monitor with safety guard.
+
+    - Current main-style state is calculated each scan.
+    - First scan baselines with no Telegram.
+    - If model settings changed, baseline again with no Telegram.
+    - SELL is only sent when a saved LONG gets a valid future close after its saved entry.
+    - This prevents false SELL blasts when old ledger/settings disagree.
     """
+    MODEL_VERSION = "TR135_BUF7_CONFIRM4_HOLD55_COOLDOWN5_SLOPE_ATR_OFF"
     symbols = _normalize_watchlist(raw_watchlist)
     try:
         max_stocks = int(max_stocks)
@@ -978,77 +995,171 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 last = trades_df.iloc[-1]
                 status_raw = str(last.get("Status", "")).upper()
                 is_open = status_raw == "OPEN"
-                position = "LONG" if is_open else "CASH"
-                signal_state = "BUY" if is_open else "SELL"
-                entry_time = str(last.get("Entry CT", ""))
-                exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
-                event_time = entry_time if is_open else exit_time
-                entry_price = last.get("Entry Price", None)
-                curr_exit_price = last.get("Exit/Current Price", price_now)
-                pnl_pct = last.get("PnL (%)", None)
+                cand_position = "LONG" if is_open else "CASH"
+                cand_signal = "BUY" if is_open else "SELL"
+                cand_entry_time = str(last.get("Entry CT", ""))
+                cand_exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
+                cand_event_time = cand_entry_time if is_open else cand_exit_time
+                cand_entry_price = last.get("Entry Price", None)
+                cand_curr_exit_price = last.get("Exit/Current Price", price_now)
+                cand_pnl_pct = last.get("PnL (%)", None)
             else:
-                position = "CASH"
-                signal_state = "CASH"
-                entry_time = ""
-                exit_time = ""
-                event_time = candle_ct
-                entry_price = None
-                curr_exit_price = price_now
-                pnl_pct = None
+                cand_position = "CASH"
+                cand_signal = "CASH"
+                cand_entry_time = ""
+                cand_exit_time = ""
+                cand_event_time = candle_ct
+                cand_entry_price = None
+                cand_curr_exit_price = price_now
+                cand_pnl_pct = None
 
-            state_key = f"{sym}|{position}|{signal_state}|{event_time}|{entry_price}|{curr_exit_price}"
+            cand_state_key = f"{MODEL_VERSION}|{sym}|{cand_position}|{cand_signal}|{cand_event_time}|{cand_entry_price}|{cand_curr_exit_price}"
             saved = ledger.get(sym)
-            saved_key = saved.get("state_key") if isinstance(saved, dict) else saved
+            if saved is not None and not isinstance(saved, dict):
+                saved = None
 
             alert_signal = "NO NEW ALERT"
             note = "No change since last scan"
 
-            if not saved_key:
-                note = "Baseline synced — no alert sent"
-            elif saved_key != state_key:
-                alert_signal = "BUY" if position == "LONG" else "SELL"
-                note = "State changed"
-                if send_telegram:
+            # Baseline if no saved state OR model settings changed.
+            if not saved or saved.get("model_version") != MODEL_VERSION:
+                saved = {
+                    "ticker": sym,
+                    "model_version": MODEL_VERSION,
+                    "position": cand_position,
+                    "state_key": cand_state_key,
+                    "event_time": cand_event_time,
+                    "entry_time": cand_entry_time,
+                    "exit_time": cand_exit_time,
+                    "price": price_now,
+                    "entry_price": cand_entry_price,
+                    "exit_current_price": cand_curr_exit_price,
+                    "pnl_pct": cand_pnl_pct,
+                    "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                }
+                ledger[sym] = saved
+                _save_main_kalman_watchlist_ledger(ledger)
+                note = "Baseline synced for current model — no alert sent"
+
+            else:
+                saved_position = str(saved.get("position", "CASH")).upper()
+                saved_entry_dt = _parse_watchlist_ct_time(saved.get("entry_time", ""))
+                cand_entry_dt = _parse_watchlist_ct_time(cand_entry_time)
+                cand_exit_dt = _parse_watchlist_ct_time(cand_exit_time)
+                saved_event_dt = _parse_watchlist_ct_time(saved.get("event_time", ""))
+
+                if saved_position == cand_position:
+                    # Same state: just update price/pnl, no Telegram.
+                    saved.update({
+                        "state_key": cand_state_key,
+                        "event_time": cand_event_time,
+                        "entry_time": cand_entry_time or saved.get("entry_time", ""),
+                        "exit_time": cand_exit_time,
+                        "price": price_now,
+                        "entry_price": cand_entry_price if cand_entry_price is not None else saved.get("entry_price"),
+                        "exit_current_price": cand_curr_exit_price,
+                        "pnl_pct": cand_pnl_pct,
+                        "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                    })
+                    note = "Same state — no alert"
+
+                elif saved_position == "LONG" and cand_position == "CASH":
+                    # SELL only if the close is a real future close after saved entry.
+                    valid_future_sell = (
+                        cand_exit_dt is not None and
+                        saved_entry_dt is not None and
+                        cand_exit_dt > saved_entry_dt and
+                        (saved_event_dt is None or cand_exit_dt > saved_event_dt)
+                    )
+                    if valid_future_sell:
+                        alert_signal = "SELL"
+                        saved.update({
+                            "position": "CASH",
+                            "state_key": cand_state_key,
+                            "event_time": cand_event_time,
+                            "entry_time": cand_entry_time or saved.get("entry_time", ""),
+                            "exit_time": cand_exit_time,
+                            "price": price_now,
+                            "entry_price": cand_entry_price if cand_entry_price is not None else saved.get("entry_price"),
+                            "exit_current_price": cand_curr_exit_price,
+                            "pnl_pct": cand_pnl_pct,
+                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                        })
+                        note = "Valid future SELL confirmed"
+                    else:
+                        # Keep saved LONG. Do NOT blast SELL.
+                        saved.update({
+                            "price": price_now,
+                            "exit_current_price": price_now,
+                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                        })
+                        cand_position = "LONG"
+                        cand_event_time = saved.get("event_time", saved.get("entry_time", ""))
+                        note = "SELL ignored — not after saved entry / likely recalculation mismatch"
+
+                elif saved_position == "CASH" and cand_position == "LONG":
+                    # BUY only if it is a future/new entry after saved event.
+                    valid_new_buy = cand_entry_dt is not None and (saved_event_dt is None or cand_entry_dt > saved_event_dt)
+                    if valid_new_buy:
+                        alert_signal = "BUY"
+                        saved.update({
+                            "position": "LONG",
+                            "state_key": cand_state_key,
+                            "event_time": cand_event_time,
+                            "entry_time": cand_entry_time,
+                            "exit_time": "Open",
+                            "price": price_now,
+                            "entry_price": cand_entry_price,
+                            "exit_current_price": cand_curr_exit_price,
+                            "pnl_pct": cand_pnl_pct,
+                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                        })
+                        note = "Valid future BUY confirmed"
+                    else:
+                        # Baseline mismatch; no telegram.
+                        saved.update({
+                            "position": cand_position,
+                            "state_key": cand_state_key,
+                            "event_time": cand_event_time,
+                            "entry_time": cand_entry_time,
+                            "exit_time": cand_exit_time,
+                            "price": price_now,
+                            "entry_price": cand_entry_price,
+                            "exit_current_price": cand_curr_exit_price,
+                            "pnl_pct": cand_pnl_pct,
+                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                        })
+                        note = "BUY state synced — no alert because event is not future/new"
+
+                ledger[sym] = saved
+                _save_main_kalman_watchlist_ledger(ledger)
+
+                if alert_signal in ["BUY", "SELL"] and send_telegram:
                     msg = (
                         "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
                         f"Ticker: {sym}\n"
                         f"Signal: {alert_signal}\n"
-                        f"Trade Position: {position}\n"
+                        f"Trade Position: {saved.get('position')}\n"
                         f"Price: {price_now}\n"
-                        f"Event Time: {event_time}\n"
-                        "Source: Main Kalman Watchlist Monitor — current main-style state\n"
+                        f"Event Time: {saved.get('event_time')}\n"
+                        "Source: Main Kalman Watchlist Monitor — guarded state change\n"
                         "Settings: Trend Rail 1.35, buffer 7%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, firewall OFF\n"
                         "Action: Notification only — no IBKR order sent."
                     )
                     ok, resp = send_telegram_alert(token, chat_id, msg)
                     note = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
 
-            ledger[sym] = {
-                "ticker": sym,
-                "position": position,
-                "state_key": state_key,
-                "event_time": event_time,
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "price": price_now,
-                "entry_price": entry_price,
-                "exit_current_price": curr_exit_price,
-                "pnl_pct": pnl_pct,
-                "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            }
-            _save_main_kalman_watchlist_ledger(ledger)
-
             rows.append({
                 "Ticker": sym,
                 "Alert Signal": alert_signal,
-                "Trade Position": position,
-                "Price": price_now,
+                "Trade Position": saved.get("position", cand_position),
+                "Price": round(float(saved.get("price", price_now)), 2) if saved.get("price", price_now) is not None else None,
                 "Candle Close CT": candle_ct,
-                "Entry CT": entry_time,
-                "Exit CT": exit_time,
-                "Entry Price": entry_price,
-                "Current/Exit Price": curr_exit_price,
-                "PnL (%)": pnl_pct,
+                "Entry CT": saved.get("entry_time", cand_entry_time),
+                "Exit CT": saved.get("exit_time", cand_exit_time),
+                "Entry Price": saved.get("entry_price", cand_entry_price),
+                "Current/Exit Price": saved.get("exit_current_price", cand_curr_exit_price),
+                "PnL (%)": saved.get("pnl_pct", cand_pnl_pct),
                 "Ledger Note": note,
             })
 
@@ -8008,7 +8119,7 @@ with st.sidebar:
     if st.button("Reset/Baseline Watchlist Alerts Now", use_container_width=True):
         try:
             _save_main_kalman_watchlist_ledger({})
-            st.success("Watchlist alert baseline cleared. Next scan will sync current main-style states without sending alerts.")
+            st.success("Watchlist alert baseline cleared. Next scan will sync current guarded states without sending alerts.")
         except Exception as _e:
             st.error(f"Could not reset baseline: {_e}")
 
