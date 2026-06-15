@@ -947,7 +947,7 @@ def _parse_watchlist_ct_time(x):
     except Exception:
         return None
 
-def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50):
+def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50, allow_sell_alerts=False):
     """
     Main Kalman Watchlist Monitor with safety guard.
 
@@ -1135,19 +1135,22 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 _save_main_kalman_watchlist_ledger(ledger)
 
                 if alert_signal in ["BUY", "SELL"] and send_telegram:
-                    msg = (
-                        "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
-                        f"Ticker: {sym}\n"
-                        f"Signal: {alert_signal}\n"
-                        f"Trade Position: {saved.get('position')}\n"
-                        f"Price: {price_now}\n"
-                        f"Event Time: {saved.get('event_time')}\n"
-                        "Source: Main Kalman Watchlist Monitor — guarded state change\n"
-                        "Settings: Trend Rail 1.35, buffer 7%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, firewall OFF\n"
-                        "Action: Notification only — no IBKR order sent."
-                    )
-                    ok, resp = send_telegram_alert(token, chat_id, msg)
-                    note = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
+                    if alert_signal == "SELL" and not bool(allow_sell_alerts):
+                        note = "SELL detected but Telegram SELL alerts are OFF"
+                    else:
+                        msg = (
+                            "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
+                            f"Ticker: {sym}\n"
+                            f"Signal: {alert_signal}\n"
+                            f"Trade Position: {saved.get('position')}\n"
+                            f"Price: {price_now}\n"
+                            f"Event Time: {saved.get('event_time')}\n"
+                            "Source: Main Kalman Watchlist Monitor — guarded state change\n"
+                            "Settings: Trend Rail 1.35, buffer 7%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, firewall OFF\n"
+                            "Action: Notification only — no IBKR order sent."
+                        )
+                        ok, resp = send_telegram_alert(token, chat_id, msg)
+                        note = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
 
             rows.append({
                 "Ticker": sym,
@@ -8020,7 +8023,7 @@ with st.sidebar:
     auto_kalman_alerts_on = st.checkbox(
         "Auto-alert Kalman Live BUY/SELL",
         value=bool(_tg_saved.get("auto_kalman", True)),
-        help="Saved locally. Sends Telegram only from the Main Institutional Trend Rail trade log. Notification only."
+        help="Kept ON for Telegram system readiness. Actual automatic alerts are sent only by the Main Kalman Watchlist Monitor."
     )
 
     if st.button("Save Telegram Settings on This Mac", use_container_width=True):
@@ -8093,6 +8096,11 @@ with st.sidebar:
         value=False,
         help="Default OFF. Turn ON only when you actively want the page to refresh every 60 seconds."
     )
+    main_kalman_monitor_sell_alerts = st.checkbox(
+        "Enable Telegram SELL alerts",
+        value=False,
+        help="Default OFF to prevent false SELL blasts. BUY alerts still work. Turn ON only after the watchlist table matches your main trade logs."
+    )
     if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
         _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
@@ -8159,6 +8167,7 @@ with st.sidebar:
             chat_id=tg_chat_id,
             show_table=True,
             max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
 
         st.markdown("#### Open / Closed Watchlist Status")
@@ -8192,6 +8201,7 @@ with st.sidebar:
             chat_id=tg_chat_id,
             show_table=True,
             max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
 
         st.markdown("#### Open / Closed Watchlist Status")
@@ -11704,32 +11714,7 @@ with tab4:
             sell_idx = changes[changes < 0].index
 
 
-            # ✅ Auto Telegram alert after Kalman changes exist.
-            try:
-                if bool(tg_alerts_on and auto_kalman_alerts_on) and len(changes) > 0:
-                    _latest_change = float(changes.iloc[-1])
-                    if _latest_change > 0 or _latest_change < 0:
-                        _sig_txt = "BUY" if _latest_change > 0 else "SELL"
-                        _last_time = bt_plot_x_series.iloc[-1] if len(bt_plot_x_series) else bt_px.index[-1]
-                        _last_price = float(bt_px.iloc[-1])
-                        _alert_key = f"KALMAN_MAIN::{TICKER}::{_sig_txt}::{_last_time}"
-                        _msg = (
-                            "PINEHURST KALMAN ALERT\n"
-                            f"Ticker: {TICKER}\n"
-                            f"Signal: {_sig_txt}\n"
-                            f"Price: {_last_price:.2f}\n"
-                            f"Time: {_last_time}\n"
-                            f"Strategy: Main Kalman Filter\n"
-                            "Reason: Latest confirmed Kalman signal changed.\n"
-                            "Action: Notification only — no IBKR order sent."
-                        )
-                        _ok, _resp = telegram_alert_once(_alert_key, tg_bot_token, tg_chat_id, _msg)
-                        if _ok:
-                            st.success(f"📲 Auto Telegram alert sent: {TICKER} {_sig_txt}")
-                        else:
-                            st.warning(f"Telegram auto alert failed: {_resp}")
-            except Exception as _e:
-                st.warning(f"Kalman auto alert skipped: {_e}")
+            # Main-tab direct Telegram alert removed. Watchlist monitor is the only Telegram engine.
 
 
             # ✅ Main Kalman graph + trade log directly inside primary Kalman screen.
