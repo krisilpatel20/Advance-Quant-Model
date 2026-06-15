@@ -7953,7 +7953,7 @@ with st.sidebar:
             tg_bot_token,
             tg_chat_id,
             tg_alerts_on,
-            auto_kalman_alerts_on,
+            True,
             kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
             auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", False))),
             auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", False))),
@@ -7969,7 +7969,7 @@ with st.sidebar:
             tg_bot_token,
             tg_chat_id,
             tg_alerts_on,
-            auto_kalman_alerts_on,
+            True,
             kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
             auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", True))),
             auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", True))),
@@ -7979,32 +7979,43 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF.")
+    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 3%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF. Watchlist auto-saves exactly as you edit it and stays locked after refresh/reboot. Auto-refresh is OFF by default.")
     _mon_saved = _load_main_kalman_monitor_settings()
     main_kalman_monitor_watchlist = st.text_area(
         "Stocks to monitor with Main Kalman Trade-Log model",
-        value=_mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL"),
+        value=str(_mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL") or "DELL, NBIS, PLTR, AAPL"),
         height=70,
-        help="Add 3-4 tickers for best speed. This uses main-style Institutional Trend Rail trade-log logic."
+        help="Add/delete tickers here. Whatever is in this box auto-saves and stays locked after refresh/reboot until you change it again."
     )
+
+    # Auto-lock current watchlist on every rerun so refresh/reboot keeps your latest edits.
+    try:
+        _save_main_kalman_monitor_settings({
+            "watchlist": str(main_kalman_monitor_watchlist).strip(),
+            "enabled": True,
+            "refresh": False,
+        })
+    except Exception:
+        pass
+
     main_kalman_monitor_on = st.checkbox(
         "Enable Main Kalman Watchlist Auto Telegram",
-        value=bool(_mon_saved.get("enabled", True)),
+        value=True,
         help="Only watchlist tickers send Telegram. Main Ticker is view-only. First scan baselines current state; alerts only after a future change."
     )
     main_kalman_monitor_refresh = st.checkbox(
         "Auto-refresh Main Kalman Monitor every 60 seconds",
-        value=bool(_mon_saved.get("refresh", True)),
-        help="Keep the app running. This refreshes the page so stocks can be monitored."
+        value=False,
+        help="Default OFF. Turn ON only when you actively want the page to refresh every 60 seconds."
     )
     if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
         _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "enabled": bool(main_kalman_monitor_on),
-            "refresh": bool(main_kalman_monitor_refresh),
+            "enabled": True,
+            "refresh": False,
         })
         if _ok_mon:
-            st.success("Main Kalman monitor settings saved.")
+            st.success("Main Kalman monitor settings saved. This exact watchlist will stay after refresh/reboot until you edit it again.")
         else:
             st.error(f"Could not save monitor settings: {_msg_mon}")
 
@@ -8012,8 +8023,8 @@ with st.sidebar:
     try:
         _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "enabled": bool(main_kalman_monitor_on),
-            "refresh": bool(main_kalman_monitor_refresh),
+            "enabled": True,
+            "refresh": False,
         })
     except Exception:
         pass
@@ -9722,9 +9733,15 @@ if bool(kalman_fast_live_mode):
                 with col_k4:
                     polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_polish_span")
 
+                # Force default trend rail distance to 1.35. If an old session kept 1.15, reset it.
+                try:
+                    if st.session_state.get("kalman_trend_rail_distance", 1.35) == 1.15:
+                        st.session_state["kalman_trend_rail_distance"] = 1.35
+                except Exception:
+                    pass
                 rail_mult = st.slider(
                     "Trend rail distance",
-                    0.40, 3.00, 1.15, step=0.05,
+                    0.40, 3.00, 1.35, step=0.05,
                     key="kalman_trend_rail_distance",
                     help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
                 )
@@ -11145,7 +11162,7 @@ with tab4:
 
         rail_mult = st.slider(
             "Trend rail distance",
-            0.40, 3.00, 1.15, step=0.05,
+            0.40, 3.00, 1.35, step=0.05,
             key="kalman_trend_rail_distance",
             help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
         )
