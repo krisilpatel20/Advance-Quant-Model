@@ -222,7 +222,8 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
             "exit_current_price": current_price,
             "pnl_pct": pnl_pct,
             "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            "source": "Synced from visible Main Kalman Trade Log",
+            "source": "Visible Main Kalman Trade Log",
+            "visible_main_authority": True,
         }
         _save_main_kalman_watchlist_ledger(ledger)
 
@@ -1008,6 +1009,24 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
     for sym in symbols:
         sym = str(sym).upper()
         try:
+            _saved_authority = ledger.get(sym)
+            if isinstance(_saved_authority, dict) and bool(_saved_authority.get("visible_main_authority", False)):
+                _pos = str(_saved_authority.get("position", "UNKNOWN")).upper()
+                rows.append({
+                    "Ticker": sym,
+                    "Alert Signal": "NO NEW ALERT",
+                    "Trade Position": _pos,
+                    "Price": _saved_authority.get("price", None),
+                    "Candle Close CT": _saved_authority.get("last_scan_ct", ""),
+                    "Entry CT": _saved_authority.get("entry_time", ""),
+                    "Exit CT": _saved_authority.get("exit_time", ""),
+                    "Entry Price": _saved_authority.get("entry_price", None),
+                    "Current/Exit Price": _saved_authority.get("exit_current_price", None),
+                    "PnL (%)": _saved_authority.get("pnl_pct", None),
+                    "Ledger Note": "Visible Main Kalman Trade Log authority",
+                })
+                continue
+
             px = _main_monitor_fetch_15m(sym, period="60d")
             if px is None or len(px) < 80:
                 rows.append({
@@ -8225,7 +8244,7 @@ with st.sidebar:
             allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
 
-        st.markdown("#### Open / Closed Watchlist Status")
+        st.markdown("#### Open / Closed Watchlist Status — synced from visible main log when available")
         try:
             _mon_df_manual = pd.DataFrame(_main_mon_rows_manual)
             if not _mon_df_manual.empty and "Trade Position" in _mon_df_manual.columns:
@@ -8259,7 +8278,7 @@ with st.sidebar:
             allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
 
-        st.markdown("#### Open / Closed Watchlist Status")
+        st.markdown("#### Open / Closed Watchlist Status — synced from visible main log when available")
         try:
             _mon_df = pd.DataFrame(_main_mon_rows)
             if not _mon_df.empty:
