@@ -128,7 +128,7 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
             return None
 
         t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = _pick_authoritative_kalman_trade_row(t)
+        last = t.iloc[-1]
         row_txt = " ".join([str(x) for x in last.values]).upper()
 
         is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
@@ -211,7 +211,6 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
         # Visible main trade log has priority. If it says OPEN, force ledger LONG.
         ledger[sym] = {
             "ticker": sym,
-            "model_version": "TR135_BUF7_CONFIRM4_HOLD55_COOLDOWN5_SLOPE_ATR_OFF",
             "position": position,
             "entry_time": entry_time,
             "exit_time": "Open" if is_open else exit_time,
@@ -222,8 +221,7 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
             "exit_current_price": current_price,
             "pnl_pct": pnl_pct,
             "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            "source": "Visible Main Kalman Trade Log",
-            "visible_main_authority": True,
+            "source": "Synced from visible Main Kalman Trade Log",
         }
         _save_main_kalman_watchlist_ledger(ledger)
 
@@ -247,13 +245,6 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
         except Exception:
             pass
 
-        try:
-            _rerun_key = f"_reran_after_visible_sync_{sym}_{position}_{event_time}"
-            if not st.session_state.get(_rerun_key, False):
-                st.session_state[_rerun_key] = True
-                st.rerun()
-        except Exception:
-            pass
         return row
     except Exception as e:
         return None
@@ -293,7 +284,7 @@ def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, t
             return False, "No main Kalman trade row."
 
         t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = _pick_authoritative_kalman_trade_row(t)
+        last = t.iloc[-1]
         row_txt = " ".join([str(x) for x in last.values]).upper()
 
         is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
@@ -353,62 +344,6 @@ def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, t
         return False, str(e)
 
 
-
-def _pick_authoritative_kalman_trade_row(trades_df):
-    """
-    Pick the correct trade row from a Kalman trade log.
-    Priority:
-    1) Any row with Status/Open/Exit == Open -> current LONG
-    2) Otherwise newest row by Entry/Exit date if possible
-    3) Otherwise first displayed row, because displayed trade logs are newest-first
-    """
-    try:
-        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-            return None
-
-        t = trades_df.copy()
-        # Prefer any open row anywhere in the table, not bottom row.
-        for idx, row in t.iterrows():
-            row_txt = " ".join([str(x) for x in row.values]).upper()
-            if ("OPEN" in row_txt) and ("CLOSED" not in row_txt):
-                return row
-
-        # No open row: choose newest date if columns exist.
-        date_cols = [c for c in ["Exit CT", "Exit Date", "Exit Time", "Entry CT", "Entry Date", "Entry Time"] if c in t.columns]
-        if date_cols:
-            best_i = None
-            best_dt = None
-            for i, row in t.iterrows():
-                for c in date_cols:
-                    val = str(row.get(c, "")).replace(" CT", "").strip()
-                    if not val or val.lower() in ["nan", "open", "none"]:
-                        continue
-                    try:
-                        dt = pd.to_datetime(val, errors="coerce")
-                        if pd.notna(dt) and (best_dt is None or dt > best_dt):
-                            best_dt = dt
-                            best_i = i
-                    except Exception:
-                        pass
-            if best_i is not None:
-                return t.loc[best_i]
-
-        # Displayed logs are newest-first in this app.
-        return t.iloc[0]
-    except Exception:
-        try:
-            return trades_df.iloc[0]
-        except Exception:
-            return None
-
-def _trade_row_is_open(row):
-    try:
-        row_txt = " ".join([str(x) for x in row.values]).upper()
-        return ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
-    except Exception:
-        return False
-
-
 def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
     """Copy main BUY/SELL trade-log state into scanner row. No separate signal math."""
     try:
@@ -424,7 +359,7 @@ def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_tim
             }
 
         t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = _pick_authoritative_kalman_trade_row(t)
+        last = t.iloc[-1]
         row_txt = " ".join([str(x) for x in last.values]).upper()
         is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
         is_long = ("LONG" in row_txt) or is_open
@@ -736,34 +671,6 @@ def _kalman_15m_trend_rail_report(ticker):
 
 
 # ---------- Main Kalman Trade-Log Watchlist Monitor ----------
-
-def _get_query_param_value(name, default=""):
-    try:
-        qp = getattr(st, "query_params", {})
-        v = qp.get(name, default)
-        if isinstance(v, list):
-            return v[0] if v else default
-        return v if v is not None else default
-    except Exception:
-        try:
-            v = st.experimental_get_query_params().get(name, [default])
-            return v[0] if isinstance(v, list) and v else default
-        except Exception:
-            return default
-
-def _set_query_param_value(name, value):
-    try:
-        st.query_params[name] = str(value)
-        return True
-    except Exception:
-        try:
-            qp = st.experimental_get_query_params()
-            qp[name] = [str(value)]
-            st.experimental_set_query_params(**qp)
-            return True
-        except Exception:
-            return False
-
 def _main_kalman_monitor_settings_path():
     try:
         return _Path.home() / ".pinehurst_main_kalman_monitor.json"
@@ -787,7 +694,7 @@ def _save_main_kalman_monitor_settings(data):
     except Exception as e:
         return False, str(e)
 
-def _main_monitor_fetch_15m(ticker, period="60d"):
+def _main_monitor_fetch_15m(ticker, period="30d"):
     df = yf.download(
         str(ticker).upper(),
         period=period,
@@ -998,7 +905,7 @@ def _candidate_from_main_watchlist_trades(sym, trades_df, row):
             "raw_status": "NO_TRADES",
         }
 
-    last = _pick_authoritative_kalman_trade_row(trades_df)
+    last = trades_df.iloc[-1]
     status = str(last.get("Status", "")).upper()
     entry_time = str(last.get("Entry CT", ""))
     exit_time = str(last.get("Exit CT", ""))
@@ -1042,7 +949,7 @@ def _parse_watchlist_ct_time(x):
 
 def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50, allow_sell_alerts=False):
     """
-    Main Kalman Watchlist Monitor with visible-main sync guard.
+    Main Kalman Watchlist Monitor with safety guard.
 
     - Current main-style state is calculated each scan.
     - First scan baselines with no Telegram.
@@ -1050,7 +957,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
     - SELL is only sent when a saved LONG gets a valid future close after its saved entry.
     - This prevents false SELL blasts when old ledger/settings disagree.
     """
-    MODEL_VERSION = "TR135_BUF7_CONFIRM4_HOLD55_COOLDOWN5_SLOPE_ATR_OFF"
+    MODEL_VERSION = "TR135_BUF7_30D_CONFIRM4_HOLD55_COOLDOWN5_SLOPE_ATR_OFF"
     symbols = _normalize_watchlist(raw_watchlist)
     try:
         max_stocks = int(max_stocks)
@@ -1065,25 +972,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
     for sym in symbols:
         sym = str(sym).upper()
         try:
-            _saved_authority = ledger.get(sym)
-            if isinstance(_saved_authority, dict) and bool(_saved_authority.get("visible_main_authority", False)):
-                _pos = str(_saved_authority.get("position", "UNKNOWN")).upper()
-                rows.append({
-                    "Ticker": sym,
-                    "Alert Signal": "NO NEW ALERT",
-                    "Trade Position": _pos,
-                    "Price": _saved_authority.get("price", None),
-                    "Candle Close CT": _saved_authority.get("last_scan_ct", ""),
-                    "Entry CT": _saved_authority.get("entry_time", ""),
-                    "Exit CT": _saved_authority.get("exit_time", ""),
-                    "Entry Price": _saved_authority.get("entry_price", None),
-                    "Current/Exit Price": _saved_authority.get("exit_current_price", None),
-                    "PnL (%)": _saved_authority.get("pnl_pct", None),
-                    "Ledger Note": "Visible Main Kalman Trade Log authority",
-                })
-                continue
-
-            px = _main_monitor_fetch_15m(sym, period="60d")
+            px = _main_monitor_fetch_15m(sym, period="30d")
             if px is None or len(px) < 80:
                 rows.append({
                     "Ticker": sym,
@@ -1103,9 +992,9 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
             price_now = round(float(px.iloc[-1]), 2)
 
             if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                last = _pick_authoritative_kalman_trade_row(trades_df)
+                last = trades_df.iloc[-1]
                 status_raw = str(last.get("Status", "")).upper()
-                is_open = (status_raw == "OPEN") or _trade_row_is_open(last)
+                is_open = status_raw == "OPEN"
                 cand_position = "LONG" if is_open else "CASH"
                 cand_signal = "BUY" if is_open else "SELL"
                 cand_entry_time = str(last.get("Entry CT", ""))
@@ -1133,13 +1022,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
             note = "No change since last scan"
 
             # Baseline if no saved state OR model settings changed.
-            # Exception: if visible Main Kalman Trade Log already synced this ticker LONG,
-            # keep that visible-main state. Do not overwrite it to CASH from monitor recalculation.
-            if (not saved or saved.get("model_version") != MODEL_VERSION) and not (
-                isinstance(saved, dict)
-                and str(saved.get("position", "")).upper() == "LONG"
-                and "Visible Main Kalman Trade Log" in str(saved.get("source", ""))
-            ):
+            if not saved or saved.get("model_version") != MODEL_VERSION:
                 saved = {
                     "ticker": sym,
                     "model_version": MODEL_VERSION,
@@ -1167,24 +1050,17 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
 
                 if saved_position == cand_position:
                     # Same state: just update price/pnl, no Telegram.
-                    if "Visible Main Kalman Trade Log" in str(saved.get("source", "")):
-                        saved.update({
-                            "price": price_now,
-                            "exit_current_price": price_now,
-                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-                        })
-                    else:
-                        saved.update({
-                            "state_key": cand_state_key,
-                            "event_time": cand_event_time,
-                            "entry_time": cand_entry_time or saved.get("entry_time", ""),
-                            "exit_time": cand_exit_time,
-                            "price": price_now,
-                            "entry_price": cand_entry_price if cand_entry_price is not None else saved.get("entry_price"),
-                            "exit_current_price": cand_curr_exit_price,
-                            "pnl_pct": cand_pnl_pct,
-                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-                        })
+                    saved.update({
+                        "state_key": cand_state_key,
+                        "event_time": cand_event_time,
+                        "entry_time": cand_entry_time or saved.get("entry_time", ""),
+                        "exit_time": cand_exit_time,
+                        "price": price_now,
+                        "entry_price": cand_entry_price if cand_entry_price is not None else saved.get("entry_price"),
+                        "exit_current_price": cand_curr_exit_price,
+                        "pnl_pct": cand_pnl_pct,
+                        "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                    })
                     note = "Same state — no alert"
 
                 elif saved_position == "LONG" and cand_position == "CASH":
@@ -1288,6 +1164,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 "Current/Exit Price": saved.get("exit_current_price", cand_curr_exit_price),
                 "PnL (%)": saved.get("pnl_pct", cand_pnl_pct),
                 "Ledger Note": note,
+                "Window": "30d 15m",
             })
 
         except Exception as e:
@@ -8181,28 +8058,14 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: Trend Rail 1.35, buffer 7%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF. Watchlist auto-saves exactly as you edit it into the URL and local settings; it stays after refresh/reboot if you keep/bookmark the current URL. All tickers are monitored up to the Max stocks setting. Auto-refresh is OFF by default.")
+    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Monitor uses the same main Kalman settings: 30d 15m window, Trend Rail 1.35, buffer 7%, confirm 4, min-hold 55, cooldown 5, slope+ATR safety, risk firewall OFF. Watchlist auto-saves exactly as you edit it and stays locked after refresh/reboot. All tickers are monitored up to the Max stocks setting. Auto-refresh is OFF by default.")
     _mon_saved = _load_main_kalman_monitor_settings()
-    _watchlist_from_url = _get_query_param_value("watchlist", "")
-    _watchlist_default = str(_watchlist_from_url or _mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL") or "DELL, NBIS, PLTR, AAPL")
     main_kalman_monitor_watchlist = st.text_area(
         "Stocks to monitor with Main Kalman Trade-Log model",
-        value=_watchlist_default,
+        value=str(_mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL") or "DELL, NBIS, PLTR, AAPL"),
         height=70,
-        help="Add/delete tickers here. The app saves this exact list into the URL and local settings so refresh/reboot keeps it."
+        help="Add/delete tickers here. Whatever is in this box auto-saves and stays locked after refresh/reboot until you change it again."
     )
-    try:
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
-        _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "enabled": True,
-            "refresh": False,
-        })
-    except Exception:
-        pass
-
-    st.caption("Watchlist persistence: saved into browser URL + local settings. On Streamlit Cloud, bookmark/copy the current URL after editing.")
 
     main_kalman_monitor_max_stocks = st.number_input(
         "Max stocks to monitor",
@@ -8215,7 +8078,6 @@ with st.sidebar:
 
     # Auto-lock current watchlist on every rerun so refresh/reboot keeps your latest edits.
     try:
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
         _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
             "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
@@ -8241,7 +8103,6 @@ with st.sidebar:
         help="Default OFF to prevent false SELL blasts. BUY alerts still work. Turn ON only after the watchlist table matches your main trade logs."
     )
     if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
         _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
             "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
@@ -8249,10 +8110,20 @@ with st.sidebar:
             "refresh": False,
         })
         if _ok_mon:
-            st.success("Watchlist saved. It is locked in the URL + local settings until you edit it again.")
+            st.success("Main Kalman monitor settings saved. This exact watchlist will stay after refresh/reboot until you edit it again.")
         else:
             st.error(f"Could not save monitor settings: {_msg_mon}")
 
+    # Auto-save Main Kalman Monitor settings on each rerun so reboot keeps selected options.
+    try:
+        _save_main_kalman_monitor_settings({
+            "watchlist": str(main_kalman_monitor_watchlist).strip(),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            "enabled": True,
+            "refresh": False,
+        })
+    except Exception:
+        pass
 
     if st.button("Reset/Baseline Watchlist Alerts Now", use_container_width=True):
         try:
@@ -8300,7 +8171,7 @@ with st.sidebar:
             allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
 
-        st.markdown("#### Open / Closed Watchlist Status — synced from visible main log when available")
+        st.markdown("#### Open / Closed Watchlist Status")
         try:
             _mon_df_manual = pd.DataFrame(_main_mon_rows_manual)
             if not _mon_df_manual.empty and "Trade Position" in _mon_df_manual.columns:
@@ -8334,7 +8205,7 @@ with st.sidebar:
             allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
 
-        st.markdown("#### Open / Closed Watchlist Status — synced from visible main log when available")
+        st.markdown("#### Open / Closed Watchlist Status")
         try:
             _mon_df = pd.DataFrame(_main_mon_rows)
             if not _mon_df.empty:
@@ -17828,7 +17699,7 @@ with tab17:
                 try:
                     intraday = yf.download(
                         TICKER,
-                        period="60d",
+                        period="30d",
                         interval="5m",
                         auto_adjust=True,
                         progress=False,
