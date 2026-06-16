@@ -128,7 +128,7 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
             return None
 
         t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
+        last = _pick_authoritative_kalman_trade_row(t)
         row_txt = " ".join([str(x) for x in last.values]).upper()
 
         is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
@@ -293,7 +293,7 @@ def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, t
             return False, "No main Kalman trade row."
 
         t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
+        last = _pick_authoritative_kalman_trade_row(t)
         row_txt = " ".join([str(x) for x in last.values]).upper()
 
         is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
@@ -353,6 +353,62 @@ def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, t
         return False, str(e)
 
 
+
+def _pick_authoritative_kalman_trade_row(trades_df):
+    """
+    Pick the correct trade row from a Kalman trade log.
+    Priority:
+    1) Any row with Status/Open/Exit == Open -> current LONG
+    2) Otherwise newest row by Entry/Exit date if possible
+    3) Otherwise first displayed row, because displayed trade logs are newest-first
+    """
+    try:
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return None
+
+        t = trades_df.copy()
+        # Prefer any open row anywhere in the table, not bottom row.
+        for idx, row in t.iterrows():
+            row_txt = " ".join([str(x) for x in row.values]).upper()
+            if ("OPEN" in row_txt) and ("CLOSED" not in row_txt):
+                return row
+
+        # No open row: choose newest date if columns exist.
+        date_cols = [c for c in ["Exit CT", "Exit Date", "Exit Time", "Entry CT", "Entry Date", "Entry Time"] if c in t.columns]
+        if date_cols:
+            best_i = None
+            best_dt = None
+            for i, row in t.iterrows():
+                for c in date_cols:
+                    val = str(row.get(c, "")).replace(" CT", "").strip()
+                    if not val or val.lower() in ["nan", "open", "none"]:
+                        continue
+                    try:
+                        dt = pd.to_datetime(val, errors="coerce")
+                        if pd.notna(dt) and (best_dt is None or dt > best_dt):
+                            best_dt = dt
+                            best_i = i
+                    except Exception:
+                        pass
+            if best_i is not None:
+                return t.loc[best_i]
+
+        # Displayed logs are newest-first in this app.
+        return t.iloc[0]
+    except Exception:
+        try:
+            return trades_df.iloc[0]
+        except Exception:
+            return None
+
+def _trade_row_is_open(row):
+    try:
+        row_txt = " ".join([str(x) for x in row.values]).upper()
+        return ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
+    except Exception:
+        return False
+
+
 def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
     """Copy main BUY/SELL trade-log state into scanner row. No separate signal math."""
     try:
@@ -368,7 +424,7 @@ def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_tim
             }
 
         t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
+        last = _pick_authoritative_kalman_trade_row(t)
         row_txt = " ".join([str(x) for x in last.values]).upper()
         is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
         is_long = ("LONG" in row_txt) or is_open
@@ -942,7 +998,7 @@ def _candidate_from_main_watchlist_trades(sym, trades_df, row):
             "raw_status": "NO_TRADES",
         }
 
-    last = trades_df.iloc[-1]
+    last = _pick_authoritative_kalman_trade_row(trades_df)
     status = str(last.get("Status", "")).upper()
     entry_time = str(last.get("Entry CT", ""))
     exit_time = str(last.get("Exit CT", ""))
@@ -1047,9 +1103,9 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
             price_now = round(float(px.iloc[-1]), 2)
 
             if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                last = trades_df.iloc[-1]
+                last = _pick_authoritative_kalman_trade_row(trades_df)
                 status_raw = str(last.get("Status", "")).upper()
-                is_open = status_raw == "OPEN"
+                is_open = (status_raw == "OPEN") or _trade_row_is_open(last)
                 cand_position = "LONG" if is_open else "CASH"
                 cand_signal = "BUY" if is_open else "SELL"
                 cand_entry_time = str(last.get("Entry CT", ""))
