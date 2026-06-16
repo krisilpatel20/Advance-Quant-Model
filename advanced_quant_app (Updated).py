@@ -211,6 +211,7 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
         # Visible main trade log has priority. If it says OPEN, force ledger LONG.
         ledger[sym] = {
             "ticker": sym,
+            "model_version": "TR135_BUF7_CONFIRM4_HOLD55_COOLDOWN5_SLOPE_ATR_OFF",
             "position": position,
             "entry_time": entry_time,
             "exit_time": "Open" if is_open else exit_time,
@@ -245,6 +246,13 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
         except Exception:
             pass
 
+        try:
+            _rerun_key = f"_reran_after_visible_sync_{sym}_{position}_{event_time}"
+            if not st.session_state.get(_rerun_key, False):
+                st.session_state[_rerun_key] = True
+                st.rerun()
+        except Exception:
+            pass
         return row
     except Exception as e:
         return None
@@ -977,7 +985,7 @@ def _parse_watchlist_ct_time(x):
 
 def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50, allow_sell_alerts=False):
     """
-    Main Kalman Watchlist Monitor with safety guard.
+    Main Kalman Watchlist Monitor with visible-main sync guard.
 
     - Current main-style state is calculated each scan.
     - First scan baselines with no Telegram.
@@ -1050,7 +1058,13 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
             note = "No change since last scan"
 
             # Baseline if no saved state OR model settings changed.
-            if not saved or saved.get("model_version") != MODEL_VERSION:
+            # Exception: if visible Main Kalman Trade Log already synced this ticker LONG,
+            # keep that visible-main state. Do not overwrite it to CASH from monitor recalculation.
+            if (not saved or saved.get("model_version") != MODEL_VERSION) and not (
+                isinstance(saved, dict)
+                and str(saved.get("position", "")).upper() == "LONG"
+                and "Visible Main Kalman Trade Log" in str(saved.get("source", ""))
+            ):
                 saved = {
                     "ticker": sym,
                     "model_version": MODEL_VERSION,
@@ -1078,17 +1092,24 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
 
                 if saved_position == cand_position:
                     # Same state: just update price/pnl, no Telegram.
-                    saved.update({
-                        "state_key": cand_state_key,
-                        "event_time": cand_event_time,
-                        "entry_time": cand_entry_time or saved.get("entry_time", ""),
-                        "exit_time": cand_exit_time,
-                        "price": price_now,
-                        "entry_price": cand_entry_price if cand_entry_price is not None else saved.get("entry_price"),
-                        "exit_current_price": cand_curr_exit_price,
-                        "pnl_pct": cand_pnl_pct,
-                        "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-                    })
+                    if "Visible Main Kalman Trade Log" in str(saved.get("source", "")):
+                        saved.update({
+                            "price": price_now,
+                            "exit_current_price": price_now,
+                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                        })
+                    else:
+                        saved.update({
+                            "state_key": cand_state_key,
+                            "event_time": cand_event_time,
+                            "entry_time": cand_entry_time or saved.get("entry_time", ""),
+                            "exit_time": cand_exit_time,
+                            "price": price_now,
+                            "entry_price": cand_entry_price if cand_entry_price is not None else saved.get("entry_price"),
+                            "exit_current_price": cand_curr_exit_price,
+                            "pnl_pct": cand_pnl_pct,
+                            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                        })
                     note = "Same state — no alert"
 
                 elif saved_position == "LONG" and cand_position == "CASH":
