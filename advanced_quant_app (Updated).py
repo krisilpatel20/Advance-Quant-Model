@@ -803,6 +803,35 @@ def _get_current_main_kalman_params():
     except Exception:
         polish_span = 3
 
+    try:
+        benchmark_aware = bool(st.session_state.get("kalman_benchmark_aware_optimizer", True))
+    except Exception:
+        benchmark_aware = True
+    try:
+        use_firewall = bool(st.session_state.get("kalman_use_risk_firewall", False))
+    except Exception:
+        use_firewall = False
+    try:
+        max_dd_allowed = float(st.session_state.get("kalman_max_dd_allowed", 35.0))
+    except Exception:
+        max_dd_allowed = 35.0
+    try:
+        trade_stop_pct = float(st.session_state.get("kalman_trade_stop_pct", 8.0))
+    except Exception:
+        trade_stop_pct = 8.0
+    try:
+        trail_stop_pct = float(st.session_state.get("kalman_trail_stop_pct", 15.0))
+    except Exception:
+        trail_stop_pct = 15.0
+    try:
+        equity_dd_stop_pct = float(st.session_state.get("kalman_equity_dd_stop_pct", 25.0))
+    except Exception:
+        equity_dd_stop_pct = 25.0
+    try:
+        firewall_cooldown = int(st.session_state.get("kalman_firewall_cooldown", 10))
+    except Exception:
+        firewall_cooldown = 10
+
     return {
         "rail_mult": rail_mult,
         "buffer_pct": buffer_pct,
@@ -814,6 +843,13 @@ def _get_current_main_kalman_params():
         "fast_gain": fast_gain,
         "slow_gain": slow_gain,
         "polish_span": polish_span,
+        "benchmark_aware": benchmark_aware,
+        "use_firewall": use_firewall,
+        "max_dd_allowed": max_dd_allowed,
+        "trade_stop_pct": trade_stop_pct,
+        "trail_stop_pct": trail_stop_pct,
+        "equity_dd_stop_pct": equity_dd_stop_pct,
+        "firewall_cooldown": firewall_cooldown,
     }
 
 def _main_kalman_params_label(params=None):
@@ -827,14 +863,15 @@ def _main_kalman_params_label(params=None):
         f"cooldown {params['cooldown_bars']}, "
         f"slope {'ON' if params['slope_confirm'] else 'OFF'}, "
         f"ATR safety {'ON' if params['atr_safety'] else 'OFF'}, "
-        "risk firewall OFF"
+        f"optimizer {'ON' if params.get('benchmark_aware', True) else 'OFF'}, "
+        f"risk firewall {'ON' if params.get('use_firewall', False) else 'OFF'}"
     )
 
 
 def _build_main_kalman_trade_log_from_prices(ticker, px):
     """
-    Watchlist version using the SAME CURRENT main Kalman controls from session_state.
-    This is the correct source for watchlist/telegram, not hardcoded buffer/hold values.
+    Watchlist version using the same current Main Kalman controls AND the same benchmark-aware optimizer logic.
+    This prevents RKLB-style mismatch where main optimizer says Closed but watchlist raw settings said Open.
     """
     ticker = str(ticker).upper()
     px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
@@ -852,95 +889,161 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
         atr_mult=float(params["rail_mult"]),
     )
     bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
-
-    buffer_pct = float(params["buffer_pct"])
-    confirm_bars = int(params["confirm_bars"])
-    min_hold_bars = int(params["min_hold_bars"])
-    cooldown_bars = int(params["cooldown_bars"])
-
     trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
 
-    close_above = px > bt_trend * (1.0 + buffer_pct)
-    close_below = px < bt_trend * (1.0 - buffer_pct)
+    def _build_sig(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars):
+        close_above = px > bt_trend * (1.0 + float(buffer_pct))
+        close_below = px < bt_trend * (1.0 - float(buffer_pct))
 
-    if bool(params["slope_confirm"]):
-        entry_cond = close_above & (trend_slope >= 0)
-        exit_cond = close_below & (trend_slope <= 0)
-    else:
-        entry_cond = close_above
-        exit_cond = close_below
-
-    if bool(params["atr_safety"]):
-        atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-        safety_exit = px < (bt_trend - 1.25 * atr_proxy)
-        exit_cond = exit_cond | safety_exit.fillna(False)
-
-    entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-    exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-
-    sig = pd.Series(0.0, index=px.index)
-    in_pos = False
-    bars_held = 0
-    cooldown_left = 0
-    entry_time = None
-    entry_price = None
-    trades = []
-
-    for dt in px.index:
-        p = float(px.loc[dt])
-        if cooldown_left > 0:
-            cooldown_left -= 1
-
-        if not in_pos:
-            if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
-                in_pos = True
-                bars_held = 0
-                entry_time = dt
-                entry_price = p
-                sig.loc[dt] = 1.0
-            else:
-                sig.loc[dt] = 0.0
+        if bool(params["slope_confirm"]):
+            entry_cond = close_above & (trend_slope >= 0)
+            exit_cond = close_below & (trend_slope <= 0)
         else:
-            bars_held += 1
-            if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
-                exit_time = dt
-                exit_price = p
-                pnl = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
-                trades.append({
-                    "Ticker": ticker,
-                    "Side": "Long",
-                    "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S CT"),
-                    "Exit CT": pd.Timestamp(exit_time).strftime("%Y-%m-%d %H:%M:%S CT"),
-                    "Entry Price": round(float(entry_price), 2),
-                    "Exit/Current Price": round(float(exit_price), 2),
-                    "PnL (%)": round(float(pnl), 2),
-                    "Status": "Closed",
-                })
-                in_pos = False
-                cooldown_left = cooldown_bars
-                bars_held = 0
-                entry_time = None
-                entry_price = None
-                sig.loc[dt] = 0.0
+            entry_cond = close_above
+            exit_cond = close_below
+
+        if bool(params["atr_safety"]):
+            atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+            exit_cond = exit_cond | (px < (bt_trend - 1.25 * atr_proxy)).fillna(False)
+
+        confirm_bars = int(confirm_bars)
+        min_hold_bars = int(min_hold_bars)
+        cooldown_bars = int(cooldown_bars)
+
+        entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+        exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+
+        sig = pd.Series(0.0, index=px.index)
+        in_pos = False
+        bars_held = 0
+        cooldown_left = 0
+        for dt in px.index:
+            if cooldown_left > 0:
+                cooldown_left -= 1
+            if not in_pos:
+                if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
+                    in_pos = True
+                    bars_held = 0
+                    sig.loc[dt] = 1.0
+                else:
+                    sig.loc[dt] = 0.0
             else:
-                sig.loc[dt] = 1.0
+                bars_held += 1
+                if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
+                    in_pos = False
+                    cooldown_left = cooldown_bars
+                    bars_held = 0
+                    sig.loc[dt] = 0.0
+                else:
+                    sig.loc[dt] = 1.0
+        return sig.ffill().fillna(0).clip(0, 1)
 
-    if in_pos and entry_time is not None and entry_price is not None:
-        last_price = float(px.iloc[-1])
-        pnl = (last_price / entry_price - 1.0) * 100.0
-        trades.append({
-            "Ticker": ticker,
-            "Side": "Long",
-            "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S CT"),
-            "Exit CT": "Open",
-            "Entry Price": round(float(entry_price), 2),
-            "Exit/Current Price": round(float(last_price), 2),
-            "PnL (%)": round(float(pnl), 2),
-            "Status": "Open",
-        })
+    chosen = {
+        "buffer": float(params["buffer_pct"]),
+        "confirm": int(params["confirm_bars"]),
+        "hold": int(params["min_hold_bars"]),
+        "cool": int(params["cooldown_bars"]),
+        "optimizer": "OFF",
+        "score": None,
+    }
 
-    trades_df = pd.DataFrame(trades)
-    status = "LONG" if (not trades_df.empty and str(trades_df.iloc[-1].get("Status", "")).lower() == "open") else "CASH"
+    kalman_signal = _build_sig(chosen["buffer"], chosen["confirm"], chosen["hold"], chosen["cool"])
+
+    if bool(params.get("benchmark_aware", True)):
+        best_pack = None
+        try:
+            initial_cap_local = float(globals().get("initial_cap", 100000.0))
+        except Exception:
+            initial_cap_local = 100000.0
+        try:
+            rf_rate_local = float(globals().get("rf_rate", 0.0))
+        except Exception:
+            rf_rate_local = 0.0
+
+        bh_reference = (float(px.iloc[-1]) / float(px.iloc[0]) - 1.0) * 100.0 if len(px) else 0.0
+
+        for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
+            for _conf in [3, 4, 5, 7, 10]:
+                for _hold in [10, 15, 21, 34, 55]:
+                    for _cool in [5, 8, 13, 21]:
+                        _sig = _build_sig(_buf, _conf, _hold, _cool)
+                        if bool(params.get("use_firewall", False)):
+                            _sig = apply_kalman_risk_firewall(
+                                px, _sig, bt_trend,
+                                max_trade_loss_pct=float(params.get("trade_stop_pct", 8.0)),
+                                trail_stop_pct=float(params.get("trail_stop_pct", 15.0)),
+                                equity_dd_stop_pct=float(params.get("equity_dd_stop_pct", 25.0)),
+                                cooldown_bars=int(params.get("firewall_cooldown", 10))
+                            )
+                        _bt = BacktestEngine.run_strategy(px, _sig, initial_cap_local)
+                        _eq = _bt.get("equity_curve", pd.Series(dtype=float))
+                        _rets = _bt.get("returns", pd.Series(dtype=float))
+                        _tr = _bt.get("trades", pd.DataFrame())
+                        if _eq is None or len(_eq) < 2:
+                            continue
+                        _strat = (float(_eq.iloc[-1]) / initial_cap_local - 1.0) * 100.0
+                        _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
+                        _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
+                        _mets = BacktestEngine.calculate_metrics(_rets, rf_rate_local) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
+                        _sh = float(_mets.get("Sharpe Ratio", 0.0))
+                        _dd_abs = abs(float(_dd))
+                        _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
+                        if _strat < bh_reference:
+                            _score -= (bh_reference - _strat) * 0.85
+                        if _dd_abs > float(params.get("max_dd_allowed", 35.0)):
+                            _score -= ((_dd_abs - float(params.get("max_dd_allowed", 35.0))) ** 2) * 2.0
+                        if _dd_abs > 60:
+                            _score -= 5000.0
+                        if best_pack is None or _score > best_pack["score"]:
+                            best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
+
+        if best_pack is not None:
+            kalman_signal = best_pack["sig"]
+            chosen = {
+                "buffer": float(best_pack["buffer"]),
+                "confirm": int(best_pack["confirm"]),
+                "hold": int(best_pack["hold"]),
+                "cool": int(best_pack["cool"]),
+                "optimizer": "ON",
+                "score": float(best_pack["score"]),
+            }
+
+    if bool(params.get("use_firewall", False)):
+        kalman_signal = apply_kalman_risk_firewall(
+            px, kalman_signal, bt_trend,
+            max_trade_loss_pct=float(params.get("trade_stop_pct", 8.0)),
+            trail_stop_pct=float(params.get("trail_stop_pct", 15.0)),
+            equity_dd_stop_pct=float(params.get("equity_dd_stop_pct", 25.0)),
+            cooldown_bars=int(params.get("firewall_cooldown", 10))
+        )
+
+    try:
+        initial_cap_local = float(globals().get("initial_cap", 100000.0))
+    except Exception:
+        initial_cap_local = 100000.0
+
+    bt = BacktestEngine.run_strategy(px, kalman_signal, initial_cap_local)
+    trades_df = bt.get("trades", pd.DataFrame()).copy()
+    if trades_df is None:
+        trades_df = pd.DataFrame()
+
+    # Normalize status names for the watchlist status table.
+    status = "CASH"
+    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+        last = trades_df.iloc[-1]
+        row_txt = " ".join([str(x) for x in last.values]).upper()
+        if ("OPEN" in row_txt) and ("CLOSED" not in row_txt):
+            status = "LONG"
+        # If Strategy engine has a Status column, trust it.
+        if "Status" in trades_df.columns:
+            status = "LONG" if str(last.get("Status", "")).upper() == "OPEN" else "CASH"
+
+    settings_txt = (
+        f"buffer {chosen['buffer']*100:.2f}%, confirm {chosen['confirm']}, "
+        f"min-hold {chosen['hold']}, cooldown {chosen['cool']}, "
+        f"optimizer {chosen['optimizer']}; "
+        + _main_kalman_params_label(params)
+    )
 
     latest = {
         "Ticker": ticker,
@@ -948,8 +1051,8 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
         "Trade Position": status,
         "Price": round(float(px.iloc[-1]), 2),
         "Candle Close CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
-        "Source": "Current Main Kalman Controls",
-        "Settings": _main_kalman_params_label(params),
+        "Source": "Current Main Kalman Controls + Optimizer",
+        "Settings": settings_txt,
     }
     return trades_df, latest
 
@@ -1071,7 +1174,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                     "Price": None,
                     "Candle Close CT": "",
                     "Ledger Note": "Not enough 15m data",
-                    "Settings": _main_kalman_params_label(params),
+                    "Settings": raw_row.get("Settings", _main_kalman_params_label(params)) if isinstance(raw_row, dict) else _main_kalman_params_label(params),
                 })
                 continue
 
@@ -1158,7 +1261,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 "Current/Exit Price": curr_exit_price,
                 "PnL (%)": pnl_pct,
                 "Ledger Note": note,
-                "Settings": _main_kalman_params_label(params),
+                "Settings": raw_row.get("Settings", _main_kalman_params_label(params)) if isinstance(raw_row, dict) else _main_kalman_params_label(params),
             })
 
         except Exception as e:
@@ -1169,7 +1272,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 "Price": None,
                 "Candle Close CT": "",
                 "Ledger Note": str(e)[:120],
-                "Settings": _main_kalman_params_label(params),
+                "Settings": raw_row.get("Settings", _main_kalman_params_label(params)) if isinstance(raw_row, dict) else _main_kalman_params_label(params),
             })
 
     df_rows = pd.DataFrame(rows)
@@ -8050,7 +8153,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Watchlist uses the CURRENT Main Kalman controls from the sliders/settings, not a separate hardcoded logic. Auto-refresh is OFF by default.")
+    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Watchlist uses the CURRENT Main Kalman controls plus the same benchmark-aware optimizer grid, not a separate hardcoded logic. Auto-refresh is OFF by default.")
     _mon_saved = _load_main_kalman_monitor_settings()
     _watchlist_from_url = _get_query_param_value("watchlist", "")
     _watchlist_default = str(_watchlist_from_url or _mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL") or "DELL, NBIS, PLTR, AAPL")
