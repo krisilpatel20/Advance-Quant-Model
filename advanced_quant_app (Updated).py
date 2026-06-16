@@ -166,15 +166,34 @@ def _trade_row_is_open(last_row, columns=None):
 
 
 
-def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, latest_time=None):
-    """Save visible main Kalman trade-log status so sidebar/scanner mirrors it."""
+def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
+    """
+    Save visible main Kalman status so the sidebar/scanner mirrors the MAIN TAB.
+
+    The main tab's chart shows LONG/CASH from the kalman_signal series (the last
+    bar's position), NOT from the trade-log DataFrame. Those can disagree on the
+    final bar. When signal_state is provided (the last value of kalman_signal),
+    it is authoritative and overrides the trade-log-derived position, so the
+    saved status always equals what you see on the chart.
+    """
     try:
         row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
+
+        # Authoritative position from the signal series when available.
+        if signal_state is not None:
+            try:
+                _is_long = int(round(float(signal_state))) == 1
+            except Exception:
+                _is_long = bool(signal_state)
+            row["Trade Position"] = "LONG" if _is_long else "CASH"
+            row["Alert"] = "Position from main kalman_signal (chart source of truth)"
+
         key = f"main_kalman_status_{str(ticker).upper()}"
         st.session_state[key] = row
         return row
     except Exception:
         return None
+
 
 
 
@@ -312,10 +331,20 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
         return None
 
 
-def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None):
-    """Show the exact main Kalman trade-log status back in Thesis Parameters."""
+def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
+    """Show the exact main Kalman status back in Thesis Parameters.
+
+    When signal_state (last value of kalman_signal) is given, it is authoritative
+    for LONG/CASH so the verify slot matches the chart exactly.
+    """
     try:
         row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
+        if signal_state is not None:
+            try:
+                _is_long = int(round(float(signal_state))) == 1
+            except Exception:
+                _is_long = bool(signal_state)
+            row["Trade Position"] = "LONG" if _is_long else "CASH"
         row["Source"] = "Main Institutional Trend Rail Graph + Main Kalman Trade Log"
         st.session_state[f"main_kalman_verified_{str(ticker).upper()}"] = row
 
@@ -10336,6 +10365,12 @@ if bool(kalman_fast_live_mode):
                 kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
                 kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
                 kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
+
+                # Authoritative current position from the signal series (chart source).
+                try:
+                    _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
+                except Exception:
+                    _kalman_signal_last = None
                 try:
                     _sync_watchlist_ledger_from_visible_main_trade_log(
                         TICKER,
@@ -10345,11 +10380,22 @@ if bool(kalman_fast_live_mode):
                 except Exception:
                     pass
                 try:
+                    _save_main_kalman_status_to_session(
+                        TICKER,
+                        kalman_trades,
+                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
+                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
+                        signal_state=_kalman_signal_last,
+                    )
+                except Exception:
+                    pass
+                try:
                     _update_thesis_main_kalman_verify(
                         TICKER,
                         kalman_trades,
                         latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                         latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
+                        signal_state=_kalman_signal_last,
                     )
                 except Exception:
                     pass
@@ -11837,6 +11883,14 @@ with tab4:
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
             kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
             kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
+
+            # Authoritative current position = last value of the signal series the
+            # chart uses. This is the LONG/CASH you actually see, and what the
+            # sidebar/watchlist must mirror.
+            try:
+                _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
+            except Exception:
+                _kalman_signal_last = None
             try:
                 _sync_watchlist_ledger_from_visible_main_trade_log(
                     TICKER,
@@ -11851,6 +11905,7 @@ with tab4:
                     kalman_trades,
                     latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                     latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
+                    signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
                 )
             except Exception:
                 pass
@@ -11861,6 +11916,7 @@ with tab4:
                     kalman_trades,
                     latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                     latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
+                    signal_state=_kalman_signal_last,
                 )
             except Exception:
                 pass
@@ -11969,6 +12025,7 @@ with tab4:
                         kalman_trades,
                         latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                         latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
+                        signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
                     )
                     if _main_status_row:
                         st.markdown("#### ✅ Main Kalman Current Status")
@@ -11984,6 +12041,7 @@ with tab4:
                             kalman_trades,
                             latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                             latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
+                            signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
                         )
                     except Exception:
                         pass
