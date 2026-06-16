@@ -170,23 +170,27 @@ def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, la
     """
     Save visible main Kalman status so the sidebar/scanner mirrors the MAIN TAB.
 
-    The main tab's chart shows LONG/CASH from the kalman_signal series (the last
-    bar's position), NOT from the trade-log DataFrame. Those can disagree on the
-    final bar. When signal_state is provided (the last value of kalman_signal),
-    it is authoritative and overrides the trade-log-derived position, so the
-    saved status always equals what you see on the chart.
+    SOURCE OF TRUTH = the executed trade log (BacktestEngine output). Its last
+    row's Open/Closed reflects whether the strategy is actually holding the
+    position right now, after cooldown/min-hold/stop logic. The raw kalman_signal
+    series can differ from the executed position (e.g. signal drops to 0 during
+    min-hold while the trade is still open), so it must NOT override an explicit
+    Open/Closed trade-log row.
+
+    signal_state is used ONLY as a fallback when the trade log is empty/missing,
+    so a brand-new in-position bar with no recorded trade still shows LONG.
     """
     try:
         row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
 
-        # Authoritative position from the signal series when available.
-        if signal_state is not None:
+        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
+        if not _have_trades and signal_state is not None:
             try:
                 _is_long = int(round(float(signal_state))) == 1
             except Exception:
                 _is_long = bool(signal_state)
             row["Trade Position"] = "LONG" if _is_long else "CASH"
-            row["Alert"] = "Position from main kalman_signal (chart source of truth)"
+            row["Alert"] = "No trade log row — position from main kalman_signal"
 
         key = f"main_kalman_status_{str(ticker).upper()}"
         st.session_state[key] = row
@@ -334,12 +338,13 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
 def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
     """Show the exact main Kalman status back in Thesis Parameters.
 
-    When signal_state (last value of kalman_signal) is given, it is authoritative
-    for LONG/CASH so the verify slot matches the chart exactly.
+    Source of truth is the executed trade log. signal_state is only a fallback
+    when there is no trade-log row, matching _save_main_kalman_status_to_session.
     """
     try:
         row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
-        if signal_state is not None:
+        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
+        if not _have_trades and signal_state is not None:
             try:
                 _is_long = int(round(float(signal_state))) == 1
             except Exception:
