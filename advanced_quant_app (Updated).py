@@ -948,10 +948,29 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     )
     bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
 
-    buffer_pct = float(params["buffer_pct"])
-    confirm_bars = int(params["confirm_bars"])
-    min_hold_bars = int(params["min_hold_bars"])
-    cooldown_bars = int(params["cooldown_bars"])
+    # If the main tab saved optimizer-chosen params for THIS ticker, use them so
+    # the watchlist reproduces the main-tab signal exactly. Otherwise fall back
+    # to the current slider params.
+    _opt = _get_main_kalman_opt_params_for_ticker(ticker)
+    if isinstance(_opt, dict):
+        buffer_pct = float(_opt.get("buffer_pct", params["buffer_pct"]))
+        confirm_bars = int(_opt.get("confirm_bars", params["confirm_bars"]))
+        min_hold_bars = int(_opt.get("min_hold_bars", params["min_hold_bars"]))
+        cooldown_bars = int(_opt.get("cooldown_bars", params["cooldown_bars"]))
+        _slope_confirm = bool(_opt.get("slope_confirm", params["slope_confirm"]))
+        _atr_safety = bool(_opt.get("atr_safety", params["atr_safety"]))
+        params = dict(params)
+        params["buffer_pct"] = buffer_pct
+        params["confirm_bars"] = confirm_bars
+        params["min_hold_bars"] = min_hold_bars
+        params["cooldown_bars"] = cooldown_bars
+        params["slope_confirm"] = _slope_confirm
+        params["atr_safety"] = _atr_safety
+    else:
+        buffer_pct = float(params["buffer_pct"])
+        confirm_bars = int(params["confirm_bars"])
+        min_hold_bars = int(params["min_hold_bars"])
+        cooldown_bars = int(params["cooldown_bars"])
 
     trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
 
@@ -1121,6 +1140,52 @@ def _save_main_kalman_watchlist_ledger(data):
         _main_kalman_watchlist_ledger_path().write_text(json.dumps(data, indent=2))
     except Exception:
         pass
+
+
+# ---- Per-ticker optimized Kalman params store -----------------------------
+# When the Benchmark-aware optimizer is ON, the main tab chooses per-ticker
+# buffer/confirm/hold/cooldown that differ from the sliders. The watchlist must
+# use those SAME per-ticker params, or it will recompute with slider defaults
+# and disagree (e.g. ELF Long in main tab, CASH in watchlist). We persist the
+# chosen params per ticker so the watchlist can reproduce the main-tab signal.
+def _main_kalman_opt_params_path():
+    try:
+        return _Path.home() / ".pinehurst_main_kalman_opt_params.json"
+    except Exception:
+        return _Path(".pinehurst_main_kalman_opt_params.json")
+
+def _load_main_kalman_opt_params():
+    try:
+        p = _main_kalman_opt_params_path()
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
+                                            slope_confirm=True, atr_safety=True):
+    """Persist the exact params the main tab used for a ticker (optimizer or sliders)."""
+    try:
+        store = _load_main_kalman_opt_params()
+        store[str(ticker).upper()] = {
+            "buffer_pct": float(buffer_pct),
+            "confirm_bars": int(confirm_bars),
+            "min_hold_bars": int(min_hold_bars),
+            "cooldown_bars": int(cooldown_bars),
+            "slope_confirm": bool(slope_confirm),
+            "atr_safety": bool(atr_safety),
+            "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+        }
+        _main_kalman_opt_params_path().write_text(json.dumps(store, indent=2))
+    except Exception:
+        pass
+
+def _get_main_kalman_opt_params_for_ticker(ticker):
+    try:
+        return _load_main_kalman_opt_params().get(str(ticker).upper())
+    except Exception:
+        return None
 
 def _parse_ct_time_safe(x):
     try:
@@ -10286,6 +10351,14 @@ if bool(kalman_fast_live_mode):
                             bool(use_slope_confirm),
                             bool(use_atr_safety)
                         )
+                        try:
+                            _save_main_kalman_opt_params_for_ticker(
+                                TICKER, float(_cached_params["buffer"]), int(_cached_params["confirm"]),
+                                int(_cached_params["hold"]), int(_cached_params["cool"]),
+                                slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
+                            )
+                        except Exception:
+                            pass
                         st.caption(
                             f"Fast mode reused optimized settings: buffer {float(_cached_params['buffer'])*100:.2f}%, "
                             f"confirm {int(_cached_params['confirm'])}, min-hold {int(_cached_params['hold'])}, "
@@ -10342,6 +10415,14 @@ if bool(kalman_fast_live_mode):
                                     "hold": int(best_pack["hold"]),
                                     "cool": int(best_pack["cool"])
                                 }
+                            try:
+                                _save_main_kalman_opt_params_for_ticker(
+                                    TICKER, float(best_pack["buffer"]), int(best_pack["confirm"]),
+                                    int(best_pack["hold"]), int(best_pack["cool"]),
+                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
+                                )
+                            except Exception:
+                                pass
                             st.info(
                                 f"Fast optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
                                 f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}."
@@ -10351,11 +10432,27 @@ if bool(kalman_fast_live_mode):
                                 kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
                                 bool(use_slope_confirm), bool(use_atr_safety)
                             )
+                            try:
+                                _save_main_kalman_opt_params_for_ticker(
+                                    TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
+                                    int(kalman_min_hold), int(kalman_cooldown),
+                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
+                                )
+                            except Exception:
+                                pass
                 else:
                     kalman_signal = _build_fast_kalman_signal(
                         kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
                         bool(use_slope_confirm), bool(use_atr_safety)
                     )
+                    try:
+                        _save_main_kalman_opt_params_for_ticker(
+                            TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
+                            int(kalman_min_hold), int(kalman_cooldown),
+                            slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
+                        )
+                    except Exception:
+                        pass
 
                 if bool(use_kalman_risk_firewall):
                     kalman_signal = apply_kalman_risk_firewall(
@@ -11874,6 +11971,27 @@ with tab4:
                     kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
                     slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
                 )
+
+            # Persist the effective params for THIS ticker so the watchlist
+            # recompute reproduces the main-tab signal (optimizer or sliders).
+            try:
+                _cs = locals().get("chosen_kalman_settings", None)
+                if isinstance(_cs, dict) and "Buffer %" in _cs:
+                    _eff_buf = float(_cs["Buffer %"]) / 100.0
+                    _eff_conf = int(_cs.get("Confirm Bars", kalman_confirm_bars))
+                    _eff_hold = int(_cs.get("Min Hold", kalman_min_hold))
+                    _eff_cool = int(_cs.get("Cooldown", kalman_cooldown))
+                else:
+                    _eff_buf = float(kalman_buffer_pct)
+                    _eff_conf = int(kalman_confirm_bars)
+                    _eff_hold = int(kalman_min_hold)
+                    _eff_cool = int(kalman_cooldown)
+                _save_main_kalman_opt_params_for_ticker(
+                    TICKER, _eff_buf, _eff_conf, _eff_hold, _eff_cool,
+                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
+                )
+            except Exception:
+                pass
 
             if bool(use_kalman_risk_firewall):
                 kalman_signal = apply_kalman_risk_firewall(
