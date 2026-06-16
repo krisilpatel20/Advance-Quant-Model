@@ -1194,7 +1194,41 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
             candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
             price_now = round(float(px.iloc[-1]), 2)
 
-            if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+            # ---- Authoritative override -------------------------------------
+            # If the Main Kalman tab has already computed and saved a status for
+            # this exact ticker, that visible trade log is the source of truth.
+            # The watchlist must mirror it instead of its own 60d/15m recompute,
+            # otherwise the sidebar can disagree with the main tab (e.g. ELF
+            # showing CASH here while the main tab shows an Open position).
+            _visible_status = None
+            try:
+                _visible_status = st.session_state.get(f"main_kalman_status_{sym}")
+            except Exception:
+                _visible_status = None
+
+            _used_visible = False
+            if isinstance(_visible_status, dict) and _visible_status.get("Trade Position") in ("LONG", "CASH"):
+                position = str(_visible_status.get("Trade Position"))
+                is_open = position == "LONG"
+                signal_state = "BUY" if is_open else "SELL"
+                # Prefer prices/times from the recomputed log when present, else
+                # fall back to the saved visible row / current price.
+                if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                    last = trades_df.iloc[-1]
+                    entry_time = str(last.get("Entry CT", ""))
+                    exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
+                    entry_price = last.get("Entry Price", None)
+                    curr_exit_price = last.get("Exit/Current Price", price_now)
+                    pnl_pct = last.get("PnL (%)", None)
+                else:
+                    entry_time = str(_visible_status.get("Candle Close CT", ""))
+                    exit_time = "Open" if is_open else ""
+                    entry_price = None
+                    curr_exit_price = _visible_status.get("Price", price_now)
+                    pnl_pct = None
+                event_time = entry_time if is_open else (exit_time or candle_ct)
+                _used_visible = True
+            elif trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
                 last = trades_df.iloc[-1]
                 is_open = _trade_row_is_open(last, columns=trades_df.columns)
                 position = "LONG" if is_open else "CASH"
@@ -1273,6 +1307,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 "Current/Exit Price": curr_exit_price,
                 "PnL (%)": pnl_pct,
                 "Ledger Note": note,
+                "Status Source": "Visible Main Kalman tab" if _used_visible else "Watchlist recompute (60d/15m)",
                 "Settings": _main_kalman_params_label(params),
             })
 
@@ -8273,40 +8308,85 @@ with st.sidebar:
             except Exception as _e:
                 st.error(f"Override failed: {_e}")
 
-    st.warning("SAFE LOAD MODE: watchlist does not auto-run on page load. Click the button below after the app loads.")
+    # ---- Auto-run / persistent results so you don't re-click every load ----
+    if "auto_run_main_kalman_monitor" not in st.session_state:
+        st.session_state["auto_run_main_kalman_monitor"] = False
+    auto_run_monitor = st.checkbox(
+        "Auto-run watchlist monitor on page load",
+        key="auto_run_main_kalman_monitor",
+        help="When ON, the watchlist runs automatically each time the app loads/reruns. When OFF you can run it manually with the button. Either way, the last results stay shown below until you run it again.",
+    )
 
-    if st.button("Run Main Kalman Monitor Now", use_container_width=True):
-        _main_mon_rows_manual = run_main_kalman_watchlist_monitor(
+    if auto_run_monitor:
+        st.caption("Auto-run is ON: the watchlist runs on each page load. Turn it OFF to use Safe Load (manual) mode.")
+    else:
+        st.warning("SAFE LOAD MODE: watchlist does not auto-run on page load. Click the button below, or enable Auto-run above.")
+
+    def _render_open_closed_status(_rows, _source_label=""):
+        """Render the Open/Closed split table. Used for manual, auto, and cached results."""
+        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
+        if _source_label:
+            st.caption(_source_label)
+        try:
+            _df = pd.DataFrame(_rows)
+            if not _df.empty and "Trade Position" in _df.columns:
+                _open_df = _df[_df["Trade Position"].astype(str).str.upper().eq("LONG")].copy()
+                _closed_df = _df[_df["Trade Position"].astype(str).str.upper().ne("LONG")].copy()
+                _cols = ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal", "Status Source"]
+                c_open, c_closed = st.columns(2)
+                with c_open:
+                    st.metric("Open / Long", int(len(_open_df)))
+                    if len(_open_df):
+                        st.dataframe(_open_df[[c for c in _cols if c in _open_df.columns]], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No open Long positions.")
+                with c_closed:
+                    st.metric("Closed / Cash", int(len(_closed_df)))
+                    if len(_closed_df):
+                        st.dataframe(_closed_df[[c for c in _cols if c in _closed_df.columns]], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No closed/cash tickers.")
+            else:
+                st.caption("No watchlist rows to show yet.")
+        except Exception as _e:
+            st.caption(f"Open/Closed status unavailable: {_e}")
+
+    def _run_monitor_and_store():
+        try:
+            _max_stocks = int(main_kalman_monitor_max_stocks)
+        except Exception:
+            _max_stocks = 50
+        try:
+            _sell_alerts = bool(main_kalman_monitor_sell_alerts)
+        except Exception:
+            _sell_alerts = False
+        _rows = run_main_kalman_watchlist_monitor(
             main_kalman_monitor_watchlist,
             send_telegram=bool(tg_alerts_on and main_kalman_monitor_on),
             token=tg_bot_token,
             chat_id=tg_chat_id,
             show_table=True,
-            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
+            max_stocks=_max_stocks,
+            allow_sell_alerts=_sell_alerts,
         )
+        st.session_state["last_main_kalman_monitor_rows"] = _rows
+        st.session_state["last_main_kalman_monitor_ct"] = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
+        return _rows
 
-        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
-        try:
-            _mon_df_manual = pd.DataFrame(_main_mon_rows_manual)
-            if not _mon_df_manual.empty and "Trade Position" in _mon_df_manual.columns:
-                _open_df_manual = _mon_df_manual[_mon_df_manual["Trade Position"].astype(str).str.upper().eq("LONG")].copy()
-                _closed_df_manual = _mon_df_manual[_mon_df_manual["Trade Position"].astype(str).str.upper().ne("LONG")].copy()
-                c_open_m, c_closed_m = st.columns(2)
-                with c_open_m:
-                    st.metric("Open / Long", int(len(_open_df_manual)))
-                    if len(_open_df_manual):
-                        st.dataframe(_open_df_manual[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _open_df_manual.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No open Long positions.")
-                with c_closed_m:
-                    st.metric("Closed / Cash", int(len(_closed_df_manual)))
-                    if len(_closed_df_manual):
-                        st.dataframe(_closed_df_manual[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _closed_df_manual.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No closed/cash tickers.")
-        except Exception as _e:
-            st.caption(f"Open/Closed status unavailable: {_e}")
+    _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
+
+    if _clicked_run:
+        _rows_now = _run_monitor_and_store()
+        _render_open_closed_status(_rows_now, "Just ran (manual).")
+    elif auto_run_monitor:
+        _rows_now = _run_monitor_and_store()
+        _render_open_closed_status(_rows_now, f"Auto-run on page load — {st.session_state.get('last_main_kalman_monitor_ct', '')}.")
+    elif st.session_state.get("last_main_kalman_monitor_rows"):
+        # Show the last result without re-running, so the table persists across reruns.
+        _render_open_closed_status(
+            st.session_state["last_main_kalman_monitor_rows"],
+            f"Showing last run from {st.session_state.get('last_main_kalman_monitor_ct', '')}. Click the button to refresh.",
+        )
 
     if False:
         st.caption("Auto monitor disabled for safe loading. Use Run Main Kalman Monitor Now.")
