@@ -10110,88 +10110,26 @@ if bool(kalman_fast_live_mode):
                     except Exception:
                         pass
 
-                if bool(benchmark_aware_kalman):
-                    _cached_params = st.session_state.get(_kalman_opt_key) if bool(kalman_fast_reuse_optimizer) else None
-
-                    if _cached_params is not None:
-                        kalman_signal = _build_fast_kalman_signal(
-                            float(_cached_params["buffer"]),
-                            int(_cached_params["confirm"]),
-                            int(_cached_params["hold"]),
-                            int(_cached_params["cool"]),
-                            bool(use_slope_confirm),
-                            bool(use_atr_safety)
-                        )
-                        st.caption(
-                            f"Fast mode reused optimized settings: buffer {float(_cached_params['buffer'])*100:.2f}%, "
-                            f"confirm {int(_cached_params['confirm'])}, min-hold {int(_cached_params['hold'])}, "
-                            f"cooldown {int(_cached_params['cool'])}. Click re-optimize for a fresh full grid search."
-                        )
-                    else:
-                        # Same full benchmark-aware optimizer grid as the full Kalman tab.
-                        # Runs once, then fast mode can reuse the chosen parameters on live refresh.
-                        best_pack = None
-                        bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-
-                        with st.spinner("Running fresh Kalman optimizer/search for Main tab..."):
-                            for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
-                                for _conf in [3, 4, 5, 7, 10]:
-                                    for _hold in [10, 15, 21, 34, 55]:
-                                        for _cool in [5, 8, 13, 21]:
-                                            _sig = _build_fast_kalman_signal(_buf, _conf, _hold, _cool, bool(use_slope_confirm), bool(use_atr_safety))
-                                            if bool(use_kalman_risk_firewall):
-                                                _sig = apply_kalman_risk_firewall(
-                                                    bt_px, _sig, bt_trend,
-                                                    max_trade_loss_pct=float(kalman_trade_stop_pct),
-                                                    trail_stop_pct=float(kalman_trail_stop_pct),
-                                                    equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                                                    cooldown_bars=int(kalman_firewall_cooldown)
-                                                )
-                                            _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
-                                            _eq = _bt.get("equity_curve", pd.Series(dtype=float))
-                                            _rets = _bt.get("returns", pd.Series(dtype=float))
-                                            _tr = _bt.get("trades", pd.DataFrame())
-                                            if _eq is None or len(_eq) < 2:
-                                                continue
-                                            _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
-                                            _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
-                                            _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
-                                            _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
-                                            _sh = float(_mets.get("Sharpe Ratio", 0.0))
-                                            _dd_abs = abs(float(_dd))
-                                            _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
-                                            if _strat < bh_reference:
-                                                _score -= (bh_reference - _strat) * 0.85
-                                            if _dd_abs > float(kalman_max_dd_allowed):
-                                                _score -= ((_dd_abs - float(kalman_max_dd_allowed)) ** 2) * 2.0
-                                            if _dd_abs > 60:
-                                                _score -= 5000.0
-                                            if best_pack is None or _score > best_pack["score"]:
-                                                best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
-
-                        if best_pack is not None:
-                            kalman_signal = best_pack["sig"]
-                            if bool(kalman_fast_reuse_optimizer):
-                                st.session_state[_kalman_opt_key] = {
-                                    "buffer": float(best_pack["buffer"]),
-                                    "confirm": int(best_pack["confirm"]),
-                                    "hold": int(best_pack["hold"]),
-                                    "cool": int(best_pack["cool"])
-                                }
-                            st.info(
-                                f"Fast optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
-                                f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}."
-                            )
-                        else:
-                            kalman_signal = _build_fast_kalman_signal(
-                                kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                                bool(use_slope_confirm), bool(use_atr_safety)
-                            )
-                else:
-                    kalman_signal = _build_fast_kalman_signal(
-                        kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                        bool(use_slope_confirm), bool(use_atr_safety)
-                    )
+                # MAIN KALMAN LOCKED MODE:
+                # Optimizer is intentionally OFF for live/source-of-truth tab.
+                # Reason: optimizer can pick different parameters after new candles arrive,
+                # which changes the historical trade log and creates unacceptable repaint-like behavior.
+                # Main tab now uses ONLY the visible/manual settings:
+                # buffer, confirm bars, min-hold bars, cooldown bars, slope/ATR toggles.
+                kalman_signal = _build_fast_kalman_signal(
+                    kalman_buffer_pct,
+                    kalman_confirm_bars,
+                    kalman_min_hold,
+                    kalman_cooldown,
+                    bool(use_slope_confirm),
+                    bool(use_atr_safety)
+                )
+                st.info(
+                    f"Main Kalman optimizer LOCKED OFF: using manual settings only — "
+                    f"buffer {float(kalman_buffer_pct)*100:.2f}%, "
+                    f"confirm {int(kalman_confirm_bars)}, "
+                    f"min-hold {int(kalman_min_hold)}, cooldown {int(kalman_cooldown)}."
+                )
 
                 if bool(use_kalman_risk_firewall):
                     kalman_signal = apply_kalman_risk_firewall(
@@ -10235,7 +10173,7 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Sidebar status matches main trade log; old historical flips do NOT trigger Telegram.")
+                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Main optimizer is LOCKED OFF; sidebar status matches main trade log; old historical flips do NOT trigger Telegram.")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
