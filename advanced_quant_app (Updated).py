@@ -102,96 +102,12 @@ def _clean_trade_log_numbers(df):
         return df
 
 
-def _trade_row_is_open(last_row, columns=None):
-    """
-    Canonical open/closed resolver for the last trade-log row.
-
-    Priority:
-      1. An explicit Status column ("Open"/"Closed") is authoritative.
-      2. Otherwise, an Exit field that is empty / NaN / literally "Open"
-         means the trade is still open.
-      3. Last fallback: substring scan of the row text.
-
-    This single helper is used by every status path (visible log, watchlist,
-    telegram, sidebar) so they can never disagree on open vs. closed.
-    """
-    try:
-        # 1) Explicit Status column wins.
-        try:
-            status_val = str(last_row.get("Status", "")).strip().upper()
-        except Exception:
-            status_val = ""
-        if status_val in ("OPEN", "LONG"):
-            return True
-        if status_val in ("CLOSED", "CLOSE", "STOP LOSS", "TRAILING STOP", "CASH"):
-            return False
-
-        # 2) Exit field check. Only true exit-time columns are reliable here:
-        #    Sell Price / Exit Price are populated even for OPEN trades (current
-        #    price), so they must NOT be treated as evidence of a close.
-        for c in ("Exit CT", "Exit Date", "Exit Time", "Exit"):
-            present = (columns is None) or (c in columns)
-            if not present:
-                continue
-            try:
-                v = last_row.get(c, "__MISSING__")
-            except Exception:
-                v = "__MISSING__"
-            if isinstance(v, str) and v == "__MISSING__":
-                # Column not actually retrievable on this row.
-                continue
-            # Column is present. Empty / NaN / None / "Open" => still open.
-            try:
-                if v is None or (pd.isna(v) if np.isscalar(v) or v is None else False):
-                    return True
-            except Exception:
-                pass
-            sv = str(v).strip()
-            if sv == "" or sv.lower() in ("nan", "none", "nat"):
-                return True
-            if sv.lower() == "open":
-                return True
-            # A real exit value present -> closed.
-            return False
-
-        # 3) Fallback: substring scan.
-        try:
-            row_txt = " ".join([str(x) for x in last_row.values]).upper()
-        except Exception:
-            row_txt = ""
-        return ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
-    except Exception:
-        return False
 
 
-
-
-def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
-    """
-    Save visible main Kalman status so the sidebar/scanner mirrors the MAIN TAB.
-
-    SOURCE OF TRUTH = the executed trade log (BacktestEngine output). Its last
-    row's Open/Closed reflects whether the strategy is actually holding the
-    position right now, after cooldown/min-hold/stop logic. The raw kalman_signal
-    series can differ from the executed position (e.g. signal drops to 0 during
-    min-hold while the trade is still open), so it must NOT override an explicit
-    Open/Closed trade-log row.
-
-    signal_state is used ONLY as a fallback when the trade log is empty/missing,
-    so a brand-new in-position bar with no recorded trade still shows LONG.
-    """
+def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, latest_time=None):
+    """Save visible main Kalman trade-log status so sidebar/scanner mirrors it."""
     try:
         row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
-
-        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
-        if not _have_trades and signal_state is not None:
-            try:
-                _is_long = int(round(float(signal_state))) == 1
-            except Exception:
-                _is_long = bool(signal_state)
-            row["Trade Position"] = "LONG" if _is_long else "CASH"
-            row["Alert"] = "No trade log row — position from main kalman_signal"
-
         key = f"main_kalman_status_{str(ticker).upper()}"
         st.session_state[key] = row
         return row
@@ -201,8 +117,7 @@ def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, la
 
 
 
-
-def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest_price=None):
+def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
     """
     Sync watchlist ledger from the visible MAIN Kalman Trade Log.
     This fixes cases where main trade log says Open/Long but Thesis Parameters shows CASH.
@@ -216,8 +131,14 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
         last = t.iloc[-1]
         row_txt = " ".join([str(x) for x in last.values]).upper()
 
-        is_open = _trade_row_is_open(last, columns=t.columns)
+        is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
         position = "LONG" if is_open else "CASH"
+
+        # NON-REPAINT GUARD:
+        # Do not let a recalculated historical closed trade force the live ledger to CASH.
+        # Open/LONG rows can sync. Closed/SELL rows only sync when latest_time proves the exit is fresh.
+        if not is_open and latest_time is None:
+            return None
 
         entry_time = ""
         exit_time = "Open" if is_open else ""
@@ -289,6 +210,12 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
                 pnl_pct = None
 
         event_time = entry_time if is_open else (exit_time or entry_time)
+
+        if (not is_open) and latest_time is not None:
+            latest_ct = str(latest_time)
+            if not _event_is_on_latest_closed_bar(event_time, latest_ct, max_minutes=20):
+                return None
+
         state_key = f"{sym}|VISIBLE_MAIN|{'BUY' if is_open else 'SELL'}|{event_time}|{position}|{entry_price}|{current_price}"
 
         ledger = _load_main_kalman_watchlist_ledger()
@@ -335,21 +262,10 @@ def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest
         return None
 
 
-def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
-    """Show the exact main Kalman status back in Thesis Parameters.
-
-    Source of truth is the executed trade log. signal_state is only a fallback
-    when there is no trade-log row, matching _save_main_kalman_status_to_session.
-    """
+def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None):
+    """Show the exact main Kalman trade-log status back in Thesis Parameters."""
     try:
         row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
-        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
-        if not _have_trades and signal_state is not None:
-            try:
-                _is_long = int(round(float(signal_state))) == 1
-            except Exception:
-                _is_long = bool(signal_state)
-            row["Trade Position"] = "LONG" if _is_long else "CASH"
         row["Source"] = "Main Institutional Trend Rail Graph + Main Kalman Trade Log"
         st.session_state[f"main_kalman_verified_{str(ticker).upper()}"] = row
 
@@ -383,7 +299,7 @@ def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, t
         last = t.iloc[-1]
         row_txt = " ".join([str(x) for x in last.values]).upper()
 
-        is_open = _trade_row_is_open(last, columns=t.columns)
+        is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
         signal = "BUY" if is_open else "SELL"
 
         # Pull event time from the visible main trade log row.
@@ -456,8 +372,9 @@ def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_tim
 
         t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
         last = t.iloc[-1]
-        is_open = _trade_row_is_open(last, columns=t.columns)
-        is_long = is_open
+        row_txt = " ".join([str(x) for x in last.values]).upper()
+        is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
+        is_long = ("LONG" in row_txt) or is_open
 
         px = latest_price
         for c in ["Current Price", "Exit Price", "Exit", "Last Price", "Price"]:
@@ -948,29 +865,10 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     )
     bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
 
-    # If the main tab saved optimizer-chosen params for THIS ticker, use them so
-    # the watchlist reproduces the main-tab signal exactly. Otherwise fall back
-    # to the current slider params.
-    _opt = _get_main_kalman_opt_params_for_ticker(ticker)
-    if isinstance(_opt, dict):
-        buffer_pct = float(_opt.get("buffer_pct", params["buffer_pct"]))
-        confirm_bars = int(_opt.get("confirm_bars", params["confirm_bars"]))
-        min_hold_bars = int(_opt.get("min_hold_bars", params["min_hold_bars"]))
-        cooldown_bars = int(_opt.get("cooldown_bars", params["cooldown_bars"]))
-        _slope_confirm = bool(_opt.get("slope_confirm", params["slope_confirm"]))
-        _atr_safety = bool(_opt.get("atr_safety", params["atr_safety"]))
-        params = dict(params)
-        params["buffer_pct"] = buffer_pct
-        params["confirm_bars"] = confirm_bars
-        params["min_hold_bars"] = min_hold_bars
-        params["cooldown_bars"] = cooldown_bars
-        params["slope_confirm"] = _slope_confirm
-        params["atr_safety"] = _atr_safety
-    else:
-        buffer_pct = float(params["buffer_pct"])
-        confirm_bars = int(params["confirm_bars"])
-        min_hold_bars = int(params["min_hold_bars"])
-        cooldown_bars = int(params["cooldown_bars"])
+    buffer_pct = float(params["buffer_pct"])
+    confirm_bars = int(params["confirm_bars"])
+    min_hold_bars = int(params["min_hold_bars"])
+    cooldown_bars = int(params["cooldown_bars"])
 
     trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
 
@@ -992,18 +890,16 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
     exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
 
-    # ---- Build the position signal EXACTLY like the visible main Kalman log ----
-    # The signal here uses the same entry/exit/confirm/min-hold/cooldown rules as
-    # _build_kalman_signal_for_params in the main tab. We then run that signal
-    # through the SAME BacktestEngine.run_strategy the visible log uses, and apply
-    # the SAME risk firewall when it is enabled. This guarantees the watchlist
-    # open/closed status matches the Main Kalman Trade Log for every stock.
     sig = pd.Series(0.0, index=px.index)
     in_pos = False
     bars_held = 0
     cooldown_left = 0
+    entry_time = None
+    entry_price = None
+    trades = []
 
     for dt in px.index:
+        p = float(px.loc[dt])
         if cooldown_left > 0:
             cooldown_left -= 1
 
@@ -1011,100 +907,49 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
             if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
                 in_pos = True
                 bars_held = 0
+                entry_time = dt
+                entry_price = p
                 sig.loc[dt] = 1.0
             else:
                 sig.loc[dt] = 0.0
         else:
             bars_held += 1
             if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
+                exit_time = dt
+                exit_price = p
+                pnl = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
+                trades.append({
+                    "Ticker": ticker,
+                    "Side": "Long",
+                    "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S CT"),
+                    "Exit CT": pd.Timestamp(exit_time).strftime("%Y-%m-%d %H:%M:%S CT"),
+                    "Entry Price": round(float(entry_price), 2),
+                    "Exit/Current Price": round(float(exit_price), 2),
+                    "PnL (%)": round(float(pnl), 2),
+                    "Status": "Closed",
+                })
                 in_pos = False
                 cooldown_left = cooldown_bars
                 bars_held = 0
+                entry_time = None
+                entry_price = None
                 sig.loc[dt] = 0.0
             else:
                 sig.loc[dt] = 1.0
 
-    sig = sig.ffill().fillna(0).clip(0, 1)
-
-    # Apply the Main Kalman risk firewall when the user has it enabled, using the
-    # same session-state settings as the main chart, so a firewall-forced exit
-    # closes the watchlist trade exactly as it closes the visible log trade.
-    try:
-        use_firewall = bool(st.session_state.get("kalman_use_risk_firewall", False))
-    except Exception:
-        use_firewall = False
-    if use_firewall and "apply_kalman_risk_firewall" in globals():
-        try:
-            sig = apply_kalman_risk_firewall(
-                px, sig, bt_trend,
-                max_trade_loss_pct=float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-                trail_stop_pct=float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-                equity_dd_stop_pct=float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-                cooldown_bars=int(st.session_state.get("kalman_firewall_cooldown", 8)),
-            )
-        except Exception:
-            pass
-
-    # Run the identical backtest engine the visible Main Kalman Trade Log uses.
-    try:
-        initial_cap = float(st.session_state.get("initial_cap", 10000.0))
-    except Exception:
-        initial_cap = 10000.0
-
-    try:
-        bt = BacktestEngine.run_strategy(px, sig, initial_cap)
-        engine_trades = bt.get("trades", pd.DataFrame())
-    except Exception:
-        engine_trades = pd.DataFrame()
-
-    last_price = round(float(px.iloc[-1]), 2)
-
-    # Convert the engine trade log (Entry Date/Exit Date/Buy Price/Sell Price/Status)
-    # into the watchlist schema, preserving the engine's authoritative Status.
-    trades = []
-    if isinstance(engine_trades, pd.DataFrame) and not engine_trades.empty:
-        for _, tr in engine_trades.iterrows():
-            status_txt = str(tr.get("Status", "")).strip()
-            is_open_row = status_txt.upper() == "OPEN"
-
-            entry_dt = tr.get("Entry Date", None)
-            exit_dt = tr.get("Exit Date", None)
-            try:
-                entry_ct = pd.Timestamp(entry_dt).strftime("%Y-%m-%d %H:%M:%S CT") if entry_dt is not None and pd.notna(entry_dt) else ""
-            except Exception:
-                entry_ct = str(entry_dt) if entry_dt is not None else ""
-
-            if is_open_row:
-                exit_ct = "Open"
-            else:
-                try:
-                    exit_ct = pd.Timestamp(exit_dt).strftime("%Y-%m-%d %H:%M:%S CT") if exit_dt is not None and pd.notna(exit_dt) else ""
-                except Exception:
-                    exit_ct = str(exit_dt) if exit_dt is not None else ""
-
-            try:
-                entry_px = round(float(tr.get("Buy Price")), 2)
-            except Exception:
-                entry_px = None
-            try:
-                exit_px = round(float(tr.get("Sell Price")), 2)
-            except Exception:
-                exit_px = last_price if is_open_row else None
-            try:
-                pnl = round(float(tr.get("PnL (%)")), 2)
-            except Exception:
-                pnl = None
-
-            trades.append({
-                "Ticker": ticker,
-                "Side": "Long",
-                "Entry CT": entry_ct,
-                "Exit CT": exit_ct,
-                "Entry Price": entry_px,
-                "Exit/Current Price": exit_px,
-                "PnL (%)": pnl,
-                "Status": "Open" if is_open_row else "Closed",
-            })
+    if in_pos and entry_time is not None and entry_price is not None:
+        last_price = float(px.iloc[-1])
+        pnl = (last_price / entry_price - 1.0) * 100.0
+        trades.append({
+            "Ticker": ticker,
+            "Side": "Long",
+            "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S CT"),
+            "Exit CT": "Open",
+            "Entry Price": round(float(entry_price), 2),
+            "Exit/Current Price": round(float(last_price), 2),
+            "PnL (%)": round(float(pnl), 2),
+            "Status": "Open",
+        })
 
     trades_df = pd.DataFrame(trades)
     status = "LONG" if (not trades_df.empty and str(trades_df.iloc[-1].get("Status", "")).lower() == "open") else "CASH"
@@ -1113,9 +958,9 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
         "Ticker": ticker,
         "Alert Signal": "NO NEW ALERT",
         "Trade Position": status,
-        "Price": last_price,
+        "Price": round(float(px.iloc[-1]), 2),
         "Candle Close CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
-        "Source": "Current Main Kalman Controls (same engine + firewall as visible log)",
+        "Source": "Current Main Kalman Controls",
         "Settings": _main_kalman_params_label(params),
     }
     return trades_df, latest
@@ -1140,52 +985,6 @@ def _save_main_kalman_watchlist_ledger(data):
         _main_kalman_watchlist_ledger_path().write_text(json.dumps(data, indent=2))
     except Exception:
         pass
-
-
-# ---- Per-ticker optimized Kalman params store -----------------------------
-# When the Benchmark-aware optimizer is ON, the main tab chooses per-ticker
-# buffer/confirm/hold/cooldown that differ from the sliders. The watchlist must
-# use those SAME per-ticker params, or it will recompute with slider defaults
-# and disagree (e.g. ELF Long in main tab, CASH in watchlist). We persist the
-# chosen params per ticker so the watchlist can reproduce the main-tab signal.
-def _main_kalman_opt_params_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_opt_params.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_opt_params.json")
-
-def _load_main_kalman_opt_params():
-    try:
-        p = _main_kalman_opt_params_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
-                                            slope_confirm=True, atr_safety=True):
-    """Persist the exact params the main tab used for a ticker (optimizer or sliders)."""
-    try:
-        store = _load_main_kalman_opt_params()
-        store[str(ticker).upper()] = {
-            "buffer_pct": float(buffer_pct),
-            "confirm_bars": int(confirm_bars),
-            "min_hold_bars": int(min_hold_bars),
-            "cooldown_bars": int(cooldown_bars),
-            "slope_confirm": bool(slope_confirm),
-            "atr_safety": bool(atr_safety),
-            "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-        }
-        _main_kalman_opt_params_path().write_text(json.dumps(store, indent=2))
-    except Exception:
-        pass
-
-def _get_main_kalman_opt_params_for_ticker(ticker):
-    try:
-        return _load_main_kalman_opt_params().get(str(ticker).upper())
-    except Exception:
-        return None
 
 def _parse_ct_time_safe(x):
     try:
@@ -1212,13 +1011,12 @@ def _candidate_from_main_watchlist_trades(sym, trades_df, row):
         }
 
     last = trades_df.iloc[-1]
-    _is_open_row = _trade_row_is_open(last, columns=trades_df.columns)
-    status = "OPEN" if _is_open_row else "CLOSED"
+    status = str(last.get("Status", "")).upper()
     entry_time = str(last.get("Entry CT", ""))
     exit_time = str(last.get("Exit CT", ""))
     price = row.get("Price") if isinstance(row, dict) else None
 
-    if _is_open_row:
+    if status == "OPEN":
         position = "LONG"
         signal = "BUY"
         event_time = entry_time
@@ -1253,6 +1051,39 @@ def _parse_watchlist_ct_time(x):
         return v
     except Exception:
         return None
+
+
+
+def _event_is_on_latest_closed_bar(event_time, latest_candle_ct, max_minutes=20):
+    """Return True only when a trade event belongs to the latest closed 15m candle."""
+    try:
+        et = _parse_watchlist_ct_time(event_time)
+        lt = _parse_watchlist_ct_time(latest_candle_ct)
+        if et is None or lt is None:
+            return False
+        diff_min = abs((lt - et).total_seconds()) / 60.0
+        return diff_min <= float(max_minutes)
+    except Exception:
+        return False
+
+
+def _preserve_live_ledger_row(sym, saved, price_now=None, candle_ct=""):
+    """Show saved live ledger instead of accepting a stale recalculated historical flip."""
+    saved = saved if isinstance(saved, dict) else {}
+    return {
+        "Ticker": str(sym).upper(),
+        "Alert Signal": "NO NEW ALERT",
+        "Trade Position": saved.get("position", "UNKNOWN"),
+        "Price": round(float(price_now), 2) if price_now is not None else saved.get("price"),
+        "Candle Close CT": candle_ct,
+        "Entry CT": saved.get("entry_time", ""),
+        "Exit CT": saved.get("exit_time", ""),
+        "Entry Price": saved.get("entry_price", None),
+        "Current/Exit Price": price_now if price_now is not None else saved.get("exit_current_price", None),
+        "PnL (%)": saved.get("pnl_pct", None),
+        "Ledger Note": "Historical/recomputed flip ignored — live ledger preserved",
+        "Settings": saved.get("settings", ""),
+    }
 
 def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50, allow_sell_alerts=False):
     """
@@ -1293,43 +1124,9 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
             candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
             price_now = round(float(px.iloc[-1]), 2)
 
-            # ---- Authoritative override -------------------------------------
-            # If the Main Kalman tab has already computed and saved a status for
-            # this exact ticker, that visible trade log is the source of truth.
-            # The watchlist must mirror it instead of its own 60d/15m recompute,
-            # otherwise the sidebar can disagree with the main tab (e.g. ELF
-            # showing CASH here while the main tab shows an Open position).
-            _visible_status = None
-            try:
-                _visible_status = st.session_state.get(f"main_kalman_status_{sym}")
-            except Exception:
-                _visible_status = None
-
-            _used_visible = False
-            if isinstance(_visible_status, dict) and _visible_status.get("Trade Position") in ("LONG", "CASH"):
-                position = str(_visible_status.get("Trade Position"))
-                is_open = position == "LONG"
-                signal_state = "BUY" if is_open else "SELL"
-                # Prefer prices/times from the recomputed log when present, else
-                # fall back to the saved visible row / current price.
-                if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                    last = trades_df.iloc[-1]
-                    entry_time = str(last.get("Entry CT", ""))
-                    exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
-                    entry_price = last.get("Entry Price", None)
-                    curr_exit_price = last.get("Exit/Current Price", price_now)
-                    pnl_pct = last.get("PnL (%)", None)
-                else:
-                    entry_time = str(_visible_status.get("Candle Close CT", ""))
-                    exit_time = "Open" if is_open else ""
-                    entry_price = None
-                    curr_exit_price = _visible_status.get("Price", price_now)
-                    pnl_pct = None
-                event_time = entry_time if is_open else (exit_time or candle_ct)
-                _used_visible = True
-            elif trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+            if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
                 last = trades_df.iloc[-1]
-                is_open = _trade_row_is_open(last, columns=trades_df.columns)
+                is_open = str(last.get("Status", "")).upper() == "OPEN"
                 position = "LONG" if is_open else "CASH"
                 signal_state = "BUY" if is_open else "SELL"
                 entry_time = str(last.get("Entry CT", ""))
@@ -1356,13 +1153,27 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
             alert_signal = "NO NEW ALERT"
             note = "No change since last scan"
 
+            # NON-REPAINT LIVE RULE:
+            # The recalculated backtest may discover/shift an old historical exit/entry after new bars arrive.
+            # That is fine for research, but it must NOT rewrite live trade position or send Telegram today.
+            # Only accept a changed BUY/SELL when the event is on the latest closed 15m candle.
+            stale_recalc_change = (
+                bool(saved_key)
+                and saved_model == model_version
+                and saved_key != state_key
+                and not _event_is_on_latest_closed_bar(event_time, candle_ct, max_minutes=20)
+            )
+            if stale_recalc_change:
+                rows.append(_preserve_live_ledger_row(sym, saved, price_now=price_now, candle_ct=candle_ct))
+                continue
+
             if not saved_key or saved_model != model_version:
                 note = "Baseline synced for current main controls — no alert sent"
             elif saved_key != state_key:
                 alert_signal = "BUY" if position == "LONG" else "SELL"
-                note = "State changed"
+                note = "Fresh latest-bar state changed"
                 if alert_signal == "SELL" and not bool(allow_sell_alerts):
-                    note = "SELL detected but Telegram SELL alerts are OFF"
+                    note = "Fresh SELL detected but Telegram SELL alerts are OFF"
                 elif send_telegram:
                     msg = (
                         "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
@@ -1372,7 +1183,7 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                         f"Price: {price_now}\n"
                         f"Event Time: {event_time}\n"
                         f"Settings: {_main_kalman_params_label(params)}\n"
-                        "Source: Watchlist monitor using current Main Kalman controls\n"
+                        "Source: Watchlist monitor using current Main Kalman controls — NON-REPAINT LEDGER\n"
                         "Action: Notification only — no IBKR order sent."
                     )
                     ok, resp = send_telegram_alert(token, chat_id, msg)
@@ -1406,7 +1217,6 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 "Current/Exit Price": curr_exit_price,
                 "PnL (%)": pnl_pct,
                 "Ledger Note": note,
-                "Status Source": "Visible Main Kalman tab" if _used_visible else "Watchlist recompute (60d/15m)",
                 "Settings": _main_kalman_params_label(params),
             })
 
@@ -8407,85 +8217,40 @@ with st.sidebar:
             except Exception as _e:
                 st.error(f"Override failed: {_e}")
 
-    # ---- Auto-run / persistent results so you don't re-click every load ----
-    if "auto_run_main_kalman_monitor" not in st.session_state:
-        st.session_state["auto_run_main_kalman_monitor"] = False
-    auto_run_monitor = st.checkbox(
-        "Auto-run watchlist monitor on page load",
-        key="auto_run_main_kalman_monitor",
-        help="When ON, the watchlist runs automatically each time the app loads/reruns. When OFF you can run it manually with the button. Either way, the last results stay shown below until you run it again.",
-    )
+    st.warning("SAFE LOAD MODE: watchlist does not auto-run on page load. Click the button below after the app loads.")
 
-    if auto_run_monitor:
-        st.caption("Auto-run is ON: the watchlist runs on each page load. Turn it OFF to use Safe Load (manual) mode.")
-    else:
-        st.warning("SAFE LOAD MODE: watchlist does not auto-run on page load. Click the button below, or enable Auto-run above.")
-
-    def _render_open_closed_status(_rows, _source_label=""):
-        """Render the Open/Closed split table. Used for manual, auto, and cached results."""
-        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
-        if _source_label:
-            st.caption(_source_label)
-        try:
-            _df = pd.DataFrame(_rows)
-            if not _df.empty and "Trade Position" in _df.columns:
-                _open_df = _df[_df["Trade Position"].astype(str).str.upper().eq("LONG")].copy()
-                _closed_df = _df[_df["Trade Position"].astype(str).str.upper().ne("LONG")].copy()
-                _cols = ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal", "Status Source"]
-                c_open, c_closed = st.columns(2)
-                with c_open:
-                    st.metric("Open / Long", int(len(_open_df)))
-                    if len(_open_df):
-                        st.dataframe(_open_df[[c for c in _cols if c in _open_df.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No open Long positions.")
-                with c_closed:
-                    st.metric("Closed / Cash", int(len(_closed_df)))
-                    if len(_closed_df):
-                        st.dataframe(_closed_df[[c for c in _cols if c in _closed_df.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No closed/cash tickers.")
-            else:
-                st.caption("No watchlist rows to show yet.")
-        except Exception as _e:
-            st.caption(f"Open/Closed status unavailable: {_e}")
-
-    def _run_monitor_and_store():
-        try:
-            _max_stocks = int(main_kalman_monitor_max_stocks)
-        except Exception:
-            _max_stocks = 50
-        try:
-            _sell_alerts = bool(main_kalman_monitor_sell_alerts)
-        except Exception:
-            _sell_alerts = False
-        _rows = run_main_kalman_watchlist_monitor(
+    if st.button("Run Main Kalman Monitor Now", use_container_width=True):
+        _main_mon_rows_manual = run_main_kalman_watchlist_monitor(
             main_kalman_monitor_watchlist,
             send_telegram=bool(tg_alerts_on and main_kalman_monitor_on),
             token=tg_bot_token,
             chat_id=tg_chat_id,
             show_table=True,
-            max_stocks=_max_stocks,
-            allow_sell_alerts=_sell_alerts,
+            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
-        st.session_state["last_main_kalman_monitor_rows"] = _rows
-        st.session_state["last_main_kalman_monitor_ct"] = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
-        return _rows
 
-    _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
-
-    if _clicked_run:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, "Just ran (manual).")
-    elif auto_run_monitor:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, f"Auto-run on page load — {st.session_state.get('last_main_kalman_monitor_ct', '')}.")
-    elif st.session_state.get("last_main_kalman_monitor_rows"):
-        # Show the last result without re-running, so the table persists across reruns.
-        _render_open_closed_status(
-            st.session_state["last_main_kalman_monitor_rows"],
-            f"Showing last run from {st.session_state.get('last_main_kalman_monitor_ct', '')}. Click the button to refresh.",
-        )
+        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
+        try:
+            _mon_df_manual = pd.DataFrame(_main_mon_rows_manual)
+            if not _mon_df_manual.empty and "Trade Position" in _mon_df_manual.columns:
+                _open_df_manual = _mon_df_manual[_mon_df_manual["Trade Position"].astype(str).str.upper().eq("LONG")].copy()
+                _closed_df_manual = _mon_df_manual[_mon_df_manual["Trade Position"].astype(str).str.upper().ne("LONG")].copy()
+                c_open_m, c_closed_m = st.columns(2)
+                with c_open_m:
+                    st.metric("Open / Long", int(len(_open_df_manual)))
+                    if len(_open_df_manual):
+                        st.dataframe(_open_df_manual[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _open_df_manual.columns]], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No open Long positions.")
+                with c_closed_m:
+                    st.metric("Closed / Cash", int(len(_closed_df_manual)))
+                    if len(_closed_df_manual):
+                        st.dataframe(_closed_df_manual[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _closed_df_manual.columns]], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No closed/cash tickers.")
+        except Exception as _e:
+            st.caption(f"Open/Closed status unavailable: {_e}")
 
     if False:
         st.caption("Auto monitor disabled for safe loading. Use Run Main Kalman Monitor Now.")
@@ -10249,12 +10014,11 @@ if bool(kalman_fast_live_mode):
                 use_slope_confirm = st.checkbox("Require trend slope confirmation", value=True, key="kalman_strategy_slope_confirm")
                 use_atr_safety = st.checkbox("Use ATR safety exit", value=True, key="kalman_strategy_atr_safety")
                 benchmark_aware_kalman = st.checkbox("Benchmark-aware Kalman optimizer", value=True, key="kalman_benchmark_aware_optimizer")
-                kalman_fast_reuse_optimizer = st.checkbox(
-                    "Reuse last optimized Kalman settings for speed",
-                    value=True,
-                    key="kalman_fast_reuse_optimizer",
-                    help="Keeps the same selected optimizer parameters during live refreshes instead of re-testing the full grid every rerun. Turn OFF or click re-optimize for an exact fresh grid search."
-                )
+                # Force OFF: do not reuse last optimized Kalman settings on the Main tab.
+                # This prevents stale cached optimizer parameters from changing/locking the source-of-truth trade log after refresh/reboot.
+                st.session_state["kalman_fast_reuse_optimizer"] = False
+                kalman_fast_reuse_optimizer = False
+                st.caption("Kalman fast reuse is OFF: Main tab always runs a fresh optimizer/search instead of reusing old optimized settings.")
                 kalman_force_reopt = st.button(
                     "Re-run full Kalman optimizer now",
                     key=f"kalman_force_reopt_{TICKER}_{data_interval}",
@@ -10313,10 +10077,9 @@ if bool(kalman_fast_live_mode):
                                 sig_i.loc[_dt] = 1.0
                     return sig_i.ffill().fillna(0).clip(0, 1)
 
-                # Fast live speed rule:
-                # Running the full benchmark-aware optimizer every Streamlit rerun is slow because it tests
-                # hundreds of parameter combinations. To keep the SAME chosen logic but avoid repeated work,
-                # fast mode can reuse the last optimized parameter set for the same ticker/timeframe/model/day.
+                # Main tab optimizer rule:
+                # Fast reuse is intentionally disabled. This always performs a fresh optimizer/search
+                # and avoids stale cached settings changing the visible Main tab source-of-truth.
                 _kalman_fast_day = None
                 try:
                     _kalman_fast_day = str(pd.Timestamp(bt_px.index[-1]).date())
@@ -10332,6 +10095,12 @@ if bool(kalman_fast_live_mode):
                     f"tr{float(kalman_trail_stop_pct):.2f}::eq{float(kalman_equity_dd_stop_pct):.2f}::"
                     f"fwc{int(kalman_firewall_cooldown)}::dd{float(kalman_max_dd_allowed):.2f}"
                 )
+
+                # Always clear this specific cached optimizer pack because Main-tab fast reuse is OFF by design.
+                try:
+                    st.session_state.pop(_kalman_opt_key, None)
+                except Exception:
+                    pass
 
                 if bool(kalman_force_reopt):
                     try:
@@ -10351,14 +10120,6 @@ if bool(kalman_fast_live_mode):
                             bool(use_slope_confirm),
                             bool(use_atr_safety)
                         )
-                        try:
-                            _save_main_kalman_opt_params_for_ticker(
-                                TICKER, float(_cached_params["buffer"]), int(_cached_params["confirm"]),
-                                int(_cached_params["hold"]), int(_cached_params["cool"]),
-                                slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                            )
-                        except Exception:
-                            pass
                         st.caption(
                             f"Fast mode reused optimized settings: buffer {float(_cached_params['buffer'])*100:.2f}%, "
                             f"confirm {int(_cached_params['confirm'])}, min-hold {int(_cached_params['hold'])}, "
@@ -10370,7 +10131,7 @@ if bool(kalman_fast_live_mode):
                         best_pack = None
                         bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
 
-                        with st.spinner("Running full Kalman optimizer once... future live refreshes will reuse it for speed."):
+                        with st.spinner("Running fresh Kalman optimizer/search for Main tab..."):
                             for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
                                 for _conf in [3, 4, 5, 7, 10]:
                                     for _hold in [10, 15, 21, 34, 55]:
@@ -10415,14 +10176,6 @@ if bool(kalman_fast_live_mode):
                                     "hold": int(best_pack["hold"]),
                                     "cool": int(best_pack["cool"])
                                 }
-                            try:
-                                _save_main_kalman_opt_params_for_ticker(
-                                    TICKER, float(best_pack["buffer"]), int(best_pack["confirm"]),
-                                    int(best_pack["hold"]), int(best_pack["cool"]),
-                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                                )
-                            except Exception:
-                                pass
                             st.info(
                                 f"Fast optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
                                 f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}."
@@ -10432,27 +10185,11 @@ if bool(kalman_fast_live_mode):
                                 kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
                                 bool(use_slope_confirm), bool(use_atr_safety)
                             )
-                            try:
-                                _save_main_kalman_opt_params_for_ticker(
-                                    TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
-                                    int(kalman_min_hold), int(kalman_cooldown),
-                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                                )
-                            except Exception:
-                                pass
                 else:
                     kalman_signal = _build_fast_kalman_signal(
                         kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
                         bool(use_slope_confirm), bool(use_atr_safety)
                     )
-                    try:
-                        _save_main_kalman_opt_params_for_ticker(
-                            TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
-                            int(kalman_min_hold), int(kalman_cooldown),
-                            slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                        )
-                    except Exception:
-                        pass
 
                 if bool(use_kalman_risk_firewall):
                     kalman_signal = apply_kalman_risk_firewall(
@@ -10467,27 +10204,12 @@ if bool(kalman_fast_live_mode):
                 kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
                 kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
                 kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
-
-                # Authoritative current position from the signal series (chart source).
-                try:
-                    _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
-                except Exception:
-                    _kalman_signal_last = None
                 try:
                     _sync_watchlist_ledger_from_visible_main_trade_log(
                         TICKER,
                         kalman_trades,
                         latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                    )
-                except Exception:
-                    pass
-                try:
-                    _save_main_kalman_status_to_session(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last,
+                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else None,
                     )
                 except Exception:
                     pass
@@ -10497,7 +10219,6 @@ if bool(kalman_fast_live_mode):
                         kalman_trades,
                         latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                         latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last,
                     )
                 except Exception:
                     pass
@@ -10512,7 +10233,7 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only.")
+                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Live monitor uses NON-REPAINT ledger: old recalculated flips are ignored.")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
@@ -11972,27 +11693,6 @@ with tab4:
                     slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
                 )
 
-            # Persist the effective params for THIS ticker so the watchlist
-            # recompute reproduces the main-tab signal (optimizer or sliders).
-            try:
-                _cs = locals().get("chosen_kalman_settings", None)
-                if isinstance(_cs, dict) and "Buffer %" in _cs:
-                    _eff_buf = float(_cs["Buffer %"]) / 100.0
-                    _eff_conf = int(_cs.get("Confirm Bars", kalman_confirm_bars))
-                    _eff_hold = int(_cs.get("Min Hold", kalman_min_hold))
-                    _eff_cool = int(_cs.get("Cooldown", kalman_cooldown))
-                else:
-                    _eff_buf = float(kalman_buffer_pct)
-                    _eff_conf = int(kalman_confirm_bars)
-                    _eff_hold = int(kalman_min_hold)
-                    _eff_cool = int(kalman_cooldown)
-                _save_main_kalman_opt_params_for_ticker(
-                    TICKER, _eff_buf, _eff_conf, _eff_hold, _eff_cool,
-                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                )
-            except Exception:
-                pass
-
             if bool(use_kalman_risk_firewall):
                 kalman_signal = apply_kalman_risk_firewall(
                     bt_px, kalman_signal, bt_trend,
@@ -12006,14 +11706,6 @@ with tab4:
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
             kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
             kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
-
-            # Authoritative current position = last value of the signal series the
-            # chart uses. This is the LONG/CASH you actually see, and what the
-            # sidebar/watchlist must mirror.
-            try:
-                _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
-            except Exception:
-                _kalman_signal_last = None
             try:
                 _sync_watchlist_ledger_from_visible_main_trade_log(
                     TICKER,
@@ -12028,7 +11720,6 @@ with tab4:
                     kalman_trades,
                     latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                     latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                    signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
                 )
             except Exception:
                 pass
@@ -12039,7 +11730,6 @@ with tab4:
                     kalman_trades,
                     latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                     latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                    signal_state=_kalman_signal_last,
                 )
             except Exception:
                 pass
@@ -12148,7 +11838,6 @@ with tab4:
                         kalman_trades,
                         latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                         latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
                     )
                     if _main_status_row:
                         st.markdown("#### ✅ Main Kalman Current Status")
@@ -12164,7 +11853,6 @@ with tab4:
                             kalman_trades,
                             latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
                             latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                            signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
                         )
                     except Exception:
                         pass
@@ -12198,7 +11886,8 @@ with tab4:
 
                     # Telegram sync from exact main trade log only.
                     if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
-                        _is_open = _trade_row_is_open(kalman_trades.iloc[-1], columns=kalman_trades.columns) if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty else False
+                        _row_txt = " ".join([str(x) for x in kalman_trades.iloc[-1].values]).upper() if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty else ""
+                        _is_open = ("OPEN" in _row_txt) and ("CLOSED" not in _row_txt)
                         _sig = "BUY" if _is_open else "SELL"
                         _event_time = str(_main_status.get("Candle Close CT", ""))
                         _ledger = _load_kalman_alert_ledger()
@@ -21482,3 +21171,6 @@ except Exception as e:
 
 st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
+
+
+
