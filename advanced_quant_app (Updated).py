@@ -1161,9 +1161,9 @@ def _save_main_kalman_watchlist_ledger(data):
 # chosen params per ticker so the watchlist can reproduce the main-tab signal.
 def _main_kalman_opt_params_path():
     try:
-        return _Path.home() / ".pinehurst_main_kalman_opt_params.json"
+        return _Path.home() / ".pinehurst_main_kalman_opt_params_V2_CLEAN.json"
     except Exception:
-        return _Path(".pinehurst_main_kalman_opt_params.json")
+        return _Path(".pinehurst_main_kalman_opt_params_V2_CLEAN.json")
 
 def _load_main_kalman_opt_params():
     try:
@@ -1207,9 +1207,9 @@ def _get_main_kalman_opt_params_for_ticker(ticker):
 # and from any later parameter changes.
 def _main_kalman_signal_lock_path():
     try:
-        return _Path.home() / ".pinehurst_main_kalman_signal_lock.json"
+        return _Path.home() / ".pinehurst_main_kalman_signal_lock_V2_CLEAN.json"
     except Exception:
-        return _Path(".pinehurst_main_kalman_signal_lock.json")
+        return _Path(".pinehurst_main_kalman_signal_lock_V2_CLEAN.json")
 
 def _load_main_kalman_signal_lock():
     try:
@@ -10418,7 +10418,7 @@ if bool(kalman_fast_live_mode):
                     value=True,
                     key="kalman_fast_reuse_optimizer",
                     disabled=True,
-                    help="LOCKED ON for live/source-of-truth mode. The optimizer runs once, then the exact chosen parameters are reused so performance stays stable and the trade log does not change on every refresh."
+                    help="LOCKED ON for live/source-of-truth mode. The optimizer runs once, then the exact chosen parameters are reused so performance stays stable and the trade log does not silently change every refresh."
                 )
                 kalman_force_reopt = st.button(
                     "Re-run full Kalman optimizer now",
@@ -10533,8 +10533,7 @@ if bool(kalman_fast_live_mode):
                     _cached_params = st.session_state.get(_kalman_opt_key) if bool(kalman_fast_reuse_optimizer) else None
 
                     # Pull persistent saved optimizer params from disk after Streamlit restart.
-                    # This keeps the same selected parameters across refresh/reboot instead of
-                    # silently re-optimizing and changing the trade log.
+                    # IMPORTANT: this uses a clean V2 cache file, so old bad/manual-locked params are ignored.
                     if _cached_params is None and bool(kalman_fast_reuse_optimizer):
                         try:
                             _saved_opt = _get_main_kalman_opt_params_for_ticker(TICKER)
@@ -10727,7 +10726,7 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Optimizer runs once, then selected settings are locked/reused for stability.")
+                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Fresh V2 optimizer cache + fresh V2 non-repaint lock active.")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
