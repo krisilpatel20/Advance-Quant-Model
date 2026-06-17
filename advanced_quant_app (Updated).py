@@ -1045,6 +1045,17 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
         except Exception:
             pass
 
+    # ---- NON-REPAINT LOCK (final, post-firewall) -----------------------
+    # Freeze the FINAL executed per-bar signal so re-running never rewrites
+    # history. Only new completed bars are appended. The firewall runs first so
+    # its stop-outs are captured in the frozen value, then nothing downstream
+    # can change a past bar. Controlled by session_state flag (default ON).
+    try:
+        _freeze = bool(st.session_state.get("kalman_non_repaint_lock", True))
+    except Exception:
+        _freeze = True
+    sig = _apply_signal_lock(ticker, sig, freeze_enabled=_freeze)
+
     # Run the identical backtest engine the visible Main Kalman Trade Log uses.
     try:
         initial_cap = float(st.session_state.get("initial_cap", 10000.0))
@@ -1186,6 +1197,80 @@ def _get_main_kalman_opt_params_for_ticker(ticker):
         return _load_main_kalman_opt_params().get(str(ticker).upper())
     except Exception:
         return None
+
+
+# ---- Non-repaint signal lock --------------------------------------------
+# To guarantee the signal NEVER repaints, we freeze the per-bar signal value
+# once a completed bar has been seen. Each run may only APPEND signal values
+# for new completed-bar timestamps; it can never rewrite the signal of a bar
+# that was already locked. This removes repaint from the rolling data window
+# and from any later parameter changes.
+def _main_kalman_signal_lock_path():
+    try:
+        return _Path.home() / ".pinehurst_main_kalman_signal_lock.json"
+    except Exception:
+        return _Path(".pinehurst_main_kalman_signal_lock.json")
+
+def _load_main_kalman_signal_lock():
+    try:
+        p = _main_kalman_signal_lock_path()
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_main_kalman_signal_lock(store):
+    try:
+        _main_kalman_signal_lock_path().write_text(json.dumps(store, indent=2))
+    except Exception:
+        pass
+
+def _apply_signal_lock(ticker, sig, freeze_enabled=True, interval="15m"):
+    """
+    Merge a freshly computed causal signal with the locked history so the result
+    is append-only (non-repainting).
+
+    For every bar timestamp already in the lock, the LOCKED value is used (the
+    fresh recompute can never change history). New completed-bar timestamps are
+    added to the lock. Keyed by ticker+interval so 15m and daily signals never
+    mix.
+    """
+    try:
+        if sig is None or len(sig) == 0:
+            return sig
+        tkey = f"{str(ticker).upper()}|{str(interval)}"
+        store = _load_main_kalman_signal_lock()
+        locked = dict(store.get(tkey, {})) if isinstance(store.get(tkey), dict) else {}
+
+        out = sig.copy()
+        changed = False
+        for dt in out.index:
+            key = pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M:%S")
+            if freeze_enabled and key in locked:
+                # Use the frozen historical value; do not repaint.
+                try:
+                    out.loc[dt] = float(locked[key])
+                except Exception:
+                    pass
+            else:
+                # New bar -> record it (lock it going forward).
+                try:
+                    locked[key] = float(out.loc[dt])
+                    changed = True
+                except Exception:
+                    pass
+
+        if changed and freeze_enabled:
+            # Cap stored history so the file cannot grow without bound.
+            if len(locked) > 6000:
+                for k in sorted(locked.keys())[: len(locked) - 6000]:
+                    locked.pop(k, None)
+            store[tkey] = locked
+            _save_main_kalman_signal_lock(store)
+        return out
+    except Exception:
+        return sig
 
 def _parse_ct_time_safe(x):
     try:
@@ -10352,6 +10437,25 @@ if bool(kalman_fast_live_mode):
                 with rf4:
                     kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
 
+                nr1, nr2 = st.columns([3, 1])
+                with nr1:
+                    st.checkbox(
+                        "🔒 Non-repaint lock (freeze signals on completed bars)",
+                        value=True,
+                        key="kalman_non_repaint_lock",
+                        help="When ON, once a 15m bar closes its signal is frozen and never changes on later runs. "
+                             "Turn OFF only if you want signals to recompute freely (can repaint).",
+                    )
+                with nr2:
+                    if st.button("Reset lock", key="reset_signal_lock_fast", use_container_width=True,
+                                 help="Clear the frozen signal history and re-baseline from the current data. "
+                                      "Do this after changing strategy parameters."):
+                        try:
+                            _save_main_kalman_signal_lock({})
+                            st.success("Signal lock cleared. It will re-baseline on the next run.")
+                        except Exception as _e:
+                            st.error(f"Could not clear lock: {_e}")
+
                 trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
 
                 def _build_fast_kalman_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
@@ -10541,6 +10645,14 @@ if bool(kalman_fast_live_mode):
                         equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
                         cooldown_bars=int(kalman_firewall_cooldown)
                     )
+
+                # Non-repaint lock: freeze main-chart signal on completed bars.
+                try:
+                    if bool(st.session_state.get("kalman_non_repaint_lock", True)):
+                        _lk_int = str(locals().get("interval", "15m"))
+                        kalman_signal = _apply_signal_lock(TICKER, kalman_signal, freeze_enabled=True, interval=_lk_int)
+                except Exception:
+                    pass
 
                 kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
                 kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
@@ -12080,6 +12192,14 @@ with tab4:
                     equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
                     cooldown_bars=int(kalman_firewall_cooldown)
                 )
+
+            # Non-repaint lock: freeze main-chart signal on completed bars.
+            try:
+                if bool(st.session_state.get("kalman_non_repaint_lock", True)):
+                    _lk_int = str(locals().get("interval", "15m"))
+                    kalman_signal = _apply_signal_lock(TICKER, kalman_signal, freeze_enabled=True, interval=_lk_int)
+            except Exception:
+                pass
 
             kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
             kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
