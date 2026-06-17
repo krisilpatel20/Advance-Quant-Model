@@ -1081,7 +1081,7 @@ def _preserve_live_ledger_row(sym, saved, price_now=None, candle_ct=""):
         "Entry Price": saved.get("entry_price", None),
         "Current/Exit Price": price_now if price_now is not None else saved.get("exit_current_price", None),
         "PnL (%)": saved.get("pnl_pct", None),
-        "Ledger Note": "Historical/recomputed flip ignored — live ledger preserved",
+        "Ledger Note": "Historical/recomputed flip synced to main trade log — no old Telegram alert",
         "Settings": saved.get("settings", ""),
     }
 
@@ -1164,10 +1164,12 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
                 and not _event_is_on_latest_closed_bar(event_time, candle_ct, max_minutes=20)
             )
             if stale_recalc_change:
-                rows.append(_preserve_live_ledger_row(sym, saved, price_now=price_now, candle_ct=candle_ct))
-                continue
-
-            if not saved_key or saved_model != model_version:
+                # IMPORTANT:
+                # Sidebar/watchlist status must match the Main Kalman Trade Log source of truth.
+                # But Telegram must NOT fire for an old historical/recalculated flip.
+                alert_signal = "NO NEW ALERT"
+                note = "Historical/recomputed flip synced to main trade log — no old Telegram alert"
+            elif not saved_key or saved_model != model_version:
                 note = "Baseline synced for current main controls — no alert sent"
             elif saved_key != state_key:
                 alert_signal = "BUY" if position == "LONG" else "SELL"
@@ -10233,7 +10235,7 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Live monitor uses NON-REPAINT ledger: old recalculated flips are ignored.")
+                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Sidebar status matches main trade log; old historical flips do NOT trigger Telegram.")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
