@@ -1193,10 +1193,10 @@ def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, mi
         pass
 
 def _get_main_kalman_opt_params_for_ticker(ticker):
-    try:
-        return _load_main_kalman_opt_params().get(str(ticker).upper())
-    except Exception:
-        return None
+    # Main Kalman is now locked to visible/manual settings.
+    # Never use old optimizer params from disk because they can make the
+    # watchlist/sidebar disagree with the Main tab after refresh.
+    return None
 
 
 # ---- Non-repaint signal lock --------------------------------------------
@@ -10522,44 +10522,46 @@ if bool(kalman_fast_live_mode):
                     except Exception:
                         pass
 
-                if bool(benchmark_aware_kalman):
-                    _cached_params = st.session_state.get(_kalman_opt_key) if bool(kalman_fast_reuse_optimizer) else None
+                # MAIN KALMAN LIVE/SOURCE-OF-TRUTH MODE — OPTIMIZER LOCKED OFF
+                # ------------------------------------------------------------
+                # Do NOT run benchmark-aware optimizer here.
+                # Do NOT reuse cached optimized params here.
+                # Reason: any optimizer can change the historical trade log after
+                # new candles arrive, which creates unacceptable repaint-like behavior.
+                # The Main tab must be stable and causal: visible/manual settings only.
+                try:
+                    st.session_state.pop(_kalman_opt_key, None)
+                except Exception:
+                    pass
 
-                    if _cached_params is not None:
-                        kalman_signal = _build_fast_kalman_signal(
-                            float(_cached_params["buffer"]),
-                            int(_cached_params["confirm"]),
-                            int(_cached_params["hold"]),
-                            int(_cached_params["cool"]),
-                            bool(use_slope_confirm),
-                            bool(use_atr_safety)
-                        )
-                        try:
-                            _save_main_kalman_opt_params_for_ticker(
-                                TICKER, float(_cached_params["buffer"]), int(_cached_params["confirm"]),
-                                int(_cached_params["hold"]), int(_cached_params["cool"]),
-                                slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                            )
-                        except Exception:
-                            pass
-                        st.caption(
-                            f"Fast mode reused optimized settings: buffer {float(_cached_params['buffer'])*100:.2f}%, "
-                            f"confirm {int(_cached_params['confirm'])}, min-hold {int(_cached_params['hold'])}, "
-                            f"cooldown {int(_cached_params['cool'])}. Click re-optimize for a fresh full grid search."
-                        )
-                    else:
-                        # Same full benchmark-aware optimizer grid as the full Kalman tab.
-                        # Runs once, then fast mode can reuse the chosen parameters on live refresh.
-                        best_pack = None
-                        bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
+                kalman_signal = _build_fast_kalman_signal(
+                    kalman_buffer_pct,
+                    kalman_confirm_bars,
+                    kalman_min_hold,
+                    kalman_cooldown,
+                    bool(use_slope_confirm),
+                    bool(use_atr_safety)
+                )
+                try:
+                    _save_main_kalman_opt_params_for_ticker(
+                        TICKER,
+                        float(kalman_buffer_pct),
+                        int(kalman_confirm_bars),
+                        int(kalman_min_hold),
+                        int(kalman_cooldown),
+                        slope_confirm=bool(use_slope_confirm),
+                        atr_safety=bool(use_atr_safety),
+                    )
+                except Exception:
+                    pass
+                st.info(
+                    f"Main Kalman optimizer LOCKED OFF: using manual settings only — "
+                    f"buffer {float(kalman_buffer_pct)*100:.2f}%, "
+                    f"confirm {int(kalman_confirm_bars)}, "
+                    f"min-hold {int(kalman_min_hold)}, cooldown {int(kalman_cooldown)}."
+                )
 
-                        with st.spinner("Running full Kalman optimizer once... future live refreshes will reuse it for speed."):
-                            for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
-                                for _conf in [3, 4, 5, 7, 10]:
-                                    for _hold in [10, 15, 21, 34, 55]:
-                                        for _cool in [5, 8, 13, 21]:
-                                            _sig = _build_fast_kalman_signal(_buf, _conf, _hold, _cool, bool(use_slope_confirm), bool(use_atr_safety))
-                                            if bool(use_kalman_risk_firewall):
+                if bool(use_kalman_risk_firewall):
                                                 _sig = apply_kalman_risk_firewall(
                                                     bt_px, _sig, bt_trend,
                                                     max_trade_loss_pct=float(kalman_trade_stop_pct),
@@ -10703,7 +10705,7 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only.")
+                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Main optimizer is LOCKED OFF.")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
