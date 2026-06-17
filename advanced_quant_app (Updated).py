@@ -374,7 +374,11 @@ def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_tim
         last = t.iloc[-1]
         row_txt = " ".join([str(x) for x in last.values]).upper()
         is_open = ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
-        is_long = ("LONG" in row_txt) or is_open
+        # IMPORTANT:
+        # "Side" is always Long for a long-only strategy, even when the trade is CLOSED.
+        # Trade Position must be LONG only when the Status/Exit says OPEN.
+        # Otherwise a closed long trade was incorrectly shown as LONG in the sidebar.
+        is_long = is_open
 
         px = latest_price
         for c in ["Current Price", "Exit Price", "Exit", "Last Price", "Price"]:
@@ -10173,7 +10177,7 @@ if bool(kalman_fast_live_mode):
                 km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
                 km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
                 km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Main optimizer is LOCKED OFF; sidebar status matches main trade log; old historical flips do NOT trigger Telegram.")
+                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Main optimizer is LOCKED OFF; sidebar status uses OPEN/CLOSED status only; old historical flips do NOT trigger Telegram.")
 
                 fig_kbt = go.Figure()
                 fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
