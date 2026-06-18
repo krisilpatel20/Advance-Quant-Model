@@ -1594,6 +1594,16 @@ class BacktestEngine:
 
 
 
+def safe_report_add(title, data):
+    """Safe report-export helper. Prevents AttributeError when report generator is disabled, skipped, or not initialized."""
+    try:
+        rg = st.session_state.get("report_gen", None)
+        if rg is not None and hasattr(rg, "add_data"):
+            rg.add_data(title, data)
+    except Exception:
+        pass
+
+
 def make_stateful_position(entry_cond, exit_cond, index):
     """
     Converts entry/exit booleans into a 0/1 long-only position series.
@@ -1814,6 +1824,57 @@ def build_regime_backtest_signal(res_model, model_index, prices_index, n_regimes
 
 
 
+def resample_to_closed_weekly_friday(prices):
+    """
+    Convert daily/raw closes to true closed weekly bars ending Friday.
+
+    pandas resample('W-FRI') can label a partial Mon-Thu week as the upcoming
+    Friday. For regime switching this feels laggy/incorrect because the displayed
+    weekly candle is not actually closed yet. This helper keeps the current week
+    only when the latest raw candle date has reached that Friday label.
+    """
+    try:
+        s = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+        if s.empty:
+            return s
+        s.index = pd.to_datetime(s.index)
+        wk = s.resample('W-FRI').last().dropna()
+        if wk.empty:
+            return wk
+        latest_raw_day = pd.Timestamp(s.index.max()).tz_localize(None).normalize() if getattr(pd.Timestamp(s.index.max()), 'tzinfo', None) is not None else pd.Timestamp(s.index.max()).normalize()
+        latest_week_label = pd.Timestamp(wk.index.max()).tz_localize(None).normalize() if getattr(pd.Timestamp(wk.index.max()), 'tzinfo', None) is not None else pd.Timestamp(wk.index.max()).normalize()
+        # If the latest weekly label is ahead of the latest real trading day, it is
+        # an incomplete week. Do not let it change the official weekly signal yet.
+        if latest_week_label > latest_raw_day:
+            wk = wk.iloc[:-1]
+        return wk.dropna()
+    except Exception:
+        try:
+            return pd.Series(prices).resample('W-FRI').last().dropna()
+        except Exception:
+            return pd.Series(dtype=float)
+
+
+def apply_confirmed_bar_execution_policy(signals, frequency="Daily", confirmed_bar=True, weekly_close_updates=True, fill_value=0.0):
+    """
+    Confirmed-bar signal policy.
+
+    Daily/intraday confirmed execution can still use prior-bar confirmation if desired.
+    Weekly signals are different: once the Friday weekly candle is closed, that
+    exact Friday bar is already confirmed. Shifting it one more weekly bar makes
+    the buy/sell change appear one week late.
+    """
+    s = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(fill_value).clip(0, 1)
+    if not bool(confirmed_bar):
+        return s
+    is_weekly = str(frequency or "").lower().startswith('week')
+    if is_weekly and bool(weekly_close_updates):
+        # No extra one-week delay. The signal is only built from the closed Friday
+        # weekly candle because resample_to_closed_weekly_friday removes partial weeks.
+        return s.ffill().fillna(fill_value).clip(0, 1)
+    return s.shift(1).ffill().fillna(fill_value).clip(0, 1)
+
+
 def _nearest_price_at_or_before(price_series, target_date):
     """Return last available raw market close at or before target_date."""
     try:
@@ -1844,7 +1905,7 @@ def _scan_one_regime_recent_trigger(ticker, start_date, end_date, frequency, n_r
             return []
 
         if str(frequency).lower().startswith('week'):
-            scan_prices = raw_prices.resample('W-FRI').last().dropna()
+            scan_prices = resample_to_closed_weekly_friday(raw_prices)
         else:
             scan_prices = raw_prices.copy()
         scan_returns = scan_prices.pct_change().dropna()
@@ -1862,8 +1923,9 @@ def _scan_one_regime_recent_trigger(ticker, start_date, end_date, frequency, n_r
             res_scan, scan_model_data.index, scan_prices.index, n_reg, str(signal_method),
             conviction=float(conviction), min_hold=int(min_hold)
         )
-        if bool(confirmed_bar):
-            sig_scan = sig_scan.shift(1).ffill().fillna(0).clip(0, 1)
+        sig_scan = apply_confirmed_bar_execution_policy(
+            sig_scan, frequency=str(frequency), confirmed_bar=bool(confirmed_bar), weekly_close_updates=True, fill_value=0.0
+        )
         sig_scan = sig_scan.reindex(scan_prices.index).ffill().fillna(0).clip(0, 1)
         if len(sig_scan) < 2:
             return []
@@ -1892,6 +1954,7 @@ def _scan_one_regime_recent_trigger(ticker, start_date, end_date, frequency, n_r
                 'Ticker': t,
                 'Action': action,
                 'Trigger Date': pd.Timestamp(actual_date).date(),
+                'Trigger Time CT': _intraday_touch_timestamp_for_weekly_trade(t, actual_date, trigger_price).strftime('%Y-%m-%d %H:%M:%S CT') if str(frequency).lower().startswith('week') and pd.notna(trigger_price) and hasattr(_intraday_touch_timestamp_for_weekly_trade(t, actual_date, trigger_price), 'strftime') else '',
                 'Signal Bar Date': pd.Timestamp(trig_dt).date(),
                 'Trigger Price': round(float(trigger_price), 2) if pd.notna(trigger_price) else np.nan,
                 'Latest Price': round(float(latest_price), 2),
@@ -2204,6 +2267,356 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
         return out
     except Exception:
         return trades_df
+
+
+def _get_secret_or_env(name: str, default: str = ""):
+    """Small safe helper. Never throws if Streamlit secrets/env are unavailable."""
+    try:
+        v = st.secrets.get(name, "")
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    try:
+        return str(os.environ.get(name, default) or default)
+    except Exception:
+        return default
+
+
+def _normalize_intraday_ohlc_ct(df, ticker: str, day):
+    """Normalize any intraday OHLC frame to CT regular-session bars."""
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        t = str(ticker).strip().upper().replace('.', '-')
+        df = _flatten_yfinance_columns(df, t)
+        lower_map = {str(c).lower(): c for c in df.columns}
+        rename = {}
+        for want in ['open', 'high', 'low', 'close']:
+            if want in lower_map:
+                rename[lower_map[want]] = want.capitalize()
+        if rename:
+            df = df.rename(columns=rename)
+        if 'Close' not in df.columns:
+            # Databento OHLCV sometimes uses price/close-like names after to_df().
+            for alt in ['close_px', 'price', 'mid', 'Close']:
+                if alt in df.columns:
+                    df['Close'] = df[alt]
+                    break
+        if 'Close' not in df.columns:
+            return pd.DataFrame()
+        for c in ['Open', 'High', 'Low']:
+            if c not in df.columns:
+                df[c] = df['Close']
+        idx = pd.DatetimeIndex(df.index)
+        try:
+            if idx.tz is None:
+                idx = idx.tz_localize('America/New_York')
+            idx = idx.tz_convert('America/Chicago')
+        except Exception:
+            idx = pd.to_datetime(df.index)
+        out = df.copy()
+        out.index = idx
+        try:
+            out = out.between_time('08:30', '15:00')
+        except Exception:
+            pass
+        day_date = pd.Timestamp(day).date()
+        out = out[out.index.date == day_date]
+        return out[['Open', 'High', 'Low', 'Close']].apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_yahoo_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str = "5m"):
+    """Yahoo/yfinance intraday. Good for recent trades only because Yahoo limits history."""
+    try:
+        t = str(ticker).strip().upper().replace('.', '-')
+        if not t:
+            return pd.DataFrame()
+        day = pd.Timestamp(day_str).date()
+        start = pd.Timestamp(day) - pd.Timedelta(days=1)
+        end = pd.Timestamp(day) + pd.Timedelta(days=2)
+        df = yf.download(t, start=start, end=end, interval=interval, progress=False, auto_adjust=False, threads=False)
+        return _normalize_intraday_ohlc_ct(df, t, day)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_databento_intraday_for_weekly_trade_time(ticker: str, day_str: str):
+    """
+    Databento historical fallback for precise old weekly trade timestamps.
+    This only runs when DATABENTO_API_KEY is set in Streamlit secrets or env.
+    It does not affect strategy logic, prices, equity, or metrics; display timestamp only.
+    """
+    try:
+        api_key = _get_secret_or_env('DATABENTO_API_KEY', '')
+        if not api_key:
+            return pd.DataFrame()
+        try:
+            import databento as db
+        except Exception:
+            return pd.DataFrame()
+
+        t = str(ticker).strip().upper().replace('.', '-')
+        day = pd.Timestamp(day_str).date()
+        # CT regular session converted through timezone-aware timestamps.
+        start_ct = pd.Timestamp.combine(day, pd.Timestamp('08:30').time()).tz_localize('America/Chicago')
+        end_ct = pd.Timestamp.combine(day, pd.Timestamp('15:00').time()).tz_localize('America/Chicago')
+        start_utc = start_ct.tz_convert('UTC').isoformat()
+        end_utc = end_ct.tz_convert('UTC').isoformat()
+
+        client = db.Historical(key=api_key)
+        # Try OHLCV first. If entitlement differs, try common equity datasets.
+        for dataset in ['XNAS.ITCH', 'EQUS.MINI']:
+            try:
+                data = client.timeseries.get_range(
+                    dataset=dataset,
+                    schema='ohlcv-1m',
+                    symbols=[t],
+                    start=start_utc,
+                    end=end_utc,
+                )
+                df = data.to_df()
+                norm = _normalize_intraday_ohlc_ct(df, t, day)
+                if not norm.empty:
+                    return norm
+            except Exception:
+                continue
+
+        # Fallback: MBP-1 top-of-book; convert bid/ask to 1-minute OHLC midpoint.
+        for dataset in ['EQUS.MINI', 'XNAS.ITCH']:
+            try:
+                data = client.timeseries.get_range(
+                    dataset=dataset,
+                    schema='mbp-1',
+                    symbols=[t],
+                    start=start_utc,
+                    end=end_utc,
+                )
+                raw = data.to_df()
+                if raw is None or raw.empty:
+                    continue
+                # Find bid/ask columns robustly.
+                cols = {str(c).lower(): c for c in raw.columns}
+                bid_col = cols.get('bid_px_00') or cols.get('levels.0.bid_px') or cols.get('bid_px')
+                ask_col = cols.get('ask_px_00') or cols.get('levels.0.ask_px') or cols.get('ask_px')
+                if not bid_col or not ask_col:
+                    continue
+                bid = pd.to_numeric(raw[bid_col], errors='coerce')
+                ask = pd.to_numeric(raw[ask_col], errors='coerce')
+                # Normalize fixed-point prices if needed.
+                mid = (bid + ask) / 2.0
+                if mid.dropna().median() > 100000:
+                    mid = mid / 1e9
+                tmp = pd.DataFrame({'Close': mid}, index=raw.index).dropna()
+                if tmp.empty:
+                    continue
+                # Resample to 1-minute OHLC midpoint bars.
+                tmp.index = pd.DatetimeIndex(tmp.index)
+                ohlc = tmp['Close'].resample('1min').ohlc().rename(columns={'open':'Open','high':'High','low':'Low','close':'Close'})
+                norm = _normalize_intraday_ohlc_ct(ohlc, t, day)
+                if not norm.empty:
+                    return norm
+            except Exception:
+                continue
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_intraday_for_weekly_trade_time(ticker: str, day_str: str, interval: str = "5m"):
+    """
+    Fetch intraday candles for one trading day for DISPLAY timestamps only.
+
+    Order of precision:
+    1) Yahoo recent intraday for requested interval.
+    2) Other Yahoo intervals, best available for recent history.
+    3) Databento historical 1-minute bars/MBP-1 if DATABENTO_API_KEY is configured.
+
+    Weekly candles alone cannot reveal exact 10:40/12:55-style trigger time.
+    For older trades, Databento or another historical intraday source is required.
+    """
+    try:
+        t = str(ticker).strip().upper().replace('.', '-')
+        day = pd.Timestamp(day_str).date()
+        # Try requested interval first, then faster/slower Yahoo fallbacks.
+        intervals = []
+        for iv in [interval, '1m', '2m', '5m', '15m', '30m', '60m']:
+            if iv not in intervals:
+                intervals.append(iv)
+        for iv in intervals:
+            df = _get_yahoo_intraday_for_weekly_trade_time(t, str(day), interval=iv)
+            if df is not None and not df.empty:
+                return df
+        # Paid/entitled historical fallback for old trades.
+        db_df = _get_databento_intraday_for_weekly_trade_time(t, str(day))
+        if db_df is not None and not db_df.empty:
+            return db_df
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _intraday_touch_timestamp_for_weekly_trade(ticker: str, dt, target_price, side: str = "entry"):
+    """
+    Backward-compatible wrapper: returns only the timestamp/display value.
+    """
+    ts, _src = _intraday_touch_timestamp_and_source_for_weekly_trade(ticker, dt, target_price, side=side)
+    return ts
+
+
+def _intraday_touch_timestamp_and_source_for_weekly_trade(ticker: str, dt, target_price, side: str = "entry"):
+    """
+    DISPLAY ONLY timestamp refinement for weekly regime trades.
+
+    Returns (timestamp_or_original_dt, source_label):
+    - "exact_5m_touch" when the displayed buy/sell price was inside a 5m candle range.
+    - "nearest_5m_estimate" when 5m data exists but the exact displayed price was not touched.
+    - "intraday_unavailable" when Yahoo/yfinance cannot provide 5m bars for that old date.
+
+    Important: this does NOT change strategy signals, equity curve, PnL logic, or model decisions.
+    It only prevents old weekly trades from being falsely displayed as if they had an exact
+    after-market 15:00 CT intraday trigger.
+    """
+    try:
+        if dt is None or pd.isna(dt) or str(dt).strip().lower() == 'open':
+            return dt, "open"
+        px = float(target_price)
+        if not np.isfinite(px) or px <= 0:
+            return dt, "no_price"
+        day = pd.Timestamp(dt).date()
+        intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
+        if intraday is None or intraday.empty:
+            return dt, "needs_historical_intraday_data"
+        lows = pd.to_numeric(intraday['Low'], errors='coerce')
+        highs = pd.to_numeric(intraday['High'], errors='coerce')
+        closes = pd.to_numeric(intraday['Close'], errors='coerce')
+        touched = intraday[(lows <= px) & (px <= highs)]
+        if not touched.empty:
+            return touched.index[0], "exact_5m_touch"
+        dist = (closes - px).abs()
+        if dist.notna().any():
+            return dist.idxmin(), "nearest_5m_estimate"
+        return dt, "needs_historical_intraday_data"
+    except Exception:
+        return dt, "needs_historical_intraday_data"
+
+def apply_weekly_regime_intraday_time_display(trades_df, ticker=""):
+    """
+    DISPLAY ONLY.
+    For weekly Regime Switching trade logs, replace date-only Entry/Exit Date values
+    with the first intraday 5-minute CT timestamp where the displayed buy/sell price
+    was touched on that real trigger date.
+
+    For old trades where 5m intraday data is unavailable, it keeps the sortable date
+    internally and tags the row so the final display says intraday time is unavailable
+    instead of falsely showing 15:00 CT as an exact buy/sell time.
+    """
+    try:
+        if trades_df is None or trades_df.empty or not str(ticker).strip():
+            return trades_df
+        out = trades_df.copy()
+        entry_sources = []
+        exit_sources = []
+        if 'Entry Date' in out.columns and 'Buy Price' in out.columns:
+            new_entry = []
+            for dt, bp in zip(out['Entry Date'], out['Buy Price']):
+                ts, src = _intraday_touch_timestamp_and_source_for_weekly_trade(str(ticker), dt, bp, side="entry")
+                new_entry.append(ts)
+                entry_sources.append(src)
+            out['Entry Date'] = new_entry
+            out['__Entry Time Source__'] = entry_sources
+        if 'Exit Date' in out.columns and 'Sell Price' in out.columns:
+            status_series = out.get('Status', pd.Series([''] * len(out), index=out.index))
+            new_exit = []
+            for dt, sp, status in zip(out['Exit Date'], out['Sell Price'], status_series):
+                if str(status).strip().lower() == 'open' or pd.isna(dt):
+                    new_exit.append(dt)
+                    exit_sources.append('open')
+                else:
+                    ts, src = _intraday_touch_timestamp_and_source_for_weekly_trade(str(ticker), dt, sp, side="exit")
+                    new_exit.append(ts)
+                    exit_sources.append(src)
+            out['Exit Date'] = new_exit
+            out['__Exit Time Source__'] = exit_sources
+        return out
+    except Exception:
+        return trades_df
+
+
+def finalize_weekly_regime_trade_time_display(trades_df):
+    """
+    DISPLAY ONLY final formatter for weekly Regime Switching trade logs.
+
+    Recent rows with available 5-minute data keep the exact CT timestamp.
+    Older rows without available intraday data show the clean weekly trade date only.
+    No "5m time unavailable" or "nearest estimate" text is appended inside the
+    Entry/Exit Date columns, so the trade log stays clean.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        out = trades_df.copy()
+
+        def _date_part(v):
+            try:
+                s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                    return 'Open' if s.lower() == 'open' else str(v)
+                return pd.Timestamp(s).strftime('%Y-%m-%d')
+            except Exception:
+                return str(v)
+
+        def _time_part(v):
+            try:
+                s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                    return 'Open' if s.lower() == 'open' else str(v)
+                return pd.Timestamp(s).strftime('%Y-%m-%d %H:%M:%S CT')
+            except Exception:
+                return str(v)
+
+        if 'Entry Date' in out.columns and '__Entry Time Source__' in out.columns:
+            vals = []
+            qvals = []
+            for v, src in zip(out['Entry Date'], out['__Entry Time Source__']):
+                src = str(src)
+                if src == 'exact_5m_touch':
+                    vals.append(_time_part(v)); qvals.append('exact intraday')
+                elif src == 'nearest_5m_estimate':
+                    vals.append(_time_part(v)); qvals.append('nearest intraday estimate')
+                else:
+                    vals.append(_date_part(v)); qvals.append('needs intraday history')
+            out['Entry Date'] = vals
+            out['Entry Time Quality'] = qvals
+
+        if 'Exit Date' in out.columns and '__Exit Time Source__' in out.columns:
+            vals = []
+            qvals = []
+            for v, src in zip(out['Exit Date'], out['__Exit Time Source__']):
+                src = str(src)
+                if str(v).strip().lower() == 'open' or src == 'open':
+                    vals.append('Open'); qvals.append('open')
+                elif src == 'exact_5m_touch':
+                    vals.append(_time_part(v)); qvals.append('exact intraday')
+                elif src == 'nearest_5m_estimate':
+                    vals.append(_time_part(v)); qvals.append('nearest intraday estimate')
+                else:
+                    vals.append(_date_part(v)); qvals.append('needs intraday history')
+            out['Exit Date'] = vals
+            out['Exit Time Quality'] = qvals
+
+        out = out.drop(columns=['__Entry Time Source__', '__Exit Time Source__'], errors='ignore')
+        return out
+    except Exception:
+        try:
+            return trades_df.drop(columns=['__Entry Time Source__', '__Exit Time Source__'], errors='ignore')
+        except Exception:
+            return trades_df
 
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
@@ -2706,6 +3119,25 @@ def buy_hold_return_pct(prices):
     if len(px) < 2 or px.iloc[0] == 0:
         return np.nan
     return (px.iloc[-1] / px.iloc[0] - 1) * 100
+
+
+def total_trade_pnl_return_pct(trades_df, include_open=True):
+    """
+    Non-cumulative total trade PnL return.
+
+    Cumulative return compounds account equity trade after trade.
+    Total Trade PnL simply adds each trade's PnL (%) values.
+    """
+    try:
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty or 'PnL (%)' not in trades_df.columns:
+            return 0.0
+        t = trades_df.copy()
+        if not include_open and 'Status' in t.columns:
+            t = t[t['Status'].astype(str).str.lower().ne('open')]
+        vals = pd.to_numeric(t['PnL (%)'], errors='coerce').dropna()
+        return float(vals.sum()) if len(vals) else 0.0
+    except Exception:
+        return 0.0
 
 
 def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=0.18, vol_throttle=True, equity_dd_guard=True, max_equity_dd=0.20, equity_guard_action="Soft Throttle"):
@@ -3608,24 +4040,27 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         full_benchmark_pct = buy_hold_return_pct(full_period_prices) if full_period_prices is not None else np.nan
         alpha_pct = strat_ret_pct - buyhold_ret_pct
         trades_df = bt_results['trades'].copy()
+        total_pnl_ret_pct = total_trade_pnl_return_pct(trades_df)
         # Show newest trades first by default
         if not trades_df.empty and 'Entry Date' in trades_df.columns:
             trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
 
         st.write(f"#### 📊 {title}: Strategy vs Buy & Hold")
         if full_period_prices is not None and pd.notna(full_benchmark_pct):
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
-            c2.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%", help="Benchmark over the same window used for this strategy result.")
-            c3.metric("Full Benchmark", f"{full_benchmark_pct:.2f}%", help="Buy & hold over the full selected chart period. Reference only if WFO starts after a training window.")
-            c4.metric("Difference vs Test Benchmark", f"{alpha_pct:+.2f}%")
-            c5.metric("Trades", len(trades_df))
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Cumulative Return", f"{strat_ret_pct:.2f}%", help="Compounded strategy/account return.")
+            c2.metric("Total Trade PnL", f"{total_pnl_ret_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+            c3.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%", help="Benchmark over the same window used for this strategy result.")
+            c4.metric("Full Benchmark", f"{full_benchmark_pct:.2f}%", help="Buy & hold over the full selected chart period. Reference only if WFO starts after a training window.")
+            c5.metric("Difference vs Test Benchmark", f"{alpha_pct:+.2f}%")
+            c6.metric("Trades", len(trades_df))
         else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Strategy Return", f"{strat_ret_pct:.2f}%")
-            c2.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%")
-            c3.metric("Difference", f"{alpha_pct:+.2f}%")
-            c4.metric("Trades", len(trades_df))
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Cumulative Return", f"{strat_ret_pct:.2f}%", help="Compounded strategy/account return.")
+            c2.metric("Total Trade PnL", f"{total_pnl_ret_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+            c3.metric(benchmark_label, f"{buyhold_ret_pct:.2f}%")
+            c4.metric("Difference", f"{alpha_pct:+.2f}%")
+            c5.metric("Trades", len(trades_df))
 
         fig_perf = go.Figure()
         fig_perf.add_trace(go.Scatter(
@@ -3645,7 +4080,16 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
         st.write(f"#### 📝 {title} Trade Log")
         if not trades_df.empty:
             trades_df = apply_trade_log_timestamp_display(trades_df)
-            st.dataframe(trades_df.style.format({
+            try:
+                if len(trades_df) > 300:
+                    st.caption(f"Showing latest 300 trade-log rows for speed out of {len(trades_df)} total rows. Download/export can be added if needed.")
+                    _display_trades_df = trades_df.head(300)
+                else:
+                    _display_trades_df = trades_df
+            except Exception:
+                _display_trades_df = trades_df
+
+            st.dataframe(_display_trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
                 "PnL (%)": "{:.2f}%",
@@ -3974,30 +4418,115 @@ def get_master_signal(ticker, df, n_regimes=4, freq='Daily', opt_goal='Robustnes
         st.error(f"Error in Decision Engine for {ticker}: {e}")
         return None
 
+def _flatten_yfinance_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Normalize yfinance single-ticker / MultiIndex output."""
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            # Common yfinance structure is (PriceField, Ticker).
+            if ticker in df.columns.get_level_values(-1):
+                df = df.xs(ticker, axis=1, level=-1, drop_level=True)
+            elif ticker in df.columns.get_level_values(0):
+                df = df.xs(ticker, axis=1, level=0, drop_level=True)
+            else:
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    except Exception:
+        pass
+    return df
+
+
+def _market_close_realtime_daily_patch(ticker: str, daily_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fix stale daily close after Friday/market close.
+
+    Yahoo daily bars can lag or exclude the current date because the `end` argument is
+    exclusive. For regime/weekly close logic, we want the latest completed regular
+    session. This helper pulls recent 5m bars and appends/replaces today's daily OHLCV
+    once today's regular session bars exist. It does not use unfinished future data.
+    """
+    try:
+        if daily_df is None or daily_df.empty or 'Close' not in daily_df.columns:
+            return daily_df
+
+        intr = yf.download(ticker, period='5d', interval='5m', progress=False, auto_adjust=False, prepost=False, threads=False)
+        intr = _flatten_yfinance_columns(intr, ticker)
+        if intr is None or intr.empty or 'Close' not in intr.columns:
+            return daily_df
+
+        # Convert intraday bars to US/Central for regular-session day grouping.
+        try:
+            if intr.index.tz is None:
+                intr.index = intr.index.tz_localize('America/New_York').tz_convert('America/Chicago')
+            else:
+                intr.index = intr.index.tz_convert('America/Chicago')
+        except Exception:
+            pass
+
+        # Keep regular session only: 8:30-15:00 CT. Last 5m bar after close is the
+        # practical completed session close proxy when Yahoo daily has not updated yet.
+        intr = intr.between_time('08:30', '15:00') if hasattr(intr, 'between_time') else intr
+        if intr.empty:
+            return daily_df
+
+        session_date = pd.Timestamp(intr.index[-1]).date()
+        last_daily_date = pd.Timestamp(daily_df.index[-1]).date()
+        if session_date < last_daily_date:
+            return daily_df
+
+        day = intr[pd.Series(intr.index.date, index=intr.index).eq(session_date)]
+        if day.empty or len(day) < 10:
+            return daily_df
+
+        row = {
+            'Open': float(day['Open'].iloc[0]) if 'Open' in day.columns else float(day['Close'].iloc[0]),
+            'High': float(day['High'].max()) if 'High' in day.columns else float(day['Close'].max()),
+            'Low': float(day['Low'].min()) if 'Low' in day.columns else float(day['Close'].min()),
+            'Close': float(day['Close'].iloc[-1]),
+            'Volume': float(day['Volume'].sum()) if 'Volume' in day.columns else np.nan,
+        }
+        if 'Adj Close' in daily_df.columns:
+            row['Adj Close'] = row['Close']
+
+        patched = daily_df.copy()
+        session_ts = pd.Timestamp(session_date)
+        # Replace if same date exists; append if daily data is still stuck on yesterday.
+        patched.loc[session_ts, list(row.keys())] = list(row.values())
+        patched = patched.sort_index()
+        return patched
+    except Exception:
+        return daily_df
+
+
 @st.cache_data(ttl=60) # Cache live data for 1 minute
 def load_data(ticker, start, end, interval='1d'):
     try:
-        df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
+        # yfinance's `end` date is EXCLUSIVE for daily bars. If the user selects
+        # Friday as the end date, `end=Friday` often returns Thursday as the last
+        # row. Add one calendar day for daily/weekly/monthly historical requests.
+        download_end = end
+        if interval in ['1d', '1wk', '1mo'] and end is not None:
+            try:
+                download_end = pd.Timestamp(end) + pd.Timedelta(days=1)
+            except Exception:
+                download_end = end
+
+        df = yf.download(ticker, start=start, end=download_end, interval=interval, progress=False, auto_adjust=False, threads=False)
         if df.empty:
             return None
+
+        df = _flatten_yfinance_columns(df, ticker)
             
         # NORMALIZE TIMEZONE: Ensure all data is timezone-naive to avoid join errors
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
 
-        # Handle MultiIndex if present
-        if isinstance(df.columns, pd.MultiIndex):
-            df = df.xs(ticker, axis=1, level=1, drop_level=True) if ticker in df.columns.get_level_values(1) else df
-            # If structure is different (Ticker as top level)
-            if ticker in df.columns:
-                 df = df[ticker]
-            # Fallback for simple single ticker download structure
-            elif 'Close' in df.columns and len(df.columns) > 1 and isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-
         # Standard cleaning
         if 'Close' not in df.columns and 'Adj Close' in df.columns:
             df['Close'] = df['Adj Close']
+
+        # Patch daily data so Friday's completed session close does not stay stuck
+        # on Thursday after the market has already closed.
+        if interval == '1d':
+            df = _market_close_realtime_daily_patch(ticker, df)
             
         if 'Close' in df.columns:
             df['Returns'] = df['Close'].pct_change()
@@ -4883,8 +5412,18 @@ with st.sidebar:
         stop_loss = st.slider("Hard Stop Loss (%)", 0.0, 30.0, 8.0, step=0.5) / 100 if use_stop_loss else 0.0
 
     st.divider()
+    st.header("🚀 Fast Startup")
+    fast_intraday_mode = st.toggle(
+        "Fast intraday-only startup",
+        value=True,
+        help="ON = skip heavy GARCH/Markov/full-dashboard calculations so the app opens fast. Use the final 0.5% Live Capture tab for today's intraday trades. Turn OFF when you want the full thesis dashboard."
+    )
+    if fast_intraday_mode:
+        st.success("Fast mode ON: heavy models skipped. Go straight to ⚡ 0.5% Live Capture.")
+
+    st.divider()
     st.header("⚡ Live Decision Mode")
-    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support.")
+    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support. Ignored when Fast intraday-only startup is ON.")
     if live_mode:
         data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
         st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
@@ -4992,7 +5531,12 @@ with st.sidebar:
 # Standardize current time to the nearest minute for robust caching
 now_rounded = datetime.now().replace(second=0, microsecond=0)
 
-if live_mode:
+if fast_intraday_mode:
+    # Fast intraday-only startup: do NOT load the big historical dataset and do NOT run
+    # GARCH/Markov/Monte Carlo on app open. The final tab fetches fresh intraday data
+    # only when the user clicks its Run button.
+    df_main = None
+elif live_mode:
     # Intraday limits: 1m (7d), 5m-15m (60d), 60m (730d)
     # We use 30d as a robust default for decision support models to have enough history
     lookback_days = 7 if data_interval == '1m' else 30
@@ -5001,7 +5545,7 @@ else:
     df_main = load_data(TICKER, start_date, end_date, interval='1d')
 
 st.subheader("Asset & Macro Analysis Suite")
-st.caption('Performance mode: CVD, VWAP, Time Series, and Microstructure are lazy-loaded so the main model opens fast.')
+st.caption('Fast mode skips heavy model loading. Last five tabs are lazy-loaded; final tab fetches today intraday only when you click Run.')
 
 # 5. UNIFIED TAB ARCHITECTURE
 # ==========================================
@@ -5032,10 +5576,1399 @@ tabs = st.tabs([
 
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20, tab21 = tabs
 
+
+# ==========================================================
+# FAST WHOLE-APP MODE
+# ==========================================================
+# This is still the whole app file. Fast mode simply stops the heavy thesis
+# tabs from executing on startup and renders a lightweight intraday final tab.
+# Turn Fast intraday-only startup OFF in the sidebar to run the full dashboard.
+if fast_intraday_mode:
+    for _t, _name in zip(
+        [tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20],
+        ["Decision Summary", "GARCH", "Regime Switching", "Heston/Jump", "Kalman", "Macro", "Structural", "Backtest", "Vol Clustering", "Advanced Regime", "SML & Alpha", "Multi-Asset Scan", "FED", "Options", "Hurst", "Hot 10", "IV Scanner", "CVD", "VWAP", "Time Series", "Microstructure"]
+    ):
+        with _t:
+            st.info(f"{_name} is paused because Fast intraday-only startup is ON. Turn it OFF in the sidebar when you want the full thesis dashboard.")
+
+    def _fast_flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        return df
+
+    @st.cache_data(ttl=20, show_spinner=False)
+    def _fast_fetch_intraday(ticker: str, period: str, interval: str) -> pd.DataFrame:
+        """
+        Robust intraday fetch for the fast final tab.
+
+        Important: on weekends/after a holiday, Yahoo can return nothing for
+        period='1d' even though the last regular session exists. So this tries
+        wider windows automatically and the UI later keeps the latest available
+        trading session.
+        """
+        t = str(ticker).strip().upper()
+        interval = str(interval).strip()
+        requested_period = str(period).strip()
+
+        # Safe yfinance fallbacks. 1m data is normally limited, so do not ask
+        # for 30d with 1m. For 60m, 60d is safe enough for stale/weekend fetches.
+        fallback_periods = []
+        def _add_period(x):
+            if x and x not in fallback_periods:
+                fallback_periods.append(x)
+        _add_period(requested_period)
+        if interval == "1m":
+            for x in ["1d", "5d", "7d"]:
+                _add_period(x)
+        elif interval in {"2m", "5m", "15m", "30m"}:
+            for x in ["1d", "5d", "7d", "30d", "60d"]:
+                _add_period(x)
+        else:
+            for x in ["1d", "5d", "30d", "60d"]:
+                _add_period(x)
+
+        df = pd.DataFrame()
+        for per in fallback_periods:
+            try:
+                temp = yf.download(t, period=per, interval=interval, progress=False, auto_adjust=True, prepost=False, threads=False)
+                temp = _fast_flatten_yf_columns(temp) if temp is not None else pd.DataFrame()
+                if temp is not None and not temp.empty:
+                    df = temp.copy()
+                    break
+            except Exception:
+                continue
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+        needed = ["Open", "High", "Low", "Close", "Volume"]
+        df = df[[c for c in needed if c in df.columns]].copy()
+        for c in ["Open", "High", "Low"]:
+            if c not in df.columns and "Close" in df.columns:
+                df[c] = df["Close"]
+        if "Volume" not in df.columns:
+            df["Volume"] = 1.0
+        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+        if df.empty:
+            return pd.DataFrame()
+        try:
+            idx = pd.DatetimeIndex(df.index)
+            if idx.tz is None:
+                df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago")
+            else:
+                df.index = idx.tz_convert("America/Chicago")
+        except Exception:
+            pass
+        return df
+
+    def _fast_add_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        typical = (out["High"] + out["Low"] + out["Close"]) / 3.0
+        vol = out["Volume"].replace(0, np.nan).fillna(1.0)
+        out["VWAP"] = (typical * vol).cumsum() / vol.cumsum()
+        out["EMA_FAST"] = out["Close"].ewm(span=5, adjust=False).mean()
+        out["EMA_SLOW"] = out["Close"].ewm(span=13, adjust=False).mean()
+        out["EMA_GUARD"] = out["Close"].ewm(span=21, adjust=False).mean()
+        out["VOL_AVG"] = out["Volume"].rolling(20, min_periods=5).mean()
+        out["VOL_RATIO"] = out["Volume"] / (out["VOL_AVG"] + 1e-9)
+        out["SESSION_OPEN"] = float(out["Open"].iloc[0])
+        out["SESSION_LOW"] = out["Low"].cummin()
+        out["SESSION_HIGH"] = out["High"].cummax()
+        out["FROM_OPEN_PCT"] = (out["Close"] / out["SESSION_OPEN"] - 1.0) * 100.0
+        out["BOUNCE_FROM_LOW_PCT"] = (out["Close"] / out["SESSION_LOW"] - 1.0) * 100.0
+        out["PULLBACK_FROM_HIGH_PCT"] = (out["Close"] / out["SESSION_HIGH"] - 1.0) * 100.0
+        out["MOM_1"] = out["Close"].pct_change(1) * 100.0
+        out["MOM_2"] = out["Close"].pct_change(2) * 100.0
+        out["MOM_3"] = out["Close"].pct_change(3) * 100.0
+        rng = (out["High"] - out["Low"]).replace(0, np.nan)
+        out["CLOSE_LOCATION"] = ((out["Close"] - out["Low"]) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.5)
+        out["LOWER_LOW_SEQ"] = ((out["Low"] <= out["Low"].shift(1)) & (out["Low"].shift(1) <= out["Low"].shift(2))).fillna(False)
+        out["LOWER_HIGH_SEQ"] = ((out["High"] <= out["High"].shift(1)) & (out["High"].shift(1) <= out["High"].shift(2))).fillna(False)
+        out["VWAP_SLOPE_5"] = out["VWAP"].diff(5)
+        out["EMA_GUARD_SLOPE_5"] = out["EMA_GUARD"].diff(5)
+        out["ABOVE_VWAP_8OF10"] = (out["Close"] > out["VWAP"]).rolling(10, min_periods=5).sum() >= 8
+        out["EMA_STACK_8OF10"] = ((out["EMA_FAST"] > out["EMA_SLOW"]) & (out["EMA_SLOW"] > out["EMA_GUARD"])).rolling(10, min_periods=5).sum() >= 8
+        out["TRUE_GREEN_AUCTION"] = (
+            (out["FROM_OPEN_PCT"] >= 1.20) &
+            (out["Close"] > out["VWAP"]) &
+            (out["Close"] > out["EMA_GUARD"]) &
+            (out["EMA_FAST"] > out["EMA_SLOW"]) &
+            (out["EMA_SLOW"] > out["EMA_GUARD"]) &
+            (out["VWAP_SLOPE_5"] > 0) &
+            (out["EMA_GUARD_SLOPE_5"] > 0) &
+            (out["ABOVE_VWAP_8OF10"]) &
+            (out["EMA_STACK_8OF10"]) &
+            (~out["LOWER_LOW_SEQ"]) &
+            (~out["LOWER_HIGH_SEQ"]) &
+            (out["CLOSE_LOCATION"] >= 0.68)
+        ).fillna(False)
+        out["DRIFT_DOWN_RISK"] = (
+            (out["FROM_OPEN_PCT"] < 0.50) |
+            (out["Close"] < out["VWAP"]) |
+            (out["Close"] < out["EMA_GUARD"]) |
+            out["LOWER_LOW_SEQ"] |
+            out["LOWER_HIGH_SEQ"]
+        ).fillna(False)
+
+        # Softer but still institutional-quality context for CMG/AAPL-type intraday waves.
+        out["BOUNCE_STRUCTURE_OK"] = (
+            (out["BOUNCE_FROM_LOW_PCT"] >= 0.25) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["MOM_2"] > 0.03) &
+            (out["CLOSE_LOCATION"] >= 0.55) &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+        out["RECLAIM_STRUCTURE_OK"] = (
+            (out["Close"] >= out["VWAP"] * 0.996) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_FAST"].shift(1)) &
+            (out["MOM_2"] > 0.05) &
+            (out["CLOSE_LOCATION"] >= 0.58) &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+        out["ADAPTIVE_TREND_OK"] = (
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_SLOW"]) &
+            (out["MOM_3"] > 0.08) &
+            (out["CLOSE_LOCATION"] >= 0.60) &
+            (out["VOL_RATIO"].fillna(1.0) >= 0.60) &
+            (~out["LOWER_LOW_SEQ"]) &
+            (~out["LOWER_HIGH_SEQ"])
+        ).fillna(False)
+        return out
+
+    def _fast_build_long_only_signals(df: pd.DataFrame, sensitivity: str, setup_mode: str, require_vwap: bool,
+                                      min_red_drop: float, bounce_confirm: float, min_vol_ratio: float) -> pd.DataFrame:
+        out = _fast_add_intraday_indicators(df)
+        if sensitivity == "Aggressive":
+            mom_req, ema_req = 0.05, False
+        elif sensitivity == "Balanced":
+            mom_req, ema_req = 0.12, True
+        else:
+            mom_req, ema_req = 0.22, True
+
+        vwap_ok = (out["Close"] >= out["VWAP"]) if require_vwap else pd.Series(True, index=out.index)
+        volume_ok = out["VOL_RATIO"].fillna(1.0) >= min_vol_ratio
+
+        # TRUE Green Momentum only.
+        # A small bounce on a red/drifting-down day is NOT Green Momentum.
+        green_momentum = (
+            out["TRUE_GREEN_AUCTION"] &
+            (out["MOM_3"] >= max(mom_req, 0.18)) &
+            (out["Close"] > out["EMA_FAST"]) &
+            ((out["EMA_FAST"] > out["EMA_SLOW"]) if ema_req else True) &
+            vwap_ok & volume_ok &
+            (~out["DRIFT_DOWN_RISK"])
+        )
+
+        # Long-only red-day bounce: no short selling. Wait for panic/drop, then buy the reclaim bounce.
+        red_dip_bounce = (
+            (out["FROM_OPEN_PCT"] <= -abs(min_red_drop)) &
+            (out["BOUNCE_FROM_LOW_PCT"] >= bounce_confirm) &
+            ((out["MOM_1"] > 0) | (out["MOM_2"] > 0)) &
+            (out["Close"] > out["EMA_FAST"]) &
+            volume_ok
+        )
+
+        # Failed selloff reclaim: useful when stock falls hard, bounces, dips again, then bounces again.
+        reclaim_pulse = (
+            (out["FROM_OPEN_PCT"] <= -abs(min_red_drop) * 0.75) &
+            (out["BOUNCE_FROM_LOW_PCT"] >= bounce_confirm) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["Close"] >= out["VWAP"] * 0.998) &
+            (out["EMA_FAST"] >= out["EMA_FAST"].shift(1)) &
+            (out["MOM_2"] > 0.10) &
+            (out["CLOSE_LOCATION"] >= 0.62) &
+            (~out["LOWER_LOW_SEQ"]) &
+            volume_ok
+        )
+
+        # Adaptive runner logic:
+        # - True Green Momentum remains strict.
+        # - Adaptive Trend Runner catches cleaner 0.5–1% waves without requiring the stock to already be +1.2%.
+        # - Dip/Reclaim setups have their own labels and are not mislabeled Green Momentum.
+        adaptive_trend_runner = (
+            out["ADAPTIVE_TREND_OK"] &
+            (out["Close"] >= out["VWAP"] * 0.995) &
+            volume_ok &
+            (~out["DRIFT_DOWN_RISK"])
+        ).fillna(False)
+
+        adaptive_dip_bounce = (
+            (out["FROM_OPEN_PCT"] <= -abs(min_red_drop) * 0.35) &
+            out["BOUNCE_STRUCTURE_OK"] &
+            volume_ok
+        ).fillna(False)
+
+        adaptive_reclaim = (
+            out["RECLAIM_STRUCTURE_OK"] &
+            volume_ok
+        ).fillna(False)
+
+        if setup_mode == "Green-Day Momentum Only":
+            entry = green_momentum | adaptive_trend_runner
+        elif setup_mode == "Red-Day Dip Bounce Only":
+            entry = red_dip_bounce | reclaim_pulse | adaptive_dip_bounce | adaptive_reclaim
+        else:
+            entry = green_momentum | adaptive_trend_runner | red_dip_bounce | reclaim_pulse | adaptive_dip_bounce | adaptive_reclaim
+
+        # Avoid impossible repeated entries on every bar. Backtest also enforces one position at a time.
+        out["ENTRY_SIGNAL"] = entry.fillna(False)
+        out["SETUP"] = np.select(
+            [
+                green_momentum,
+                adaptive_trend_runner,
+                red_dip_bounce,
+                adaptive_dip_bounce,
+                reclaim_pulse,
+                adaptive_reclaim,
+            ],
+            [
+                "True Green Momentum",
+                "Adaptive Trend Runner",
+                "Red-Day Dip Bounce",
+                "Adaptive Dip Bounce",
+                "Red-Day Reclaim Pulse",
+                "Adaptive VWAP Reclaim",
+            ],
+            default=""
+        )
+        return out
+
+
+    def _fast_build_micro_wave_signals(df: pd.DataFrame, sensitivity: str, require_vwap: bool,
+                                       bounce_confirm: float, min_vol_ratio: float, wave_density: str = "Active") -> pd.DataFrame:
+        """
+        Long-only Micro-Wave Capture engine.
+
+        Designed for stocks that move up/down 0.5–1.0% multiple times in one session.
+        It creates repeated wave entries but still blocks obvious fake pops / drift-down noise.
+        """
+        out = _fast_add_intraday_indicators(df)
+
+        if sensitivity == "Aggressive":
+            mom1_req, mom2_req, close_loc_req = 0.005, 0.018, 0.50
+        elif sensitivity == "Strict":
+            mom1_req, mom2_req, close_loc_req = 0.035, 0.085, 0.61
+        else:
+            mom1_req, mom2_req, close_loc_req = 0.012, 0.040, 0.54
+
+        if wave_density == "Calm":
+            mom1_req *= 1.40
+            mom2_req *= 1.35
+            close_loc_req += 0.04
+            chase_limit = 1.10
+        elif wave_density == "High Activity":
+            mom1_req *= 0.55
+            mom2_req *= 0.60
+            close_loc_req -= 0.04
+            chase_limit = 1.75
+        else:  # Active
+            chase_limit = 1.45
+
+        volume_ok = out["VOL_RATIO"].fillna(1.0) >= min_vol_ratio
+        above_vwap_soft = out["Close"] >= out["VWAP"] * (1.000 if require_vwap else 0.994)
+
+        # Block true garbage: lower lows while below VWAP/EMA guard. But do not block every normal pullback.
+        drift_guard = (
+            (out["LOWER_LOW_SEQ"] & (out["Close"] < out["VWAP"]) & (out["EMA_GUARD_SLOPE_5"] <= 0)) |
+            ((out["Close"] < out["EMA_GUARD"]) & (out["VWAP_SLOPE_5"] <= 0) & (out["FROM_OPEN_PCT"] < -0.60))
+        ).fillna(False)
+
+        # Repeated continuation waves.
+        micro_trend_wave = (
+            above_vwap_soft &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["MOM_1"] > mom1_req) &
+            (out["MOM_2"] > mom2_req) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~drift_guard)
+        ).fillna(False)
+
+        # VWAP reclaim or VWAP hold continuation. This is what was too restrictive before.
+        micro_vwap_reclaim = (
+            (out["Close"] >= out["VWAP"] * 0.996) &
+            (
+                (out["Close"].shift(1) < out["VWAP"].shift(1) * 1.0015) |
+                ((out["Low"] <= out["VWAP"] * 1.003) & (out["Close"] > out["Open"]))
+            ) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["MOM_1"] > mom1_req * 0.70) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~drift_guard)
+        ).fillna(False)
+
+        # Dip bounce from intraday swing lows.
+        micro_dip_bounce = (
+            (out["BOUNCE_FROM_LOW_PCT"] >= bounce_confirm) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["MOM_1"] > 0) &
+            (out["MOM_2"] > mom2_req * 0.45) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~drift_guard)
+        ).fillna(False)
+
+        # Pullback resume: catches another wave after a shallow pullback in an up session.
+        pullback_resume = (
+            (out["PULLBACK_FROM_HIGH_PCT"] <= -0.25) &
+            (out["PULLBACK_FROM_HIGH_PCT"] >= -1.80) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["Close"] >= out["VWAP"] * 0.994) &
+            (out["MOM_1"] > 0) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~drift_guard)
+        ).fillna(False)
+
+        # Avoid chasing a stretched bar too far above VWAP.
+        dist_vwap = (out["Close"] / out["VWAP"] - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0) * 100
+        chase_guard = dist_vwap > chase_limit
+
+        entry = (micro_trend_wave | micro_vwap_reclaim | micro_dip_bounce | pullback_resume) & (~chase_guard)
+
+        out["ENTRY_SIGNAL"] = entry.fillna(False)
+        out["SETUP"] = np.select(
+            [micro_vwap_reclaim, micro_dip_bounce, pullback_resume, micro_trend_wave],
+            ["Micro VWAP Reclaim", "Micro Dip Bounce", "Micro Pullback Resume", "Micro Trend Wave"],
+            default=""
+        )
+        out["DRIFT_GUARD"] = drift_guard.astype(bool)
+        out["CHASE_GUARD"] = chase_guard.astype(bool)
+        return out
+
+
+
+    def _fast_build_trend_day_core_signals(df: pd.DataFrame, sensitivity: str, require_vwap: bool,
+                                           min_vol_ratio: float) -> pd.DataFrame:
+        """
+        Trend-Day Core Capture.
+
+        This is the honest retail-friendly approach for a stock that moves 5–6%:
+        identify the trend day, enter once after confirmation, hold the core runner,
+        and exit only when the trend actually breaks. It avoids noisy 0.5% chop scalps.
+        """
+        out = _fast_add_intraday_indicators(df)
+
+        if sensitivity == "Aggressive":
+            move_req, mom_req, close_loc_req = 0.35, 0.035, 0.52
+        elif sensitivity == "Strict":
+            move_req, mom_req, close_loc_req = 0.90, 0.090, 0.62
+        else:
+            move_req, mom_req, close_loc_req = 0.55, 0.055, 0.56
+
+        volume_ok = out["VOL_RATIO"].fillna(1.0) >= max(0.45, float(min_vol_ratio) * 0.75)
+        vwap_ok = out["Close"] >= out["VWAP"] if require_vwap else out["Close"] >= out["VWAP"] * 0.995
+
+        bullish_stack = (
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["EMA_FAST"] >= out["EMA_SLOW"]) &
+            (out["Close"] >= out["EMA_GUARD"] * 0.997)
+        )
+
+        trend_day_confirm = (
+            (out["FROM_OPEN_PCT"] >= move_req) &
+            vwap_ok &
+            bullish_stack &
+            (out["MOM_2"] >= mom_req) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+
+        # Allow a later entry after first pullback resume on trend day.
+        pullback_resume = (
+            (out["FROM_OPEN_PCT"] >= move_req) &
+            (out["PULLBACK_FROM_HIGH_PCT"] <= -0.20) &
+            (out["PULLBACK_FROM_HIGH_PCT"] >= -2.20) &
+            (out["Close"] > out["EMA_FAST"]) &
+            (out["Close"] >= out["VWAP"] * 0.995) &
+            (out["MOM_1"] > 0) &
+            (out["CLOSE_LOCATION"] >= close_loc_req) &
+            volume_ok &
+            (~out["LOWER_LOW_SEQ"])
+        ).fillna(False)
+
+        out["ENTRY_SIGNAL"] = (trend_day_confirm | pullback_resume).fillna(False)
+        out["SETUP"] = np.select(
+            [trend_day_confirm, pullback_resume],
+            ["Trend-Day Core Long", "Trend-Day Pullback Resume"],
+            default=""
+        )
+        out["TREND_DAY_CONFIRM"] = trend_day_confirm.astype(bool)
+        out["TREND_DAY_PULLBACK"] = pullback_resume.astype(bool)
+        return out
+
+
+    def _fast_run_trend_day_core_backtest(df: pd.DataFrame, initial_stop_pct: float,
+                                          trail_pct: float, max_hold_bars: int) -> pd.DataFrame:
+        """
+        Core runner execution:
+        - One main core trade.
+        - No forced 0.5% profit exit.
+        - Uses break-of-trend exit and adaptive trailing stop.
+        """
+        trades = []
+        in_pos = False
+        pending = None
+        entry_price = entry_time = entry_setup = None
+        stop_price = None
+        high_since = None
+        bars_held = 0
+
+        for i in range(len(df)):
+            row = df.iloc[i]
+            ts = df.index[i]
+            price = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+
+                # Trail only after price proves itself.
+                gain_pct = (high_since / entry_price - 1.0) * 100.0
+                adaptive_trail = trail_pct
+                if gain_pct >= 2.0:
+                    adaptive_trail = max(trail_pct, 0.75)
+                elif gain_pct >= 1.0:
+                    adaptive_trail = max(trail_pct, 0.50)
+
+                trail_stop = high_since * (1.0 - adaptive_trail / 100.0)
+
+                # Trend break: below VWAP and EMA fast, or lower-low damage after run.
+                trend_break = (
+                    (price < float(row.get("VWAP", price)) * 0.997 and price < float(row.get("EMA_FAST", price)) * 0.997) or
+                    (bool(row.get("LOWER_LOW_SEQ", False)) and price < float(row.get("EMA_SLOW", price)) * 0.998)
+                )
+
+                exit_reason = None
+                exit_price = None
+                if low <= stop_price:
+                    exit_reason = "Initial Stop"
+                    exit_price = stop_price
+                elif gain_pct >= 0.70 and low <= trail_stop:
+                    exit_reason = "Core Trail"
+                    exit_price = trail_stop
+                elif trend_break and bars_held >= 3:
+                    exit_reason = "Trend Break"
+                    exit_price = price
+                elif bars_held >= max_hold_bars:
+                    exit_reason = "Max Hold"
+                    exit_price = price
+
+                if exit_reason is not None:
+                    pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+                    trades.append({
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_price, 4),
+                        "Sell Price": round(exit_price, 4),
+                        "PnL %": round(pnl_pct, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": bars_held,
+                    })
+                    in_pos = False
+                    break
+
+            # Confirm entry on next bar so we do not buy the first fake candle.
+            if (not in_pos) and pending is not None:
+                sig_price = float(pending["price"])
+                sig_high = float(pending["high"])
+                confirmed = (price >= sig_price * 1.0002) or (high >= sig_high * 1.0001 and price >= sig_price * 0.999)
+                if confirmed:
+                    in_pos = True
+                    entry_price = price
+                    entry_time = ts
+                    entry_setup = str(pending["setup"])
+                    stop_price = entry_price * (1.0 - initial_stop_pct / 100.0)
+                    high_since = price
+                    bars_held = 0
+                    pending = None
+                    continue
+                else:
+                    pending = None
+
+            if (not in_pos) and pending is None and bool(row.get("ENTRY_SIGNAL", False)) and str(row.get("SETUP", "")):
+                pending = {"time": ts, "price": price, "high": high, "setup": str(row.get("SETUP", "Trend-Day Core Long"))}
+
+        if in_pos:
+            last = df.iloc[-1]
+            exit_price = float(last["Close"])
+            pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+            trades.append({
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_price, 4),
+                "Sell Price": round(exit_price, 4),
+                "PnL %": round(pnl_pct, 3),
+                "Exit Reason": "Open",
+                "Bars Held": bars_held,
+            })
+        return pd.DataFrame(trades)
+
+
+    def _fast_run_micro_wave_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
+                                      trail_pct: float, max_hold_bars: int, max_trades: int, cooldown_bars: int,
+                                      max_consecutive_stops: int = 2, profit_rearm_bars: int = 1) -> pd.DataFrame:
+        """
+        Micro-wave execution:
+        - Requires one-bar confirmation after a signal.
+        - Allows multiple waves per session.
+        - After a stop, pauses and requires a fresh signal.
+        - Blocks repeated same-price reentries after a stop.
+        """
+        trades = []
+        in_pos = False
+        pending = None
+        entry_price = entry_time = entry_setup = None
+        stop_price = target_price = None
+        high_since = None
+        bars_held = 0
+        cooldown = 0
+        consecutive_stops = 0
+        last_stop_price = None
+
+        for i in range(len(df)):
+            row = df.iloc[i]
+            ts = df.index[i]
+            price = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+                exit_reason = None
+                exit_price = None
+
+                if low <= stop_price:
+                    exit_reason = "Stop"
+                    exit_price = stop_price
+                elif runner_on and high >= target_price:
+                    trail_stop = high_since * (1.0 - trail_pct / 100.0)
+                    if low <= trail_stop:
+                        exit_reason = "Runner Trail"
+                        exit_price = max(trail_stop, entry_price * (1.0 + target_pct * 0.30 / 100.0))
+                elif (not runner_on) and high >= target_price:
+                    exit_reason = "Target"
+                    exit_price = target_price
+                elif bars_held >= max_hold_bars:
+                    exit_reason = "Max Hold"
+                    exit_price = price
+
+                if exit_reason is not None:
+                    pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+                    trades.append({
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_price, 4),
+                        "Sell Price": round(exit_price, 4),
+                        "PnL %": round(pnl_pct, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": bars_held,
+                    })
+                    if exit_reason == "Stop":
+                        consecutive_stops += 1
+                        last_stop_price = exit_price
+                        cooldown = max(int(cooldown_bars), 4)
+                    else:
+                        # Winning/neutral exits should re-arm quickly; otherwise a 5–6% trend only gives 1–2 trades.
+                        consecutive_stops = 0
+                        cooldown = max(0, int(profit_rearm_bars))
+                    in_pos = False
+                    pending = None
+                    entry_price = entry_time = entry_setup = None
+                    stop_price = target_price = high_since = None
+                    bars_held = 0
+                    if len(trades) >= max_trades or consecutive_stops >= max_consecutive_stops:
+                        break
+                    continue
+
+            # Pending signal confirms on the next bar, not on the same bar.
+            if (not in_pos) and pending is not None and cooldown == 0:
+                sig_price = float(pending["price"])
+                sig_high = float(pending["high"])
+                sig_setup = str(pending["setup"])
+                drift_now = bool(row.get("DRIFT_GUARD", False))
+                chase_now = bool(row.get("CHASE_GUARD", False))
+
+                confirmed = (
+                    (price >= sig_price * 1.0001) or
+                    ((high >= sig_high * 1.00005) and (price >= sig_price * 0.9990)) or
+                    (str(sig_setup) in {"Micro Dip Bounce", "Micro Pullback Resume"} and price >= sig_price * 0.9985)
+                )
+                not_same_failed_level = True
+                if last_stop_price is not None:
+                    not_same_failed_level = price >= float(last_stop_price) * 1.001 or str(sig_setup) != str(pending.get("last_setup", ""))
+
+                if confirmed and (not drift_now) and (not chase_now) and not_same_failed_level:
+                    in_pos = True
+                    entry_price = price
+                    entry_time = ts
+                    entry_setup = sig_setup
+                    stop_price = entry_price * (1.0 - stop_pct / 100.0)
+                    target_price = entry_price * (1.0 + target_pct / 100.0)
+                    high_since = price
+                    bars_held = 0
+                    pending = None
+                    continue
+                else:
+                    # signal failed confirmation; drop it
+                    pending = None
+
+            if (not in_pos) and cooldown == 0 and len(trades) < int(max_trades):
+                if bool(row.get("ENTRY_SIGNAL", False)) and str(row.get("SETUP", "")):
+                    pending = {
+                        "time": ts,
+                        "price": price,
+                        "high": high,
+                        "setup": str(row.get("SETUP", "Micro Wave")),
+                        "last_setup": trades[-1]["Setup"] if len(trades) else ""
+                    }
+
+        if in_pos:
+            last = df.iloc[-1]
+            exit_price = float(last["Close"])
+            pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+            trades.append({
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_price, 4),
+                "Sell Price": round(exit_price, 4),
+                "PnL %": round(pnl_pct, 3),
+                "Exit Reason": "Open",
+                "Bars Held": bars_held,
+            })
+        return pd.DataFrame(trades)
+
+
+    def _fast_run_long_only_backtest(df: pd.DataFrame, target_pct: float, stop_pct: float, runner_on: bool,
+                                     trail_pct: float, max_hold_bars: int, max_trades: int, cooldown_bars: int) -> pd.DataFrame:
+        trades = []
+        in_pos = False
+        entry_price = entry_time = entry_setup = None
+        stop_price = target_price = None
+        high_since = None
+        bars_held = 0
+        cooldown = 0
+        consecutive_stops = 0
+        stopped_once = False
+
+        for i in range(len(df)):
+            row = df.iloc[i]
+            ts = df.index[i]
+            price = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+                exit_reason = None
+                exit_price = None
+
+                # Same-bar conservative rule: stop before target/trail.
+                if low <= stop_price:
+                    exit_reason = "Stop"
+                    exit_price = stop_price
+                elif runner_on and high >= target_price:
+                    trail_stop = high_since * (1.0 - trail_pct / 100.0)
+                    if low <= trail_stop:
+                        exit_reason = "Runner Trail"
+                        exit_price = trail_stop
+                elif (not runner_on) and high >= target_price:
+                    exit_reason = "Target"
+                    exit_price = target_price
+                elif bars_held >= max_hold_bars:
+                    exit_reason = "Max Hold"
+                    exit_price = price
+
+                if exit_reason is not None:
+                    pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+                    trades.append({
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_price, 4),
+                        "Sell Price": round(exit_price, 4),
+                        "PnL %": round(pnl_pct, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": bars_held,
+                    })
+                    if exit_reason == "Stop":
+                        consecutive_stops += 1
+                        stopped_once = True
+                        cooldown = max(int(cooldown_bars), 20)
+                    else:
+                        consecutive_stops = 0
+                        cooldown = int(cooldown_bars)
+                    in_pos = False
+                    if len(trades) >= max_trades or consecutive_stops >= 2:
+                        break
+                    continue
+
+            entry_signal_now = bool(row.get("ENTRY_SIGNAL", False))
+            setup_now = str(row.get("SETUP", "Long")) or "Long"
+            drift_now = bool(row.get("DRIFT_DOWN_RISK", True))
+            true_green_now = bool(row.get("TRUE_GREEN_AUCTION", False))
+
+            reentry_ok = True
+            if stopped_once:
+                if setup_now == "True Green Momentum":
+                    reentry_ok = bool(true_green_now) and (not drift_now)
+                elif setup_now == "Adaptive Trend Runner":
+                    reentry_ok = bool(row.get("ADAPTIVE_TREND_OK", False)) and (not drift_now)
+                else:
+                    reentry_ok = (not drift_now)
+
+            if (not in_pos) and cooldown == 0 and entry_signal_now and reentry_ok and consecutive_stops < 2:
+                in_pos = True
+                entry_price = price
+                entry_time = ts
+                entry_setup = setup_now
+                stop_price = entry_price * (1.0 - stop_pct / 100.0)
+                target_price = entry_price * (1.0 + target_pct / 100.0)
+                high_since = price
+                bars_held = 0
+
+        if in_pos:
+            last = df.iloc[-1]
+            exit_price = float(last["Close"])
+            pnl_pct = (exit_price / entry_price - 1.0) * 100.0
+            trades.append({
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_price, 4),
+                "Sell Price": round(exit_price, 4),
+                "PnL %": round(pnl_pct, 3),
+                "Exit Reason": "Open",
+                "Bars Held": bars_held,
+            })
+        return pd.DataFrame(trades)
+
+    # ==========================================================
+    # TAB 21: INSTITUTIONAL RELATIVE STRENGTH / UNUSUAL VOLUME
+    # ==========================================================
+    def _rs_flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None:
+            return pd.DataFrame()
+        out = df.copy()
+        if isinstance(out.columns, pd.MultiIndex):
+            out.columns = [c[0] if isinstance(c, tuple) else str(c) for c in out.columns]
+        return out
+
+    @st.cache_data(ttl=45, show_spinner=False)
+    def _rs_fetch_intraday_one(ticker: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
+        try:
+            t = str(ticker).strip().upper().replace(".", "-")
+            if not t:
+                return pd.DataFrame()
+            df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=True, prepost=False, threads=False)
+            df = _rs_flatten_cols(df)
+            if df is None or df.empty or "Close" not in df.columns:
+                return pd.DataFrame()
+            needed = ["Open", "High", "Low", "Close", "Volume"]
+            df = df[[c for c in needed if c in df.columns]].copy()
+            for c in ["Open", "High", "Low"]:
+                if c not in df.columns:
+                    df[c] = df["Close"]
+            if "Volume" not in df.columns:
+                df["Volume"] = 0.0
+            df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+            try:
+                idx = pd.DatetimeIndex(df.index)
+                if idx.tz is None:
+                    df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago")
+                else:
+                    df.index = idx.tz_convert("America/Chicago")
+            except Exception:
+                pass
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    @st.cache_data(ttl=180, show_spinner=False)
+    def _rs_fetch_daily_one(ticker: str, period: str = "3mo") -> pd.DataFrame:
+        try:
+            t = str(ticker).strip().upper().replace(".", "-")
+            df = yf.download(t, period=period, interval="1d", progress=False, auto_adjust=True, prepost=False, threads=False)
+            df = _rs_flatten_cols(df)
+            if df is None or df.empty or "Close" not in df.columns:
+                return pd.DataFrame()
+            needed = ["Open", "High", "Low", "Close", "Volume"]
+            df = df[[c for c in needed if c in df.columns]].copy()
+            return df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+        except Exception:
+            return pd.DataFrame()
+
+    def _rs_latest_session(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        try:
+            last_date = df.index[-1].date()
+            d = df[df.index.date == last_date].copy()
+            return d if len(d) >= 3 else df.copy()
+        except Exception:
+            return df.copy()
+
+    def _rs_add_features(d: pd.DataFrame) -> pd.DataFrame:
+        out = d.copy()
+        if out.empty:
+            return out
+        typical = (out["High"] + out["Low"] + out["Close"]) / 3.0
+        vol = out["Volume"].replace(0, np.nan).fillna(1.0)
+        out["VWAP"] = (typical * vol).cumsum() / vol.cumsum()
+        out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
+        out["EMA21"] = out["Close"].ewm(span=21, adjust=False).mean()
+        out["MOM_3"] = out["Close"].pct_change(3) * 100.0
+        out["MOM_6"] = out["Close"].pct_change(6) * 100.0
+        out["VOL_AVG20"] = out["Volume"].rolling(20, min_periods=5).mean()
+        out["VOL_RATIO"] = out["Volume"] / (out["VOL_AVG20"] + 1e-9)
+        rng = (out["High"] - out["Low"]).replace(0, np.nan)
+        out["CLOSE_LOC"] = ((out["Close"] - out["Low"]) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.5)
+        out["SESSION_OPEN"] = float(out["Open"].iloc[0])
+        out["SESSION_HIGH"] = out["High"].cummax()
+        out["SESSION_LOW"] = out["Low"].cummin()
+        out["FROM_OPEN_%"] = (out["Close"] / out["SESSION_OPEN"] - 1.0) * 100.0
+        out["FROM_LOW_%"] = (out["Close"] / out["SESSION_LOW"] - 1.0) * 100.0
+        out["OFF_HIGH_%"] = (out["Close"] / out["SESSION_HIGH"] - 1.0) * 100.0
+        return out
+
+    def _safe_last(series, default=np.nan):
+        try:
+            s = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
+            return float(s.iloc[-1]) if not s.empty else default
+        except Exception:
+            return default
+
+    def _rs_score_one(ticker: str, bench_day: pd.DataFrame, interval: str, period: str,
+                      min_price: float, min_dollar_vol: float) -> dict:
+        raw = _rs_fetch_intraday_one(ticker, period=period, interval=interval)
+        day = _rs_latest_session(raw)
+        day = _rs_add_features(day)
+        daily = _rs_fetch_daily_one(ticker, period="3mo")
+        if day is None or day.empty or len(day) < 6:
+            return {"Ticker": ticker, "Error": "No intraday data"}
+        try:
+            open_px = float(day["Open"].iloc[0])
+            last_px = float(day["Close"].iloc[-1])
+            high_px = float(day["High"].max())
+            low_px = float(day["Low"].min())
+            session_ret = (last_px / open_px - 1.0) * 100.0
+            day_ret = session_ret
+            if daily is not None and not daily.empty and len(daily) >= 2:
+                prev_close = float(daily["Close"].iloc[-2])
+                day_ret = (last_px / prev_close - 1.0) * 100.0
+                avg_daily_vol = float(daily["Volume"].tail(20).mean()) if "Volume" in daily.columns else np.nan
+            else:
+                prev_close = open_px
+                avg_daily_vol = np.nan
+            cum_vol = float(day["Volume"].sum())
+            dollar_vol = float((day["Close"] * day["Volume"]).sum())
+            rel_vol_day = cum_vol / (avg_daily_vol + 1e-9) if avg_daily_vol and avg_daily_vol > 0 else np.nan
+            vwap = _safe_last(day["VWAP"], last_px)
+            ema9 = _safe_last(day["EMA9"], last_px)
+            ema21 = _safe_last(day["EMA21"], last_px)
+            vol_ratio_now = _safe_last(day["VOL_RATIO"], 1.0)
+            mom3 = _safe_last(day["MOM_3"], 0.0)
+            mom6 = _safe_last(day["MOM_6"], 0.0)
+            close_loc = _safe_last(day["CLOSE_LOC"], 0.5)
+            off_high = _safe_last(day["OFF_HIGH_%"], 0.0)
+            from_low = _safe_last(day["FROM_LOW_%"], 0.0)
+
+            bench_ret = 0.0
+            if bench_day is not None and not bench_day.empty and len(bench_day) >= 2:
+                try:
+                    bench_ret = (float(bench_day["Close"].iloc[-1]) / float(bench_day["Open"].iloc[0]) - 1.0) * 100.0
+                except Exception:
+                    bench_ret = 0.0
+            rel_strength = session_ret - bench_ret
+
+            above_vwap = last_px > vwap
+            ema_stack = last_px > ema9 > ema21
+            near_high = off_high >= -0.70
+            strong_close = close_loc >= 0.62
+            impulse = (mom3 > 0.10) or (mom6 > 0.20)
+            liquid = (last_px >= min_price) and (dollar_vol >= min_dollar_vol)
+
+            score = 0.0
+            score += max(min(rel_strength * 8.0, 30), -20)
+            score += max(min(day_ret * 4.0, 20), -12)
+            score += max(min(session_ret * 3.0, 18), -12)
+            score += 14 if above_vwap else -8
+            score += 12 if ema_stack else -5
+            score += 10 if near_high else -4
+            score += 8 if strong_close else -3
+            score += max(min((vol_ratio_now - 1.0) * 7.0, 12), -4)
+            if np.isfinite(rel_vol_day):
+                score += max(min((rel_vol_day - 0.25) * 10.0, 12), -3)
+            score += 8 if impulse else -4
+            if not liquid:
+                score -= 25
+
+            if score >= 70 and above_vwap and ema_stack and rel_strength > 0:
+                grade = "A+ Institutional Momentum"
+            elif score >= 55 and above_vwap and rel_strength > 0:
+                grade = "A Watch / Strong RS"
+            elif score >= 40:
+                grade = "B Developing"
+            elif score >= 25:
+                grade = "C Mixed"
+            else:
+                grade = "Avoid / No Edge"
+
+            if (bench_ret < 0) and (day_ret > 0) and (rel_strength > 1.0):
+                tape_note = "Green while market red"
+            elif rel_strength > 1.0:
+                tape_note = "Outperforming market"
+            elif day_ret > 0:
+                tape_note = "Green but weak RS"
+            else:
+                tape_note = "Weak / red"
+
+            entry_zone = max(vwap, ema9)
+            invalidation = min(vwap, ema21) * 0.992
+            first_target = last_px * 1.012
+            runner_level = high_px * 1.005
+
+            return {
+                "Ticker": ticker,
+                "Score": round(float(score), 1),
+                "Grade": grade,
+                "Tape Note": tape_note,
+                "Last": round(last_px, 2),
+                "Day %": round(day_ret, 2),
+                "From Open %": round(session_ret, 2),
+                "RelStrength vs Bench %": round(rel_strength, 2),
+                "Vol Ratio Now": round(vol_ratio_now, 2),
+                "RelVol Day": round(rel_vol_day, 2) if np.isfinite(rel_vol_day) else np.nan,
+                "Dollar Vol": round(dollar_vol, 0),
+                "Above VWAP": bool(above_vwap),
+                "EMA Stack": bool(ema_stack),
+                "Near High": bool(near_high),
+                "Close Loc": round(close_loc, 2),
+                "Entry Zone": round(entry_zone, 2),
+                "Invalidation": round(invalidation, 2),
+                "First Target": round(first_target, 2),
+                "Runner Break": round(runner_level, 2),
+                "Error": "",
+            }
+        except Exception as e:
+            return {"Ticker": ticker, "Error": str(e)}
+
+    def _rs_scan_market(tickers: list, benchmark: str, interval: str, period: str,
+                        min_price: float, min_dollar_vol: float) -> pd.DataFrame:
+        bench = _rs_add_features(_rs_latest_session(_rs_fetch_intraday_one(benchmark, period=period, interval=interval)))
+        rows = []
+        seen = set()
+        for t in tickers:
+            t = str(t).strip().upper().replace(".", "-")
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            rows.append(_rs_score_one(t, bench, interval, period, min_price, min_dollar_vol))
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        if "Score" in df.columns:
+            df["Score"] = pd.to_numeric(df["Score"], errors="coerce")
+            df = df.sort_values(["Score"], ascending=False, na_position="last")
+        return df.reset_index(drop=True)
+
+    def _rs_build_trade_log(ticker: str, interval: str, period: str, benchmark: str,
+                            target_pct: float, stop_pct: float, trail_pct: float,
+                            max_trades: int, min_score: float, min_vol_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Institutional Momentum trade log.
+
+        Logic:
+        Entry only when the stock has unusual volume + relative strength + VWAP/EMA buyer control.
+        Exit on target, trail, VWAP/EMA breakdown, hard stop, or end of session.
+        Long-only. No forced scalping.
+        """
+        raw = _rs_fetch_intraday_one(ticker, period=period, interval=interval)
+        day = _rs_add_features(_rs_latest_session(raw))
+        bench = _rs_add_features(_rs_latest_session(_rs_fetch_intraday_one(benchmark, period=period, interval=interval)))
+        if day is None or day.empty or len(day) < 8:
+            return pd.DataFrame(), day
+
+        try:
+            bench_ret_now = 0.0
+            if bench is not None and not bench.empty and len(bench) >= 2:
+                bench_open = float(bench["Open"].iloc[0])
+                bench_close = float(bench["Close"].iloc[-1])
+                bench_ret_now = (bench_close / bench_open - 1.0) * 100.0
+        except Exception:
+            bench_ret_now = 0.0
+
+        trades = []
+        in_pos = False
+        entry_px = entry_time = entry_setup = None
+        stop_px = target_px = None
+        high_since = None
+        bars_held = 0
+        cooldown = 0
+
+        # Store bar-by-bar signal score for diagnostics/chart markers.
+        sig_scores = []
+        entry_flags = []
+        exit_flags = []
+
+        for i in range(len(day)):
+            row = day.iloc[i]
+            ts = day.index[i]
+            px = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+            open0 = float(day["Open"].iloc[0])
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            from_open = (px / open0 - 1.0) * 100.0
+            rel_strength = from_open - bench_ret_now
+            vol_ratio = float(row.get("VOL_RATIO", 1.0) if pd.notna(row.get("VOL_RATIO", 1.0)) else 1.0)
+            above_vwap = px > float(row.get("VWAP", px))
+            ema_stack = px > float(row.get("EMA9", px)) > float(row.get("EMA21", px))
+            close_loc = float(row.get("CLOSE_LOC", 0.5))
+            mom3 = float(row.get("MOM_3", 0.0) if pd.notna(row.get("MOM_3", 0.0)) else 0.0)
+            near_high = float(row.get("OFF_HIGH_%", -99.0)) >= -0.85
+
+            # Bar score intentionally simpler than the scanner score.
+            bar_score = 0.0
+            bar_score += max(min(rel_strength * 10.0, 30), -20)
+            bar_score += max(min(from_open * 5.0, 20), -12)
+            bar_score += 18 if above_vwap else -12
+            bar_score += 15 if ema_stack else -8
+            bar_score += 12 if vol_ratio >= min_vol_ratio else -6
+            bar_score += 8 if close_loc >= 0.60 else -4
+            bar_score += 7 if mom3 > 0.08 else -4
+            bar_score += 5 if near_high else -3
+
+            sig_scores.append(round(bar_score, 2))
+            entry_flags.append(False)
+            exit_flags.append(False)
+
+            if in_pos:
+                bars_held += 1
+                high_since = max(high_since, high)
+                trail_stop = high_since * (1.0 - trail_pct / 100.0)
+                trend_break = (
+                    (px < float(row.get("VWAP", px)) * 0.996 and px < float(row.get("EMA9", px)) * 0.996) or
+                    (px < float(row.get("EMA21", px)) * 0.994)
+                )
+
+                exit_reason = None
+                exit_px = None
+                if low <= stop_px:
+                    exit_reason = "Hard Stop"
+                    exit_px = stop_px
+                elif high >= target_px:
+                    # Take first target, but if it runs hard, trail may capture better later in live interpretation.
+                    exit_reason = "Target"
+                    exit_px = target_px
+                elif high_since > entry_px * 1.008 and low <= trail_stop:
+                    exit_reason = "Trail"
+                    exit_px = trail_stop
+                elif trend_break and bars_held >= 2:
+                    exit_reason = "VWAP/EMA Breakdown"
+                    exit_px = px
+
+                if exit_reason is not None:
+                    pnl = (exit_px / entry_px - 1.0) * 100.0
+                    trades.append({
+                        "Ticker": ticker,
+                        "Setup": entry_setup,
+                        "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                        "Exit Time CT": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts),
+                        "Buy Price": round(entry_px, 4),
+                        "Sell Price": round(exit_px, 4),
+                        "PnL %": round(pnl, 3),
+                        "Exit Reason": exit_reason,
+                        "Bars Held": int(bars_held),
+                    })
+                    exit_flags[-1] = True
+                    in_pos = False
+                    entry_px = entry_time = entry_setup = None
+                    stop_px = target_px = high_since = None
+                    bars_held = 0
+                    cooldown = 2
+                    if len(trades) >= int(max_trades):
+                        break
+                    continue
+
+            # Entry: only institutional momentum, not random wiggles.
+            clean_entry = (
+                (not in_pos) and
+                cooldown == 0 and
+                (bar_score >= min_score) and
+                (rel_strength > 0.30) and
+                above_vwap and
+                (ema_stack or px > float(row.get("EMA21", px))) and
+                (vol_ratio >= min_vol_ratio) and
+                (close_loc >= 0.58) and
+                (mom3 > 0.04 or from_open > 0.80)
+            )
+
+            if clean_entry:
+                in_pos = True
+                entry_px = px
+                entry_time = ts
+                entry_setup = "Institutional Momentum Long"
+                # Stop is the tighter of fixed stop or VWAP/EMA structure, but not above entry.
+                structure_stop = min(float(row.get("VWAP", px)), float(row.get("EMA21", px))) * 0.994
+                fixed_stop = entry_px * (1.0 - stop_pct / 100.0)
+                stop_px = min(entry_px * 0.999, max(structure_stop, fixed_stop))
+                target_px = entry_px * (1.0 + target_pct / 100.0)
+                high_since = px
+                bars_held = 0
+                entry_flags[-1] = True
+
+        if in_pos:
+            last = day.iloc[-1]
+            exit_px = float(last["Close"])
+            pnl = (exit_px / entry_px - 1.0) * 100.0
+            trades.append({
+                "Ticker": ticker,
+                "Setup": entry_setup,
+                "Entry Time CT": entry_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(entry_time, "strftime") else str(entry_time),
+                "Exit Time CT": "Open / Marked at latest bar",
+                "Buy Price": round(entry_px, 4),
+                "Sell Price": round(exit_px, 4),
+                "PnL %": round(pnl, 3),
+                "Exit Reason": "Open",
+                "Bars Held": int(bars_held),
+            })
+
+        try:
+            day["Signal Score"] = pd.Series(sig_scores, index=day.index[:len(sig_scores)])
+            day["Trade Entry"] = pd.Series(entry_flags, index=day.index[:len(entry_flags)]).fillna(False)
+            day["Trade Exit"] = pd.Series(exit_flags, index=day.index[:len(exit_flags)]).fillna(False)
+        except Exception:
+            pass
+
+        return pd.DataFrame(trades), day
+
+    def _rs_build_multi_trade_logs(tickers: list, interval: str, period: str, benchmark: str,
+                                   target_pct: float, stop_pct: float, trail_pct: float,
+                                   max_trades_each: int, min_score: float, min_vol_ratio: float) -> tuple[pd.DataFrame, dict]:
+        all_trades = []
+        chart_data = {}
+        for t in tickers:
+            tr, d = _rs_build_trade_log(t, interval, period, benchmark, target_pct, stop_pct, trail_pct,
+                                        max_trades_each, min_score, min_vol_ratio)
+            chart_data[t] = d
+            if tr is not None and not tr.empty:
+                all_trades.append(tr)
+        if all_trades:
+            return pd.concat(all_trades, ignore_index=True), chart_data
+        return pd.DataFrame(), chart_data
+
+    with tab21:
+        st.header("🚨 Institutional Momentum Scanner — Relative Strength + Unusual Volume")
+        st.caption("Replaces the old 0.5% scalper. Goal: find the few stocks acting strong while the broader market is weak, then build a clean trade plan.")
+
+        default_universe = "TPR, GLXY, HIMS, RDDT, AAPL, NVDA, TSLA, PLTR, CMG, RKLB, QBTS, QUBT, RGTI, SOFI, HOOD, COIN, MSTR, AMD, AVGO, SMCI, META, AMZN, MSFT, GOOGL, NFLX, CRWD, NET, SHOP, CAVA, ELF, CELH, ARM, IONQ, APP, UPST, AFRM"
+
+        c1, c2, c3 = st.columns([2.2, 1, 1])
+        with c1:
+            universe_text = st.text_area("Scan universe", value=default_universe, height=95, key="inst_mom_universe",
+                                         help="Paste tickers separated by commas. This scanner ranks relative strength + unusual volume + intraday structure.")
+        with c2:
+            benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "IWM"], index=0, key="inst_mom_bench")
+            interval = st.selectbox("Intraday interval", ["1m", "2m", "5m", "15m", "30m"], index=2, key="inst_mom_interval")
+            period = st.selectbox("Data window", ["1d", "5d", "7d", "30d"], index=1, key="inst_mom_period")
+        with c3:
+            min_price = st.number_input("Min price", 1.0, 1000.0, 5.0, 1.0, key="inst_mom_min_price")
+            min_dollar_vol_m = st.number_input("Min intraday dollar vol ($M)", 0.0, 5000.0, 20.0, 5.0, key="inst_mom_min_dv")
+            top_n = st.number_input("Show top N", 5, 50, 15, 1, key="inst_mom_topn")
+
+        with st.expander("Trade log engine settings", expanded=False):
+            tl1, tl2, tl3, tl4, tl5 = st.columns(5)
+            with tl1:
+                tl_target = st.number_input("Target %", 0.20, 10.0, 1.20, 0.10, key="inst_mom_tl_target")
+            with tl2:
+                tl_stop = st.number_input("Hard stop %", 0.10, 5.0, 0.70, 0.05, key="inst_mom_tl_stop")
+            with tl3:
+                tl_trail = st.number_input("Trail %", 0.10, 5.0, 0.80, 0.05, key="inst_mom_tl_trail")
+            with tl4:
+                tl_min_score = st.number_input("Min signal score", 20.0, 90.0, 48.0, 1.0, key="inst_mom_tl_score")
+            with tl5:
+                tl_min_vol_ratio = st.number_input("Min vol ratio", 0.20, 5.0, 1.10, 0.10, key="inst_mom_tl_minvol")
+                tl_max_trades = st.number_input("Max trades / stock", 1, 20, 5, 1, key="inst_mom_tl_maxtr")
+
+        tickers = [x.strip().upper() for x in universe_text.replace("\n", ",").split(",") if x.strip()]
+        run_scan = st.button("Run Institutional Momentum Scan", type="primary", use_container_width=True, key="inst_mom_run")
+
+        if not run_scan:
+            st.info("Click scan. Best use: during market hours or after close. Look for A/A+ names that are green while SPY/QQQ are red.")
+        else:
+            with st.spinner(f"Scanning {len(tickers)} tickers for unusual strength and volume..."):
+                scan_df = _rs_scan_market(tickers, benchmark, interval, period, min_price, min_dollar_vol_m * 1_000_000)
+
+            if scan_df.empty:
+                st.error("No scan results. Try fewer tickers or a wider data window.")
+            else:
+                valid = scan_df[scan_df["Error"].fillna("") == ""].copy()
+                bad = scan_df[scan_df["Error"].fillna("") != ""].copy()
+
+                if valid.empty:
+                    st.error("No valid ticker data returned.")
+                else:
+                    top = valid.head(int(top_n)).copy()
+                    st.subheader("Ranked Institutional Momentum Candidates")
+                    show_cols = [
+                        "Ticker", "Score", "Grade", "Tape Note", "Last", "Day %", "From Open %",
+                        "RelStrength vs Bench %", "Vol Ratio Now", "RelVol Day", "Dollar Vol",
+                        "Above VWAP", "EMA Stack", "Near High", "Close Loc",
+                        "Entry Zone", "Invalidation", "First Target", "Runner Break"
+                    ]
+                    st.dataframe(top[[c for c in show_cols if c in top.columns]], use_container_width=True, hide_index=True)
+
+                    aplus = top[top["Grade"].astype(str).str.contains("A\\+", regex=True)]
+                    a = top[top["Grade"].astype(str).str.startswith("A")]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Scanned", len(valid))
+                    m2.metric("A+ Names", len(aplus))
+                    m3.metric("A/A+ Names", len(a))
+                    m4.metric("Top Score", f"{float(top['Score'].max()):.1f}")
+
+                    best = str(top.iloc[0]["Ticker"])
+                    trade_log_choices = top["Ticker"].tolist()
+                    selected_logs = st.multiselect(
+                        "Select stocks for trade logs",
+                        trade_log_choices,
+                        default=trade_log_choices[:min(5, len(trade_log_choices))],
+                        key="inst_mom_trade_log_select",
+                        help="Choose one or more ranked tickers to generate institutional momentum trade logs."
+                    )
+
+                    if selected_logs:
+                        trade_logs, chart_map = _rs_build_multi_trade_logs(
+                            selected_logs, interval, period, benchmark,
+                            float(tl_target), float(tl_stop), float(tl_trail),
+                            int(tl_max_trades), float(tl_min_score), float(tl_min_vol_ratio)
+                        )
+
+                        st.subheader("Institutional Momentum Trade Logs")
+                        if trade_logs.empty:
+                            st.warning("No trade-log entries passed the institutional momentum execution filter for the selected stocks. This means the scan may like the name, but no clean intraday entry confirmed under the trade-log rules.")
+                        else:
+                            st.dataframe(trade_logs, use_container_width=True, hide_index=True)
+                            closed_logs = trade_logs[trade_logs["Exit Reason"] != "Open"].copy()
+                            if not closed_logs.empty:
+                                k1, k2, k3, k4 = st.columns(4)
+                                k1.metric("Closed trades", len(closed_logs))
+                                k2.metric("Win rate", f"{(closed_logs['PnL %'] > 0).mean()*100:.1f}%")
+                                k3.metric("Sum PnL", f"{closed_logs['PnL %'].sum():.2f}%")
+                                k4.metric("Avg PnL", f"{closed_logs['PnL %'].mean():.2f}%")
+
+                        chart_pick = st.selectbox("Chart / detailed trade-plan ticker", selected_logs, index=0, key="inst_mom_chart_pick")
+                    else:
+                        trade_logs = pd.DataFrame()
+                        chart_map = {}
+                        chart_pick = best
+                        st.info("Select at least one stock to generate trade logs.")
+
+                    selected = chart_pick
+                    raw_sel = _rs_fetch_intraday_one(selected, period=period, interval=interval)
+                    day_sel = chart_map.get(selected)
+                    if day_sel is None or day_sel.empty:
+                        day_sel = _rs_add_features(_rs_latest_session(raw_sel))
+                    row_sel = top[top["Ticker"] == selected].iloc[0].to_dict() if selected in top["Ticker"].tolist() else {}
+
+                    st.subheader(f"{selected} — Institutional Trade Plan")
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("Score", f"{row_sel.get('Score', np.nan)}")
+                    p2.metric("Grade", str(row_sel.get("Grade", "")))
+                    p3.metric("RelStrength", f"{row_sel.get('RelStrength vs Bench %', np.nan)}%")
+                    p4.metric("Vol Ratio", f"{row_sel.get('Vol Ratio Now', np.nan)}x")
+
+                    plan1, plan2, plan3 = st.columns(3)
+                    plan1.success(f"Entry zone: {row_sel.get('Entry Zone', np.nan)}")
+                    plan2.warning(f"Invalidation: {row_sel.get('Invalidation', np.nan)}")
+                    plan3.info(f"First target / runner: {row_sel.get('First Target', np.nan)} / {row_sel.get('Runner Break', np.nan)}")
+
+                    if not day_sel.empty:
+                        fig = go.Figure()
+                        fig.add_trace(go.Candlestick(
+                            x=day_sel.index, open=day_sel["Open"], high=day_sel["High"],
+                            low=day_sel["Low"], close=day_sel["Close"], name="Price"
+                        ))
+                        fig.add_trace(go.Scatter(x=day_sel.index, y=day_sel["VWAP"], name="VWAP", mode="lines"))
+                        fig.add_trace(go.Scatter(x=day_sel.index, y=day_sel["EMA9"], name="EMA9", mode="lines"))
+                        fig.add_trace(go.Scatter(x=day_sel.index, y=day_sel["EMA21"], name="EMA21", mode="lines"))
+
+                        # Plot trade-log markers for this selected stock.
+                        try:
+                            if not trade_logs.empty:
+                                one_tr = trade_logs[trade_logs["Ticker"] == selected].copy()
+                                if not one_tr.empty:
+                                    entry_x = pd.to_datetime(one_tr["Entry Time CT"], errors="coerce")
+                                    entry_y = one_tr["Buy Price"].astype(float)
+                                    fig.add_trace(go.Scatter(x=entry_x, y=entry_y, name="Trade Entries", mode="markers",
+                                                             marker=dict(size=11, symbol="triangle-up")))
+                                    exits = one_tr[one_tr["Exit Time CT"] != "Open / Marked at latest bar"].copy()
+                                    if not exits.empty:
+                                        exit_x = pd.to_datetime(exits["Exit Time CT"], errors="coerce")
+                                        exit_y = exits["Sell Price"].astype(float)
+                                        fig.add_trace(go.Scatter(x=exit_x, y=exit_y, name="Trade Exits", mode="markers",
+                                                                 marker=dict(size=10, symbol="x")))
+                        except Exception:
+                            pass
+
+                        try:
+                            fig.add_hline(y=float(row_sel.get("Entry Zone")), line_dash="dash", annotation_text="Entry zone")
+                            fig.add_hline(y=float(row_sel.get("Invalidation")), line_dash="dot", annotation_text="Invalidation")
+                            fig.add_hline(y=float(row_sel.get("First Target")), line_dash="dash", annotation_text="First target")
+                        except Exception:
+                            pass
+                        fig.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_dark",
+                                          title=f"{selected} Intraday RS / Volume Structure + Trade Log")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    with st.expander("Selected ticker diagnostics", expanded=False):
+                        diag_cols = [c for c in ["Close", "VWAP", "EMA9", "EMA21", "FROM_OPEN_%", "MOM_3", "MOM_6", "VOL_RATIO", "CLOSE_LOC", "Signal Score", "Trade Entry", "Trade Exit"] if c in day_sel.columns]
+                        st.dataframe(day_sel[diag_cols].tail(120), use_container_width=True)
+
+                    with st.expander("How to read this institutional scanner", expanded=False):
+                        st.markdown("""
+                        **A+ Institutional Momentum** means the stock is not just green. It has:
+                        - positive relative strength versus the benchmark,
+                        - unusual/above-average volume,
+                        - price holding above VWAP,
+                        - EMA structure supporting buyers,
+                        - close near session highs,
+                        - enough dollar volume to be tradable.
+
+                        **Trade idea:** do not chase blindly. Wait for pullback toward entry zone or a clean high-volume continuation candle.  
+                        **Invalidation:** if price loses VWAP/EMA structure, the institutional momentum thesis is broken.
+                        """)
+
+                if not bad.empty:
+                    with st.expander("Tickers with data issues", expanded=False):
+                        st.dataframe(bad[["Ticker", "Error"]], use_container_width=True, hide_index=True)
+
+    st.stop()
+
 if df_main is not None:
     # Initialize Report Generator
     st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
-    st.session_state.report_gen.add_data("Historical Data", df_main.tail(100))
+    safe_report_add("Historical Data", df_main.tail(100))
     
     # 6. UNIFIED DECISION ENGINE (Global Signals)
     # ==========================================
@@ -5219,7 +7152,7 @@ with tab1:
                 }).set_index("Param")
                 st.subheader("Model Parameters")
                 st.dataframe(params_df.style.format("{:.4f}"))
-                st.session_state.report_gen.add_data("GARCH Parameters", params_df)
+                safe_report_add("GARCH Parameters", params_df)
                 
                 st.markdown("### Analysis")
                 
@@ -5285,7 +7218,7 @@ with tab1:
                     fig_qq = go.Figure()
                     fig_qq.add_trace(go.Scatter(x=theoretical, y=observed, mode='markers', marker=dict(color='#00f2ff'), name='Data'))
                     fig_qq.add_trace(go.Scatter(x=theoretical, y=trend_y, mode='lines', line=dict(color='red'), name='Fit'))
-                    fig_qq.update_layout(title="Q-Q Plot (vs Normal)", hovermode="closest", template="plotly_dark", height=350)
+                    fig_qq.update_layout(title="Q-Q Plot (vs Normal)", hovermode="x unified", template="plotly_dark", height=350)
                     st.plotly_chart(fig_qq, use_container_width=True)
                     
                 # 3. Serial Correlation Tests
@@ -5426,16 +7359,27 @@ with tab2:
     st.markdown("[Reference: Regime Switching Models (James D. Hamilton)](https://econweb.ucsd.edu/~jhamilton/palgrave.pdf)")
     
     # ===== CONFIGURATION =====
-    col_config1, col_config2, col_config3 = st.columns(3)
-    
+    col_config1, col_config2, col_config3, col_config4 = st.columns(4)
+
     with col_config1:
-        # CHANGED: Default index 1 is Weekly (0=Daily, 1=Weekly)
-        regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=1)
+        # Default remains Weekly for cleaner regime confirmation.
+        regime_freq = st.selectbox("Data Frequency", ["Daily", "Weekly"], index=1, key="regime_freq_main")
     with col_config2:
-        # CHANGED: Default value 2
-        lookback_years = st.slider("Lookback Period (Years)", 1, 10, 2)
+        regime_window_mode = st.selectbox(
+            "Regime Window",
+            ["Rolling 1-Year", "Custom Lookback"],
+            index=0,
+            key="regime_window_mode_main",
+            help="Rolling 1-Year is best for live/current signals. Custom Lookback is better for historical comparison."
+        )
     with col_config3:
-        n_regimes = st.slider("Number of Regimes", 2, 4, 2)
+        if regime_window_mode == "Rolling 1-Year":
+            lookback_years = 1
+            st.metric("Lookback", "1Y rolling")
+        else:
+            lookback_years = st.slider("Lookback Period (Years)", 1, 10, 2, key="regime_custom_lookback_years")
+    with col_config4:
+        n_regimes = st.slider("Number of Regimes", 2, 4, 2, key="regime_n_regimes_main")
     
     # New: Signal Stability Control
     # CHANGED: Default value 4
@@ -5456,22 +7400,30 @@ with tab2:
     
     # ===== PRE-FLIGHT CHECKS =====
     warnings = []
-    if lookback_years <= 1:
-        warnings.append("⚠️ Very short history - consider 3+ years for stable regimes")
-        if regime_freq == "Weekly":
-            warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
-            regime_freq = "Daily"
-    
-    if regime_freq == "Daily" and switch_trend and lookback_years < 3:
-        warnings.append("⚠️ Daily + Switching Trend needs 3+ years. Disabling...")
-        switch_trend = False
-    
+    if regime_window_mode == "Rolling 1-Year":
+        st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
+    else:
+        if lookback_years <= 1:
+            warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
+            if regime_freq == "Weekly":
+                warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
+                regime_freq = "Daily"
+
+        if regime_freq == "Daily" and switch_trend and lookback_years < 3:
+            warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
+            switch_trend = False
+
     if warnings:
         for w in warnings:
             st.warning(w)
     
     # ===== DATA PREPARATION =====
-    start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
+    if regime_window_mode == "Rolling 1-Year":
+        # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
+        _regime_end_ts = pd.Timestamp(end_date)
+        start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
+    else:
+        start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
     df_regime = load_data(TICKER, start_dt_regime, end_date)
     
     if df_regime is None:
@@ -5512,7 +7464,8 @@ with tab2:
         st.error(f"Data Prep Error: {e}")
         st.stop()
     
-    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {start_dt_regime.date()}")
+    _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
+    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
     
     # ===== MODEL FITTING =====
     with st.spinner(f"Fitting {n_regimes}-regime model..."):
@@ -5581,7 +7534,7 @@ with tab2:
             avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
             st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
     
-    st.session_state.report_gen.add_data("Regime Statistics", pd.DataFrame(regime_stats))
+    safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
     
     # ===== CURRENT STATE =====
     # Use .iloc[-1] to get the probabilities at the LAST time step
@@ -5852,7 +7805,7 @@ with tab3:
             )
             st.plotly_chart(fig, use_container_width=True)
             st.session_state.report_gen.add_plot("Merton Jump Diffusion", fig)
-            st.session_state.report_gen.add_data("Merton Metrics", {"Mean": final_mean, "Median": final_median})
+            safe_report_add("Merton Metrics", {"Mean": final_mean, "Median": final_median})
 
     elif sim_type == "Heston Stochastic Volatility":
         col1, col2 = st.columns([1, 3])
@@ -5964,7 +7917,7 @@ with tab3:
             )
             st.plotly_chart(fig_h, use_container_width=True)
             st.session_state.report_gen.add_plot("Heston Price Simulation", fig_h)
-            st.session_state.report_gen.add_data("Heston Metrics", {"Mean": final_mean, "Median": final_median})
+            safe_report_add("Heston Metrics", {"Mean": final_mean, "Median": final_median})
             
             # Volatility Plot (Optional, keep simple or upgrade too)
             st.write("**Stochastic Volatility Paths**")
@@ -6029,7 +7982,7 @@ with tab4:
                 fig_k.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_k, use_container_width=True)
                 st.session_state.report_gen.add_plot("Kalman Pairs Analysis", fig_k)
-                st.session_state.report_gen.add_data("Kalman Hedge Ratio", {"Beta": beta[-1]})
+                safe_report_add("Kalman Hedge Ratio", {"Beta": beta[-1]})
                 st.write(f"Current Hedge Ratio: **{beta[-1]:.4f}** (Long 1 {TICKER}, Short {beta[-1]:.4f} {PAIR_TICKER})")
             else:
                 st.error("Not enough overlapping data for pairs analysis.")
@@ -6085,7 +8038,7 @@ with tab4:
         current_price = prices[-1]
         diff_pct = (current_price - current_trend) / current_trend * 100
 
-        st.session_state.report_gen.add_data("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
+        safe_report_add("Kalman Trend Metrics", {"Price": current_price, "Trend": current_trend, "Deviation": diff_pct})
         
         # Display Current Values
         c1, c2, c3 = st.columns(3)
@@ -6147,7 +8100,7 @@ with tab5:
         fig_hm.update_layout(title="Asset Class Correlations", template="plotly_dark", width=600, height=600)
         st.plotly_chart(fig_hm, use_container_width=True)
         st.session_state.report_gen.add_plot("Macro Correlations", fig_hm)
-        st.session_state.report_gen.add_data("Correlation Matrix", corr_matrix)
+        safe_report_add("Correlation Matrix", corr_matrix)
         
         st.write(f"**Structural Thesis Check:**")
         oil_corr = corr_matrix.loc[TICKER, 'Crude Oil']
@@ -6160,7 +8113,7 @@ with tab5:
         else:
             st.warning(f"Low sensitivity to Energy prices ({oil_corr:.2f}).")
         
-        st.session_state.report_gen.add_data("Macro Sensitivity Thesis", {
+        safe_report_add("Macro Sensitivity Thesis", {
             "Oil Correlation": oil_corr,
             "Rate Correlation": rate_corr
         })
@@ -6187,7 +8140,7 @@ with tab6:
         fig_dec.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Structural Decomposition")
         st.plotly_chart(fig_dec, use_container_width=True)
         st.session_state.report_gen.add_plot("Structural Decomposition", fig_dec)
-        st.session_state.report_gen.add_data("Decomposition Period", {"Period": period})
+        safe_report_add("Decomposition Period", {"Period": period})
     else:
         st.warning("Insufficient data for decomposition with selected period.")
 
@@ -6201,7 +8154,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -6286,6 +8239,16 @@ with tab7:
         with col_sig3:
             confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
 
+        weekly_close_same_bar = True
+        if str(bt_freq) == "Weekly":
+            weekly_close_same_bar = st.checkbox(
+                "Weekly signal updates on Friday close",
+                value=True,
+                key="bt_weekly_same_close_signal",
+                help="When ON, the weekly Regime signal changes as soon as the Friday weekly candle is closed. It does not wait one extra week. Partial Mon-Thu weeks are ignored to avoid repainting."
+            )
+            st.caption("✅ Weekly regime fix ON: official weekly signals use only closed Friday bars, and buy/sell changes are allowed on that closed Friday bar instead of being delayed to the next week.")
+
         with st.expander("🧭 Regime WFO Settings", expanded=True):
             wf_c1, wf_c2, wf_c3, wf_c4, wf_c5 = st.columns(5)
             enable_regime_wfo = wf_c1.checkbox("Enable Regime WFO", value=False, key="bt_regime_enable_wfo")
@@ -6365,7 +8328,7 @@ with tab7:
             with st.spinner("Analyzing model complexity and performance..."):
                 comp_results = []
                 # Setup local data context
-                loc_prices = prices_bt.resample('W-FRI').last().dropna() if bt_freq == "Weekly" else prices_bt
+                loc_prices = resample_to_closed_weekly_friday(prices_bt) if bt_freq == "Weekly" else prices_bt
                 loc_returns = loc_prices.pct_change().dropna()
                 if bt_stability > 0:
                     loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
@@ -6392,8 +8355,10 @@ with tab7:
                             conviction=float(conviction),
                             min_hold=int(min_hold_period)
                         )
-                        if confirmed_regime_bar:
-                            sigs = sigs.shift(1).ffill().fillna(0).clip(0, 1)
+                        sigs = apply_confirmed_bar_execution_policy(
+                            sigs, frequency=str(bt_freq), confirmed_bar=bool(confirmed_regime_bar),
+                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                        )
 
                         # 3. Run Backtest
                         common_idx = loc_prices.index.intersection(sigs.index)
@@ -6449,8 +8414,13 @@ with tab7:
                 regime_live_hybrid_enabled = False
 
         if regime_model_freq == "Weekly":
-            # Resample Prices to Weekly (Last Close)
-            prices_bt_resampled = regime_source_prices.resample('W-FRI').last().dropna()
+            # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
+            prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
+            try:
+                if len(prices_bt_resampled):
+                    st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
+            except Exception:
+                pass
         else:
             prices_bt_resampled = regime_source_prices.dropna()
 
@@ -6516,8 +8486,10 @@ with tab7:
                         index=signals.index
                     ).clip(0, 1)
 
-                    if confirmed_regime_bar:
-                        signals = signals.shift(1).ffill().fillna(0).clip(0, 1)
+                    signals = apply_confirmed_bar_execution_policy(
+                        signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                        weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                    )
 
                     # --- Walk-forward validation / primary signal ---
                     if enable_regime_wfo:
@@ -6535,7 +8507,7 @@ with tab7:
                                 initial_capital=initial_cap,
                                 trailing_stop_pct=trailing_stop,
                                 stop_loss_pct=stop_loss,
-                                confirmed_bar=bool(confirmed_regime_bar),
+                                confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
                                 use_strong_runner_override=bool(use_regime_runner_override),
                                 activity_mode=str(regime_activity_mode),
                                 use_return_booster=bool(use_regime_return_booster),
@@ -6620,8 +8592,10 @@ with tab7:
                                         booster_full = benchmark_aware_trend_participation_signal(
                                             strat_prices, mode=str(regime_return_booster_mode)
                                         ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                        if bool(confirmed_regime_bar):
-                                            booster_full = booster_full.shift(1).ffill().fillna(0).clip(0, 1)
+                                        booster_full = apply_confirmed_bar_execution_policy(
+                                            booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                                        )
 
                                         mode_l = str(regime_return_booster_mode or "Balanced").lower()
                                         original_signals = signals.copy()
@@ -6800,6 +8774,438 @@ with tab7:
                 
                 fig_ctx.update_layout(title="Momentum Hedge Signal (EMA/SMA Cross)", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "VWAP/TWAP Swing Filter":
+        st.markdown("### 🧭 VWAP/TWAP Benchmark-Aware Swing Filter")
+        st.caption("Goal: not just signals — benchmark-aware selection. If the custom VWAP/TWAP logic cannot beat buy & hold in the selected sample, the app clearly shows 'No custom edge'.")
+
+        vt_c1, vt_c2, vt_c3, vt_c4 = st.columns(4)
+        with vt_c1:
+            vt_interval = st.selectbox("Chart timeframe", ["15m", "30m", "60m", "90m", "1d"], index=1, key="bt_vt_interval")
+            vt_twap_len = st.number_input("Manual TWAP length", min_value=5, max_value=200, value=20, step=1, key="bt_vt_twap_len")
+            vt_entry_mode = st.selectbox("Manual entry mode", ["Institutional Swing Hold", "State Trend Filter", "Strict Cross Only"], index=0, key="bt_vt_entry_mode")
+        with vt_c2:
+            vt_use_ema50 = st.checkbox("Use 50 EMA trend filter", value=True, key="bt_vt_use_ema50")
+            vt_use_ema_slope = st.checkbox("Require EMA50 slope up", value=True, key="bt_vt_ema_slope")
+            vt_use_volume = st.checkbox("Require volume on entry", value=False, key="bt_vt_use_volume")
+            vt_vol_mult = st.number_input("Volume higher than normal x", min_value=0.5, max_value=5.0, value=1.00, step=0.05, key="bt_vt_vol_mult")
+        with vt_c3:
+            vt_use_rs = st.checkbox("Use market relative strength filter", value=True, key="bt_vt_use_rs")
+            vt_benchmark = st.text_input("Market benchmark", value="SPY", key="bt_vt_benchmark")
+            vt_rs_threshold = st.number_input("Min RS vs benchmark %", min_value=-5.0, max_value=5.0, value=0.00, step=0.05, key="bt_vt_rs_thresh")
+        with vt_c4:
+            vt_optimize = st.checkbox("Benchmark-aware optimizer", value=True, key="bt_vt_optimizer",
+                                      help="Tests multiple VWAP/TWAP settings and selects only if it improves vs buy & hold after drawdown/trade penalties.")
+            vt_selection_mode = st.selectbox("Selection objective", ["Beat Benchmark", "Risk Adjusted", "Low Churn"], index=0, key="bt_vt_selection_mode")
+            vt_allow_no_edge = st.checkbox("Show No Edge if it cannot beat benchmark", value=True, key="bt_vt_no_edge")
+            vt_no_edge_fallback = st.selectbox(
+                "If no custom edge",
+                ["Benchmark Fallback", "Cash / No Trade"],
+                index=0,
+                key="bt_vt_no_edge_fallback",
+                help="Benchmark Fallback keeps exposure like buy & hold so metrics stay realistic. Cash / No Trade shows what happens if you avoid the trade completely."
+            )
+            vt_optimizer_speed = st.selectbox("Optimizer speed", ["Fast", "Balanced", "Deep"], index=0, key="bt_vt_opt_speed",
+                                             help="Fast is recommended. Deep tests many combinations and can be slow.")
+
+        with st.expander("Manual / optimizer controls", expanded=False):
+            oc1, oc2, oc3, oc4, oc5 = st.columns(5)
+            with oc1:
+                vt_chop_window = st.number_input("Chop flip window", min_value=3, max_value=80, value=18, step=1, key="bt_vt_chop_window")
+                vt_max_flips = st.number_input("Max flips allowed", min_value=1, max_value=10, value=3, step=1, key="bt_vt_max_flips")
+            with oc2:
+                vt_entry_confirm = st.number_input("Entry confirm bars", min_value=1, max_value=10, value=3, step=1, key="bt_vt_entry_confirm")
+                vt_exit_confirm = st.number_input("Exit confirm bars", min_value=1, max_value=12, value=4, step=1, key="bt_vt_exit_confirm")
+            with oc3:
+                vt_cooldown = st.number_input("Re-entry cooldown bars", min_value=0, max_value=100, value=8, step=1, key="bt_vt_cooldown")
+                vt_break_buffer = st.number_input("Breakdown buffer %", min_value=0.0, max_value=5.0, value=0.25, step=0.05, key="bt_vt_break_buffer")
+            with oc4:
+                vt_trade_penalty = st.number_input("Trade penalty", min_value=0.0, max_value=2.0, value=0.03, step=0.01, key="bt_vt_trade_penalty")
+                vt_dd_penalty = st.number_input("Drawdown penalty", min_value=0.0, max_value=3.0, value=0.35, step=0.05, key="bt_vt_dd_penalty")
+            with oc5:
+                vt_min_alpha = st.number_input("Minimum alpha required %", min_value=-20.0, max_value=20.0, value=0.25, step=0.25, key="bt_vt_min_alpha")
+
+        st.info("My honest rule: if this cannot beat buy & hold after penalties, it should say No Custom Edge instead of pretending the strategy is good.")
+
+        def _bt_vt_fetch_safe(ticker, interval, start_dt, end_dt):
+            try:
+                df0 = load_data(ticker, start_dt, end_dt, interval=str(interval))
+                if df0 is not None and not df0.empty and "Close" in df0.columns:
+                    return df0, "selected date range"
+            except Exception:
+                pass
+            try:
+                interval_s = str(interval)
+                if interval_s == "1m":
+                    per = "7d"
+                elif interval_s in ["2m", "5m", "15m", "30m", "60m", "90m"]:
+                    per = "60d"
+                else:
+                    per = "2y"
+                yf_df = yf.download(str(ticker).strip().upper(), period=per, interval=interval_s, progress=False, auto_adjust=True, prepost=False, threads=False)
+                if yf_df is not None and not yf_df.empty:
+                    if isinstance(yf_df.columns, pd.MultiIndex):
+                        yf_df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in yf_df.columns]
+                    yf_df = yf_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+                    try:
+                        idx = pd.DatetimeIndex(yf_df.index)
+                        if idx.tz is None and interval_s != "1d":
+                            yf_df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago")
+                        elif idx.tz is not None:
+                            yf_df.index = idx.tz_convert("America/Chicago")
+                    except Exception:
+                        pass
+                    return yf_df, f"Yahoo fallback period={per}"
+            except Exception:
+                pass
+            return pd.DataFrame(), "failed"
+
+        try:
+            if live_mode:
+                vt_df, vt_data_source = _bt_vt_fetch_safe(TICKER, vt_interval, start_date, end_date)
+            else:
+                vt_df, vt_data_source = _bt_vt_fetch_safe(TICKER, vt_interval, bt_start_date, bt_end_date)
+        except Exception:
+            vt_df, vt_data_source = pd.DataFrame(), "failed"
+
+        if vt_df is None or vt_df.empty or "Close" not in vt_df.columns:
+            st.error("Could not load VWAP/TWAP data. Try 30m recent range, 60m, or 1d for longer history.")
+            signals = None
+        else:
+            st.caption(f"VWAP/TWAP data source: {vt_data_source}")
+            vt_df = vt_df.copy().replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+            for _c in ["Open", "High", "Low"]:
+                if _c not in vt_df.columns:
+                    vt_df[_c] = vt_df["Close"]
+            if "Volume" not in vt_df.columns:
+                vt_df["Volume"] = 1.0
+
+            typical_vt = (vt_df["High"] + vt_df["Low"] + vt_df["Close"]) / 3.0
+            vol_vt = vt_df["Volume"].replace(0, np.nan).fillna(1.0)
+            try:
+                session_key = pd.DatetimeIndex(vt_df.index).date
+                session_vwap = ((typical_vt * vol_vt).groupby(session_key).cumsum()) / (vol_vt.groupby(session_key).cumsum() + 1e-9)
+            except Exception:
+                session_vwap = (typical_vt * vol_vt).cumsum() / (vol_vt.cumsum() + 1e-9)
+
+            ema50 = vt_df["Close"].ewm(span=50, adjust=False).mean()
+            vol_avg = vt_df["Volume"].rolling(20, min_periods=5).mean()
+
+            # benchmark relative strength
+            bench_ret = pd.Series(0.0, index=vt_df.index)
+            try:
+                if live_mode:
+                    bench_df = load_data(str(vt_benchmark), start_date, end_date, interval=str(vt_interval))
+                else:
+                    bench_df = load_data(str(vt_benchmark), bt_start_date, bt_end_date, interval=str(vt_interval))
+                if bench_df is not None and not bench_df.empty and "Close" in bench_df.columns:
+                    bench_close = bench_df["Close"].reindex(vt_df.index).ffill()
+                else:
+                    bench_close = pd.Series(index=vt_df.index, data=np.nan)
+            except Exception:
+                bench_close = pd.Series(index=vt_df.index, data=np.nan)
+
+            def _build_vt_signal(params):
+                twap_len = int(params.get("twap_len", 20))
+                entry_mode = str(params.get("entry_mode", "Institutional Swing Hold"))
+                use_ema = bool(params.get("use_ema", True))
+                use_slope = bool(params.get("use_slope", True))
+                use_vol = bool(params.get("use_vol", False))
+                vol_mult = float(params.get("vol_mult", 1.0))
+                use_rs = bool(params.get("use_rs", True))
+                rs_thresh = float(params.get("rs_thresh", 0.0))
+                chop_window = int(params.get("chop_window", 18))
+                max_flips = int(params.get("max_flips", 3))
+                entry_confirm = int(params.get("entry_confirm", 3))
+                exit_confirm = int(params.get("exit_confirm", 4))
+                cooldown = int(params.get("cooldown", 8))
+                break_buffer = float(params.get("break_buffer", 0.25)) / 100.0
+
+                twap_local = typical_vt.rolling(twap_len, min_periods=max(3, twap_len//3)).mean()
+                asset_ret_local = vt_df["Close"].pct_change(max(3, twap_len//2)).fillna(0)
+                if bench_close.notna().sum() > 5:
+                    bench_ret_local = bench_close.pct_change(max(3, twap_len//2)).fillna(0)
+                    rs_spread_pct_local = (asset_ret_local - bench_ret_local) * 100.0
+                else:
+                    rs_spread_pct_local = pd.Series(0.0, index=vt_df.index)
+
+                cross_up_local = (session_vwap > twap_local) & (session_vwap.shift(1) <= twap_local.shift(1))
+                cross_down_local = (session_vwap < twap_local) & (session_vwap.shift(1) >= twap_local.shift(1))
+                bullish_state_raw_local = (session_vwap > twap_local) & (vt_df["Close"] > session_vwap) & (vt_df["Close"] > twap_local)
+                bullish_state_local = bullish_state_raw_local.rolling(entry_confirm, min_periods=1).sum() >= entry_confirm
+                ema_ok_local = (vt_df["Close"] > ema50) if use_ema else pd.Series(True, index=vt_df.index)
+                ema_slope_ok_local = (ema50.diff(5) >= 0) if use_slope else pd.Series(True, index=vt_df.index)
+                ema_bad_local = (vt_df["Close"] < ema50 * (1.0 - break_buffer)) if use_ema else pd.Series(False, index=vt_df.index)
+                rs_ok_local = (rs_spread_pct_local >= rs_thresh) if use_rs else pd.Series(True, index=vt_df.index)
+                vol_ok_local = (vt_df["Volume"] > vol_avg * vol_mult) if use_vol else pd.Series(True, index=vt_df.index)
+                flip_event_local = (cross_up_local | cross_down_local).astype(int)
+                flip_count_local = flip_event_local.rolling(chop_window, min_periods=1).sum()
+                chop_ok_local = flip_count_local <= max_flips
+
+                trend_reclaim_local = bullish_state_local & (~bullish_state_local.shift(1).fillna(False))
+                trend_cont_local = bullish_state_local & ema_ok_local & ema_slope_ok_local & rs_ok_local & chop_ok_local
+
+                if entry_mode == "Strict Cross Only":
+                    raw_long_local = cross_up_local & bullish_state_raw_local & ema_ok_local & ema_slope_ok_local & vol_ok_local & rs_ok_local & chop_ok_local
+                elif entry_mode == "State Trend Filter":
+                    raw_long_local = (cross_up_local | trend_reclaim_local | trend_cont_local) & ema_ok_local & ema_slope_ok_local & vol_ok_local & rs_ok_local & chop_ok_local
+                else:
+                    raw_long_local = (trend_reclaim_local | (bullish_state_local & cross_up_local)) & ema_ok_local & ema_slope_ok_local & vol_ok_local & rs_ok_local & chop_ok_local
+
+                weak_vt_local = (vt_df["Close"] < session_vwap * (1.0 - break_buffer)) & (vt_df["Close"] < twap_local * (1.0 - break_buffer))
+                weak_cross_local = session_vwap < twap_local * (1.0 - break_buffer)
+                weakness_local = weak_vt_local | weak_cross_local | ema_bad_local | (~chop_ok_local)
+                exit_local = weakness_local.rolling(exit_confirm, min_periods=1).sum() >= exit_confirm
+
+                sig_local = pd.Series(0.0, index=vt_df.index)
+                long_marks_local = pd.Series(False, index=vt_df.index)
+                in_pos_local = False
+                cd = 0
+                for ii, dt in enumerate(vt_df.index):
+                    if cd > 0:
+                        cd -= 1
+                    if in_pos_local:
+                        sig_local.iloc[ii] = 1.0
+                        if bool(exit_local.loc[dt]):
+                            in_pos_local = False
+                            sig_local.iloc[ii] = 0.0
+                            cd = cooldown
+                    else:
+                        if cd == 0 and bool(raw_long_local.loc[dt]):
+                            in_pos_local = True
+                            sig_local.iloc[ii] = 1.0
+                            long_marks_local.loc[dt] = True
+
+                diag_local = {
+                    "twap": twap_local,
+                    "rs_spread_pct": rs_spread_pct_local,
+                    "bullish_state": bullish_state_local,
+                    "raw_bullish_state": bullish_state_raw_local,
+                    "flip_count": flip_count_local,
+                    "long_cond": long_marks_local,
+                    "exit_cond": exit_local,
+                    "chop_ok": chop_ok_local
+                }
+                return sig_local.clip(0, 1), diag_local
+
+            def _score_vt_candidate(sig, params):
+                px = vt_df["Close"].dropna()
+                common = px.index.intersection(sig.index)
+                px = px.loc[common]
+                sg = sig.loc[common].ffill().fillna(0)
+                if len(px) < 10:
+                    return None
+                bt_tmp = BacktestEngine.run_strategy(px, sg, initial_cap, trailing_stop, stop_loss)
+                eq = bt_tmp.get("equity_curve", pd.Series(dtype=float))
+                rets = bt_tmp.get("returns", pd.Series(dtype=float))
+                trades_tmp = bt_tmp.get("trades", pd.DataFrame())
+                if eq.empty:
+                    return None
+                strat_ret = (float(eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
+                bh_ret = (float(px.iloc[-1]) / float(px.iloc[0]) - 1.0) * 100.0 if float(px.iloc[0]) != 0 else np.nan
+                curve = (1 + rets.fillna(0)).cumprod()
+                dd = ((curve / curve.cummax()) - 1.0).min() * 100.0 if len(curve) else 0.0
+                trades_n = len(trades_tmp) if trades_tmp is not None else 0
+                alpha = strat_ret - bh_ret
+                objective = alpha - float(vt_dd_penalty) * abs(dd) - float(vt_trade_penalty) * trades_n
+                if str(vt_selection_mode) == "Risk Adjusted":
+                    metrics_tmp = BacktestEngine.calculate_metrics(rets)
+                    objective = float(metrics_tmp.get("Sharpe Ratio", 0.0)) * 10 + alpha - float(vt_trade_penalty) * trades_n
+                elif str(vt_selection_mode) == "Low Churn":
+                    objective = alpha - float(vt_trade_penalty) * trades_n * 2.0 - float(vt_dd_penalty) * abs(dd)
+                return {
+                    "Objective": objective,
+                    "Strategy Return %": strat_ret,
+                    "BuyHold %": bh_ret,
+                    "Alpha %": alpha,
+                    "MaxDD %": dd,
+                    "Trades": trades_n,
+                    **params
+                }
+
+            manual_params = {
+                "twap_len": int(vt_twap_len),
+                "entry_mode": str(vt_entry_mode),
+                "use_ema": bool(vt_use_ema50),
+                "use_slope": bool(vt_use_ema_slope),
+                "use_vol": bool(vt_use_volume),
+                "vol_mult": float(vt_vol_mult),
+                "use_rs": bool(vt_use_rs),
+                "rs_thresh": float(vt_rs_threshold),
+                "chop_window": int(vt_chop_window),
+                "max_flips": int(vt_max_flips),
+                "entry_confirm": int(vt_entry_confirm),
+                "exit_confirm": int(vt_exit_confirm),
+                "cooldown": int(vt_cooldown),
+                "break_buffer": float(vt_break_buffer)
+            }
+
+            selected_params = manual_params.copy()
+            optimizer_df = pd.DataFrame()
+            if bool(vt_optimize):
+                grid = []
+                # Speed control:
+                # Fast ≈ 24 candidates, Balanced ≈ 144, Deep ≈ previous larger search.
+                if str(vt_optimizer_speed) == "Fast":
+                    _twaps = [16, 20, 30]
+                    _emodes = ["Institutional Swing Hold", "State Trend Filter"]
+                    _exits = [4, 6]
+                    _entries = [2, 3]
+                    _buffers = [0.25]
+                    _cooldowns = [8]
+                    _slopes = [True]
+                elif str(vt_optimizer_speed) == "Balanced":
+                    _twaps = [12, 16, 20, 24, 30, 40]
+                    _emodes = ["Institutional Swing Hold", "State Trend Filter"]
+                    _exits = [3, 4, 6]
+                    _entries = [2, 3]
+                    _buffers = [0.20, 0.35]
+                    _cooldowns = [6, 12]
+                    _slopes = [True]
+                else:
+                    _twaps = [12, 16, 20, 24, 30, 40]
+                    _emodes = ["Institutional Swing Hold", "State Trend Filter"]
+                    _exits = [3, 4, 5, 6]
+                    _entries = [2, 3, 4]
+                    _buffers = [0.15, 0.25, 0.40, 0.60]
+                    _cooldowns = [4, 8, 12, 18]
+                    _slopes = [True, False]
+
+                for twl in _twaps:
+                    for emode in _emodes:
+                        for exconf in _exits:
+                            for entconf in _entries:
+                                for bbuf in _buffers:
+                                    for cdv in _cooldowns:
+                                        for slopev in _slopes:
+                                            grid.append({
+                                                **manual_params,
+                                                "twap_len": twl,
+                                                "entry_mode": emode,
+                                                "entry_confirm": entconf,
+                                                "exit_confirm": exconf,
+                                                "break_buffer": bbuf,
+                                                "cooldown": cdv,
+                                                "use_slope": slopev
+                                            })
+                rows = []
+                best_row = None
+                best_sig = None
+                best_diag = None
+                st.caption(f"Optimizer speed: {vt_optimizer_speed} | Testing {len(grid)} VWAP/TWAP candidate settings plus benchmark baselines.")
+                with st.spinner(f"Optimizing {len(grid)} VWAP/TWAP candidates against benchmark..."):
+                    # Baseline 1: buy and hold. If custom strategy cannot beat this, no custom edge exists.
+                    bh_sig = pd.Series(1.0, index=vt_df.index)
+                    bh_row = _score_vt_candidate(bh_sig, {**manual_params, "twap_len": int(vt_twap_len), "entry_mode": "Benchmark Buy & Hold", "entry_confirm": 0, "exit_confirm": 0, "break_buffer": 0.0, "cooldown": 0})
+                    if bh_row is not None:
+                        rows.append(bh_row)
+
+                    # Baseline 2: simple major trend hold using EMA50 only.
+                    ema_trend_sig = (vt_df["Close"] > ema50).astype(float).ffill().fillna(0)
+                    ema_row = _score_vt_candidate(ema_trend_sig, {**manual_params, "twap_len": int(vt_twap_len), "entry_mode": "EMA50 Trend Baseline", "entry_confirm": 0, "exit_confirm": 0, "break_buffer": 0.0, "cooldown": 0})
+                    if ema_row is not None:
+                        rows.append(ema_row)
+
+                    for params in grid:
+                        sig_try, diag_try = _build_vt_signal(params)
+                        row = _score_vt_candidate(sig_try, params)
+                        if row is None:
+                            continue
+                        rows.append(row)
+                        if str(row.get("entry_mode", "")) in ["Benchmark Buy & Hold", "EMA50 Trend Baseline"]:
+                            continue
+                        if best_row is None or row["Objective"] > best_row["Objective"]:
+                            best_row = row
+                            best_sig = sig_try
+                            best_diag = diag_try
+                optimizer_df = pd.DataFrame(rows).sort_values("Objective", ascending=False) if rows else pd.DataFrame()
+                if best_row is not None:
+                    if (float(best_row["Alpha %"]) >= float(vt_min_alpha)) or not bool(vt_allow_no_edge):
+                        selected_params = {k: best_row[k] for k in manual_params.keys() if k in best_row}
+                        signals = best_sig
+                        vt_diag = best_diag
+                        st.success(f"Optimizer selected VWAP/TWAP candidate with Alpha {best_row['Alpha %']:.2f}% vs buy & hold. Objective {best_row['Objective']:.2f}.")
+                    else:
+                        # No custom edge: show it honestly.
+                        # Do NOT default to an all-cash signal because it creates useless 0% returns
+                        # and can produce absurd Sharpe from near-zero variance.
+                        if str(vt_no_edge_fallback) == "Benchmark Fallback":
+                            signals = pd.Series(1.0, index=vt_df.index)
+                            st.error(f"NO CUSTOM EDGE: best VWAP/TWAP candidate alpha was only {best_row['Alpha %']:.2f}% vs buy & hold, below required {float(vt_min_alpha):.2f}%.")
+                            st.info("Using Benchmark Fallback for metrics: this means the honest answer is buy/hold was better than the custom VWAP/TWAP timing strategy for this sample.")
+                        else:
+                            signals = pd.Series(0.0, index=vt_df.index)
+                            st.error(f"NO CUSTOM EDGE: best VWAP/TWAP candidate alpha was only {best_row['Alpha %']:.2f}% vs buy & hold, below required {float(vt_min_alpha):.2f}%.")
+                            st.info("Using Cash / No Trade fallback. This will show 0% return and is mainly for comparison, not as a valid alpha strategy.")
+                        vt_diag = _build_vt_signal(manual_params)[1]
+                else:
+                    signals, vt_diag = _build_vt_signal(manual_params)
+            else:
+                signals, vt_diag = _build_vt_signal(manual_params)
+
+            strat_prices = vt_df["Close"].dropna()
+            prices_bt = strat_prices
+            returns_bt = strat_prices.pct_change().fillna(0)
+            df_bt = vt_df
+            benchmark_label_for_metrics = f"Buy & Hold ({vt_interval})"
+
+            if bool(vt_optimize) and not optimizer_df.empty:
+                with st.expander("Optimizer leaderboard", expanded=False):
+                    st.dataframe(
+                        optimizer_df.head(25)[["Objective", "Strategy Return %", "BuyHold %", "Alpha %", "MaxDD %", "Trades", "twap_len", "entry_mode", "entry_confirm", "exit_confirm", "break_buffer", "cooldown", "use_slope"]],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+            with st.expander("See VWAP/TWAP Strategy Context", expanded=True):
+                twap = vt_diag["twap"]
+                rs_spread_pct = vt_diag["rs_spread_pct"]
+                bullish_state = vt_diag["bullish_state"]
+                bullish_state_raw = vt_diag["raw_bullish_state"]
+                flip_count = vt_diag["flip_count"]
+                long_cond = vt_diag["long_cond"]
+                exit_cond = vt_diag["exit_cond"]
+
+                fig_ctx = go.Figure()
+                fig_ctx.add_trace(go.Candlestick(
+                    x=vt_df.index, open=vt_df["Open"], high=vt_df["High"], low=vt_df["Low"], close=vt_df["Close"], name="Price"
+                ))
+                fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=session_vwap, mode="lines", name="Session VWAP"))
+                fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=twap, mode="lines", name=f"TWAP ({int(selected_params.get('twap_len', vt_twap_len))})"))
+                if bool(selected_params.get("use_ema", True)):
+                    fig_ctx.add_trace(go.Scatter(x=vt_df.index, y=ema50, mode="lines", name="EMA 50"))
+                buys = vt_df[long_cond.fillna(False)]
+                sells = vt_df[exit_cond.fillna(False)]
+                if not buys.empty:
+                    fig_ctx.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="VWAP/TWAP Buy", marker=dict(size=11, symbol="triangle-up")))
+                if not sells.empty:
+                    fig_ctx.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="Avoid/Exit", marker=dict(size=9, symbol="x")))
+                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.10)
+                fig_ctx.update_layout(
+                    title=f"VWAP/TWAP Benchmark-Aware Swing Filter — {TICKER} ({vt_interval})",
+                    hovermode="x unified",
+                    template="plotly_dark",
+                    height=650,
+                    xaxis_rangeslider_visible=False
+                )
+                st.plotly_chart(fig_ctx, use_container_width=True)
+
+                diag = pd.DataFrame({
+                    "Close": vt_df["Close"],
+                    "Session VWAP": session_vwap,
+                    f"TWAP {int(selected_params.get('twap_len', vt_twap_len))}": twap,
+                    "EMA50": ema50,
+                    "Volume": vt_df["Volume"],
+                    "Vol Avg20": vol_avg,
+                    "RS Spread %": rs_spread_pct,
+                    "Bullish State Confirmed": bullish_state,
+                    "Raw Bullish State": bullish_state_raw,
+                    "Flip Count": flip_count,
+                    "Long Condition": long_cond,
+                    "Exit/Avoid Condition": exit_cond,
+                    "Signal": signals
+                })
+                st.dataframe(diag.tail(120), use_container_width=True)
 
     elif strategy_type == "MAD Trend Modes":
         st.markdown("### 📊 MAD Trend Modes Settings")
@@ -7722,50 +10128,869 @@ with tab7:
         # Metrics
         strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
         bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
+        total_pnl_return_pct = total_trade_pnl_return_pct(bt_results.get('trades', pd.DataFrame()))
         
         # Display Metrics
         st.write("#### 📊 Performance Metrics")
         current_benchmark_pct = (bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100
         if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
-            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
+            met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
             with met_col1:
-                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
             with met_col2:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
             with met_col3:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col5:
                 help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
-            with met_col5:
+            with met_col6:
                 strategy_pct_now = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
                 if benchmark_label_for_metrics == "Full Benchmark":
-                    st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy return minus full-period buy & hold return.")
+                    st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
                 else:
                     st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
         else:
-            met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
             with met_col1:
-                st.metric("Total Return (Strategy)", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%")
+                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
             with met_col2:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
             with met_col3:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
+                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+            with met_col5:
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
-            
-        # Equity Curve Plot
-        st.write("#### 📈 Equity Curve")
-        fig_bt = go.Figure()
-        fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
-        fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
-        fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
-        st.plotly_chart(fig_bt, use_container_width=True)
-        st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
-        st.session_state.report_gen.add_data("Backtest Metrics", strat_metrics)
-        
+
+        def _latest_display_price_and_time_for_regime():
+            """Get the freshest available close for display-only marking."""
+            try:
+                candidates = []
+                try:
+                    if df_main is not None and not df_main.empty and "Close" in df_main.columns:
+                        candidates.append((pd.Timestamp(df_main.index[-1]), float(df_main["Close"].iloc[-1]), "loaded chart data"))
+                except Exception:
+                    pass
+                # Try live/recent intraday first so the graph box does not get stuck on yesterday
+                # while the market/current session already has bars.
+                for _intv, _per in [("1m", "1d"), ("5m", "5d"), ("15m", "5d")]:
+                    try:
+                        _fresh_intra = yf.download(
+                            TICKER,
+                            period=_per,
+                            interval=_intv,
+                            auto_adjust=True,
+                            progress=False,
+                            prepost=False,
+                            threads=False
+                        )
+                        if _fresh_intra is not None and not _fresh_intra.empty:
+                            if isinstance(_fresh_intra.columns, pd.MultiIndex):
+                                _fresh_intra.columns = [c[0] if isinstance(c, tuple) else c for c in _fresh_intra.columns]
+                            _c = "Close" if "Close" in _fresh_intra.columns else None
+                            if _c:
+                                _idx = pd.Timestamp(_fresh_intra.index[-1])
+                                try:
+                                    if getattr(_idx, "tzinfo", None) is not None:
+                                        _idx = _idx.tz_convert("America/Chicago").tz_localize(None)
+                                except Exception:
+                                    pass
+                                candidates.append((_idx, float(_fresh_intra[_c].iloc[-1]), f"fresh Yahoo {_intv}"))
+                                break
+                    except Exception:
+                        pass
+
+                try:
+                    _fresh_daily = yf.download(
+                        TICKER,
+                        period="7d",
+                        interval="1d",
+                        auto_adjust=True,
+                        progress=False,
+                        prepost=False,
+                        threads=False
+                    )
+                    if _fresh_daily is not None and not _fresh_daily.empty:
+                        if isinstance(_fresh_daily.columns, pd.MultiIndex):
+                            _fresh_daily.columns = [c[0] if isinstance(c, tuple) else c for c in _fresh_daily.columns]
+                        _c = "Close" if "Close" in _fresh_daily.columns else None
+                        if _c:
+                            _didx = pd.Timestamp(_fresh_daily.index[-1])
+                            # Yahoo daily bars are date-only. If a fresher intraday bar exists,
+                            # that intraday timestamp will win in the final sorted candidates.
+                            candidates.append((_didx, float(_fresh_daily[_c].iloc[-1]), "fresh Yahoo daily"))
+                except Exception:
+                    pass
+                try:
+                    _sp = pd.Series(strat_prices).dropna()
+                    if not _sp.empty:
+                        candidates.append((pd.Timestamp(_sp.index[-1]), float(_sp.iloc[-1]), "strategy price"))
+                except Exception:
+                    pass
+                if not candidates:
+                    return pd.NaT, np.nan, "none"
+                candidates = sorted(candidates, key=lambda x: x[0])
+                return candidates[-1]
+            except Exception:
+                return pd.NaT, np.nan, "none"
+
+        def _mark_latest_regime_trade_open_if_signal_long(trades_in):
+            """
+            Display-only fix:
+            If the latest Regime signal is still LONG, the most recent trade is an open position.
+            The backtest engine may still show the last available weekly/daily close as an exit.
+            That made the trade log look stale/laggy. This changes only the display trade log,
+            not performance metrics or model logic.
+            """
+            try:
+                if trades_in is None or trades_in.empty:
+                    return trades_in
+                if strategy_type != "Regime Switching (Trend Following)":
+                    return trades_in
+                latest_sig = float(pd.Series(signals).dropna().iloc[-1])
+                if latest_sig <= 0:
+                    return trades_in
+
+                latest_dt, latest_px, latest_src = _latest_display_price_and_time_for_regime()
+                if pd.isna(latest_dt) or not np.isfinite(latest_px):
+                    return trades_in
+
+                out = trades_in.copy()
+                if "Entry Date" in out.columns:
+                    def _parse_sort_dt(v):
+                        try:
+                            s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                            ts = pd.Timestamp(s)
+                            if getattr(ts, "tzinfo", None) is not None:
+                                ts = ts.tz_convert(None)
+                            return ts
+                        except Exception:
+                            return pd.NaT
+                    sort_key = out["Entry Date"].apply(_parse_sort_dt)
+                    idx_latest = sort_key.sort_values(ascending=False, na_position="last").index[0]
+                else:
+                    idx_latest = out.index[-1]
+
+                if "Status" in out.columns:
+                    out.loc[idx_latest, "Status"] = "Open"
+                if "Exit Date" in out.columns:
+                    out.loc[idx_latest, "Exit Date"] = "Open"
+                if "Exit Time" in out.columns:
+                    out.loc[idx_latest, "Exit Time"] = f"Open — marked latest close ({latest_src})"
+                if "Sell Price" in out.columns:
+                    out.loc[idx_latest, "Sell Price"] = float(latest_px)
+                if "Exit Price" in out.columns:
+                    out.loc[idx_latest, "Exit Price"] = float(latest_px)
+                if "PnL (%)" in out.columns:
+                    buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+                    if buy_col is not None:
+                        buy_px = pd.to_numeric(out.loc[idx_latest, buy_col], errors="coerce")
+                        if pd.notna(buy_px) and float(buy_px) != 0:
+                            out.loc[idx_latest, "PnL (%)"] = (float(latest_px) / float(buy_px) - 1.0) * 100.0
+                out["Latest Mark Source"] = ""
+                out.loc[idx_latest, "Latest Mark Source"] = f"{latest_src} @ {pd.Timestamp(latest_dt).strftime('%Y-%m-%d')}"
+                return out
+            except Exception:
+                return trades_in
+
+        # Price / Equity Graphs
+        if strategy_type == "Regime Switching (Trend Following)":
+            st.write("#### 📈 Regime Switching Price Graph")
+            st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
+
+            pgc1, pgc2, pgc3 = st.columns(3)
+            with pgc1:
+                regime_graph_mode = st.selectbox(
+                    "Price graph display range",
+                    ["Recent only (fast)", "Full anchor history (slow)"],
+                    index=0,
+                    key=f"regime_price_graph_display_range_{TICKER}_{bt_freq}",
+                    help="Recent only keeps the chart fast for long anchors like 2020/01/01. Model/backtest still uses the full selected anchor history."
+                )
+            with pgc2:
+                regime_graph_bars = st.number_input(
+                    "Recent graph bars",
+                    min_value=100,
+                    max_value=5000,
+                    value=900,
+                    step=100,
+                    key=f"regime_price_graph_recent_bars_{TICKER}_{bt_freq}"
+                )
+            with pgc3:
+                regime_precise_old_times = st.checkbox(
+                    "Precise intraday times for old trades",
+                    value=False,
+                    key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
+                    help="OFF is faster. ON can be slow for old anchors because it tries to map historical trade times."
+                )
+
+            try:
+                plot_trades_df = bt_results['trades'].copy()
+                if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                    try:
+                        plot_trades_df = map_weekly_trade_log_dates_only(plot_trades_df, df_bt)
+                        plot_trades_df = apply_weekly_live_trigger_display_overrides(
+                            plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
+                        )
+                        if bool(regime_precise_old_times):
+                            plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
+                    except Exception:
+                        pass
+                try:
+                    plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
+                except Exception:
+                    pass
+
+                def _clean_trade_ts_for_plot(v):
+                    try:
+                        if v is None:
+                            return pd.NaT
+                        s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                        if s.lower() in {"", "open", "nan", "nat", "none"}:
+                            return pd.NaT
+                        ts = pd.Timestamp(s)
+                        if pd.isna(ts):
+                            return pd.NaT
+                        if getattr(ts, "tzinfo", None) is not None:
+                            ts = ts.tz_convert(None)
+                        return ts
+                    except Exception:
+                        return pd.NaT
+
+                def _nearest_price_points(ts_values, price_series):
+                    xs, ys = [], []
+                    p = pd.Series(price_series).dropna()
+                    if p.empty:
+                        return xs, ys
+                    p_index_naive = pd.DatetimeIndex(p.index)
+                    try:
+                        if p_index_naive.tz is not None:
+                            p_index_naive = p_index_naive.tz_convert(None)
+                    except Exception:
+                        pass
+                    p_tmp = pd.Series(p.values, index=p_index_naive)
+
+                    for raw_ts in ts_values:
+                        ts = _clean_trade_ts_for_plot(raw_ts)
+                        if pd.isna(ts):
+                            continue
+                        # If intraday timestamp is used while the plotted series is daily/weekly,
+                        # match by same date first, otherwise use nearest earlier available bar.
+                        try:
+                            same_day = p_tmp[p_tmp.index.normalize() == ts.normalize()]
+                            if not same_day.empty:
+                                loc_ts = same_day.index[-1]
+                                xs.append(loc_ts)
+                                ys.append(float(same_day.iloc[-1]))
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            idxer = p_tmp.index.get_indexer([ts], method="nearest")
+                            if len(idxer) and idxer[0] >= 0:
+                                loc_ts = p_tmp.index[idxer[0]]
+                                xs.append(loc_ts)
+                                ys.append(float(p_tmp.iloc[idxer[0]]))
+                        except Exception:
+                            pass
+                    return xs, ys
+
+                def _trade_log_points_for_plot(trades_df_src, date_col, price_candidates, status_filter=None, side_label=""):
+                    """
+                    Build graph marker points strictly from the displayed trade log rows.
+                    X comes from Entry Date / Exit Date in the trade log.
+                    Y comes from Buy Price / Sell Price in the trade log.
+                    This avoids marker hover times/prices drifting to nearest chart bars.
+                    """
+                    xs, ys, js_points = [], [], []
+                    try:
+                        if trades_df_src is None or trades_df_src.empty or date_col not in trades_df_src.columns:
+                            return xs, ys, js_points
+
+                        dfp = trades_df_src.copy()
+                        # In fast recent graph mode, only plot markers inside the visible chart range.
+                        try:
+                            if str(regime_graph_mode).startswith("Recent") and 'price_for_plot' in locals():
+                                _visible_min = pd.Timestamp(pd.Series(price_for_plot).dropna().index.min())
+                                _visible_max = pd.Timestamp(pd.Series(price_for_plot).dropna().index.max())
+                                def _in_visible_range(_v):
+                                    _tsv = _clean_trade_ts_for_plot(_v)
+                                    if pd.isna(_tsv):
+                                        return False
+                                    return (_tsv >= _visible_min - pd.Timedelta(days=3)) and (_tsv <= _visible_max + pd.Timedelta(days=3))
+                                dfp = dfp[dfp[date_col].apply(_in_visible_range)]
+                        except Exception:
+                            pass
+                        if status_filter is not None and "Status" in dfp.columns:
+                            dfp = dfp[status_filter(dfp["Status"].astype(str))]
+
+                        price_col = None
+                        for c in price_candidates:
+                            if c in dfp.columns:
+                                price_col = c
+                                break
+                        if price_col is None:
+                            return xs, ys, js_points
+
+                        for _, row in dfp.iterrows():
+                            raw_dt = row.get(date_col, None)
+                            ts = _clean_trade_ts_for_plot(raw_dt)
+                            if pd.isna(ts):
+                                continue
+                            px = pd.to_numeric(row.get(price_col, np.nan), errors="coerce")
+                            if pd.isna(px):
+                                continue
+
+                            raw_txt = str(raw_dt).strip()
+                            clean_txt = raw_txt.replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+
+                            # Date/time shown in the top-left box must match the trade log's CT display.
+                            # If raw value is UTC/tz-aware, convert to America/Chicago before displaying.
+                            # This fixes 13:30:00 showing instead of 08:30:00 CT.
+                            date_txt = ""
+                            time_txt = ""
+                            try:
+                                if "CT" in raw_txt or "CST" in raw_txt or "CDT" in raw_txt:
+                                    _parts = raw_txt.split()
+                                    if len(_parts) >= 1:
+                                        date_txt = pd.Timestamp(_parts[0]).strftime("%b %d, %Y")
+                                    if len(_parts) >= 2:
+                                        time_txt = " ".join(_parts[1:])
+                                else:
+                                    tstamp_raw = pd.Timestamp(raw_dt)
+                                    try:
+                                        # If timestamp has timezone, convert to Central.
+                                        if getattr(tstamp_raw, "tzinfo", None) is not None:
+                                            tstamp_disp = tstamp_raw.tz_convert("America/Chicago")
+                                        else:
+                                            # Strings like 2026-04-07 13:30:00+00:00 sometimes parse as tz-aware,
+                                            # but keep this fallback safe.
+                                            tstamp_disp = tstamp_raw
+                                    except Exception:
+                                        tstamp_disp = pd.Timestamp(ts)
+
+                                    date_txt = pd.Timestamp(tstamp_disp).strftime("%b %d, %Y")
+                                    if not (tstamp_disp.hour == 0 and tstamp_disp.minute == 0 and tstamp_disp.second == 0):
+                                        time_txt = pd.Timestamp(tstamp_disp).strftime("%H:%M:%S CT")
+                            except Exception:
+                                try:
+                                    date_txt = pd.Timestamp(ts).strftime("%b %d, %Y")
+                                except Exception:
+                                    date_txt = clean_txt.split(" ")[0] if clean_txt else ""
+                                time_txt = ""
+
+                            xs.append(ts)
+                            ys.append(float(px))
+                            js_points.append({
+                                "t": pd.Timestamp(ts).isoformat(),
+                                "p": float(px),
+                                "date": date_txt,
+                                "time": time_txt,
+                                "raw": raw_txt,
+                                "side": side_label
+                            })
+                    except Exception:
+                        return xs, ys, js_points
+                    return xs, ys, js_points
+
+                # Use a daily-basis display chart when the strategy itself is weekly.
+                # This keeps everything else the same (trade log, markers, top-left box, equity curve),
+                # but makes the visible price chart daily so weekday trade dates make more sense on the chart.
+                price_for_plot = pd.Series(strat_prices).replace([np.inf, -np.inf], np.nan).dropna()
+                try:
+                    if bt_freq == "Weekly" and len(price_for_plot) >= 2:
+                        chart_start = (pd.Timestamp(price_for_plot.index.min()) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+                        chart_end = (pd.Timestamp(price_for_plot.index.max()) + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+                        _daily_chart = yf.download(
+                            TICKER,
+                            start=chart_start,
+                            end=chart_end,
+                            interval="1d",
+                            auto_adjust=True,
+                            progress=False,
+                            prepost=False,
+                            threads=False
+                        )
+                        if _daily_chart is not None and not _daily_chart.empty:
+                            if isinstance(_daily_chart.columns, pd.MultiIndex):
+                                _daily_chart.columns = [c[0] if isinstance(c, tuple) else c for c in _daily_chart.columns]
+                            _close_col = None
+                            for _c in _daily_chart.columns:
+                                if str(_c).lower() == "close":
+                                    _close_col = _c
+                                    break
+                            if _close_col is not None:
+                                _daily_close = pd.to_numeric(_daily_chart[_close_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                                if not _daily_close.empty:
+                                    price_for_plot = _daily_close
+                except Exception:
+                    pass
+
+                # Display-only freshness fix: weekly model prices can stop at last closed weekly bar.
+                # Append/replace latest available close so the price graph top-left panel is not stale.
+                try:
+                    latest_dt_disp, latest_px_disp, latest_src_disp = _latest_display_price_and_time_for_regime()
+                    if pd.notna(latest_dt_disp) and np.isfinite(latest_px_disp):
+                        _pf = pd.Series(price_for_plot).copy()
+                        _idx = pd.Timestamp(latest_dt_disp)
+                        try:
+                            if getattr(_idx, "tzinfo", None) is not None:
+                                _idx = _idx.tz_convert(None)
+                        except Exception:
+                            pass
+                        _pf.loc[_idx] = float(latest_px_disp)
+                        _pf = _pf.sort_index()
+                        price_for_plot = _pf[~_pf.index.duplicated(keep="last")]
+                except Exception:
+                    pass
+
+                # Fast display for long anchors: trim chart data only.
+                # This does not change model fitting, signals, metrics, or trade log.
+                try:
+                    if str(regime_graph_mode).startswith("Recent"):
+                        _pf_trim = pd.Series(price_for_plot).dropna().sort_index()
+                        if len(_pf_trim) > int(regime_graph_bars):
+                            price_for_plot = _pf_trim.tail(int(regime_graph_bars))
+                            st.caption(f"Fast graph mode: showing last {len(price_for_plot)} price bars only. Backtest/trade log still uses the full anchor history.")
+                except Exception:
+                    pass
+
+                # Initial fixed top-left hover panel.
+                # It intentionally does NOT show latest/open trade details because those belong in the trade log.
+                latest_price_text = "N/A"
+                latest_date_text = "N/A"
+                latest_src_text = ""
+                try:
+                    _ldt, _lpx, _lsrc = _latest_display_price_and_time_for_regime()
+                    if pd.notna(_ldt) and np.isfinite(_lpx):
+                        latest_price_text = f"${float(_lpx):,.2f}"
+                        latest_date_text = pd.Timestamp(_ldt).strftime("%b %d, %Y")
+                        latest_src_text = str(_lsrc)
+                    else:
+                        latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
+                        latest_date_text = pd.Timestamp(price_for_plot.index[-1]).strftime("%b %d, %Y")
+                except Exception:
+                    try:
+                        latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
+                        latest_date_text = pd.Timestamp(price_for_plot.index[-1]).strftime("%b %d, %Y")
+                    except Exception:
+                        pass
+
+                fixed_info_text = (
+                    f"<b>{TICKER}</b><br>"
+                    f"Move cursor on chart<br>"
+                    f"Latest date: <b>{latest_date_text}</b><br>"
+                    f"Latest price: <b>{latest_price_text}</b>"
+                )
+
+                fig_price = go.Figure()
+                fig_price.add_trace(go.Scatter(
+                    x=price_for_plot.index,
+                    y=price_for_plot.values,
+                    mode="lines",
+                    line=dict(color="#5b7cfa", width=2),
+                    name=f"{TICKER} Price",
+                    hovertemplate="<b>%{x}</b><br>Price: $%{y:,.2f}<extra></extra>"
+                ))
+
+                buy_points_for_js = []
+                sell_points_for_js = []
+
+                if not plot_trades_df.empty and "Entry Date" in plot_trades_df.columns:
+                    bx, by, buy_points_for_js = _trade_log_points_for_plot(
+                        plot_trades_df,
+                        "Entry Date",
+                        ["Buy Price", "Entry Price", "Long Price", "Price"],
+                        side_label="Buy"
+                    )
+                    if len(bx) > 0:
+                        fig_price.add_trace(go.Scatter(
+                            x=bx, y=by, mode="markers", name="Buy",
+                            marker=dict(symbol="triangle-up", size=9, color="lime"),
+                            hovertemplate="<b>BUY</b><br>%{x}<br>Trade log price: $%{y:,.2f}<extra></extra>"
+                        ))
+
+                if not plot_trades_df.empty and "Exit Date" in plot_trades_df.columns:
+                    sx, sy, sell_points_for_js = _trade_log_points_for_plot(
+                        plot_trades_df,
+                        "Exit Date",
+                        ["Sell Price", "Exit Price", "Cover Price", "Price"],
+                        status_filter=lambda s: s.str.lower().ne("open"),
+                        side_label="Sell/Exit"
+                    )
+                    if len(sx) > 0:
+                        fig_price.add_trace(go.Scatter(
+                            x=sx, y=sy, mode="markers", name="Sell / Exit",
+                            marker=dict(symbol="triangle-down", size=9, color="red"),
+                            hovertemplate="<b>SELL / EXIT</b><br>%{x}<br>Trade log price: $%{y:,.2f}<extra></extra>"
+                        ))
+
+                fig_price.update_layout(
+                    title=f"{TICKER} Regime Switching Price + Entry/Exit Markers",
+                    template="plotly_dark",
+                    height=560,
+                    hovermode="closest",
+                    dragmode="pan",
+                    margin=dict(l=70, r=30, t=60, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    hoverlabel=dict(bgcolor="rgba(0,0,0,0.86)", font_size=12, font_color="white")
+                )
+                fig_price.update_xaxes(
+                    rangeslider=dict(visible=True),
+                    showgrid=False,
+                    showspikes=True,
+                    spikemode="across",
+                    spikesnap="cursor",
+                    spikecolor="white",
+                    spikethickness=1,
+                    spikedash="solid",
+                    showline=True
+                )
+                fig_price.update_yaxes(
+                    showgrid=True,
+                    showspikes=True,
+                    spikemode="across",
+                    spikesnap="cursor",
+                    spikecolor="white",
+                    spikethickness=1,
+                    spikedash="solid",
+                    showline=True
+                )
+
+                # Render with a fixed top-left hover panel that updates as the crosshair moves.
+                # Keep full Plotly interaction: zoom, pan, crosshair/spikes, draw-line tools.
+                try:
+                    fig_price.update_layout(
+                        annotations=[],
+                        hovermode="closest",
+                        dragmode="pan",
+                        hoverlabel=dict(bgcolor="rgba(0,0,0,0.85)", font_size=12, font_color="white")
+                    )
+                except Exception:
+                    fig_price.update_layout(hovermode="closest", dragmode="pan")
+
+                try:
+                    chart_div_id = f"regime_price_chart_{TICKER}_{bt_freq}".replace(" ", "_").replace(".", "_").replace("-", "_")
+                    hover_panel_id = f"regime_hover_panel_{TICKER}_{bt_freq}".replace(" ", "_").replace(".", "_").replace("-", "_")
+
+                    # Build plain JSON arrays for the fixed top-left panel.
+                    # This avoids Plotly typed-array serialization causing "Price: undefined".
+                    price_points_for_js = []
+                    try:
+                        for _dt, _px in price_for_plot.items():
+                            _ts = pd.Timestamp(_dt)
+                            try:
+                                if getattr(_ts, "tzinfo", None) is not None:
+                                    _ts = _ts.tz_convert(None)
+                            except Exception:
+                                pass
+                            if pd.notna(_px):
+                                price_points_for_js.append({"t": _ts.isoformat(), "p": float(_px)})
+                    except Exception:
+                        price_points_for_js = []
+
+                    # Force the top-left panel data to include the freshest latest display point.
+                    try:
+                        _ldt2, _lpx2, _lsrc2 = _latest_display_price_and_time_for_regime()
+                        if pd.notna(_ldt2) and np.isfinite(_lpx2):
+                            _ts2 = pd.Timestamp(_ldt2)
+                            try:
+                                if getattr(_ts2, "tzinfo", None) is not None:
+                                    _ts2 = _ts2.tz_convert(None)
+                            except Exception:
+                                pass
+                            price_points_for_js.append({"t": _ts2.isoformat(), "p": float(_lpx2)})
+                    except Exception:
+                        pass
+
+                    # Buy/sell JS points are built strictly from the displayed trade log above.
+                    price_points_json = json.dumps(price_points_for_js)
+                    buy_points_json = json.dumps(buy_points_for_js)
+                    sell_points_json = json.dumps(sell_points_for_js)
+
+                    chart_html = fig_price.to_html(
+                        full_html=False,
+                        include_plotlyjs="cdn",
+                        config={
+                            "scrollZoom": True,
+                            "displaylogo": False,
+                            "displayModeBar": True,
+                            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                            "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
+                        },
+                        div_id=chart_div_id
+                    )
+
+                    html = f"""
+                    <style>
+                        /* Hide only Plotly's floating tooltip box.
+                           Keep spike/crosshair lines visible. */
+                        #{chart_div_id} .hoverlayer .hovertext {{
+                            display:none !important;
+                        }}
+                    </style>
+                    <div style="position:relative; width:100%;">
+                        <div id="{hover_panel_id}" style="
+                            position:absolute;
+                            top:62px;
+                            left:82px;
+                            z-index:9999;
+                            background:rgba(0,0,0,0.74);
+                            color:white;
+                            border:1px solid rgba(255,255,255,0.32);
+                            border-radius:6px;
+                            padding:7px 9px;
+                            font-family:Arial, sans-serif;
+                            font-size:12px;
+                            line-height:1.28;
+                            min-width:165px;
+                            max-width:230px;
+                            pointer-events:none;">
+                            <b>{TICKER}</b><br>
+                            Move crosshair on chart<br>
+                            Latest date: <b>{latest_date_text}</b><br>
+                            Latest price: <b>{latest_price_text}</b>
+                        </div>
+                        {chart_html}
+                    </div>
+
+                    <script>
+                    (function() {{
+                        const plot = document.getElementById("{chart_div_id}");
+                        const panel = document.getElementById("{hover_panel_id}");
+
+                        function fmtDate(x) {{
+                            try {{
+                                const d = new Date(x);
+                                if (!isNaN(d.getTime())) {{
+                                    return d.toLocaleDateString("en-US", {{ year:"numeric", month:"short", day:"numeric" }});
+                                }}
+                            }} catch(e) {{}}
+                            return String(x);
+                        }}
+
+                        function fmtPrice(y) {{
+                            if (y === undefined || y === null || y === "") return "N/A";
+                            const n = Number(y);
+                            if (Number.isFinite(n)) {{
+                                return "$" + n.toLocaleString("en-US", {{ minimumFractionDigits:2, maximumFractionDigits:2 }});
+                            }}
+                            return "N/A";
+                        }}
+
+                        const pricePoints = {price_points_json};
+                        const buyPoints = {buy_points_json};
+                        const sellPoints = {sell_points_json};
+
+                        function nearestPointByX(xVal, arr) {{
+                            if (!arr || arr.length === 0) return null;
+
+                            const target = new Date(xVal).getTime();
+                            let best = null;
+                            let bestD = Infinity;
+
+                            for (let i = 0; i < arr.length; i++) {{
+                                const tx = new Date(arr[i].t).getTime();
+                                const py = Number(arr[i].p);
+                                if (isNaN(tx) || !Number.isFinite(py)) continue;
+                                const diff = Math.abs(tx - target);
+                                if (diff < bestD) {{
+                                    bestD = diff;
+                                    best = arr[i];
+                                }}
+                            }}
+                            return best;
+                        }}
+
+                        function medianPriceStepMs() {{
+                            try {{
+                                if (!pricePoints || pricePoints.length < 2) return 24 * 60 * 60 * 1000;
+                                let diffs = [];
+                                for (let i = 1; i < pricePoints.length; i++) {{
+                                    const a = new Date(pricePoints[i - 1].t).getTime();
+                                    const b = new Date(pricePoints[i].t).getTime();
+                                    const d = Math.abs(b - a);
+                                    if (Number.isFinite(d) && d > 0) diffs.push(d);
+                                }}
+                                if (!diffs.length) return 24 * 60 * 60 * 1000;
+                                diffs.sort((a, b) => a - b);
+                                return diffs[Math.floor(diffs.length / 2)];
+                            }} catch(e) {{
+                                return 24 * 60 * 60 * 1000;
+                            }}
+                        }}
+
+                        function nearestSignalByX(xVal, arr) {{
+                            if (!arr || arr.length === 0) return null;
+
+                            const target = new Date(xVal).getTime();
+                            if (!Number.isFinite(target)) return null;
+
+                            // Weekly charts skip weekday trade dates. Use half the chart bar spacing,
+                            // so a Tuesday/Wednesday trade still appears when hovering that week.
+                            const step = medianPriceStepMs();
+                            const tolerance = Math.max(step * 0.55, 12 * 60 * 60 * 1000);
+
+                            let best = null;
+                            let bestD = Infinity;
+                            for (let i = 0; i < arr.length; i++) {{
+                                const tx = new Date(arr[i].t).getTime();
+                                const py = Number(arr[i].p);
+                                if (!Number.isFinite(tx) || !Number.isFinite(py)) continue;
+                                const diff = Math.abs(tx - target);
+                                if (diff < bestD) {{
+                                    bestD = diff;
+                                    best = arr[i];
+                                }}
+                            }}
+
+                            if (best && bestD <= tolerance) return best;
+                            return null;
+                        }}
+
+                        function updatePanelFromX(xVal) {{
+                            if (!panel) return;
+
+                            const nearest = nearestPointByX(xVal, pricePoints);
+                            if (!nearest) return;
+
+                            let dateTxt = fmtDate(nearest.t);
+                            let priceTxt = fmtPrice(nearest.p);
+                            let timeTxt = "";
+                            let signalTxt = "";
+
+                            try {{
+                                const b = nearestSignalByX(xVal, buyPoints);
+                                const s = nearestSignalByX(xVal, sellPoints);
+
+                                // If a buy/sell signal is being shown, the main Date/Price must
+                                // come strictly from the trade log row, not from the nearest daily
+                                // price bar. This prevents mismatches like Date Apr 8 but Signal date Apr 7.
+                                const primarySignal = b ? b : (s ? s : null);
+                                if (primarySignal) {{
+                                    if (primarySignal.date) {{
+                                        dateTxt = primarySignal.date;
+                                    }} else {{
+                                        dateTxt = fmtDate(primarySignal.t);
+                                    }}
+                                    priceTxt = fmtPrice(primarySignal.p);
+                                    if (primarySignal.time) {{
+                                        timeTxt = "<br>Time: <b>" + primarySignal.time + "</b>";
+                                    }}
+                                }}
+
+                                if (b) {{
+                                    signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b.p) + "</b>";
+                                }}
+                                if (s) {{
+                                    signalTxt += "<br>🔴 Sell/Exit: <b>" + fmtPrice(s.p) + "</b>";
+                                }}
+                            }} catch(e) {{}}
+
+                            panel.innerHTML = "<b>{TICKER}</b><br>"
+                                + "Date: <b>" + dateTxt + "</b>"
+                                + timeTxt
+                                + "<br>Price: <b>" + priceTxt + "</b>"
+                                + signalTxt;
+                        }}
+
+                        function updatePanel(evt) {{
+                            if (!evt || !evt.points || evt.points.length === 0) return;
+                            updatePanelFromX(evt.points[0].x);
+                        }}
+
+                        function attach() {{
+                            if (!plot || typeof plot.on !== "function") {{
+                                setTimeout(attach, 250);
+                                return;
+                            }}
+
+                            plot.on("plotly_hover", updatePanel);
+                            plot.on("plotly_click", updatePanel);
+
+                            // Update panel anywhere inside plotting area using mouse x-position.
+                            plot.addEventListener("mousemove", function(e) {{
+                                try {{
+                                    const gd = plot;
+                                    const full = gd._fullLayout;
+                                    if (!full || !full.xaxis) return;
+
+                                    const bb = gd.getBoundingClientRect();
+                                    const xPixel = e.clientX - bb.left - full.margin.l;
+                                    const plotW = full.width - full.margin.l - full.margin.r;
+                                    if (xPixel < 0 || xPixel > plotW) return;
+
+                                    const xr = full.xaxis.range;
+                                    const x0 = new Date(xr[0]).getTime();
+                                    const x1 = new Date(xr[1]).getTime();
+                                    if (isNaN(x0) || isNaN(x1)) return;
+
+                                    const t = x0 + (xPixel / plotW) * (x1 - x0);
+                                    updatePanelFromX(new Date(t));
+                                }} catch(err) {{}}
+                            }});
+                        }}
+                        attach();
+                    }})();
+                    </script>
+                    """
+                    components.html(html, height=640, scrolling=False)
+                except Exception:
+                    st.plotly_chart(
+                        fig_price,
+                        use_container_width=True,
+                        config={
+                            "scrollZoom": True,
+                            "displaylogo": False,
+                            "displayModeBar": True,
+                            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                            "toImageButtonOptions": {"format": "png", "filename": f"{TICKER}_regime_price_chart"}
+                        }
+                    )
+
+                safe_report_add("Regime Price Entry Exit Chart", fig_price)
+
+            except Exception as plot_err:
+                st.warning(f"Could not render regime price entry/exit graph: {plot_err}")
+
+            show_equity_curve_secondary = st.checkbox(
+                "Show strategy performance / equity curve",
+                value=False,
+                key=f"show_regime_equity_curve_secondary_{TICKER}_{bt_freq}_{strategy_type}"
+            )
+            if show_equity_curve_secondary:
+                st.write("#### 📉 Strategy Performance / Equity Curve")
+                fig_bt = go.Figure()
+                fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
+                fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
+                fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
+                fig_bt.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", rangeslider=dict(visible=True))
+                fig_bt.update_yaxes(showspikes=True, spikemode="across", spikesnap="cursor")
+                st.plotly_chart(
+                    fig_bt,
+                    use_container_width=True,
+                    config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"]}
+                )
+                st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+        else:
+            # Equity Curve Plot
+            st.write("#### 📈 Equity Curve")
+            fig_bt = go.Figure()
+            fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name=f'Strategy ({strategy_type})'))
+            fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
+            fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
+            st.plotly_chart(fig_bt, use_container_width=True)
+            st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+
+        safe_report_add("Backtest Metrics", strat_metrics)
+
         # Trade Log
         st.write("#### 📝 Trade Log")
+        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+            st.caption("Weekly trade times: exact intraday times are shown when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly/daily candles alone cannot produce precise intraday time.")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
@@ -7776,16 +11001,56 @@ with tab7:
                     trades_df = apply_weekly_live_trigger_display_overrides(
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
+                    try:
+                        _precise_ok = bool(regime_precise_old_times)
+                    except Exception:
+                        _precise_ok = False
+                    if _precise_ok:
+                        trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
             except Exception:
                 pass
 
-            # Show newest trades first by default
+            try:
+                trades_df = _mark_latest_regime_trade_open_if_signal_long(trades_df)
+            except Exception:
+                pass
+
+            # Show newest trades first by default.
+            # IMPORTANT: weekly intraday timestamp display can create a mixed Entry Date column
+            # (Timestamp objects + strings like "2026-06-05 10:40:00 CT"). Pandas cannot
+            # directly sort mixed tz-aware/tz-naive/string values, so sort by a parsed helper key
+            # and keep the visible Entry Date unchanged.
             if 'Entry Date' in trades_df.columns:
-                trades_df = trades_df.sort_values('Entry Date', ascending=False).reset_index(drop=True)
+                try:
+                    def _entry_sort_key_for_display(v):
+                        try:
+                            if v is None:
+                                return pd.NaT
+                            s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                            if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                                return pd.NaT
+                            ts = pd.Timestamp(s)
+                            if pd.isna(ts):
+                                return pd.NaT
+                            if getattr(ts, 'tzinfo', None) is not None:
+                                ts = ts.tz_convert(None)
+                            return ts
+                        except Exception:
+                            return pd.NaT
+                    trades_df['__entry_sort_key__'] = trades_df['Entry Date'].apply(_entry_sort_key_for_display)
+                    trades_df = (
+                        trades_df.sort_values('__entry_sort_key__', ascending=False, na_position='last')
+                                 .drop(columns=['__entry_sort_key__'], errors='ignore')
+                                 .reset_index(drop=True)
+                    )
+                except Exception:
+                    trades_df = trades_df.reset_index(drop=True)
             # Remove impossible duplicate/overlapping trade-log rows created by weekly/date mapping.
             trades_df = clean_overlapping_duplicate_trades(trades_df)
             # Format dates
             trades_df = apply_trade_log_timestamp_display(trades_df)
+            if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                trades_df = finalize_weekly_regime_trade_time_display(trades_df)
             
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
@@ -7855,7 +11120,7 @@ with tab8:
     else:
         st.success("Stable: Volatility mean-reverts quickly.")
 
-    st.session_state.report_gen.add_data("Volatility Clustering Metrics", {
+    safe_report_add("Volatility Clustering Metrics", {
         "RV": rv, "BV": bv, "Jump Ratio": jump_res['jump_ratio'],
         "Branching Ratio": br, "Half-Life": hl
     })
@@ -8017,8 +11282,8 @@ with tab10:
                 fig_dyn.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_dyn, use_container_width=True)
                 st.session_state.report_gen.add_plot("SML Factor Dynamics", fig_dyn)
-                st.session_state.report_gen.add_data("SML Analysis Results", res_sml.tail(100))
-                st.session_state.report_gen.add_data("Current SML Metrics", last_row.to_dict())
+                safe_report_add("SML Analysis Results", res_sml.tail(100))
+                safe_report_add("Current SML Metrics", last_row.to_dict())
 
             else:
                 st.error(f"Could not load data for Benchmark: {bench_ticker}")
@@ -8995,7 +12260,7 @@ with tab16:
                 top10 = filtered.head(10)
                 for _, row in top10.iterrows():
                     with st.expander(f"{'🟢' if 'BUY' in row['verdict'] else '🟡'} {row['ticker']} — {row['name']} | Score: {row['score']:.1f} | {row['verdict']}"):
-                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1, m2, m3, m4, m5, m6 = st.columns(6)
                         m1.metric("Price", f"${row['price']:.2f}")
                         m2.metric("ATM IV", f"{row['atm_iv']:.1f}%")
                         m3.metric("IV Rank", f"{row['iv_rank']:.0f}")
@@ -9039,359 +12304,1135 @@ with tab16:
 
 
 # ==========================================
-# TAB 17: CUMULATIVE VOLUME DELTA (CVD)
+# TAB 17-21 SAFE LIGHTWEIGHT REBUILD
+# ==========================================
+# This block intentionally keeps the last five tabs lightweight on initial app load.
+# Heavy calculations only run after the user clicks a checkbox/button inside the tab.
+
+def _safe_last_tab_error(tab_obj, tab_name, err):
+    try:
+        with tab_obj:
+            st.error(f"{tab_name} error: {err}")
+            st.caption("The rest of the app should continue loading. This tab is isolated so one module cannot break the final tabs.")
+    except Exception:
+        pass
+
+
+
+def _load_fresh_intraday_for_capture(ticker, interval='1m', period='1d', include_prepost=False):
+    """
+    Fetch fresh intraday data directly for the final Live Capture tab.
+    This intentionally does NOT use df_main/start_date, because df_main can be
+    daily historical data from 2024 when the rest of the dashboard is not in Live Mode.
+
+    Robust weekend/holiday behavior: if period='1d' returns empty after the
+    market is closed or on Saturday/Sunday, automatically widen the window and
+    the cleaner keeps the latest available trading session.
+    """
+    try:
+        t = str(ticker).strip().upper()
+        if not t:
+            return pd.DataFrame(), "No ticker selected."
+
+        interval = str(interval).strip()
+        period = str(period).strip()
+
+        fallback_periods = []
+        def _add_period(x):
+            if x and x not in fallback_periods:
+                fallback_periods.append(x)
+        _add_period(period)
+        if interval == '1m':
+            for x in ['1d', '5d', '7d']:
+                _add_period(x)
+        elif interval in {'2m', '5m', '15m', '30m'}:
+            for x in ['1d', '5d', '7d', '30d', '60d']:
+                _add_period(x)
+        else:
+            for x in ['1d', '5d', '30d', '60d']:
+                _add_period(x)
+
+        d = pd.DataFrame()
+        used_period = None
+        for per in fallback_periods:
+            try:
+                temp = yf.download(t, period=per, interval=interval, progress=False, auto_adjust=True, prepost=bool(include_prepost), threads=False)
+                if temp is not None and not temp.empty:
+                    d = temp.copy()
+                    used_period = per
+                    break
+            except Exception:
+                continue
+
+        if d is None or d.empty:
+            return pd.DataFrame(), f"No fresh intraday data returned for {t}. Yahoo may be delayed/unavailable; try 5m with 5d window."
+
+        # Flatten multi-index columns if yfinance returns them.
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
+
+        keep = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in d.columns]
+        d = d[keep].copy()
+        if 'Close' not in d.columns:
+            return pd.DataFrame(), "Fresh intraday data loaded, but Close column is missing."
+
+        for c in ['Open', 'High', 'Low']:
+            if c not in d.columns:
+                d[c] = d['Close']
+        if 'Volume' not in d.columns:
+            d['Volume'] = 1.0
+
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
+        d = d[d['Close'] > 0]
+        if d.empty:
+            return pd.DataFrame(), "Fresh intraday data was empty after cleaning."
+
+        # Convert timezone-aware timestamps to Central Time for display/session filtering.
+        try:
+            idx = pd.DatetimeIndex(d.index)
+            if idx.tz is not None:
+                d.index = idx.tz_convert('America/Chicago')
+            else:
+                # Yahoo daily-like output may be naive. Keep as-is but do not convert date-only data.
+                d.index = idx
+        except Exception:
+            pass
+
+        return d, ""
+    except Exception as e:
+        return pd.DataFrame(), f"Fresh intraday fetch failed: {e}"
+
+def _intraday_clean_frame(source_df, today_only=True):
+    """Prepare intraday OHLCV frame safely for the Live Capture tab."""
+    try:
+        d = source_df.copy()
+        if d is None or d.empty:
+            return pd.DataFrame()
+        d = d[[c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in d.columns]].copy()
+        if 'Close' not in d.columns:
+            return pd.DataFrame()
+        for c in ['Open', 'High', 'Low', 'Close']:
+            if c not in d.columns:
+                d[c] = d['Close']
+        if 'Volume' not in d.columns:
+            d['Volume'] = 1.0
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
+        d = d[d['Close'] > 0]
+        if len(d) == 0:
+            return pd.DataFrame()
+
+        # Keep only today's session when intraday timestamps are available.
+        if today_only:
+            idx = pd.to_datetime(d.index, errors='coerce')
+            if getattr(idx, 'tz', None) is not None:
+                idx_ct = idx.tz_convert('America/Chicago')
+            else:
+                idx_ct = idx
+            if len(idx_ct) and pd.notna(idx_ct[-1]):
+                last_date = idx_ct[-1].date()
+                mask = pd.Series([x.date() == last_date if pd.notna(x) else False for x in idx_ct], index=d.index)
+                if mask.sum() >= 25:
+                    d = d.loc[mask].copy()
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+
+
+def _calculate_intraday_vwap_zscore_kalman(d, window=15):
+    """VWAP z-score + causal Kalman estimate for long-only flush/snapback logic.
+
+    Uses only information available up to each bar. No centered windows, no future bars.
+    If pykalman is unavailable, a deterministic one-dimensional Kalman filter is used.
+    """
+    out = d.copy()
+    # Support both app OHLCV capitalization and user-provided lowercase columns.
+    colmap = {c.lower(): c for c in out.columns}
+    high = out[colmap.get('high', 'High')].astype(float) if colmap.get('high', 'High') in out.columns else out[colmap.get('close', 'Close')].astype(float)
+    low = out[colmap.get('low', 'Low')].astype(float) if colmap.get('low', 'Low') in out.columns else out[colmap.get('close', 'Close')].astype(float)
+    close = out[colmap.get('close', 'Close')].astype(float)
+    volume = out[colmap.get('volume', 'Volume')].astype(float) if colmap.get('volume', 'Volume') in out.columns else pd.Series(1.0, index=out.index)
+    volume = volume.replace(0, np.nan).fillna(1.0)
+
+    typical_price = (high + low + close) / 3.0
+    cum_vol = volume.cumsum().replace(0, np.nan)
+    vwap = (typical_price * volume).cumsum() / cum_vol
+
+    # Standard deviation of distance from VWAP is more stable than raw price std.
+    distance = typical_price - vwap
+    vwap_std = distance.rolling(int(window), min_periods=max(5, int(window)//3)).std()
+    fallback_std = typical_price.rolling(int(window), min_periods=max(5, int(window)//3)).std()
+    vwap_std = vwap_std.fillna(fallback_std).replace(0, np.nan)
+    z_score = ((close - vwap) / vwap_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    vals = close.values.astype(float)
+    kalman_vals = np.zeros(len(vals), dtype=float)
+    try:
+        from pykalman import KalmanFilter as _PyKalmanFilter
+        kf = _PyKalmanFilter(
+            transition_matrices=[1],
+            observation_matrices=[1],
+            initial_state_mean=float(vals[0]),
+            initial_state_covariance=1,
+            observation_covariance=1,
+            transition_covariance=0.01,
+        )
+        state_means, _ = kf.filter(vals)
+        kalman_vals = np.asarray(state_means).reshape(-1)
+        kalman_source = 'pykalman'
+    except Exception:
+        # Causal scalar Kalman fallback so the app does not require pykalman install.
+        q = 0.01
+        r = 1.0
+        x = float(vals[0])
+        P = 1.0
+        for i, z in enumerate(vals):
+            P = P + q
+            K = P / (P + r)
+            x = x + K * (float(z) - x)
+            P = (1 - K) * P
+            kalman_vals[i] = x
+        kalman_source = 'internal scalar fallback'
+
+    kalman_price = pd.Series(kalman_vals, index=out.index)
+    kalman_residual = close - kalman_price
+
+    out['VWAP_Z_Typical'] = typical_price
+    out['VWAP_Z_VWAP'] = vwap
+    out['VWAP_Z_STD'] = vwap_std
+    out['VWAP_Z_SCORE'] = z_score
+    out['Kalman Price'] = kalman_price
+    out['Kalman Residual'] = kalman_residual
+    out['Kalman Source'] = kalman_source
+    return out
+
+def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False, direction_mode='Long Only', use_kalman_vwap=False, z_entry=-2.5, z_exit=-1.0, z_window=15):
+    """
+    Long-only auction-quality intraday engine.
+
+    Important idea:
+    Institutions do NOT buy every dip. They wait for the auction to prove that
+    sellers are exhausted or buyers are in control. Since this app is long-only,
+    the correct answer on many red/downtrend days is NO TRADE.
+
+    Playbooks:
+    1) Trend-up continuation: only above VWAP, EMA stack, pullback/OR breakout.
+    2) Red-day reversal: only after capitulation + reclaim + higher-low/break-of-structure.
+    3) VWAP reclaim: only when reclaim holds and momentum confirms.
+
+    Hard avoids:
+    - waterfall / lower-low sequence
+    - below VWAP and below EMA21 on trend-down days
+    - weak bounce with no structure
+    - overextended chase
+    - low volume / bad candle close
+    """
+    # Adaptive edge mode: enough trade attempts to capture multiple waves,
+    # but no unlimited machine-gun behavior.
+    try:
+        max_trades = max(1, min(int(max_trades), 15))
+    except Exception:
+        max_trades = 8
+    try:
+        max_consecutive_losses = max(1, int(max_consecutive_losses))
+    except Exception:
+        max_consecutive_losses = 2
+
+    close = d['Close'].astype(float)
+    high = d['High'].astype(float) if 'High' in d.columns else close
+    low = d['Low'].astype(float) if 'Low' in d.columns else close
+    open_ = d['Open'].astype(float) if 'Open' in d.columns else close
+    vol = d['Volume'].astype(float).replace(0, np.nan).fillna(1.0) if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
+
+    idx = close.index
+    n = len(close)
+    false = pd.Series(False, index=idx)
+    if n < 30:
+        features = pd.DataFrame({'Close': close, 'Final Entry': 0, 'Long Entry': 0, 'Short Entry': 0, 'Model Decision': 'Not enough bars'}, index=idx)
+        return false, false, features
+
+    ema5 = close.ewm(span=5, adjust=False).mean()
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    typical = (high + low + close) / 3.0
+    vwap = (typical * vol).cumsum() / vol.cumsum().replace(0, np.nan)
+
+    rng = (high - low).replace(0, np.nan)
+    close_location = ((close - low) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.5)
+    body_pct = ((close - open_) / open_.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
+    ret1 = close.pct_change().fillna(0)
+    mom3 = close.pct_change(3).fillna(0)
+    mom6 = close.pct_change(6).fillna(0)
+    session_move = (close / close.iloc[0] - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    vol_ma20 = vol.rolling(20, min_periods=5).mean()
+    vol_ratio = (vol / vol_ma20).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    vol_impulse = vol_ratio > 1.15
+
+    rolling_high = high.cummax()
+    rolling_low = low.cummin()
+    bounce_from_low = (close / rolling_low - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+    distance_vwap = (close / vwap - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+    distance_ema21 = (close / ema21 - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    bar_no = pd.Series(np.arange(n), index=idx)
+    or_bars = min(max(5, int(n * 0.08)), 20)
+    opening_high = pd.Series(high.iloc[:or_bars].max(), index=idx)
+    opening_low = pd.Series(low.iloc[:or_bars].min(), index=idx)
+    opening_mid = (opening_high + opening_low) / 2.0
+    above_opening_high = close > opening_high
+    above_opening_mid = close > opening_mid
+
+    # Structure: this is the part the old version was missing.
+    recent_low_8 = low.rolling(8, min_periods=3).min()
+    recent_high_8 = high.rolling(8, min_periods=3).max()
+    prior_high_5 = high.shift(1).rolling(5, min_periods=3).max()
+    prior_low_5 = low.shift(1).rolling(5, min_periods=3).min()
+    higher_low = low > prior_low_5
+    break_structure_up = close > prior_high_5
+    reclaim_fast = (close > ema9) & (close.shift(1) <= ema9.shift(1))
+    reclaim_vwap = (close > vwap) & (close.shift(1) <= vwap.shift(1))
+    hold_vwap = (close > vwap) & (low >= vwap * 0.998)
+
+    # Waterfall / distribution detection. Long-only model should usually stand aside here.
+    lower_low_sequence = (low <= low.shift(1)) & (low.shift(1) <= low.shift(2)) & (low.shift(2) <= low.shift(3))
+    lower_high_sequence = (high <= high.shift(1)) & (high.shift(1) <= high.shift(2))
+    below_stack = (close < vwap) & (close < ema9) & (ema9 < ema21)
+    trend_down_day = (session_move < -0.012) & below_stack
+    waterfall = (session_move < -0.018) & lower_low_sequence & (mom3 < 0)
+    distribution = trend_down_day & lower_high_sequence & (close_location < 0.55)
+
+    # Real trend-up auction filter. A weak early pop is not institutional green momentum.
+    # This blocks the exact problem the user saw: repeated "Green Momentum" buys on a day
+    # that was not actually being controlled by buyers.
+    vwap_slope_up = vwap.diff(5).fillna(0) > 0
+    ema21_slope_up = ema21.diff(5).fillna(0) > 0
+    ema9_slope_up = ema9.diff(3).fillna(0) > 0
+    near_session_high = close >= (rolling_high * 0.996)
+    above_vwap_persist = (close > vwap).rolling(5, min_periods=3).sum() >= 4
+    ema_stack_persist = ((ema5 >= ema9) & (ema9 >= ema21)).rolling(5, min_periods=3).sum() >= 4
+    buyer_close_persist = (close_location > 0.60).rolling(3, min_periods=2).sum() >= 2
+    recent_seller_control = lower_low_sequence.rolling(10, min_periods=1).max().astype(bool)
+    failed_opening_drive = (bar_no < 45) & (close < opening_high) & (rolling_high >= opening_high * 1.001)
+
+    trend_up_day = (
+        (session_move > 0.0075) &
+        above_vwap_persist &
+        ema_stack_persist &
+        vwap_slope_up &
+        ema21_slope_up &
+        ema9_slope_up &
+        near_session_high &
+        buyer_close_persist &
+        (~recent_seller_control) &
+        (~failed_opening_drive)
+    )
+    chop_day = (session_move.abs() < 0.005) & (distance_vwap.abs() < 0.0035)
+
+    # Capitulation is not an entry. It only says: maybe wait for reversal confirmation.
+    large_down_bar = (body_pct < -0.004) | (ret1 < -0.004)
+    capitulation = ((low <= rolling_low.shift(1).fillna(low)) & (vol_impulse | large_down_bar)).rolling(8, min_periods=1).max().astype(bool)
+
+    # Red-day long only requires all three: panic happened, structure reclaimed, and seller pressure slowed.
+    red_reversal_confirmed = (
+        (session_move < -0.012) &
+        capitulation &
+        (bounce_from_low > 0.0065) &
+        (higher_low | break_structure_up) &
+        (close > ema9) &
+        (mom3 > 0.0012) &
+        (close_location > 0.60) &
+        (~waterfall) &
+        (~distribution)
+    )
+
+    # Very strong reclaim pulse: allowed even before VWAP, but only if price breaks structure.
+    red_reclaim_pulse = (
+        red_reversal_confirmed &
+        ((reclaim_fast | break_structure_up) | (close > ema21)) &
+        (vol_ratio > 0.75)
+    )
+
+    # Green-day continuation. This is now a BUYER-CONTROL setup only.
+    # No more buying every early pop. It needs a real trend-up auction, persistent VWAP hold,
+    # slope confirmation, and no recent seller-control sequence.
+    pullback_hold = (
+        trend_up_day &
+        (low <= ema9 * 1.002) &
+        (close > ema9) &
+        (close_location > 0.62) &
+        (mom3 > 0.0005) &
+        buyer_close_persist
+    )
+    opening_breakout_quality = (
+        trend_up_day &
+        above_opening_high &
+        (close.shift(1) > opening_high.shift(1).fillna(opening_high)) &
+        (close > vwap) &
+        (vol_ratio > 1.05) &
+        (close_location > 0.65) &
+        (mom3 > 0.0015)
+    )
+    # Extra institutional green gate: a real green-day momentum long must be a controlled auction,
+    # not just a small morning pop. This is intentionally strict to stop the 3-stop-loss
+    # machine-gun behavior the user saw on AAPL/CMG-style tests.
+    price_path = close.diff().abs().rolling(20, min_periods=8).sum().replace(0, np.nan)
+    trend_efficiency_20 = ((close - close.shift(20)).abs() / price_path).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    positive_auction_20 = (close > close.shift(20)) & (trend_efficiency_20 > 0.32)
+    new_20bar_high_area = close >= high.rolling(20, min_periods=8).max() * 0.998
+    vwap_slope_strong = vwap.diff(10).fillna(0) > 0
+    ema21_slope_strong = ema21.diff(10).fillna(0) > 0
+    above_vwap_8of10 = (close > vwap).rolling(10, min_periods=6).sum() >= 8
+    ema_stack_8of10 = ((ema5 >= ema9) & (ema9 >= ema21)).rolling(10, min_periods=6).sum() >= 8
+    no_recent_close_below_ema21 = (close < ema21).rolling(10, min_periods=3).sum() == 0
+    no_recent_stop_pattern = ((close_location < 0.45) | (ret1 < -0.0025)).rolling(8, min_periods=2).sum() <= 1
+    institutional_green_gate = (
+        (session_move > 0.012) &
+        above_vwap_8of10 &
+        ema_stack_8of10 &
+        positive_auction_20 &
+        new_20bar_high_area &
+        vwap_slope_strong &
+        ema21_slope_strong &
+        no_recent_close_below_ema21 &
+        no_recent_stop_pattern &
+        (vol_ratio > 0.85)
+    )
+
+    # Green Momentum must be a TRUE controlled up-auction.
+    # It is blocked if the stock is below VWAP/EMA21, making lower lows/highs,
+    # or the session is not firmly green. This prevents repeated "Green Momentum"
+    # buys on a red/drifting-down session.
+    green_momentum = (
+        institutional_green_gate &
+        trend_up_day &
+        (session_move > 0.012) &
+        (close > vwap) &
+        (close > ema21) &
+        (ema5 >= ema9) & (ema9 >= ema21) &
+        (close > close.shift(5)) &
+        ((pullback_hold) | (opening_breakout_quality) | ((mom3 > 0.0020) & break_structure_up & near_session_high)) &
+        (distance_vwap < 0.012) &
+        (close_location > 0.68) &
+        (~recent_seller_control) &
+        (~lower_high_sequence) &
+        (~lower_low_sequence) &
+        (~failed_opening_drive)
+    )
+
+    # VWAP reclaim needs a hold/confirmation, not just touching VWAP.
+    vwap_reclaim_quality = (
+        reclaim_vwap &
+        hold_vwap &
+        (close > ema9) &
+        (ema9 >= ema21) &
+        (mom3 > 0.0012) &
+        (close_location > 0.65) &
+        (vol_ratio > 0.95) &
+        (~waterfall) &
+        (~distribution) &
+        (~lower_high_sequence)
+    )
+
+    setup_raw = (green_momentum | red_reclaim_pulse | vwap_reclaim_quality | opening_breakout_quality).fillna(False)
+
+    # Overextension and adverse-selection avoids.
+    too_extended_up = (distance_vwap > 0.020) | (distance_ema21 > 0.018)
+    low_quality_volume = vol_ratio < 0.55
+    bad_close = close_location < 0.50
+    # False-green protection: blocks longs when the stock had a pop but buyers are not in control.
+    false_green_pop = (
+        (setup_raw | above_opening_high) &
+        (session_move < 0.0075) &
+        ((~above_vwap_persist) | (~ema_stack_persist) | (~vwap_slope_up) | recent_seller_control | failed_opening_drive)
+    )
+    first_minutes_filter = bar_no < max(10, min(20, int(n * 0.06)))
+    weak_red_bounce = (session_move < -0.010) & (close < ema9) & (~break_structure_up)
+    no_long_below_auction = trend_down_day & (close < opening_mid) & (~red_reversal_confirmed)
+    require_real_reclaim_on_red = (session_move < -0.012) & (~red_reversal_confirmed)
+
+    avoid = (
+        too_extended_up |
+        low_quality_volume |
+        bad_close |
+        first_minutes_filter |
+        weak_red_bounce |
+        no_long_below_auction |
+        require_real_reclaim_on_red |
+        false_green_pop |
+        waterfall |
+        distribution
+    ).fillna(False)
+
+    if require_vwap:
+        avoid = avoid | (close < vwap)
+
+    # Score: quality of auction, not quantity of triggers.
+    momentum_score = pd.Series(0.0, index=idx)
+    momentum_score += np.where(close > vwap, 18, 0)
+    momentum_score += np.where(ema5 >= ema9, 10, 0)
+    momentum_score += np.where(ema9 >= ema21, 12, 0)
+    momentum_score += np.where(above_opening_high, 10, 0)
+    momentum_score += np.where(break_structure_up, 16, 0)
+    momentum_score += np.where(mom3 > 0.0015, 12, 0)
+    momentum_score += np.where(vol_ratio > 1.0, 10, 0)
+    momentum_score += np.where(close_location > 0.62, 12, 0)
+
+    reversal_score = pd.Series(0.0, index=idx)
+    reversal_score += np.where(session_move < -0.012, 8, 0)
+    reversal_score += np.where(capitulation, 16, 0)
+    reversal_score += np.where(bounce_from_low > 0.0065, 16, 0)
+    reversal_score += np.where(higher_low, 14, 0)
+    reversal_score += np.where(break_structure_up, 18, 0)
+    reversal_score += np.where(close > ema9, 10, 0)
+    reversal_score += np.where(mom3 > 0.0012, 10, 0)
+    reversal_score += np.where(close_location > 0.60, 8, 0)
+
+    alpha_score = pd.concat([momentum_score, reversal_score], axis=1).max(axis=1).clip(0, 100)
+    risk_penalty = pd.Series(0.0, index=idx)
+    risk_penalty += np.where(waterfall, 35, 0)
+    risk_penalty += np.where(distribution, 30, 0)
+    risk_penalty += np.where(too_extended_up, 20, 0)
+    risk_penalty += np.where(low_quality_volume, 14, 0)
+    risk_penalty += np.where(bad_close, 14, 0)
+    risk_penalty += np.where(weak_red_bounce, 24, 0)
+    risk_penalty += np.where(no_long_below_auction, 28, 0)
+    risk_penalty += np.where(false_green_pop, 34, 0)
+    risk_penalty += np.where(recent_seller_control, 18, 0)
+    trade_quality_score = (alpha_score - risk_penalty).clip(0, 100)
+
+    sens = str(sensitivity).lower()
+    if sens == 'aggressive':
+        min_score = 74
+    elif sens == 'strict':
+        min_score = 88
+    else:
+        min_score = 82
+
+    raw_long = setup_raw & (~avoid) & (trade_quality_score >= min_score)
+
+    # Structural risk gate: do not enter if the nearest logical swing stop is too far.
+    swing_stop = recent_low_8 * 0.999
+    structural_risk = ((close / swing_stop) - 1.0).replace([np.inf, -np.inf], np.nan).fillna(9.0)
+    raw_long = raw_long & (structural_risk <= 0.0065)
+
+    # Final debounce: this is an allocator, not a scalper clicking every bounce.
+    long_entry_base = raw_long & ~raw_long.shift(1).fillna(False)
+    last_signal_i = -999
+    cleaned = []
+    for i, val in enumerate(long_entry_base.fillna(False).values):
+        if val and (i - last_signal_i) >= 35:
+            cleaned.append(True)
+            last_signal_i = i
+        else:
+            cleaned.append(False)
+    long_entry_auction = pd.Series(cleaned, index=idx)
+    short_entry = pd.Series(False, index=idx)
+
+    # Optional VWAP Z-score + Kalman mean-reversion playbook supplied by user.
+    # Long-only: buy extreme flushes, exit on snapback back inside the band.
+    kalman_buy = pd.Series(False, index=idx)
+    kalman_snapback_exit = pd.Series(False, index=idx)
+    kalman_price = pd.Series(np.nan, index=idx)
+    kalman_residual = pd.Series(np.nan, index=idx)
+    vwap_z_score = pd.Series(np.nan, index=idx)
+    if bool(use_kalman_vwap):
+        try:
+            kv = _calculate_intraday_vwap_zscore_kalman(d, window=int(z_window))
+            vwap_z_score = pd.Series(kv['VWAP_Z_SCORE'], index=idx).astype(float)
+            kalman_price = pd.Series(kv['Kalman Price'], index=idx).astype(float)
+            kalman_residual = pd.Series(kv['Kalman Residual'], index=idx).astype(float)
+
+            raw_kalman_buy = (vwap_z_score < float(z_entry)) & (kalman_residual < 0)
+            # Make it safer than a blind falling-knife buy: require either capitulation, a strong close,
+            # or an early bounce from the session low. Still no shorts.
+            kalman_quality_gate = (capitulation | (close_location > 0.52) | (bounce_from_low > 0.0025)) & (~waterfall.shift(1).fillna(False))
+            raw_kalman_buy = raw_kalman_buy & kalman_quality_gate
+
+            cleaned_k = []
+            last_k = -999
+            for j, val in enumerate(raw_kalman_buy.fillna(False).values):
+                if val and (j - last_k) >= 20:
+                    cleaned_k.append(True)
+                    last_k = j
+                else:
+                    cleaned_k.append(False)
+            kalman_buy = pd.Series(cleaned_k, index=idx)
+            kalman_snapback_exit = (vwap_z_score >= float(z_exit))
+        except Exception:
+            kalman_buy = pd.Series(False, index=idx)
+            kalman_snapback_exit = pd.Series(False, index=idx)
+
+    long_entry = (long_entry_auction | kalman_buy).astype(bool)
+
+    day_type = pd.Series('No Edge / Wait', index=idx, dtype='object')
+    day_type.loc[chop_day] = 'Chop / Wait'
+    day_type.loc[trend_up_day] = 'Trend Up Auction'
+    day_type.loc[trend_down_day] = 'Trend Down Auction — Longs Disabled'
+    day_type.loc[red_reversal_confirmed] = 'Confirmed Red-Day Reversal'
+    day_type.loc[opening_breakout_quality] = 'Opening Drive Up'
+
+    setup_name = pd.Series('None', index=idx, dtype='object')
+    setup_name.loc[green_momentum] = 'Trend-Up Continuation Long'
+    setup_name.loc[vwap_reclaim_quality] = 'VWAP Reclaim Hold Long'
+    setup_name.loc[opening_breakout_quality] = 'Opening Range Breakout Long'
+    setup_name.loc[red_reclaim_pulse] = 'Confirmed Red-Day Reversal Long'
+    setup_name.loc[kalman_buy] = 'VWAP Z-Score + Kalman Flush Long'
+
+    model_decision = pd.Series('WAIT — no proven long edge', index=idx, dtype='object')
+    model_decision.loc[waterfall] = 'NO TRADE — waterfall / lower lows'
+    model_decision.loc[distribution] = 'NO TRADE — distribution below VWAP/EMA'
+    model_decision.loc[weak_red_bounce] = 'NO TRADE — weak bounce, no structure'
+    model_decision.loc[false_green_pop] = 'NO TRADE — false green pop / buyers not in control'
+    model_decision.loc[too_extended_up] = 'NO TRADE — chase/overextended'
+    model_decision.loc[raw_long] = 'QUALIFIED SETUP — waiting debounce/execution'
+    model_decision.loc[kalman_buy] = 'ENTER LONG — VWAP/Kalman flush snapback setup'
+    model_decision.loc[long_entry_auction] = 'ENTER LONG — auction confirmed'
+
+    features = pd.DataFrame({
+        'Close': close,
+        'VWAP': vwap,
+        'EMA5': ema5,
+        'EMA9': ema9,
+        'EMA21': ema21,
+        'EMA50': ema50,
+        'Kalman Price': kalman_price,
+        'Kalman Residual': kalman_residual,
+        'VWAP Z-Score': vwap_z_score,
+        'Day Type': day_type,
+        'Setup Name': setup_name,
+        'Model Decision': model_decision,
+        'Session Move %': session_move * 100,
+        'Bounce From Low %': bounce_from_low * 100,
+        'Distance VWAP %': distance_vwap * 100,
+        'Mom3 %': mom3 * 100,
+        'Mom6 %': mom6 * 100,
+        'Vol Ratio': vol_ratio,
+        'Close Location': close_location,
+        'Higher Low': higher_low.astype(int),
+        'Break Structure Up': break_structure_up.astype(int),
+        'Capitulation Seen': capitulation.astype(int),
+        'Waterfall': waterfall.astype(int),
+        'Distribution': distribution.astype(int),
+        'False Green Pop': false_green_pop.astype(int),
+        'Above VWAP Persist': above_vwap_persist.astype(int),
+        'EMA Stack Persist': ema_stack_persist.astype(int),
+        'VWAP Slope Up': vwap_slope_up.astype(int),
+        'Recent Seller Control': recent_seller_control.astype(int),
+        'Institutional Green Gate': institutional_green_gate.astype(int),
+        'Trend Efficiency 20': trend_efficiency_20.round(3),
+        'Above VWAP 8/10': above_vwap_8of10.astype(int),
+        'EMA Stack 8/10': ema_stack_8of10.astype(int),
+        'No Recent Stop Pattern': no_recent_stop_pattern.astype(int),
+        'Momentum Score': momentum_score.round(1),
+        'Reversal Score': reversal_score.round(1),
+        'Risk Penalty': risk_penalty.round(1),
+        'Structural Risk %': (structural_risk * 100).round(3),
+        'Trade Quality Score': trade_quality_score.round(1),
+        'Min Score Used': min_score,
+        'Trend Continuation': green_momentum.astype(int),
+        'Confirmed Red Reversal': red_reclaim_pulse.astype(int),
+        'VWAP Reclaim Quality': vwap_reclaim_quality.astype(int),
+        'Opening Breakout': opening_breakout_quality.astype(int),
+        'Kalman Flush Buy': kalman_buy.astype(int),
+        'Kalman Snapback Exit': kalman_snapback_exit.astype(int),
+        'Avoid Filter': avoid.astype(int),
+        'Long Entry': long_entry.astype(int),
+        'Short Entry': short_entry.astype(int),
+        'True Green Session': ((session_move > 0.012) & (close > vwap) & (close > ema21)).astype(int),
+        'Lower High Sequence': lower_high_sequence.astype(int),
+        'Lower Low Sequence': lower_low_sequence.astype(int),
+        'Final Entry': long_entry.astype(int),
+    }, index=idx)
+    return long_entry.astype(bool), short_entry.astype(bool), features
+
+def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_exit_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
+                          min_hold_bars=3, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
+                          let_winners_run=True, allow_shorts=False, cooldown_after_loss=12, max_consecutive_losses=2,
+                          quality_score=None, reentry_quality_boost=8.0, session_profit_target_pct=0.05,
+                          auction_ok=None, drift_risk=None):
+    """Risk-first single-position intraday engine. Long-only by default.
+
+    Capital protection upgrades:
+    - no short selling unless explicitly allowed by caller
+    - cooldown after a losing trade
+    - disables engine after max consecutive losses
+    - disables engine at max session loss
+    """
+    close = d['Close'].astype(float)
+    high = d['High'].astype(float) if 'High' in d.columns else close
+    low = d['Low'].astype(float) if 'Low' in d.columns else close
+    if short_entry_signal is None:
+        short_entry_signal = pd.Series(False, index=close.index)
+    short_entry_signal = pd.Series(short_entry_signal, index=close.index).fillna(False).astype(bool)
+    long_entry_signal = pd.Series(long_entry_signal, index=close.index).fillna(False).astype(bool)
+    if quality_score is None:
+        quality_score = pd.Series(100.0, index=close.index)
+    else:
+        quality_score = pd.Series(quality_score, index=close.index).reindex(close.index).ffill().fillna(0.0).astype(float)
+    if auction_ok is None:
+        auction_ok = pd.Series(True, index=close.index)
+    else:
+        auction_ok = pd.Series(auction_ok, index=close.index).reindex(close.index).ffill().fillna(False).astype(bool)
+    if drift_risk is None:
+        drift_risk = pd.Series(False, index=close.index)
+    else:
+        drift_risk = pd.Series(drift_risk, index=close.index).reindex(close.index).ffill().fillna(False).astype(bool)
+    if long_exit_signal is None:
+        long_exit_signal = pd.Series(False, index=close.index)
+    long_exit_signal = pd.Series(long_exit_signal, index=close.index).fillna(False).astype(bool)
+
+    initial = 10000.0
+    equity = initial
+    in_pos = False
+    side = None
+    entry_price = 0.0
+    entry_time = None
+    entry_equity = initial
+    best_price = 0.0
+    bars_held = 0
+    trades_today = 0
+    disabled = False
+    disabled_reason = ''
+    cooldown_bars = 0
+    consecutive_losses = 0
+    trades = []
+    eq_vals = []
+
+    def open_return(px):
+        if not in_pos or entry_price <= 0:
+            return 0.0
+        return (px / entry_price - 1.0) if side == 'Long' else (entry_price / px - 1.0)
+
+    for i, ts in enumerate(close.index):
+        px = float(close.iloc[i])
+        hi = float(high.iloc[i])
+        lo = float(low.iloc[i])
+
+        if cooldown_bars > 0:
+            cooldown_bars -= 1
+
+        if in_pos:
+            bars_held += 1
+            exit_reason = None
+            exit_price = px
+
+            if side == 'Long':
+                best_price = max(best_price, hi, px)
+                if bars_held >= int(min_hold_bars):
+                    if lo <= entry_price * (1 - stop_pct):
+                        exit_price = entry_price * (1 - stop_pct)
+                        exit_reason = 'Long stop hit'
+                    elif bool(long_exit_signal.iloc[i]):
+                        exit_price = px
+                        exit_reason = 'VWAP/Kalman snapback exit'
+                    elif let_winners_run and best_price >= entry_price * (1 + target_pct):
+                        trail_stop_price = best_price * (1 - trail_pct)
+                        if lo <= trail_stop_price:
+                            exit_price = max(trail_stop_price, entry_price * (1 + target_pct * 0.35))
+                            exit_reason = 'Long runner trailing exit'
+                    elif (not let_winners_run) and hi >= entry_price * (1 + target_pct):
+                        exit_price = entry_price * (1 + target_pct)
+                        exit_reason = 'Long target hit'
+                    elif bars_held >= int(max_hold_bars):
+                        exit_price = px
+                        exit_reason = 'Long max hold exit'
+            else:
+                best_price = min(best_price, lo, px)
+                if bars_held >= int(min_hold_bars):
+                    if hi >= entry_price * (1 + stop_pct):
+                        exit_price = entry_price * (1 + stop_pct)
+                        exit_reason = 'Short stop hit'
+                    elif let_winners_run and best_price <= entry_price * (1 - target_pct):
+                        trail_stop_price = best_price * (1 + trail_pct)
+                        if hi >= trail_stop_price:
+                            exit_price = min(trail_stop_price, entry_price * (1 - target_pct * 0.35))
+                            exit_reason = 'Short runner trailing exit'
+                    elif (not let_winners_run) and lo <= entry_price * (1 - target_pct):
+                        exit_price = entry_price * (1 - target_pct)
+                        exit_reason = 'Short target hit'
+                    elif bars_held >= int(max_hold_bars):
+                        exit_price = px
+                        exit_reason = 'Short max hold exit'
+
+            if exit_reason:
+                trade_ret = (exit_price / entry_price - 1.0) if side == 'Long' else (entry_price / exit_price - 1.0)
+                equity = entry_equity * (1 + trade_ret)
+                trades.append({
+                    'Side': side,
+                    'Entry Date': entry_time,
+                    'Exit Date': ts,
+                    'Buy Price' if side == 'Long' else 'Short Price': round(entry_price, 4),
+                    'Sell Price' if side == 'Long' else 'Cover Price': round(exit_price, 4),
+                    'PnL (%)': round(trade_ret * 100, 3),
+                    'Cumulative Return (%)': round((equity / initial - 1) * 100, 3),
+                    'Bars Held': int(bars_held),
+                    'Status': 'Closed',
+                    'Reason': exit_reason,
+                })
+                if trade_ret < 0:
+                    consecutive_losses += 1
+                    cooldown_bars = int(cooldown_after_loss)
+
+                    # Adaptive reset: one loss does not kill the whole day.
+                    # But the next entry must pass a higher quality score gate.
+                    if consecutive_losses >= int(max_consecutive_losses):
+                        disabled = True
+                        disabled_reason = f'Adaptive stop: {consecutive_losses} consecutive losses hit'
+                else:
+                    consecutive_losses = 0
+                    cooldown_bars = 2
+                    if int(max_trades) <= 1:
+                        disabled = True
+                        disabled_reason = 'One completed trade limit reached'
+                in_pos = False
+                side = None
+                entry_price = 0.0
+                entry_time = None
+                bars_held = 0
+                best_price = 0.0
+                if consecutive_losses >= int(max_consecutive_losses):
+                    disabled = True
+                    disabled_reason = f'Max consecutive losses hit ({consecutive_losses})'
+                if (equity / initial - 1.0) <= -float(max_day_loss):
+                    disabled = True
+                    disabled_reason = f'Max session loss guard hit ({max_day_loss*100:.2f}%)'
+                if (equity / initial - 1.0) >= float(session_profit_target_pct):
+                    disabled = True
+                    disabled_reason = f'Session profit target reached ({session_profit_target_pct*100:.2f}%)'
+
+        if (not in_pos) and (not disabled) and cooldown_bars == 0 and trades_today < int(max_trades):
+            q_now = float(quality_score.iloc[i]) if i < len(quality_score) else 0.0
+            auction_now = bool(auction_ok.iloc[i]) if i < len(auction_ok) else False
+            drift_now = bool(drift_risk.iloc[i]) if i < len(drift_risk) else True
+
+            # After a loss, do not buy the next random bounce.
+            # Re-entry must be a clean auction again and not a lower-high/lower-low drift.
+            min_q_after_loss = 88.0 + float(reentry_quality_boost) if consecutive_losses > 0 else 0.0
+            quality_reentry_ok = (consecutive_losses == 0) or (q_now >= min_q_after_loss)
+            auction_reentry_ok = auction_now and (not drift_now)
+
+            go_long = bool(long_entry_signal.iloc[i]) and bool(quality_reentry_ok) and bool(auction_reentry_ok)
+            go_short = bool(short_entry_signal.iloc[i]) and bool(allow_shorts)
+            if go_long or go_short:
+                in_pos = True
+                side = 'Short' if go_short and not go_long else 'Long'
+                entry_price = px
+                entry_time = ts
+                entry_equity = equity
+                best_price = px
+                bars_held = 0
+                trades_today += 1
+
+        mark_equity = entry_equity * (1 + open_return(px)) if in_pos and entry_price > 0 else equity
+        eq_vals.append(mark_equity)
+
+    if in_pos and entry_price > 0:
+        px = float(close.iloc[-1])
+        mark_equity = entry_equity * (1 + open_return(px))
+        trade_ret = open_return(px)
+        trades.append({
+            'Side': side,
+            'Entry Date': entry_time,
+            'Exit Date': 'Open',
+            'Buy Price' if side == 'Long' else 'Short Price': round(entry_price, 4),
+            'Sell Price' if side == 'Long' else 'Cover Price': round(px, 4),
+            'PnL (%)': round(trade_ret * 100, 3),
+            'Cumulative Return (%)': round((mark_equity / initial - 1) * 100, 3),
+            'Bars Held': int(bars_held),
+            'Status': 'Open',
+            'Reason': 'Open runner mark-to-market'
+        })
+        if eq_vals:
+            eq_vals[-1] = mark_equity
+
+    eq = pd.Series(eq_vals, index=close.index, dtype=float) if len(eq_vals) else pd.Series(dtype=float)
+    trades_df = pd.DataFrame(trades)
+    bh = ((float(close.iloc[-1]) / float(close.iloc[0])) - 1.0) * 100 if len(close) >= 2 and close.iloc[0] > 0 else np.nan
+    strat = ((float(eq.iloc[-1]) / initial) - 1.0) * 100 if not eq.empty else np.nan
+    dd = ((eq / eq.cummax()) - 1.0).min() * 100 if not eq.empty else np.nan
+    longs = int((trades_df['Side'] == 'Long').sum()) if 'Side' in trades_df.columns else 0
+    shorts = int((trades_df['Side'] == 'Short').sum()) if 'Side' in trades_df.columns else 0
+    return trades_df, eq, {
+        'Strategy Return %': strat,
+        'Buy & Hold Return %': bh,
+        'Max Drawdown %': dd,
+        'Trades': len(trades_df),
+        'Long Trades': longs,
+        'Short Trades': shorts,
+        'Daily Guard Hit': disabled,
+        'Disabled Reason': disabled_reason,
+        'Consecutive Losses': consecutive_losses,
+        'Adaptive Edge Mode': 'ON'
+    }
+
+
+# ==========================================
+# TAB 17: CVD & VOLUME DELTA
 # ==========================================
 with tab17:
     st.header('📊 CVD & Volume Delta')
     _load_cvd_tab = st.checkbox('Load CVD module', value=False, key='lazy_load_cvd_tab_v3')
     if not _load_cvd_tab:
         st.info('CVD is ready, but not loaded yet. Click the checkbox above to run this tab so the full app stays fast.')
+    elif df_main is None or df_main.empty:
+        st.warning('Please load a ticker first.')
     else:
-        st.write("### 📊 Institutional Cumulative Volume Delta (CVD)")
-        st.markdown("""
-        **CVD** measures the net buying vs selling pressure over time by classifying each bar's volume
-        as buy-initiated or sell-initiated. Rising CVD + Rising Price = Confirmed Uptrend.
-        Divergence between CVD and Price = Institutional Warning Signal.
-        """)
+        try:
+            d_base = df_main.copy()
 
-        if df_main is None:
-            st.warning("Please load a ticker to view CVD analysis.")
-        else:
-            # ── Configuration ──────────────────────────────────────────────────
-            cvd_col1, cvd_col2, cvd_col3 = st.columns(3)
-            with cvd_col1:
-                cvd_method = st.selectbox("Volume Classification Method", [
-                    "Aggressive (Close vs Open)",
-                    "Tick Rule (Close vs Prior Close)",
-                    "High-Low Weighted",
-                    "True Strength (OHLCV)"
-                ], help="How each bar's volume is split into buy vs sell pressure.")
-            with cvd_col2:
-                cvd_smooth = st.slider("CVD Smoothing (EMA span)", 1, 20, 3,
-                                       help="1 = raw CVD, higher = smoother signal")
-            with cvd_col3:
-                cvd_lookback = st.slider("Divergence Lookback (bars)", 5, 60, 20)
+            cvd_src = st.selectbox(
+                "CVD data source",
+                ["Current chart data", "Recent 5m intraday precise"],
+                index=0,
+                key="cvd_exact_source_selector",
+                help="Current chart data matches the visible chart. Recent 5m intraday precise gives real 5-minute times when Yahoo has intraday data."
+            )
 
-            df_cvd = df_main.copy()
+            def _normalize_yf_ohlcv(raw):
+                out = raw.copy()
+                if isinstance(out.columns, pd.MultiIndex):
+                    out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
+                rename = {}
+                for c in out.columns:
+                    lc = str(c).lower()
+                    if lc == 'open': rename[c] = 'Open'
+                    elif lc == 'high': rename[c] = 'High'
+                    elif lc == 'low': rename[c] = 'Low'
+                    elif lc == 'close': rename[c] = 'Close'
+                    elif lc == 'adj close': rename[c] = 'Adj Close'
+                    elif lc == 'volume': rename[c] = 'Volume'
+                return out.rename(columns=rename)
 
-            # ── Volume Delta Calculation ────────────────────────────────────────
-            try:
-                hi = df_cvd['High']
-                lo = df_cvd['Low']
-                op = df_cvd['Open']
-                cl = df_cvd['Close']
-                vol = df_cvd['Volume'] if 'Volume' in df_cvd.columns else pd.Series(
-                    np.ones(len(df_cvd)), index=df_cvd.index)
-
-                if cvd_method == "Aggressive (Close vs Open)":
-                    # Positive delta when close > open (buyers won the bar)
-                    direction = np.sign(cl - op)
-                    delta = vol * direction
-
-                elif cvd_method == "Tick Rule (Close vs Prior Close)":
-                    direction = np.sign(cl - cl.shift(1)).fillna(0)
-                    delta = vol * direction
-
-                elif cvd_method == "High-Low Weighted":
-                    # Fraction of vol attributed to buys based on where close lands in H-L range
-                    hl_range = (hi - lo).replace(0, np.nan)
-                    buy_frac = ((cl - lo) / hl_range).fillna(0.5)
-                    sell_frac = 1 - buy_frac
-                    delta = vol * (buy_frac - sell_frac)
-
-                else:  # True Strength (OHLCV)
-                    # Kauffman-style: weights upper wick as selling, lower wick as buying
-                    hl_range = (hi - lo).replace(0, np.nan)
-                    upper_wick = hi - np.maximum(op, cl)
-                    lower_wick = np.minimum(op, cl) - lo
-                    body = np.abs(cl - op)
-                    buy_pressure = lower_wick + 0.5 * body * (cl > op).astype(float)
-                    sell_pressure = upper_wick + 0.5 * body * (cl <= op).astype(float)
-                    delta = vol * (buy_pressure - sell_pressure) / hl_range.fillna(1)
-
-                delta = delta.fillna(0)
-                cvd = delta.cumsum()
-
-                # Optional smoothing
-                if cvd_smooth > 1:
-                    cvd_plot = cvd.ewm(span=cvd_smooth, adjust=False).mean()
-                else:
-                    cvd_plot = cvd
-
-                # ── Divergence Detection ────────────────────────────────────────
-                price_change = cl - cl.shift(cvd_lookback)
-                cvd_change   = cvd - cvd.shift(cvd_lookback)
-
-                bull_div = (price_change < 0) & (cvd_change > 0)   # Price down, CVD up  → hidden bull
-                bear_div = (price_change > 0) & (cvd_change < 0)   # Price up, CVD down  → hidden bear
-
-                # ── Rolling Delta Bars (daily net flow) ─────────────────────────
-                rolling_delta = delta.rolling(window=5).sum()
-
-                # ── Metrics ────────────────────────────────────────────────────
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Cumulative Delta (Total)", f"{cvd.iloc[-1]:+,.0f}")
-                m2.metric("Last Bar Delta", f"{delta.iloc[-1]:+,.0f}")
-                m3.metric("5-Bar Rolling Delta", f"{rolling_delta.iloc[-1]:+,.0f}")
-                latest_pressure = "BUYING" if delta.iloc[-1] > 0 else "SELLING"
-                m4.metric("Latest Pressure", latest_pressure,
-                          delta="Bullish" if latest_pressure == "BUYING" else "Bearish",
-                          delta_color="normal" if latest_pressure == "BUYING" else "inverse")
-
-                if bear_div.iloc[-1]:
-                    st.error("🚨 **BEARISH DIVERGENCE**: Price rising but CVD declining — institutional distribution detected.")
-                elif bull_div.iloc[-1]:
-                    st.success("✅ **BULLISH DIVERGENCE**: Price falling but CVD rising — institutional accumulation detected.")
-                else:
-                    st.info("📊 No significant CVD divergence at current bar.")
-
-                # ── Main Chart ─────────────────────────────────────────────────
-                fig_cvd = make_subplots(
-                    rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                    row_heights=[0.35, 0.25, 0.25, 0.15],
-                    subplot_titles=(
-                        f"{TICKER} Price",
-                        "Cumulative Volume Delta (CVD)",
-                        "Bar-by-Bar Volume Delta",
-                        "5-Bar Rolling Net Flow"
+            d = d_base.copy()
+            if cvd_src == "Recent 5m intraday precise":
+                try:
+                    intraday = yf.download(
+                        TICKER,
+                        period="60d",
+                        interval="5m",
+                        auto_adjust=True,
+                        progress=False,
+                        prepost=False,
+                        threads=False
                     )
+                    intraday = _normalize_yf_ohlcv(intraday)
+                    if intraday is not None and not intraday.empty and {'Close', 'Volume'}.issubset(set(intraday.columns)):
+                        d = intraday.dropna(subset=['Close']).copy()
+                    else:
+                        st.warning("5m intraday data was not returned, so CVD is using current chart data.")
+                except Exception as intraday_err:
+                    st.warning(f"5m intraday fetch failed, so CVD is using current chart data: {intraday_err}")
+
+            cl = d['Close'].astype(float)
+            high = d['High'].astype(float) if 'High' in d.columns else cl
+            vol = d['Volume'] if 'Volume' in d.columns else pd.Series(np.ones(len(d)), index=d.index)
+            vol = vol.fillna(0).astype(float)
+
+            # EXACT graph data from the reference CVD tab:
+            # delta = volume * sign(close change), CVD = cumulative delta, one CVD EMA.
+            delta = vol * np.sign(cl.diff().fillna(0))
+            cvd = delta.cumsum()
+            cvd_ema = cvd.ewm(span=8, adjust=False).mean()
+
+            st.caption("Graph stays simple: Price on top, CVD + one CVD EMA below. Choose exact graph cross or balanced regime mode.")
+
+            mode_col1, mode_col2, mode_col3 = st.columns(3)
+            with mode_col1:
+                cvd_trade_mode = st.radio(
+                    "CVD trade mode",
+                    ["Balanced regime", "Exact graph cross"],
+                    index=0,
+                    horizontal=True,
+                    key="cvd_trade_mode_balanced_or_exact",
+                    help="Exact cross is accurate but whipsaws. Balanced regime waits for CVD to actually control the auction, but still exits on the visible CVD/EMA cross down."
+                )
+            with mode_col2:
+                confirm_bars = st.slider(
+                    "Balanced confirm bars",
+                    2, 12, 5,
+                    key="cvd_balanced_confirm_bars",
+                    help="Used only in Balanced regime. Higher means fewer trades."
+                )
+            with mode_col3:
+                use_price_filter = st.checkbox(
+                    "Use price trend filter",
+                    value=True,
+                    key="cvd_balanced_price_filter",
+                    help="Used only in Balanced regime. Blocks CVD buys when price structure is weak."
                 )
 
-                # Row 1 – Price (candlestick if possible, else line)
-                if all(c in df_cvd.columns for c in ['Open', 'High', 'Low', 'Close']):
-                    fig_cvd.add_trace(go.Candlestick(
-                        x=df_cvd.index, open=df_cvd['Open'], high=df_cvd['High'],
-                        low=df_cvd['Low'], close=df_cvd['Close'],
-                        name="Price", increasing_line_color='#26a69a',
-                        decreasing_line_color='#ef5350', showlegend=False
-                    ), row=1, col=1)
-                else:
-                    fig_cvd.add_trace(go.Scatter(
-                        x=df_cvd.index, y=cl, mode='lines',
-                        line=dict(color='gray', width=1.5), name="Price"
-                    ), row=1, col=1)
+            exact_cross_up = (cvd > cvd_ema) & (cvd.shift(1) <= cvd_ema.shift(1))
+            exact_cross_down = (cvd < cvd_ema) & (cvd.shift(1) >= cvd_ema.shift(1))
 
-                # Mark divergences on price chart
-                bull_dates = df_cvd.index[bull_div]
-                bear_dates = df_cvd.index[bear_div]
-                if len(bull_dates) > 0:
-                    fig_cvd.add_trace(go.Scatter(
-                        x=bull_dates, y=cl[bull_div], mode='markers',
-                        marker=dict(symbol='triangle-up', color='lime', size=10),
-                        name="Bull Divergence"
-                    ), row=1, col=1)
-                if len(bear_dates) > 0:
-                    fig_cvd.add_trace(go.Scatter(
-                        x=bear_dates, y=cl[bear_div], mode='markers',
-                        marker=dict(symbol='triangle-down', color='red', size=10),
-                        name="Bear Divergence"
-                    ), row=1, col=1)
-
-                # Row 2 – CVD
-                fig_cvd.add_trace(go.Scatter(
-                    x=df_cvd.index, y=cvd_plot, mode='lines',
-                    line=dict(color='#00f2ff', width=2), name="CVD"
-                ), row=2, col=1)
-                fig_cvd.add_hline(y=0, line_dash="dash", line_color="white",
-                                  opacity=0.3, row=2, col=1)
-                # Shade positive / negative CVD
-                cvd_pos = cvd_plot.copy(); cvd_pos[cvd_pos < 0] = 0
-                cvd_neg = cvd_plot.copy(); cvd_neg[cvd_neg > 0] = 0
-                fig_cvd.add_trace(go.Scatter(
-                    x=df_cvd.index, y=cvd_pos, fill='tozeroy',
-                    mode='lines', line=dict(width=0),
-                    fillcolor='rgba(0,255,100,0.15)', showlegend=False
-                ), row=2, col=1)
-                fig_cvd.add_trace(go.Scatter(
-                    x=df_cvd.index, y=cvd_neg, fill='tozeroy',
-                    mode='lines', line=dict(width=0),
-                    fillcolor='rgba(255,50,50,0.15)', showlegend=False
-                ), row=2, col=1)
-
-                # Row 3 – Bar Delta (colored bars)
-                bar_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in delta]
-                fig_cvd.add_trace(go.Bar(
-                    x=df_cvd.index, y=delta,
-                    marker_color=bar_colors, name="Bar Delta"
-                ), row=3, col=1)
-
-                # Row 4 – Rolling Net Flow
-                roll_colors = ['#00ff88' if v >= 0 else '#ff4444' for v in rolling_delta]
-                fig_cvd.add_trace(go.Bar(
-                    x=df_cvd.index, y=rolling_delta,
-                    marker_color=roll_colors, name="5-Bar Flow"
-                ), row=4, col=1)
-
-                fig_cvd.update_layout(
-                    height=900, hovermode="x unified", template="plotly_dark",
-                    title=f"Institutional CVD Dashboard — {TICKER}",
-                    xaxis_rangeslider_visible=False
-                )
-                st.plotly_chart(fig_cvd, use_container_width=True)
-
-                # ── CVD Trade Log ──────────────────────────────────────────────
-                st.divider()
-                st.write("#### 📝 CVD Trade Signal Log")
-                st.caption("Signals fired when CVD crosses its own rolling mean — institutional-grade entry/exit confirmation.")
-
-                cvd_ma = cvd.rolling(window=cvd_lookback).mean()
-                cvd_cross_up   = (cvd > cvd_ma) & (cvd.shift(1) <= cvd_ma.shift(1))
-                cvd_cross_down = (cvd < cvd_ma) & (cvd.shift(1) >= cvd_ma.shift(1))
-
-                trade_log_rows = []
-                for dt in df_cvd.index[cvd_cross_up]:
-                    trade_log_rows.append({
-                        "Date": dt.date(),
-                        "Signal": "🟢 BUY (CVD Cross Up)",
-                        "Price": round(float(cl.loc[dt]), 2),
-                        "CVD at Signal": round(float(cvd.loc[dt]), 0),
-                        "Bar Delta": round(float(delta.loc[dt]), 0),
-                        "5-Bar Flow": round(float(rolling_delta.loc[dt]), 0),
-                        "Divergence": "Bull Div" if bull_div.loc[dt] else "None"
-                    })
-                for dt in df_cvd.index[cvd_cross_down]:
-                    trade_log_rows.append({
-                        "Date": dt.date(),
-                        "Signal": "🔴 SELL (CVD Cross Down)",
-                        "Price": round(float(cl.loc[dt]), 2),
-                        "CVD at Signal": round(float(cvd.loc[dt]), 0),
-                        "Bar Delta": round(float(delta.loc[dt]), 0),
-                        "5-Bar Flow": round(float(rolling_delta.loc[dt]), 0),
-                        "Divergence": "Bear Div" if bear_div.loc[dt] else "None"
-                    })
-
-                if trade_log_rows:
-                    tlog_df = pd.DataFrame(trade_log_rows).sort_values("Date", ascending=False)
-                    st.dataframe(tlog_df, use_container_width=True)
-
-                    # CVD performance quick-check
-                    buys  = tlog_df[tlog_df['Signal'].str.contains("BUY")]
-                    sells = tlog_df[tlog_df['Signal'].str.contains("SELL")]
-                    st.caption(f"Total CVD Signals: {len(tlog_df)} | Buy Signals: {len(buys)} | Sell Signals: {len(sells)}")
-
-                    # Download
-                    csv_cvd = tlog_df.to_csv(index=False)
-                    st.download_button("📥 Download CVD Signal Log", csv_cvd,
-                                       file_name=f"CVD_SignalLog_{TICKER}.csv", mime="text/csv")
-                else:
-                    st.info("No CVD crossover signals in the selected date range.")
-
-                # ── CVD Adaptive Strategy Backtest ──────────────────────────────
-                st.divider()
-                st.write("#### 🧪 CVD Strategy Backtest")
-                st.caption("Goal: beat buy & hold by using CVD confirmation, price trend, and risk-off exits instead of one weak CVD mean-cross rule.")
-
-                cvd_ma = cvd.rolling(window=cvd_lookback).mean()
-                cvd_fast = cvd.ewm(span=max(3, cvd_lookback // 3), adjust=False).mean()
-                cvd_slow = cvd.ewm(span=max(8, cvd_lookback), adjust=False).mean()
+            if cvd_trade_mode == "Exact graph cross":
+                cvd_buy = exact_cross_up.fillna(False)
+                cvd_sell = exact_cross_down.fillna(False)
+                setup_name = "Exact CVD/EMA Graph Cross"
+                exit_reason_text = "CVD crossed below CVD EMA"
+            else:
+                # Balanced regime:
+                # - Entry waits for CVD to stay above EMA, EMA to slope up, and price to agree.
+                # - Exit still uses exact visible cross below, so the trade log does not ignore
+                #   the red CVD crossing below green CVD EMA.
                 ema20 = cl.ewm(span=20, adjust=False).mean()
                 ema50 = cl.ewm(span=50, adjust=False).mean()
-                ema200 = cl.ewm(span=200, adjust=False).mean()
-                price_mom_5 = cl.pct_change(5)
-                price_mom_20 = cl.pct_change(20)
-                cvd_mom_5 = cvd.diff(5)
-                cvd_mom_20 = cvd.diff(20)
-                flow_z = (rolling_delta - rolling_delta.rolling(50).mean()) / (rolling_delta.rolling(50).std() + 1e-9)
-                cvd_high = cvd.rolling(cvd_lookback).max().shift(1)
-                cvd_low = cvd.rolling(cvd_lookback).min().shift(1)
+                cvd_above = cvd > cvd_ema
+                cvd_confirmed_above = cvd_above.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+                cvd_ema_slope_up = cvd_ema.diff(max(2, confirm_bars // 2)) > 0
+                price_ok = ((cl > ema20) & (ema20 >= ema50)) if use_price_filter else pd.Series(True, index=d.index)
+                raw_buy = cvd_confirmed_above & cvd_ema_slope_up & price_ok
+                cvd_buy = (raw_buy & (~raw_buy.shift(1).fillna(False))).fillna(False)
+                cvd_sell = exact_cross_down.fillna(False)
+                setup_name = "Balanced CVD Regime"
+                exit_reason_text = "Exact CVD/EMA cross down"
 
-                # Uses the exact CVD line shown in chart row 2.
-                # Long when CVD flips above zero / green zone.
-                # Exit immediately when CVD flips below zero / red zone.
-                cvd_zero_cross_up = (cvd_plot > 0) & (cvd_plot.shift(1) <= 0)
-                cvd_zero_cross_down = (cvd_plot < 0) & (cvd_plot.shift(1) >= 0)
+            trades = []
+            in_pos = False
+            entry_dt = None
+            entry_px = None
+            entry_cvd = None
+            entry_ema = None
 
-                cvd_position_basic = make_stateful_position(cvd_cross_up, cvd_cross_down, df_cvd.index)
-                cvd_position_zero_flip = make_stateful_position(
-                    cvd_zero_cross_up,
-                    (cvd_plot < 0) | cvd_zero_cross_down,
-                    df_cvd.index
+            for dt in d.index:
+                if (not in_pos) and bool(cvd_buy.loc[dt]):
+                    in_pos = True
+                    entry_dt = dt
+                    entry_px = float(cl.loc[dt])
+                    entry_cvd = float(cvd.loc[dt])
+                    entry_ema = float(cvd_ema.loc[dt])
+
+                elif in_pos and bool(cvd_sell.loc[dt]):
+                    exit_px = float(cl.loc[dt])
+                    pnl = ((exit_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
+                    trades.append({
+                        'Setup': setup_name,
+                        'Entry Date': entry_dt,
+                        'Exit Date': dt,
+                        'Buy Price': round(entry_px, 4),
+                        'Sell Price': round(exit_px, 4),
+                        'PnL (%)': round(pnl, 3),
+                        'Bars Held': int(d.index.get_loc(dt) - d.index.get_loc(entry_dt)) if entry_dt in d.index else np.nan,
+                        'Entry CVD': round(entry_cvd, 0),
+                        'Entry CVD EMA': round(entry_ema, 0),
+                        'Exit CVD': round(float(cvd.loc[dt]), 0),
+                        'Exit CVD EMA': round(float(cvd_ema.loc[dt]), 0),
+                        'Status': 'Closed',
+                        'Exit Reason': exit_reason_text
+                    })
+                    in_pos = False
+                    entry_dt = None
+                    entry_px = None
+                    entry_cvd = None
+                    entry_ema = None
+
+            if in_pos and entry_dt is not None:
+                last_px = float(cl.iloc[-1])
+                pnl = ((last_px - entry_px) / entry_px * 100.0) if entry_px else 0.0
+                trades.append({
+                    'Setup': setup_name,
+                    'Entry Date': entry_dt,
+                    'Exit Date': 'Open',
+                    'Buy Price': round(entry_px, 4),
+                    'Sell Price': round(last_px, 4),
+                    'PnL (%)': round(pnl, 3),
+                    'Bars Held': int(len(d) - 1 - d.index.get_loc(entry_dt)) if entry_dt in d.index else np.nan,
+                    'Entry CVD': round(entry_cvd, 0),
+                    'Entry CVD EMA': round(entry_ema, 0),
+                    'Exit CVD': round(float(cvd.iloc[-1]), 0),
+                    'Exit CVD EMA': round(float(cvd_ema.iloc[-1]), 0),
+                    'Status': 'Open',
+                    'Exit Reason': 'Open'
+                })
+
+            buy_hold_return = ((float(cl.iloc[-1]) / float(cl.iloc[0])) - 1.0) * 100.0 if len(cl) > 1 and float(cl.iloc[0]) > 0 else np.nan
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric('Last Delta', f"{delta.iloc[-1]:+,.0f}")
+            m2.metric('CVD', f"{cvd.iloc[-1]:+,.0f}")
+            m3.metric('Pressure', 'BUYING' if delta.iloc[-1] > 0 else 'SELLING')
+            m4.metric('Buy & Hold', f"{buy_hold_return:+.2f}%")
+
+            fig = make_subplots(
+                rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                subplot_titles=(f'{TICKER} Price', 'CVD')
+            )
+            fig.add_trace(go.Scatter(x=d.index, y=cl, mode='lines', name='Close', line=dict(width=2)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=d.index, y=cvd, mode='lines', name='CVD', line=dict(width=2)), row=2, col=1)
+            fig.add_trace(go.Scatter(x=d.index, y=cvd_ema, mode='lines', name='CVD EMA', line=dict(width=2)), row=2, col=1)
+
+            trades_df = pd.DataFrame(trades)
+            if not trades_df.empty:
+                entry_idx = pd.to_datetime(trades_df['Entry Date'], errors='coerce').dropna()
+                exit_idx = pd.to_datetime(trades_df.loc[trades_df['Status'].astype(str).str.lower().eq('closed'), 'Exit Date'], errors='coerce').dropna()
+                entry_idx = pd.DatetimeIndex(entry_idx).intersection(d.index)
+                exit_idx = pd.DatetimeIndex(exit_idx).intersection(d.index)
+
+                if len(entry_idx) > 0:
+                    fig.add_trace(go.Scatter(x=entry_idx, y=cl.reindex(entry_idx), mode='markers', name='Buy',
+                                             marker=dict(symbol='triangle-up', size=9, color='lime')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=entry_idx, y=cvd.reindex(entry_idx), mode='markers', name='Buy on CVD',
+                                             marker=dict(symbol='triangle-up', size=8, color='lime')), row=2, col=1)
+                if len(exit_idx) > 0:
+                    fig.add_trace(go.Scatter(x=exit_idx, y=cl.reindex(exit_idx), mode='markers', name='Sell',
+                                             marker=dict(symbol='triangle-down', size=9, color='red')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=exit_idx, y=cvd.reindex(exit_idx), mode='markers', name='Sell on CVD',
+                                             marker=dict(symbol='triangle-down', size=8, color='red')), row=2, col=1)
+
+            fig.update_layout(height=650, template='plotly_dark', hovermode='x unified')
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.write(f'#### 📒 Trade Log — {setup_name}')
+            if trades_df.empty:
+                st.info(f'No {setup_name} trades in the selected range.')
+            else:
+                closed = trades_df[trades_df['Status'].astype(str).str.lower().eq('closed')].copy()
+                c1, c2, c3 = st.columns(3)
+                c1.metric('Closed trades', int(len(closed)))
+                c2.metric('Win rate', f"{((closed['PnL (%)'] > 0).mean() * 100.0) if len(closed) else 0.0:.1f}%")
+                c3.metric('Sum trade PnL', f"{closed['PnL (%)'].sum() if len(closed) else 0.0:+.2f}%")
+
+                def _is_date_only_index(idx):
+                    try:
+                        ts = pd.DatetimeIndex(idx)
+                        return bool(((ts.hour == 0) & (ts.minute == 0) & (ts.second == 0)).all())
+                    except Exception:
+                        return False
+
+                if _is_date_only_index(trades_df['Entry Date'].dropna()):
+                    display_df = trades_df.copy()
+                    display_df['Entry Date'] = pd.to_datetime(display_df['Entry Date'], errors='coerce').dt.strftime('%Y-%m-%d').astype('object')
+                    display_df['Exit Date'] = display_df['Exit Date'].astype('object')
+                    closed_exit_mask = display_df['Status'].astype(str).str.lower().eq('closed')
+                    exit_str = pd.to_datetime(display_df.loc[closed_exit_mask, 'Exit Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    display_df.loc[closed_exit_mask, 'Exit Date'] = exit_str.astype('object')
+                    display_df.loc[~closed_exit_mask, 'Exit Date'] = 'Open'
+                else:
+                    try:
+                        display_df = apply_trade_log_timestamp_display(trades_df)
+                    except Exception:
+                        display_df = trades_df.copy()
+
+                sort_col = pd.to_datetime(trades_df['Entry Date'], errors='coerce')
+                display_df['__sort__'] = sort_col
+                display_df = display_df.sort_values('__sort__', ascending=False).drop(columns='__sort__')
+                st.dataframe(display_df, use_container_width=True)
+                st.download_button(
+                    f'📥 Download {setup_name} Trade Log',
+                    display_df.to_csv(index=False),
+                    file_name=f'{setup_name.replace(" ", "_").replace("/", "_")}_TradeLog_{TICKER}.csv',
+                    mime='text/csv'
                 )
-                cvd_position_confirmed = make_stateful_position(
-                    (cvd > cvd_ma) & (rolling_delta > 0) & (cl > ema20),
-                    (cvd < cvd_ma) | (rolling_delta < 0) | (cl < ema20),
-                    df_cvd.index
-                )
-                cvd_position_breakout = make_stateful_position(
-                    (cvd > cvd_high) & (cl > ema50) & (price_mom_20 > 0),
-                    (cvd < cvd_ma) | (cl < ema20) | (cvd < cvd_low),
-                    df_cvd.index
-                )
-                cvd_position_smart_money = make_stateful_position(
-                    (cvd_fast > cvd_slow) & (cvd_mom_5 > 0) & (rolling_delta > 0) & (cl > ema50),
-                    (cvd_fast < cvd_slow) | (rolling_delta < 0) | (cl < ema50),
-                    df_cvd.index
-                )
-                cvd_position_accumulation = make_stateful_position(
-                    (cvd_mom_20 > 0) & (price_mom_5 > -0.03) & (cl > ema200) & (flow_z > -0.5),
-                    (cvd_mom_20 < 0) | (cl < ema50) | (flow_z < -1.25),
-                    df_cvd.index
-                )
-                cvd_position_risk_on = make_stateful_position(
-                    (cl > ema20) & (ema20 > ema50) & (cvd > cvd_slow) & (rolling_delta > 0),
-                    (cl < ema20) | (cvd < cvd_slow) | (rolling_delta < 0),
-                    df_cvd.index
-                )
 
-                cvd_candidates = [
-                    ("CVD Zero-Line Flip", "Uses the CVD graph row 2 directly: long when CVD crosses above zero/green, cash immediately when CVD goes below zero/red.", cvd_position_zero_flip),
-                    ("CVD Mean Cross", "Long after CVD crosses above its rolling mean; cash after CVD crosses below.", cvd_position_basic),
-                    ("CVD Confirmed Trend", "Long only when CVD is above mean, rolling flow is positive, and price is above EMA20.", cvd_position_confirmed),
-                    ("CVD Breakout + Price Momentum", "Long when CVD breaks its rolling high while price is above EMA50 and 20-bar momentum is positive.", cvd_position_breakout),
-                    ("Smart-Money CVD Flow", "Long when fast CVD is above slow CVD, CVD momentum is positive, rolling delta is positive, and price is above EMA50.", cvd_position_smart_money),
-                    ("Accumulation Filter", "Long when 20-bar CVD momentum is positive, price is above EMA200, and flow is not strongly negative.", cvd_position_accumulation),
-                    ("Risk-On CVD Trend", "Long only when EMA20 > EMA50, price is above EMA20, CVD is above slow CVD, and rolling delta is positive.", cvd_position_risk_on),
-                ]
-
-                display_adaptive_strategy_lab("CVD", cl, cvd_candidates, file_prefix="CVD_Adaptive_Strategy")
-
-                # ── Delta Profile (Volume at Price bucket) ─────────────────────
-                st.divider()
-                st.write("#### 📊 Delta Profile (Buy vs Sell by Price Bucket)")
-                n_buckets = st.slider("Price Buckets", 10, 50, 20)
-
-                price_min = float(cl.min())
-                price_max = float(cl.max())
-                buckets = np.linspace(price_min, price_max, n_buckets + 1)
-                bucket_labels = [f"{b:.2f}" for b in buckets[:-1]]
-
-                buy_vol  = pd.cut(cl, bins=buckets, labels=bucket_labels).astype(str)
-                buy_profile  = delta.clip(lower=0).groupby(buy_vol).sum()
-                sell_profile = delta.clip(upper=0).abs().groupby(buy_vol).sum()
-
-                fig_profile = go.Figure()
-                fig_profile.add_trace(go.Bar(
-                    y=buy_profile.index, x=buy_profile.values,
-                    orientation='h', name='Buy Volume',
-                    marker_color='rgba(0,200,100,0.7)'
-                ))
-                fig_profile.add_trace(go.Bar(
-                    y=sell_profile.index, x=-sell_profile.values,
-                    orientation='h', name='Sell Volume',
-                    marker_color='rgba(255,80,80,0.7)'
-                ))
-                fig_profile.update_layout(
-                    barmode='overlay', template="plotly_dark",
-                    title="Volume Delta Profile (Price × Buy/Sell Pressure)",
-                    xaxis_title="Delta Volume (Buy=+, Sell=-)",
-                    yaxis_title="Price Level",
-                    height=500, hovermode="y unified"
-                )
-                st.plotly_chart(fig_profile, use_container_width=True)
-
-                if st.session_state.report_gen:
-                    st.session_state.report_gen.add_plot("CVD Dashboard", fig_cvd)
-                    if trade_log_rows:
-                        st.session_state.report_gen.add_data("CVD Trade Log", tlog_df)
-
-            except Exception as e:
-                st.error(f"CVD calculation failed: {e}")
-                st.info("Ensure the ticker has OHLCV data (Volume column required for full analysis).")
+        except Exception as e:
+            st.error(f'CVD calculation failed: {e}')
+            st.info('Ensure the ticker has OHLCV data, especially a Volume column.')
 
 
-    # ==========================================
-    # TAB 18: INSTITUTIONAL VWAP
-    # ==========================================
+# ==========================================
+# TAB 18: INSTITUTIONAL VWAP
+# ==========================================
 with tab18:
     st.header('📈 Institutional VWAP')
     _load_vwap_tab = st.checkbox('Load VWAP module', value=False, key='lazy_load_vwap_tab_v3')
@@ -12252,249 +16293,328 @@ except Exception as e:
         pass
 
 
+
+def _build_last_tab_institutional_context(d):
+    """
+    Lightweight institutional context pack for the final intraday tab.
+
+    Uses helper logic already present in the thesis code:
+    - Ehlers SuperSmoother / Decycler for smoother trend read
+    - rolling Hurst for trend/chop context
+    - RealizedVolatility RV/BV jump component
+    - HawkesVolatility clustering proxy
+    - Kalman local trend proxy
+
+    Display/support only. It does not alter trade execution unless the user reads
+    the context and changes final-tab settings manually.
+    """
+    out = {
+        "metrics": {},
+        "series": pd.DataFrame(),
+        "verdict": "Neutral / observe",
+        "notes": []
+    }
+    try:
+        if d is None or not isinstance(d, pd.DataFrame) or d.empty or "Close" not in d.columns:
+            return out
+
+        close = pd.to_numeric(d["Close"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if len(close) < 10:
+            return out
+
+        idx = close.index
+        ctx_series = pd.DataFrame(index=idx)
+        ctx_series["Close"] = close
+
+        # Ehlers smoother/decycler
+        try:
+            ss_period = max(5, min(20, max(5, len(close) // 8)))
+            dc_period = max(20, min(80, max(20, len(close) // 3)))
+            ctx_series["Ehlers SuperSmoother"] = EhlersFilters.super_smoother(close, period=ss_period)
+            ctx_series["Ehlers Decycler"] = EhlersFilters.simple_decycler(close, period=dc_period)
+            decycler_slope = float(ctx_series["Ehlers Decycler"].diff(3).iloc[-1])
+            out["metrics"]["Ehlers Slope"] = decycler_slope
+        except Exception:
+            out["metrics"]["Ehlers Slope"] = np.nan
+
+        # Kalman local trend, causal
+        try:
+            kf = KalmanFilterTrend(process_noise=1e-5, measurement_noise=1e-3)
+            kalman_vals, _ = kf.filter(close.values.astype(float))
+            ctx_series["Kalman Trend"] = pd.Series(kalman_vals, index=idx)
+            out["metrics"]["Kalman Residual %"] = float((close.iloc[-1] / ctx_series["Kalman Trend"].iloc[-1] - 1.0) * 100.0) if ctx_series["Kalman Trend"].iloc[-1] else np.nan
+        except Exception:
+            out["metrics"]["Kalman Residual %"] = np.nan
+
+        # Returns for RV / Hawkes / Hurst
+        rets = np.log(close / close.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
+
+        try:
+            if len(close) >= 60:
+                h_window = max(40, min(120, len(close) // 2))
+                h = rolling_hurst(close, window=h_window, max_lag=min(20, max(8, h_window // 4)))
+                out["metrics"]["Hurst"] = float(h.dropna().iloc[-1]) if not h.dropna().empty else np.nan
+            else:
+                out["metrics"]["Hurst"] = np.nan
+        except Exception:
+            out["metrics"]["Hurst"] = np.nan
+
+        try:
+            j = RealizedVolatility.jump_component(rets.values if hasattr(rets, "values") else rets)
+            out["metrics"]["Jump Ratio"] = float(j.get("jump_ratio", np.nan)) * 100.0
+            out["metrics"]["Jump Z"] = float(j.get("z_score", np.nan))
+        except Exception:
+            out["metrics"]["Jump Ratio"] = np.nan
+            out["metrics"]["Jump Z"] = np.nan
+
+        try:
+            hv = HawkesVolatility().fit(rets.values if hasattr(rets, "values") else rets)
+            out["metrics"]["Hawkes Branching"] = float(hv.branching_ratio())
+            out["metrics"]["Shock Half-Life Bars"] = float(hv.half_life())
+        except Exception:
+            out["metrics"]["Hawkes Branching"] = np.nan
+            out["metrics"]["Shock Half-Life Bars"] = np.nan
+
+        # Simple action context
+        hurst_val = out["metrics"].get("Hurst", np.nan)
+        jump_ratio = out["metrics"].get("Jump Ratio", np.nan)
+        branch = out["metrics"].get("Hawkes Branching", np.nan)
+        e_slope = out["metrics"].get("Ehlers Slope", np.nan)
+
+        trend_up = pd.notna(e_slope) and e_slope > 0
+        trend_down = pd.notna(e_slope) and e_slope < 0
+        jumpy = pd.notna(jump_ratio) and jump_ratio > 20
+        clustered = pd.notna(branch) and branch > 0.65
+        trending = pd.notna(hurst_val) and hurst_val > 0.55
+        choppy = pd.notna(hurst_val) and hurst_val < 0.45
+
+        if trend_up and trending and not jumpy:
+            out["verdict"] = "Trend participation favored"
+        elif trend_down or jumpy or clustered:
+            out["verdict"] = "Risk guard / wait for stronger confirmation"
+        elif choppy:
+            out["verdict"] = "Chop regime — smaller targets or no trade"
+        else:
+            out["verdict"] = "Neutral / confirmation needed"
+
+        if jumpy:
+            out["notes"].append("High jump component: avoid chasing weak bounces.")
+        if clustered:
+            out["notes"].append("Volatility clustering elevated: stops can trigger faster.")
+        if choppy:
+            out["notes"].append("Hurst below trend zone: expect whipsaw.")
+        if trend_up and trending:
+            out["notes"].append("Trend structure supportive if VWAP/auction conditions agree.")
+
+        out["series"] = ctx_series
+        return out
+    except Exception:
+        return out
+
+
 # ==========================================
-# 0.5% LIVE CAPTURE MODE
+# TAB 21: 0.5% LIVE CAPTURE — INTRADAY RUNNER ENGINE
 # ==========================================
 try:
     with tab21:
-        st.header("⚡ 0.5% Live Capture Mode")
-        st.caption("Execution-focused intraday module. Designed for selective 0.5%–1.0% captures using VWAP, trend, volume, spread proxy, and strict risk controls.")
-        _load_lc_tab = st.checkbox("Load 0.5% Live Capture module", value=False, key="lazy_load_live_capture_tab_v3")
-        if not _load_lc_tab:
-            st.info("0.5% Live Capture is ready, but not loaded yet. Click the checkbox above only when you want to run this module so the full app stays fast.")
-        else:
+        st.header('⚡ Auction-Quality Long-Only Intraday Engine')
+        st.caption('Fresh intraday candles only. Long-only. This version waits for auction confirmation: no more buying every weak bounce.')
 
-            if df_main is None or df_main.empty:
-                st.warning("No price data loaded yet.")
+        c0a, c0b, c0c, c0d = st.columns(4)
+        with c0a:
+            lc_interval = st.selectbox('Intraday interval', ['1m', '2m', '5m', '15m', '30m', '60m'], index=0, key='safe_lc_interval')
+        with c0b:
+            lc_period = st.selectbox('Data window', ['1d', '5d', '7d', '30d'], index=0, key='safe_lc_period')
+        with c0c:
+            include_prepost = st.checkbox('Include pre/after hours', value=False, key='safe_lc_prepost')
+        with c0d:
+            force_latest_session = st.checkbox('Latest session only', value=True, key='safe_lc_latest_session')
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            sensitivity = st.selectbox('Entry sensitivity', ['Aggressive', 'Balanced', 'Strict'], index=2, key='safe_lc_sensitivity')
+            direction_mode = 'Long Only'
+            st.info('Direction mode: Long Only — no short selling.')
+        with c2:
+            target_pct = st.number_input('Base target (%)', min_value=0.20, max_value=5.00, value=0.55, step=0.05, key='safe_lc_target') / 100.0
+            stop_pct = st.number_input('Hard stop (%)', min_value=0.10, max_value=3.00, value=0.25, step=0.05, key='safe_lc_stop') / 100.0
+        with c3:
+            let_winners_run = st.checkbox('Let winners run', value=True, key='safe_lc_runner')
+            trail_pct = st.number_input('Runner trail (%)', min_value=0.10, max_value=3.00, value=0.30, step=0.05, key='safe_lc_trail') / 100.0
+        with c4:
+            max_hold = st.number_input('Max hold bars', min_value=5, max_value=300, value=45, step=5, key='safe_lc_maxhold')
+            max_trades = st.number_input('Max trades/session', min_value=1, max_value=15, value=8, step=1, key='safe_lc_maxtrades_v4',
+                                         help='Adaptive mode: enough chances to capture multiple 0.5–1% waves, but still guarded by loss limits and quality reset.')
+
+        c5, c6 = st.columns(2)
+        with c5:
+            require_vwap = st.checkbox('Require VWAP side filter', value=False, key='safe_lc_req_vwap', help='Longs require above VWAP; shorts require below VWAP. OFF is more aggressive.')
+        with c6:
+            max_day_loss = st.number_input('Max session loss guard (%)', min_value=0.3, max_value=10.0, value=1.20, step=0.10, key='safe_lc_dayloss',
+                                           help='Stops the session if total strategy drawdown reaches this level. Adaptive default gives room without allowing a blow-up.') / 100.0
+
+        c7, c8, c9 = st.columns(3)
+        with c7:
+            max_consec_losses = st.number_input('Max consecutive stops', min_value=1, max_value=5, value=2, step=1, key='safe_lc_max_consec_losses_v4',
+                                                help='First stop does not kill the day; second consecutive stop does.')
+        with c8:
+            cooldown_after_loss = st.number_input('Cooldown after stop bars', min_value=2, max_value=90, value=12, step=1, key='safe_lc_cooldown_loss_v4',
+                                                  help='Pause after a stop, then only allow higher-quality re-entry.')
+        with c9:
+            session_profit_target = st.number_input('Session profit target (%)', min_value=0.5, max_value=15.0, value=5.0, step=0.5, key='safe_lc_session_profit_target') / 100.0
+
+        st.markdown('##### VWAP Z-Score + Kalman Flush/Snapback Add-on')
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            use_kalman_vwap = st.checkbox('Enable VWAP/Kalman flush logic', value=True, key='safe_lc_use_kalman_vwap')
+        with k2:
+            z_entry = st.number_input('Flush buy Z-score', min_value=-6.0, max_value=-0.5, value=-2.5, step=0.1, key='safe_lc_z_entry')
+        with k3:
+            z_exit = st.number_input('Snapback exit Z-score', min_value=-3.0, max_value=1.0, value=-1.0, step=0.1, key='safe_lc_z_exit')
+        with k4:
+            z_window = st.number_input('VWAP std window bars', min_value=5, max_value=80, value=15, step=1, key='safe_lc_z_window')
+
+        st.warning('Adaptive edge mode ON: not killed after one loss, but after a stop it requires a stronger quality score before re-entry. Goal is multi-wave capture without machine-gun stops.')
+
+        st.markdown('##### Institutional Context Add-on')
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            show_inst_context = st.checkbox('Show institutional context metrics', value=True, key='safe_lc_show_inst_context')
+        with ic2:
+            overlay_inst_lines = st.checkbox('Overlay Ehlers/Kalman trend lines', value=True, key='safe_lc_overlay_inst_lines')
+
+        run_lc = st.button('Fetch latest intraday session + Run Long-Only Engine', key='safe_lc_run')
+
+        if run_lc:
+            fresh, fetch_msg = _load_fresh_intraday_for_capture(TICKER, interval=lc_interval, period=lc_period, include_prepost=include_prepost)
+            if fetch_msg:
+                st.warning(fetch_msg)
+            d = _intraday_clean_frame(fresh, today_only=bool(force_latest_session))
+            if d.empty or len(d) < 10:
+                st.session_state['safe_lc_pack'] = None
+                st.error('No usable intraday candles. Try 5m interval and 5d window. On weekends, the app now uses the latest available trading session, not old 2024 daily rows.')
             else:
-                lc_df = df_main.copy()
-                if not isinstance(lc_df.index, pd.DatetimeIndex):
-                    lc_df.index = pd.to_datetime(lc_df.index, errors='coerce')
-                lc_df = lc_df.sort_index()
+                long_entry, short_entry, feats = _build_intraday_runner_signals(d, sensitivity=sensitivity, require_vwap=bool(require_vwap), direction_mode=direction_mode, use_kalman_vwap=bool(use_kalman_vwap), z_entry=float(z_entry), z_exit=float(z_exit), z_window=int(z_window))
+                trades_df, eq, summ = _run_intraday_capture(
+                    d, long_entry, short_entry, long_exit_signal=(feats['Kalman Snapback Exit'].astype(bool) if isinstance(feats, pd.DataFrame) and 'Kalman Snapback Exit' in feats.columns else None),
+                    target_pct=float(target_pct),
+                    stop_pct=float(stop_pct),
+                    trail_pct=float(trail_pct),
+                    min_hold_bars=3,
+                    max_hold_bars=int(max_hold),
+                    max_trades=int(max_trades),
+                    max_day_loss=float(max_day_loss),
+                    let_winners_run=bool(let_winners_run),
+                    allow_shorts=False,
+                    cooldown_after_loss=int(cooldown_after_loss),
+                    max_consecutive_losses=int(max_consec_losses),
+                    quality_score=(feats['Trade Quality Score'] if isinstance(feats, pd.DataFrame) and 'Trade Quality Score' in feats.columns else None),
+                    reentry_quality_boost=8.0,
+                    session_profit_target_pct=float(session_profit_target),
+                    auction_ok=(feats['True Green Session'].astype(bool) if isinstance(feats, pd.DataFrame) and 'True Green Session' in feats.columns else None),
+                    drift_risk=(((feats['Lower High Sequence'].astype(bool)) | (feats['Lower Low Sequence'].astype(bool)) | (feats['Distribution'].astype(bool)) | (feats['Waterfall'].astype(bool))) if isinstance(feats, pd.DataFrame) and all(c in feats.columns for c in ['Lower High Sequence','Lower Low Sequence','Distribution','Waterfall']) else None),
+                )
+                inst_context = _build_last_tab_institutional_context(d)
+                st.session_state['safe_lc_pack'] = {
+                    'd': d, 'long_entry': long_entry, 'short_entry': short_entry, 'features': feats, 'trades': trades_df, 'equity': eq, 'summary': summ,
+                    'institutional_context': inst_context,
+                    'interval': lc_interval, 'period': lc_period, 'direction_mode': 'Long Only', 'latest_bar': str(d.index[-1]), 'first_bar': str(d.index[0])
+                }
 
-                ctop1, ctop2, ctop3 = st.columns(3)
-                with ctop1:
-                    lc_run = st.button("Run 0.5% Live Capture Backtest", key="lc_run_button")
-                    lc_live_only = st.checkbox("Use only today's session if available", value=True, key="lc_today_only")
-                with ctop2:
-                    target_pct = st.number_input("Target profit (%)", min_value=0.10, max_value=3.00, value=0.60, step=0.05, key="lc_target_pct") / 100.0
-                    stop_pct = st.number_input("Stop loss (%)", min_value=0.05, max_value=2.00, value=0.30, step=0.05, key="lc_stop_pct") / 100.0
-                with ctop3:
-                    max_trades = st.number_input("Max trades per day", min_value=1, max_value=20, value=5, step=1, key="lc_max_trades")
-                    max_day_loss = st.number_input("Max daily loss guard (%)", min_value=0.25, max_value=10.0, value=1.50, step=0.25, key="lc_max_day_loss") / 100.0
+        pack = st.session_state.get('safe_lc_pack')
+        if isinstance(pack, dict):
+            st.info(f"Intraday source used: {pack.get('interval', 'N/A')} / {pack.get('period', 'N/A')} | first bar: {pack.get('first_bar', 'N/A')} | latest bar: {pack.get('latest_bar', 'N/A')}")
+            summ = pack.get('summary', {})
+            trades_df = pack.get('trades', pd.DataFrame())
+            eq = pack.get('equity', pd.Series(dtype=float))
+            feats = pack.get('features', pd.DataFrame())
+            d = pack.get('d', pd.DataFrame())
+            m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+            m1.metric('Strategy Return', f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else 'N/A')
+            m2.metric('Buy & Hold', f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else 'N/A')
+            m3.metric('Max DD', f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else 'N/A')
+            m4.metric('Trades', str(int(summ.get('Trades', 0))))
+            m5.metric('Long Trades', str(int(summ.get('Long Trades', 0))))
+            m6.metric('Guard', 'HIT' if summ.get('Daily Guard Hit') else 'OK')
+            m7.metric('Edge Mode', summ.get('Adaptive Edge Mode', 'ON'))
+            if summ.get('Daily Guard Hit'):
+                st.error(f"Trading disabled by risk guard: {summ.get('Disabled Reason', 'Guard hit')}")
 
-                cflt1, cflt2, cflt3, cflt4 = st.columns(4)
-                with cflt1:
-                    fast_span = st.number_input("Fast EMA", min_value=3, max_value=50, value=8, step=1, key="lc_fast")
-                    slow_span = st.number_input("Slow EMA", min_value=5, max_value=100, value=21, step=1, key="lc_slow")
-                with cflt2:
-                    vol_mult = st.number_input("Min volume vs avg", min_value=0.5, max_value=5.0, value=1.10, step=0.10, key="lc_vol_mult")
-                    max_spread_proxy = st.number_input("Max candle spread proxy (%)", min_value=0.05, max_value=5.0, value=1.20, step=0.05, key="lc_spread_proxy") / 100.0
-                with cflt3:
-                    min_hold_bars = st.number_input("Min hold bars", min_value=1, max_value=50, value=3, step=1, key="lc_min_hold")
-                    max_hold_bars = st.number_input("Max hold bars", min_value=2, max_value=200, value=24, step=1, key="lc_max_hold")
-                with cflt4:
-                    cooldown_bars = st.number_input("Cooldown bars", min_value=0, max_value=100, value=6, step=1, key="lc_cooldown")
-                    use_db_pressure = st.checkbox("Use latest Databento bid-pressure confirmation if available", value=False, key="lc_use_db")
+            inst_context = pack.get('institutional_context', {})
+            if bool(st.session_state.get('safe_lc_show_inst_context', True)) and isinstance(inst_context, dict):
+                ctx_metrics = inst_context.get('metrics', {}) if isinstance(inst_context.get('metrics', {}), dict) else {}
+                st.write('#### Institutional Context Snapshot')
+                cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
+                _h = ctx_metrics.get('Hurst', np.nan)
+                _jr = ctx_metrics.get('Jump Ratio', np.nan)
+                _br = ctx_metrics.get('Hawkes Branching', np.nan)
+                _hl = ctx_metrics.get('Shock Half-Life Bars', np.nan)
+                _kr = ctx_metrics.get('Kalman Residual %', np.nan)
+                _es = ctx_metrics.get('Ehlers Slope', np.nan)
+                cc1.metric('Context Verdict', inst_context.get('verdict', 'N/A'))
+                cc2.metric('Hurst', f"{_h:.2f}" if pd.notna(_h) else 'N/A')
+                cc3.metric('Jump Ratio', f"{_jr:.1f}%" if pd.notna(_jr) else 'N/A')
+                cc4.metric('Hawkes Branch', f"{_br:.2f}" if pd.notna(_br) else 'N/A')
+                cc5.metric('Shock Half-Life', f"{_hl:.1f} bars" if pd.notna(_hl) else 'N/A')
+                cc6.metric('Kalman Residual', f"{_kr:+.2f}%" if pd.notna(_kr) else 'N/A')
+                _notes = inst_context.get('notes', [])
+                if isinstance(_notes, list) and _notes:
+                    st.caption(' | '.join([str(x) for x in _notes[:4]]))
 
-                st.info("This is not a prediction model. It is an execution model: fewer clean trades, fixed target/stop, and hard daily-loss control.")
+            if isinstance(d, pd.DataFrame) and not d.empty:
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=(f'{TICKER} Intraday Setup', 'Equity Curve'))
+                fig.add_trace(go.Scatter(x=d.index, y=d['Close'], mode='lines', name='Close'), row=1, col=1)
+                if isinstance(feats, pd.DataFrame) and 'VWAP' in feats.columns:
+                    fig.add_trace(go.Scatter(x=feats.index, y=feats['VWAP'], mode='lines', name='VWAP'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=feats.index, y=feats['EMA21'], mode='lines', name='EMA21'), row=1, col=1)
+                    if 'Kalman Price' in feats.columns:
+                        fig.add_trace(go.Scatter(x=feats.index, y=feats['Kalman Price'], mode='lines', name='Kalman Price'), row=1, col=1)
+                if bool(st.session_state.get('safe_lc_overlay_inst_lines', True)) and isinstance(inst_context, dict):
+                    ctx_series = inst_context.get('series', pd.DataFrame())
+                    if isinstance(ctx_series, pd.DataFrame) and not ctx_series.empty:
+                        for _col in ['Ehlers SuperSmoother', 'Ehlers Decycler', 'Kalman Trend']:
+                            if _col in ctx_series.columns:
+                                fig.add_trace(go.Scatter(x=ctx_series.index, y=ctx_series[_col], mode='lines', name=_col, line=dict(width=1)), row=1, col=1)
+                if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                    closed_or_open = trades_df.copy()
+                    buys = closed_or_open[closed_or_open['Entry Date'].notna()]
+                    if 'Buy Price' in buys.columns:
+                        long_buys = buys[buys.get('Side', '') == 'Long'] if 'Side' in buys.columns else buys
+                        if not long_buys.empty:
+                            fig.add_trace(go.Scatter(x=long_buys['Entry Date'], y=long_buys['Buy Price'], mode='markers', name='Long Entry'), row=1, col=1)
+                    if False and 'Short Price' in buys.columns and 'Side' in buys.columns:
+                        short_buys = buys[buys['Side'] == 'Short']
+                        if not short_buys.empty:
+                            fig.add_trace(go.Scatter(x=short_buys['Entry Date'], y=short_buys['Short Price'], mode='markers', name='Short Entry'), row=1, col=1)
+                if isinstance(eq, pd.Series) and not eq.empty:
+                    fig.add_trace(go.Scatter(x=eq.index, y=eq, mode='lines', name='Equity'), row=2, col=1)
+                fig.update_layout(height=760, template='plotly_dark', hovermode='x unified')
+                st.plotly_chart(fig, use_container_width=True)
 
-                def _prep_live_capture_frame(dfx, today_only=True):
-                    d = dfx.copy()
-                    needed = [c for c in ['Open','High','Low','Close','Volume'] if c in d.columns]
-                    d = d[needed].replace([np.inf, -np.inf], np.nan).dropna()
-                    if d.empty or 'Close' not in d.columns:
-                        return d
-                    if today_only and isinstance(d.index, pd.DatetimeIndex):
-                        try:
-                            last_date = d.index[-1].date()
-                            todays = d[d.index.date == last_date]
-                            if len(todays) >= 20:
-                                d = todays
-                        except Exception:
-                            pass
-                    return d
+            st.write('#### Intraday Capture Trade Log')
+            if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                display_trades = trades_df.copy()
+                try:
+                    display_trades = apply_trade_log_timestamp_display(display_trades)
+                except Exception:
+                    pass
+                st.dataframe(display_trades, use_container_width=True, hide_index=True)
+                st.download_button('Download intraday capture trade log', display_trades.to_csv(index=False).encode('utf-8'), file_name=f'{TICKER}_intraday_capture_trades.csv', mime='text/csv', key='safe_lc_download')
+            else:
+                st.warning('No long trades fired. Try Aggressive sensitivity, remove VWAP requirement, lower bounce/target settings, or use 1m/5m live data.')
 
-                def _build_live_capture_signals(d, use_db=False):
-                    close = d['Close'].astype(float)
-                    high = d['High'].astype(float) if 'High' in d.columns else close
-                    low = d['Low'].astype(float) if 'Low' in d.columns else close
-                    vol = d['Volume'].astype(float) if 'Volume' in d.columns else pd.Series(1.0, index=d.index)
-                    typical = (high + low + close) / 3.0
-                    vwap = (typical * vol).cumsum() / (vol.cumsum() + 1e-9)
-                    ema_fast = close.ewm(span=int(fast_span), adjust=False).mean()
-                    ema_slow = close.ewm(span=int(slow_span), adjust=False).mean()
-                    vol_avg = vol.rolling(20, min_periods=5).mean()
-                    mom = close.pct_change(3).fillna(0.0)
-                    spread_proxy = ((high - low) / close).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-                    pullback_reclaim = (close > vwap) & (close.shift(1) <= vwap.shift(1))
-                    trend_ok = (close > vwap) & (ema_fast > ema_slow) & (mom > 0)
-                    liquidity_ok = (vol >= vol_avg * float(vol_mult)) & (spread_proxy <= float(max_spread_proxy))
-                    entry = (trend_ok & liquidity_ok & (pullback_reclaim | (close > ema_fast))).fillna(False)
-                    # Optional Databento latest top-of-book confirmation from Microstructure session buffer.
-                    if use_db:
-                        try:
-                            live_key = f"mm_live_buffer_{str(TICKER).upper()}"
-                            dbdf = st.session_state.get(live_key, pd.DataFrame())
-                            if isinstance(dbdf, pd.DataFrame) and not dbdf.empty and 'imbalance' in dbdf.columns:
-                                latest_pressure = float(pd.to_numeric(dbdf['imbalance'], errors='coerce').dropna().iloc[-1])
-                                st.caption(f"Latest Databento bid pressure used: {latest_pressure*100:.1f}%")
-                                if latest_pressure < 0.55:
-                                    entry = pd.Series(False, index=d.index)
-                        except Exception:
-                            pass
-                    features = pd.DataFrame({
-                        'Close': close, 'VWAP': vwap, 'EMA Fast': ema_fast, 'EMA Slow': ema_slow,
-                        'Volume': vol, 'Volume Avg': vol_avg, 'Momentum 3 bars': mom, 'Spread Proxy': spread_proxy, 'Entry Setup': entry.astype(int)
-                    }, index=d.index)
-                    return entry, features
+            with st.expander('Signal diagnostics / features', expanded=False):
+                if isinstance(feats, pd.DataFrame) and not feats.empty:
+                    st.caption(f"Signals: long={int(feats['Long Entry'].sum())}, short={int(feats['Short Entry'].sum())}, final={int(feats['Final Entry'].sum())}")
+                    st.dataframe(feats.tail(300), use_container_width=True)
+                    if isinstance(inst_context, dict) and isinstance(inst_context.get('series', None), pd.DataFrame):
+                        st.write('##### Institutional context series')
+                        st.dataframe(inst_context.get('series').tail(300), use_container_width=True)
 
-                def _run_live_capture_engine(d, entry_setup):
-                    close = d['Close'].astype(float)
-                    high = d['High'].astype(float) if 'High' in d.columns else close
-                    low = d['Low'].astype(float) if 'Low' in d.columns else close
-                    initial = 10000.0
-                    equity = initial
-                    in_pos = False
-                    entry_price = 0.0
-                    entry_time = None
-                    entry_equity = initial
-                    bars_held = 0
-                    cooldown = 0
-                    trades = []
-                    eq_vals = []
-                    trades_today = 0
-                    disabled = False
-
-                    first_price = float(close.iloc[0]) if len(close) else np.nan
-
-                    for i, ts in enumerate(close.index):
-                        px = float(close.iloc[i])
-                        hi = float(high.iloc[i])
-                        lo = float(low.iloc[i])
-                        if cooldown > 0:
-                            cooldown -= 1
-
-                        if in_pos:
-                            bars_held += 1
-                            exit_reason = None
-                            exit_price = px
-                            # Stop/target are checked with high/low, but filled conservatively at target/stop level.
-                            if bars_held >= int(min_hold_bars):
-                                if hi >= entry_price * (1 + float(target_pct)):
-                                    exit_price = entry_price * (1 + float(target_pct))
-                                    exit_reason = 'Target hit'
-                                elif lo <= entry_price * (1 - float(stop_pct)):
-                                    exit_price = entry_price * (1 - float(stop_pct))
-                                    exit_reason = 'Stop hit'
-                                elif bars_held >= int(max_hold_bars):
-                                    exit_price = px
-                                    exit_reason = 'Max hold exit'
-
-                            if exit_reason:
-                                trade_ret = (exit_price / entry_price) - 1.0
-                                equity = entry_equity * (1 + trade_ret)
-                                cum_ret = (equity / initial - 1) * 100
-                                trades.append({
-                                    'Side': 'Long', 'Entry Date': entry_time, 'Exit Date': ts,
-                                    'Buy Price': round(float(entry_price), 4), 'Sell Price': round(float(exit_price), 4),
-                                    'PnL (%)': round(float(trade_ret * 100), 3), 'Cumulative Return (%)': round(float(cum_ret), 3),
-                                    'Bars Held': int(bars_held), 'Status': 'Closed', 'Reason': exit_reason
-                                })
-                                in_pos = False
-                                entry_price = 0.0
-                                entry_time = None
-                                bars_held = 0
-                                cooldown = int(cooldown_bars)
-                                if (equity / initial - 1.0) <= -float(max_day_loss):
-                                    disabled = True
-
-                        if (not in_pos) and (not disabled) and cooldown == 0 and trades_today < int(max_trades):
-                            if bool(entry_setup.iloc[i]):
-                                in_pos = True
-                                entry_price = px
-                                entry_time = ts
-                                entry_equity = equity
-                                bars_held = 0
-                                trades_today += 1
-
-                        if in_pos:
-                            mark_equity = entry_equity * (px / entry_price) if entry_price > 0 else equity
-                        else:
-                            mark_equity = equity
-                        eq_vals.append(mark_equity)
-
-                    if in_pos and entry_price > 0:
-                        px = float(close.iloc[-1])
-                        mark_equity = entry_equity * (px / entry_price)
-                        cum_ret = (mark_equity / initial - 1) * 100
-                        trades.append({
-                            'Side': 'Long', 'Entry Date': entry_time, 'Exit Date': 'Open',
-                            'Buy Price': round(float(entry_price), 4), 'Sell Price': round(float(px), 4),
-                            'PnL (%)': round(float((px / entry_price - 1) * 100), 3), 'Cumulative Return (%)': round(float(cum_ret), 3),
-                            'Bars Held': int(bars_held), 'Status': 'Open', 'Reason': 'Open position mark-to-market'
-                        })
-                        if eq_vals:
-                            eq_vals[-1] = mark_equity
-
-                    eq = pd.Series(eq_vals, index=close.index, dtype=float) if len(eq_vals) else pd.Series(dtype=float)
-                    trades_df = pd.DataFrame(trades)
-                    bh = ((float(close.iloc[-1]) / first_price) - 1) * 100 if first_price and first_price > 0 else np.nan
-                    strat = ((float(eq.iloc[-1]) / initial) - 1) * 100 if not eq.empty else np.nan
-                    dd = ((eq / eq.cummax()) - 1).min() * 100 if not eq.empty else np.nan
-                    return trades_df, eq, {'Strategy Return %': strat, 'Buy & Hold Return %': bh, 'Max Drawdown %': dd, 'Trades': len(trades_df), 'Daily Guard Hit': disabled}
-
-                if lc_run:
-                    d = _prep_live_capture_frame(lc_df, today_only=bool(lc_live_only))
-                    if d.empty or len(d) < 30:
-                        st.warning("Not enough intraday data for 0.5% Live Capture. Try live mode with 5m/15m data or turn off today's-session-only.")
-                    else:
-                        entry_setup, feats = _build_live_capture_signals(d, use_db=bool(use_db_pressure))
-                        trades_df, equity_curve, summ = _run_live_capture_engine(d, entry_setup)
-                        st.session_state['live_capture_pack'] = {'trades': trades_df, 'equity': equity_curve, 'features': feats, 'summary': summ}
-
-                pack = st.session_state.get('live_capture_pack')
-                if isinstance(pack, dict):
-                    summ = pack.get('summary', {})
-                    trades_df = pack.get('trades', pd.DataFrame())
-                    equity_curve = pack.get('equity', pd.Series(dtype=float))
-                    feats = pack.get('features', pd.DataFrame())
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Live Capture Return", f"{summ.get('Strategy Return %', np.nan):.2f}%" if pd.notna(summ.get('Strategy Return %', np.nan)) else "N/A")
-                    m2.metric("Buy & Hold Return", f"{summ.get('Buy & Hold Return %', np.nan):.2f}%" if pd.notna(summ.get('Buy & Hold Return %', np.nan)) else "N/A")
-                    m3.metric("Max Drawdown", f"{summ.get('Max Drawdown %', np.nan):.2f}%" if pd.notna(summ.get('Max Drawdown %', np.nan)) else "N/A")
-                    m4.metric("Trades", f"{int(summ.get('Trades', 0))}")
-                    m5.metric("Daily Guard", "HIT" if summ.get('Daily Guard Hit') else "OK")
-
-                    if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(x=equity_curve.index, y=equity_curve, mode='lines', name='0.5% Capture Equity'))
-                        fig.update_layout(title="0.5% Live Capture Equity", template="plotly_dark", height=340, hovermode="x unified")
-                        st.plotly_chart(fig, use_container_width=True)
-
-                    st.write("#### 0.5% Capture Trade Log")
-                    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                        display_trades = trades_df.copy()
-                        try:
-                            display_trades = apply_trade_log_timestamp_display(display_trades)
-                        except Exception:
-                            pass
-                        st.dataframe(display_trades, use_container_width=True, hide_index=True)
-                        csv = display_trades.to_csv(index=False).encode('utf-8')
-                        st.download_button("Download 0.5% capture trade log", csv, file_name=f"{TICKER}_live_capture_trades.csv", mime="text/csv", key="lc_download")
-                    else:
-                        st.info("No 0.5% capture trades found with current filters. This is acceptable — no trade is better than forcing bad trades.")
-
-                    with st.expander("Show setup/features", expanded=False):
-                        if isinstance(feats, pd.DataFrame) and not feats.empty:
-                            st.dataframe(feats.tail(300), use_container_width=True)
-
-            st.markdown("""
-            **Institutional rule:** this tab is for execution timing, not prediction.  \n        Weekly/regime model decides whether the stock is worth touching. This tab decides whether a clean 0.5%–1.0% intraday capture is available.
-            """)
+        st.markdown('---')
+        st.caption('Long-only intraday execution tab. It captures upside momentum or bounce waves after red-day panic; it does not short sell.')
 except Exception as e:
-    try:
-        with tab21:
-            st.error(f"0.5% Live Capture tab error: {e}")
-    except Exception:
-        pass
+    _safe_last_tab_error(tab21, 'Intraday Live Capture tab', e)
+
+st.markdown('---')
+st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
