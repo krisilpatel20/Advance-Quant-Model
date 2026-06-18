@@ -6805,7 +6805,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
 @st.cache_data(ttl=3600, show_spinner=False)
 
 
-def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_reps=20):
+def fit_regime_model(model_data, n_regimes, switch_vol, switch_trend, search_reps=5):
     """
     Cached helper to fit Markov Regression.
     Returns the fitted result object.
