@@ -13080,322 +13080,338 @@ with tab7:
                         st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
 
 
-        try:
-            regime_run_precise_now
-        except NameError:
-            regime_run_precise_now = False
+        # ===== SPEED GATE FOR REGIME BACKTEST =====
+        # Speed-only change: all Regime Switching math below is unchanged.
+        # It simply will not run until you click this button.
+        _run_regime_backtest_now = st.button(
+            "▶️ Run Regime Switching Backtest",
+            key=f"run_regime_backtest_now_{TICKER}_{bt_freq}_{bt_n_regimes}_{bt_stability}_{signal_method}",
+            type="primary",
+            use_container_width=True,
+            help="Prevents Markov/WFO regime fitting from running on every Streamlit rerun. Click only when you want to compute/update this backtest."
+        )
 
-        # Resample if Weekly
-        regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
-        live_execution_prices_for_regime = prices_bt.dropna().copy()
-        regime_source_prices = prices_bt.dropna().copy()
-        regime_model_freq = bt_freq
-
-        if regime_live_hybrid_enabled:
+        if not _run_regime_backtest_now:
+            st.info("Regime Switching Backtest is ready but not running. Click **Run Regime Switching Backtest** to fit the model and build the trade log.")
+            signals = None
+        else:
             try:
-                # Use longer 1D history for the regime brain so live mode does not fit
-                # Markov states on only a noisy 7-30 day intraday window.
-                anchor_df = load_data(TICKER, start_date, datetime.now(), interval='1d')
-                if anchor_df is not None and not anchor_df.empty and len(anchor_df) >= 80:
-                    regime_source_prices = anchor_df['Close'].dropna().copy()
-                    regime_model_freq = str(live_regime_anchor_freq)
-                    st.caption(f"ℹ️ Live Regime Stabilizer ON: fitting regime brain on {regime_model_freq} historical 1D data, then mapping to live {data_interval} candles.")
-                else:
-                    st.warning("Live Regime Stabilizer could not load enough historical anchor data. Falling back to normal live intraday regime fitting.")
+                regime_run_precise_now
+            except NameError:
+                regime_run_precise_now = False
+
+            # Resample if Weekly
+            regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
+            live_execution_prices_for_regime = prices_bt.dropna().copy()
+            regime_source_prices = prices_bt.dropna().copy()
+            regime_model_freq = bt_freq
+
+            if regime_live_hybrid_enabled:
+                try:
+                    # Use longer 1D history for the regime brain so live mode does not fit
+                    # Markov states on only a noisy 7-30 day intraday window.
+                    anchor_df = load_data(TICKER, start_date, datetime.now(), interval='1d')
+                    if anchor_df is not None and not anchor_df.empty and len(anchor_df) >= 80:
+                        regime_source_prices = anchor_df['Close'].dropna().copy()
+                        regime_model_freq = str(live_regime_anchor_freq)
+                        st.caption(f"ℹ️ Live Regime Stabilizer ON: fitting regime brain on {regime_model_freq} historical 1D data, then mapping to live {data_interval} candles.")
+                    else:
+                        st.warning("Live Regime Stabilizer could not load enough historical anchor data. Falling back to normal live intraday regime fitting.")
+                        regime_live_hybrid_enabled = False
+                except Exception as e:
+                    st.warning(f"Live Regime Stabilizer failed to load anchor data: {e}. Falling back to normal live intraday regime fitting.")
                     regime_live_hybrid_enabled = False
-            except Exception as e:
-                st.warning(f"Live Regime Stabilizer failed to load anchor data: {e}. Falling back to normal live intraday regime fitting.")
-                regime_live_hybrid_enabled = False
 
-        if regime_model_freq == "Weekly":
-            # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
-            prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
-            try:
-                if len(prices_bt_resampled):
-                    st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
-            except Exception:
-                pass
-        else:
-            prices_bt_resampled = regime_source_prices.dropna()
+            if regime_model_freq == "Weekly":
+                # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
+                prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
+                try:
+                    if len(prices_bt_resampled):
+                        st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
+                except Exception:
+                    pass
+            else:
+                prices_bt_resampled = regime_source_prices.dropna()
 
-        # Apply smoothing consistently to prices first, then calculate returns from those same prices.
-        # This fixes the old mismatch where model data was smoothed but execution prices were raw.
-        if bt_stability > 0:
-            prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
-            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
-        else:
-            prices_bt_model = prices_bt_resampled.copy()
+            # Apply smoothing consistently to prices first, then calculate returns from those same prices.
+            # This fixes the old mismatch where model data was smoothed but execution prices were raw.
+            if bt_stability > 0:
+                prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
+                st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
+            else:
+                prices_bt_model = prices_bt_resampled.copy()
 
-        strat_prices = prices_bt_model
-        returns_bt_resampled = prices_bt_model.pct_change().dropna()
-        model_data_bt = returns_bt_resampled.dropna() * 100
+            strat_prices = prices_bt_model
+            returns_bt_resampled = prices_bt_model.pct_change().dropna()
+            model_data_bt = returns_bt_resampled.dropna() * 100
 
-        # FIX: Robust 1D Series reconstruction
-        if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
-            model_data_bt = pd.Series(
-                model_data_bt.values.flatten().astype(float),
-                index=model_data_bt.index
-            )
+            # FIX: Robust 1D Series reconstruction
+            if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
+                model_data_bt = pd.Series(
+                    model_data_bt.values.flatten().astype(float),
+                    index=model_data_bt.index
+                )
         
-        if len(model_data_bt) < 10:
-             st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
-             st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
-             if live_mode and bt_freq == "Weekly":
-                 st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
-             elif not live_mode:
-                 st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
-        else:
-            with st.spinner("Fitting Regime Model..."):
-                # Fit Model
-                res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
+            if len(model_data_bt) < 10:
+                 st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
+                 st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
+                 if live_mode and bt_freq == "Weekly":
+                     st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
+                 elif not live_mode:
+                     st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
+            else:
+                with st.spinner("Fitting Regime Model..."):
+                    # Fit Model
+                    res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
                 
-                if res_bt:
-                    # --- DISPLAY FITNESS METRICS ---
-                    fit_col1, fit_col2 = st.columns(2)
-                    with fit_col1:
-                        st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
-                    with fit_col2:
-                        st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
-                    st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
+                    if res_bt:
+                        # --- DISPLAY FITNESS METRICS ---
+                        fit_col1, fit_col2 = st.columns(2)
+                        with fit_col1:
+                            st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
+                        with fit_col2:
+                            st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
+                        st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
                     
-                    # Build selected-method full-history signal using conviction + min-hold logic
-                    signals, regime_context = build_regime_backtest_signal(
-                        res_bt,
-                        model_data_bt.index,
-                        strat_prices.index,
-                        int(bt_n_regimes),
-                        signal_method,
-                        conviction=float(conviction),
-                        min_hold=int(min_hold_period)
-                    )
+                        # Build selected-method full-history signal using conviction + min-hold logic
+                        signals, regime_context = build_regime_backtest_signal(
+                            res_bt,
+                            model_data_bt.index,
+                            strat_prices.index,
+                            int(bt_n_regimes),
+                            signal_method,
+                            conviction=float(conviction),
+                            min_hold=int(min_hold_period)
+                        )
 
-                    # Price trend override for strong runners
-                    price_override = get_price_trend_override(
-                        strat_prices.index,
-                        model_data_bt.index,
-                        strat_prices
-                    )
-                    signals = pd.Series(
-                        np.maximum(signals.values, price_override.reindex(signals.index).fillna(0).values),
-                        index=signals.index
-                    ).clip(0, 1)
+                        # Price trend override for strong runners
+                        price_override = get_price_trend_override(
+                            strat_prices.index,
+                            model_data_bt.index,
+                            strat_prices
+                        )
+                        signals = pd.Series(
+                            np.maximum(signals.values, price_override.reindex(signals.index).fillna(0).values),
+                            index=signals.index
+                        ).clip(0, 1)
 
-                    signals = apply_confirmed_bar_execution_policy(
-                        signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
-                        weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
-                    )
+                        signals = apply_confirmed_bar_execution_policy(
+                            signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                        )
 
-                    # --- Walk-forward validation / primary signal ---
-                    if enable_regime_wfo:
-                        with st.spinner("Running Regime Walk-Forward Optimization..."):
-                            wf_regime = walk_forward_regime_selection(
-                                strat_prices,
-                                returns_bt_resampled,
-                                n_regimes="Auto" if bool(auto_wfo_regimes) else int(bt_n_regimes),
-                                switch_vol=bool(bt_switch_vol),
-                                switch_trend=bool(bt_switch_trend),
-                                train_window=int(regime_wf_train),
-                                forward_window=int(regime_wf_forward),
-                                conviction=float(conviction),
-                                min_hold=int(min_hold_period),
-                                initial_capital=initial_cap,
-                                trailing_stop_pct=trailing_stop,
-                                stop_loss_pct=stop_loss,
-                                confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
-                                use_strong_runner_override=bool(use_regime_runner_override),
-                                activity_mode=str(regime_activity_mode),
-                                use_return_booster=bool(use_regime_return_booster),
-                                return_booster_mode=str(regime_return_booster_mode)
-                            )
+                        # --- Walk-forward validation / primary signal ---
+                        if enable_regime_wfo:
+                            with st.spinner("Running Regime Walk-Forward Optimization..."):
+                                wf_regime = walk_forward_regime_selection(
+                                    strat_prices,
+                                    returns_bt_resampled,
+                                    n_regimes="Auto" if bool(auto_wfo_regimes) else int(bt_n_regimes),
+                                    switch_vol=bool(bt_switch_vol),
+                                    switch_trend=bool(bt_switch_trend),
+                                    train_window=int(regime_wf_train),
+                                    forward_window=int(regime_wf_forward),
+                                    conviction=float(conviction),
+                                    min_hold=int(min_hold_period),
+                                    initial_capital=initial_cap,
+                                    trailing_stop_pct=trailing_stop,
+                                    stop_loss_pct=stop_loss,
+                                    confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
+                                    use_strong_runner_override=bool(use_regime_runner_override),
+                                    activity_mode=str(regime_activity_mode),
+                                    use_return_booster=bool(use_regime_return_booster),
+                                    return_booster_mode=str(regime_return_booster_mode)
+                                )
 
-                        st.write("#### 🧭 Regime Walk-Forward Result")
-                        if wf_regime is None or wf_regime.get("overall") is None:
-                            st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
-                            using_wfo_primary_for_metrics = False
-                        else:
-                            wf_overall = wf_regime["overall"]
-                            eff_train = wf_regime.get("effective_train_window", regime_wf_train)
-                            eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
-                            if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
-                                st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
-                            full_bh = buy_hold_return_pct(strat_prices)
-                            wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
-                            wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
-                            wfc2.metric("WF Test Benchmark", f"{wf_overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample WFO test window.")
-                            wfc3.metric("Full Benchmark", f"{full_bh:.2f}%" if pd.notna(full_bh) else "N/A", help="Buy & hold over the full selected period. Reference only.")
-                            wfc4.metric("WF Difference", f"{wf_overall['Difference %']:+.2f}%")
-                            wfc5.metric("WF Stability", f"{wf_regime['stability_score']:.0f}/100")
-
-                            if wf_overall['Difference %'] > 0 and wf_regime['stability_score'] >= 60:
-                                st.success("Regime WFO is positive and reasonably stable.")
-                            elif wf_overall['Difference %'] > 0:
-                                st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
+                            st.write("#### 🧭 Regime Walk-Forward Result")
+                            if wf_regime is None or wf_regime.get("overall") is None:
+                                st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
+                                using_wfo_primary_for_metrics = False
                             else:
-                                st.warning("Regime WFO did not beat buy & hold on unseen windows. If the benchmark is extremely high, the stock is a strong runner and defensive regime exits may still lag buy-and-hold.")
+                                wf_overall = wf_regime["overall"]
+                                eff_train = wf_regime.get("effective_train_window", regime_wf_train)
+                                eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
+                                if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
+                                    st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
+                                full_bh = buy_hold_return_pct(strat_prices)
+                                wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
+                                wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
+                                wfc2.metric("WF Test Benchmark", f"{wf_overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample WFO test window.")
+                                wfc3.metric("Full Benchmark", f"{full_bh:.2f}%" if pd.notna(full_bh) else "N/A", help="Buy & hold over the full selected period. Reference only.")
+                                wfc4.metric("WF Difference", f"{wf_overall['Difference %']:+.2f}%")
+                                wfc5.metric("WF Stability", f"{wf_regime['stability_score']:.0f}/100")
 
-                            wf_rows = wf_regime["rows"].copy()
-                            if not wf_rows.empty:
-                                for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
-                                    wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
-                                st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
-
-                            if use_regime_wfo:
-                                first_forward_start = wf_regime["first_forward_start"]
-                                full_wfo_prices = strat_prices.copy()
-
-                                if bool(regime_full_benchmark_mode):
-                                    # Full-benchmark mode: compare the strategy against buy & hold from the
-                                    # selected start date, not only after the WFO training window.
-                                    # WFO cannot produce a model-selected signal before the first forward period,
-                                    # so the pre-WFO section uses a causal trend bridge. This is clearly labeled
-                                    # as a bridge, not as out-of-sample WFO validation.
-                                    wf_only_signal = wf_regime["signal"].reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
-                                    bridge_signal = benchmark_aware_trend_participation_signal(
-                                        full_wfo_prices, mode=str(regime_return_booster_mode)
-                                    ).reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
-                                    if bool(confirmed_regime_bar):
-                                        bridge_signal = bridge_signal.shift(1).ffill().fillna(0).clip(0, 1)
-
-                                    signals = wf_only_signal.copy()
-                                    pre_wfo_mask = signals.index < first_forward_start
-                                    signals.loc[pre_wfo_mask] = bridge_signal.loc[pre_wfo_mask]
-                                    strat_prices = full_wfo_prices
-                                    benchmark_label_for_metrics = "Full Benchmark"
-                                    full_period_benchmark_pct_for_metrics = full_bh
-                                    using_wfo_primary_for_metrics = True
-                                    try:
-                                        st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
-                                    except Exception:
-                                        pass
+                                if wf_overall['Difference %'] > 0 and wf_regime['stability_score'] >= 60:
+                                    st.success("Regime WFO is positive and reasonably stable.")
+                                elif wf_overall['Difference %'] > 0:
+                                    st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
                                 else:
-                                    # Pure WFO-test mode: compare only over the out-of-sample forward-test window.
-                                    strat_prices = strat_prices.loc[first_forward_start:]
-                                    signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                    benchmark_label_for_metrics = "WFO Test Benchmark"
-                                    full_period_benchmark_pct_for_metrics = full_bh
-                                    using_wfo_primary_for_metrics = True
+                                    st.warning("Regime WFO did not beat buy & hold on unseen windows. If the benchmark is extremely high, the stock is a strong runner and defensive regime exits may still lag buy-and-hold.")
 
-                                # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
-                                # Previous versions could show identical results because the booster was only
-                                # a WFO candidate or overlay inside each block. If WFO selected the same
-                                # base regime exposure, the final BacktestEngine.run_strategy() still received
-                                # the old signal. This block applies the booster to the exact `signals` series
-                                # used by the performance metrics and trade log below.
-                                if bool(use_regime_return_booster):
-                                    try:
-                                        booster_full = benchmark_aware_trend_participation_signal(
-                                            strat_prices, mode=str(regime_return_booster_mode)
-                                        ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                        booster_full = apply_confirmed_bar_execution_policy(
-                                            booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
-                                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
-                                        )
+                                wf_rows = wf_regime["rows"].copy()
+                                if not wf_rows.empty:
+                                    for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
+                                        wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
+                                    st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
 
-                                        mode_l = str(regime_return_booster_mode or "Balanced").lower()
-                                        original_signals = signals.copy()
-                                        if ("optimized" in mode_l) or ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
-                                            # Full Benchmark Capture / Maximum Capture must become the primary
-                                            # final signal, otherwise the WFO signal can still keep returns far
-                                            # below the full buy-and-hold benchmark.
-                                            signals = booster_full
-                                        elif mode_l == "conservative":
-                                            # Conservative only adds high-confidence exposure.
-                                            high_conf = booster_full.where(booster_full >= 0.75, 0.0)
-                                            signals = pd.concat([signals, high_conf], axis=1).max(axis=1).clip(0, 1)
-                                        else:
-                                            # Balanced: combine WFO regime signal with benchmark-aware trend hold.
-                                            signals = pd.concat([signals, booster_full], axis=1).max(axis=1).clip(0, 1)
+                                if use_regime_wfo:
+                                    first_forward_start = wf_regime["first_forward_start"]
+                                    full_wfo_prices = strat_prices.copy()
 
-                                            # If the max overlay is still identical, force the booster as the
-                                            # final signal because the user explicitly enabled the return booster.
-                                            # This prevents the exact same metrics problem.
-                                            changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
-                                            if changed_bars == 0:
-                                                signals = booster_full
-                                                st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
-                                            else:
-                                                st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
+                                    if bool(regime_full_benchmark_mode):
+                                        # Full-benchmark mode: compare the strategy against buy & hold from the
+                                        # selected start date, not only after the WFO training window.
+                                        # WFO cannot produce a model-selected signal before the first forward period,
+                                        # so the pre-WFO section uses a causal trend bridge. This is clearly labeled
+                                        # as a bridge, not as out-of-sample WFO validation.
+                                        wf_only_signal = wf_regime["signal"].reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                        bridge_signal = benchmark_aware_trend_participation_signal(
+                                            full_wfo_prices, mode=str(regime_return_booster_mode)
+                                        ).reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                        if bool(confirmed_regime_bar):
+                                            bridge_signal = bridge_signal.shift(1).ffill().fillna(0).clip(0, 1)
 
-                                        signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        signals = wf_only_signal.copy()
+                                        pre_wfo_mask = signals.index < first_forward_start
+                                        signals.loc[pre_wfo_mask] = bridge_signal.loc[pre_wfo_mask]
+                                        strat_prices = full_wfo_prices
+                                        benchmark_label_for_metrics = "Full Benchmark"
+                                        full_period_benchmark_pct_for_metrics = full_bh
+                                        using_wfo_primary_for_metrics = True
                                         try:
-                                            st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
+                                            st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
                                         except Exception:
                                             pass
-                                    except Exception as e:
-                                        st.warning(f"Return booster final overlay could not be applied: {e}")
+                                    else:
+                                        # Pure WFO-test mode: compare only over the out-of-sample forward-test window.
+                                        strat_prices = strat_prices.loc[first_forward_start:]
+                                        signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        benchmark_label_for_metrics = "WFO Test Benchmark"
+                                        full_period_benchmark_pct_for_metrics = full_bh
+                                        using_wfo_primary_for_metrics = True
 
-                                # benchmark_label_for_metrics / full_period_benchmark_pct_for_metrics
-                                # are set above depending on whether full-benchmark mode is ON.
-                                using_wfo_primary_for_metrics = True
+                                    # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
+                                    # Previous versions could show identical results because the booster was only
+                                    # a WFO candidate or overlay inside each block. If WFO selected the same
+                                    # base regime exposure, the final BacktestEngine.run_strategy() still received
+                                    # the old signal. This block applies the booster to the exact `signals` series
+                                    # used by the performance metrics and trade log below.
+                                    if bool(use_regime_return_booster):
+                                        try:
+                                            booster_full = benchmark_aware_trend_participation_signal(
+                                                strat_prices, mode=str(regime_return_booster_mode)
+                                            ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                            booster_full = apply_confirmed_bar_execution_policy(
+                                                booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                                                weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                                            )
 
-                    # Live Regime Hybrid final mapping
-                    # Keeps the stable daily/weekly regime brain but lets live mode update on intraday candles.
-                    if bool(regime_live_hybrid_enabled):
+                                            mode_l = str(regime_return_booster_mode or "Balanced").lower()
+                                            original_signals = signals.copy()
+                                            if ("optimized" in mode_l) or ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
+                                                # Full Benchmark Capture / Maximum Capture must become the primary
+                                                # final signal, otherwise the WFO signal can still keep returns far
+                                                # below the full buy-and-hold benchmark.
+                                                signals = booster_full
+                                            elif mode_l == "conservative":
+                                                # Conservative only adds high-confidence exposure.
+                                                high_conf = booster_full.where(booster_full >= 0.75, 0.0)
+                                                signals = pd.concat([signals, high_conf], axis=1).max(axis=1).clip(0, 1)
+                                            else:
+                                                # Balanced: combine WFO regime signal with benchmark-aware trend hold.
+                                                signals = pd.concat([signals, booster_full], axis=1).max(axis=1).clip(0, 1)
+
+                                                # If the max overlay is still identical, force the booster as the
+                                                # final signal because the user explicitly enabled the return booster.
+                                                # This prevents the exact same metrics problem.
+                                                changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
+                                                if changed_bars == 0:
+                                                    signals = booster_full
+                                                    st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
+                                                else:
+                                                    st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
+
+                                            signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                            try:
+                                                st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
+                                            except Exception:
+                                                pass
+                                        except Exception as e:
+                                            st.warning(f"Return booster final overlay could not be applied: {e}")
+
+                                    # benchmark_label_for_metrics / full_period_benchmark_pct_for_metrics
+                                    # are set above depending on whether full-benchmark mode is ON.
+                                    using_wfo_primary_for_metrics = True
+
+                        # Live Regime Hybrid final mapping
+                        # Keeps the stable daily/weekly regime brain but lets live mode update on intraday candles.
+                        if bool(regime_live_hybrid_enabled):
+                            try:
+                                anchor_signal_for_live = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                live_px_for_regime = pd.Series(live_execution_prices_for_regime).replace([np.inf, -np.inf], np.nan).dropna()
+                                if not live_px_for_regime.empty:
+                                    signals = build_live_regime_hybrid_signal(
+                                        anchor_signal_for_live,
+                                        strat_prices,
+                                        live_px_for_regime,
+                                        enable_overlay=bool(live_regime_overlay),
+                                        mode=str(live_regime_sensitivity)
+                                    )
+                                    strat_prices = live_px_for_regime.reindex(signals.index).ffill().dropna()
+                                    signals = signals.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                    benchmark_label_for_metrics = f"Live {data_interval} Benchmark"
+                                    using_wfo_primary_for_metrics = False
+                                    st.caption(f"ℹ️ Live hybrid mapped stable regime signal to {len(signals)} live candles. Current live exposure: {signals.iloc[-1]*100:.0f}%")
+                            except Exception as e:
+                                st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
+
+                        # TRUE NON-REPAINT LEDGER
+                        # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
+                        # cannot rewrite already recorded signals for this ticker/frequency/settings.
                         try:
-                            anchor_signal_for_live = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
-                            live_px_for_regime = pd.Series(live_execution_prices_for_regime).replace([np.inf, -np.inf], np.nan).dropna()
-                            if not live_px_for_regime.empty:
-                                signals = build_live_regime_hybrid_signal(
-                                    anchor_signal_for_live,
-                                    strat_prices,
-                                    live_px_for_regime,
-                                    enable_overlay=bool(live_regime_overlay),
-                                    mode=str(live_regime_sensitivity)
+                            if bool(lock_regime_ledger):
+                                signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
+                                    signals, regime_lock_key, enabled=True
                                 )
-                                strat_prices = live_px_for_regime.reindex(signals.index).ffill().dropna()
-                                signals = signals.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                benchmark_label_for_metrics = f"Live {data_interval} Benchmark"
-                                using_wfo_primary_for_metrics = False
-                                st.caption(f"ℹ️ Live hybrid mapped stable regime signal to {len(signals)} live candles. Current live exposure: {signals.iloc[-1]*100:.0f}%")
-                        except Exception as e:
-                            st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
+                                if _ledger_ok:
+                                    st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
+                                else:
+                                    st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
+                        except Exception as _lock_e:
+                            st.warning(f"Locked Regime Ledger failed: {_lock_e}")
 
-                    # TRUE NON-REPAINT LEDGER
-                    # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
-                    # cannot rewrite already recorded signals for this ticker/frequency/settings.
-                    try:
-                        if bool(lock_regime_ledger):
-                            signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
-                                signals, regime_lock_key, enabled=True
-                            )
-                            if _ledger_ok:
-                                st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
+                        # Plot Context
+                        with st.expander("See Strategy Context"):
+                            fig_ctx = go.Figure()
+                            if signal_method == "Regime Weighted Expected Return" and "expected_ret" in regime_context:
+                                expected_ret = regime_context["expected_ret"].reindex(strat_prices.index).ffill()
+                                fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
+                                fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
+                                highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.2)
+                                highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.2)
+                                fig_ctx.update_layout(title="Regime-Weighted Expected Return + Conviction Filter", hovermode="x unified", template="plotly_dark", height=400)
                             else:
-                                st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
-                    except Exception as _lock_e:
-                        st.warning(f"Locked Regime Ledger failed: {_lock_e}")
+                                bull_probs = regime_context.get("bull_probs", pd.Series(dtype=float)).reindex(strat_prices.index).ffill()
+                                fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=bull_probs, mode='lines', line=dict(color='green', width=1.5), name='Bull Probability'))
+                                fig_ctx.add_hline(y=float(conviction), line_dash="dash", line_color="white", annotation_text="Min Bull Probability")
+                                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.15)
+                                fig_ctx.update_layout(title=f"{signal_method} (Conviction={conviction:.0%}, Min Hold={int(min_hold_period)})", hovermode="x unified", template="plotly_dark", height=400)
+                            st.plotly_chart(fig_ctx, use_container_width=True)
 
-                    # Plot Context
-                    with st.expander("See Strategy Context"):
-                        fig_ctx = go.Figure()
-                        if signal_method == "Regime Weighted Expected Return" and "expected_ret" in regime_context:
-                            expected_ret = regime_context["expected_ret"].reindex(strat_prices.index).ffill()
-                            fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
-                            fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
-                            highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.2)
-                            highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.2)
-                            fig_ctx.update_layout(title="Regime-Weighted Expected Return + Conviction Filter", hovermode="x unified", template="plotly_dark", height=400)
-                        else:
-                            bull_probs = regime_context.get("bull_probs", pd.Series(dtype=float)).reindex(strat_prices.index).ffill()
-                            fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=bull_probs, mode='lines', line=dict(color='green', width=1.5), name='Bull Probability'))
-                            fig_ctx.add_hline(y=float(conviction), line_dash="dash", line_color="white", annotation_text="Min Bull Probability")
-                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.15)
-                            fig_ctx.update_layout(title=f"{signal_method} (Conviction={conviction:.0%}, Min Hold={int(min_hold_period)})", hovermode="x unified", template="plotly_dark", height=400)
-                        st.plotly_chart(fig_ctx, use_container_width=True)
-
-                    # Debug Dataframe
-                    with st.expander("🔍 Debug: Signal Details"):
-                        debug_df = pd.DataFrame({
-                            "Price": strat_prices,
-                            "Alert Signal": signals
-                        }).dropna()
-                        st.dataframe(debug_df.style.format({
-                            "Price": "{:.2f}",
-                            "Signal": "{:.0f}"
-                        }), use_container_width=True)
+                        # Debug Dataframe
+                        with st.expander("🔍 Debug: Signal Details"):
+                            debug_df = pd.DataFrame({
+                                "Price": strat_prices,
+                                "Alert Signal": signals
+                            }).dropna()
+                            st.dataframe(debug_df.style.format({
+                                "Price": "{:.2f}",
+                                "Signal": "{:.0f}"
+                            }), use_container_width=True)
                         
-                else:
-                    st.error("Regime model fitting failed.")
+                    else:
+                        st.error("Regime model fitting failed.")
+
 
     elif strategy_type == "Kalman Filter (Trend Crossover)":
         st.markdown("**Strategy:** Long when Price crosses **ABOVE** Kalman Trend. Sell when Price crosses **BELOW**.")
