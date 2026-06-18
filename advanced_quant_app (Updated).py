@@ -11199,13 +11199,13 @@ with tab2:
     # It simply will not execute until you explicitly load this tab.
     _load_regime_switching_now = st.checkbox(
         "Load / run Regime Switching model",
-        value=False,
+        value=True,
         key="lazy_load_regime_switching_tab_no_logic_change",
-        help="Keeps the full app fast. Turn ON only when you want to fit the Markov regime model."
+        help="Runs automatically. Uncheck to pause it if you want the app faster."
     )
 
     if not _load_regime_switching_now:
-        st.info("Regime Switching is ready but not running on startup. Turn ON the checkbox above to run the exact same model.")
+        st.info("Regime Switching is paused. Turn ON the checkbox above to run the model.")
     else:
         # ===== PRE-FLIGHT CHECKS =====
         warnings = []
