@@ -596,7 +596,7 @@ def _kalman_15m_signal_from_prices(px):
 
     # Main Kalman-style defaults; same family as the primary graph/trade-log logic.
     buffer_pct = 0.0125
-    confirm_bars = 1
+    confirm_bars = 3
     min_hold = 5
     cooldown_bars = 3
 
@@ -866,9 +866,9 @@ def _get_current_main_kalman_params():
     except Exception:
         buffer_pct = 0.0125
     try:
-        confirm_bars = int(st.session_state.get("kalman_strategy_confirm_bars", 1))
+        confirm_bars = int(st.session_state.get("kalman_strategy_confirm_bars", 3))
     except Exception:
-        confirm_bars = 1
+        confirm_bars = 3
     try:
         min_hold_bars = int(st.session_state.get("kalman_strategy_min_hold", 5))
     except Exception:
@@ -1131,109 +1131,7 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     }
     return trades_df, latest
 
-
-def _main_kalman_signal_progress(ticker, px):
-    """
-    Live 'signal building' indicator. Computes how many consecutive recent bars
-    are stacking toward a BUY (entry) or SELL (exit), out of the confirm_bars
-    required to fire. This is DISPLAY ONLY — it never changes the actual signal,
-    so it cannot affect the zero-repaint guarantee.
-
-    Returns a dict: {position, building, need, have, direction, note} or None.
-    """
-    try:
-        ticker = str(ticker).upper()
-        px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-        if len(px) < 80:
-            return None
-
-        params = _get_current_main_kalman_params()
-        _opt = _get_main_kalman_opt_params_for_ticker(ticker)
-        if isinstance(_opt, dict):
-            buffer_pct = float(_opt.get("buffer_pct", params["buffer_pct"]))
-            confirm_bars = int(_opt.get("confirm_bars", params["confirm_bars"]))
-            slope_confirm = bool(_opt.get("slope_confirm", params["slope_confirm"]))
-            atr_safety = bool(_opt.get("atr_safety", params["atr_safety"]))
-        else:
-            buffer_pct = float(params["buffer_pct"])
-            confirm_bars = int(params["confirm_bars"])
-            slope_confirm = bool(params["slope_confirm"])
-            atr_safety = bool(params["atr_safety"])
-
-        rail, center, long_state = institutional_trend_rail(
-            px,
-            fast_gain=float(params["fast_gain"]),
-            slow_gain=float(params["slow_gain"]),
-            polish_span=int(params["polish_span"]),
-            atr_window=14,
-            atr_mult=float(params["rail_mult"]),
-        )
-        bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
-        trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
-
-        close_above = px > bt_trend * (1.0 + buffer_pct)
-        close_below = px < bt_trend * (1.0 - buffer_pct)
-        if slope_confirm:
-            entry_cond = close_above & (trend_slope >= 0)
-            exit_cond = close_below & (trend_slope <= 0)
-        else:
-            entry_cond = close_above
-            exit_cond = close_below
-        if atr_safety:
-            atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-            exit_cond = exit_cond | (px < (bt_trend - 1.25 * atr_proxy)).fillna(False)
-
-        # Count consecutive True at the most recent completed bar.
-        def _trailing_run(cond):
-            run = 0
-            for v in reversed(list(cond.values)):
-                if bool(v):
-                    run += 1
-                else:
-                    break
-            return run
-
-        entry_run = _trailing_run(entry_cond)
-        exit_run = _trailing_run(exit_cond)
-
-        # Current position from the frozen signal (source of truth).
-        pos_long = bool(long_state.iloc[-1]) if len(long_state) else False
-        # Determine which direction is currently building (the one relevant to a flip).
-        if entry_run > 0 and entry_run >= exit_run:
-            direction = "BUY"
-            have = min(entry_run, confirm_bars)
-        elif exit_run > 0:
-            direction = "SELL"
-            have = min(exit_run, confirm_bars)
-        else:
-            direction = None
-            have = 0
-
-        building = direction is not None and have < confirm_bars and have > 0
-        ready = have >= confirm_bars and direction is not None
-
-        if ready:
-            note = f"{direction} confirmed ({have}/{confirm_bars}) on the latest closed bar."
-        elif building:
-            bars_left = confirm_bars - have
-            note = (f"{direction} building: {have} of {confirm_bars} bars confirmed — "
-                    f"{bars_left} more closed bar(s) (~{bars_left*15} min) needed to fire.")
-        else:
-            note = "No setup forming on the latest closed bar."
-
-        return {
-            "direction": direction,
-            "have": int(have),
-            "need": int(confirm_bars),
-            "building": bool(building),
-            "ready": bool(ready),
-            "last_close_ct": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
-            "note": note,
-        }
-    except Exception:
-        return None
-
-
+def _main_kalman_watchlist_ledger_path():
     try:
         return _Path.home() / ".pinehurst_main_kalman_watchlist_ledger.json"
     except Exception:
@@ -8564,7 +8462,7 @@ with st.sidebar:
             "initial_cap": float(st.session_state.get("initial_cap", 10000.0)),
             "kalman_trend_rail_distance": float(st.session_state.get("kalman_trend_rail_distance", 1.35)),
             "kalman_strategy_cross_buffer_pct": float(st.session_state.get("kalman_strategy_cross_buffer_pct", 1.25)),
-            "kalman_strategy_confirm_bars": int(st.session_state.get("kalman_strategy_confirm_bars", 1)),
+            "kalman_strategy_confirm_bars": int(st.session_state.get("kalman_strategy_confirm_bars", 3)),
             "kalman_strategy_min_hold": int(st.session_state.get("kalman_strategy_min_hold", 5)),
             "kalman_strategy_cooldown": int(st.session_state.get("kalman_strategy_cooldown", 3)),
             "kalman_strategy_slope_confirm": bool(st.session_state.get("kalman_strategy_slope_confirm", True)),
@@ -10506,7 +10404,7 @@ if bool(kalman_fast_live_mode):
                 with ks1:
                     kalman_buffer_pct = st.slider("Cross buffer (%)", 0.00, 8.00, 1.25, step=0.25, key="kalman_strategy_cross_buffer_pct") / 100.0
                 with ks2:
-                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 1, step=1, key="kalman_strategy_confirm_bars", help="Closed 15m bars that must agree before firing. 1 = fastest (~15 min), non-repainting at any value.")
+                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 3, step=1, key="kalman_strategy_confirm_bars")
                 with ks3:
                     kalman_min_hold = st.slider("Minimum hold bars", 1, 40, 5, step=1, key="kalman_strategy_min_hold")
                 with ks4:
@@ -11296,265 +11194,277 @@ with tab2:
         switch_vol = st.checkbox("Switching Volatility", value=True,
                                   help="Uncheck to focus ONLY on Trend (ignore volatility changes)")
     
-    # ===== PRE-FLIGHT CHECKS =====
-    warnings = []
-    if regime_window_mode == "Rolling 1-Year":
-        st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
-    else:
-        if lookback_years <= 1:
-            warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
-            if regime_freq == "Weekly":
-                warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
-                regime_freq = "Daily"
+    # ===== LAZY LOAD GATE =====
+    # Speed-only change: regime math/logic below is unchanged.
+    # It simply will not execute until you explicitly load this tab.
+    _load_regime_switching_now = st.checkbox(
+        "Load / run Regime Switching model",
+        value=False,
+        key="lazy_load_regime_switching_tab_no_logic_change",
+        help="Keeps the full app fast. Turn ON only when you want to fit the Markov regime model."
+    )
 
-        if regime_freq == "Daily" and switch_trend and lookback_years < 3:
-            warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
-            switch_trend = False
+    if not _load_regime_switching_now:
+        st.info("Regime Switching is ready but not running on startup. Turn ON the checkbox above to run the exact same model.")
+    else:
+        # ===== PRE-FLIGHT CHECKS =====
+        warnings = []
+        if regime_window_mode == "Rolling 1-Year":
+            st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
+        else:
+            if lookback_years <= 1:
+                warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
+                if regime_freq == "Weekly":
+                    warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
+                    regime_freq = "Daily"
 
-    if warnings:
-        for w in warnings:
-            st.warning(w)
+            if regime_freq == "Daily" and switch_trend and lookback_years < 3:
+                warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
+                switch_trend = False
+
+        if warnings:
+            for w in warnings:
+                st.warning(w)
     
-    # ===== DATA PREPARATION =====
-    if regime_window_mode == "Rolling 1-Year":
-        # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
-        _regime_end_ts = pd.Timestamp(end_date)
-        start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
-    else:
-        start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
-    df_regime = load_data(TICKER, start_dt_regime, end_date)
+        # ===== DATA PREPARATION =====
+        if regime_window_mode == "Rolling 1-Year":
+            # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
+            _regime_end_ts = pd.Timestamp(end_date)
+            start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
+        else:
+            start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
+        df_regime = load_data(TICKER, start_dt_regime, end_date)
     
-    if df_regime is None:
-        st.error("Could not load data")
-        st.stop()
-    
-    # Prepare data
-    if regime_freq == "Weekly":
-        returns = df_regime['Returns'].resample('W').sum()
-    else:
-        returns = df_regime['Returns']
-    
-    # Apply Pre-Smoothing (EWMA) if requested
-    if stability > 0:
-        returns = returns.ewm(span=stability, adjust=False).mean()
-        st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
-    
-    # FIX: Ensure data is strictly 1D Series with Float dtype
-    try:
-        model_data = returns.dropna() * 100
-        
-        # Reconstruct Series to guarantee 1D structure
-        # This handles (N,1) DataFrames, Series, etc.
-        if len(model_data) < 10:
-            st.error("Insufficient data points for modeling (>10 required).")
+        if df_regime is None:
+            st.error("Could not load data")
             st.stop()
+    
+        # Prepare data
+        if regime_freq == "Weekly":
+            returns = df_regime['Returns'].resample('W').sum()
+        else:
+            returns = df_regime['Returns']
+    
+        # Apply Pre-Smoothing (EWMA) if requested
+        if stability > 0:
+            returns = returns.ewm(span=stability, adjust=False).mean()
+            st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
+    
+        # FIX: Ensure data is strictly 1D Series with Float dtype
+        try:
+            model_data = returns.dropna() * 100
+        
+            # Reconstruct Series to guarantee 1D structure
+            # This handles (N,1) DataFrames, Series, etc.
+            if len(model_data) < 10:
+                st.error("Insufficient data points for modeling (>10 required).")
+                st.stop()
             
-        model_data = pd.Series(
-            model_data.values.flatten().astype(float), 
-            index=model_data.index
-        )
+            model_data = pd.Series(
+                model_data.values.flatten().astype(float), 
+                index=model_data.index
+            )
         
-        if model_data.ndim != 1:
-            st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
-            st.stop()
+            if model_data.ndim != 1:
+                st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
+                st.stop()
              
-    except Exception as e:
-        st.error(f"Data Prep Error: {e}")
-        st.stop()
+        except Exception as e:
+            st.error(f"Data Prep Error: {e}")
+            st.stop()
     
-    _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
-    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
+        _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
+        st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
     
-    # ===== MODEL FITTING =====
-    with st.spinner(f"Fitting {n_regimes}-regime model..."):
-        res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
+        # ===== MODEL FITTING =====
+        with st.spinner(f"Fitting {n_regimes}-regime model..."):
+            res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
         
-    if res_markov is None:
-        st.error("Model fitting failed (fit_regime_model returned None).")
-        st.stop()
+        if res_markov is None:
+            st.error("Model fitting failed (fit_regime_model returned None).")
+            st.stop()
         
-    # Verify convergence implicitly via success return
+        # Verify convergence implicitly via success return
 
         
-    # ===== CONVERGENCE CHECKS =====
-    if not res_markov.mle_retvals['converged']:
-        st.error("⛔ Model did not converge. Try longer history or simpler model.")
-        st.stop()
+        # ===== CONVERGENCE CHECKS =====
+        if not res_markov.mle_retvals['converged']:
+            st.error("⛔ Model did not converge. Try longer history or simpler model.")
+            st.stop()
     
-    trans_matrix = np.squeeze(res_markov.regime_transition)
+        trans_matrix = np.squeeze(res_markov.regime_transition)
     
-    # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
-    if trans_matrix.ndim < 2:
-         trans_matrix = np.atleast_2d(trans_matrix)
+        # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
+        if trans_matrix.ndim < 2:
+             trans_matrix = np.atleast_2d(trans_matrix)
     
-    # Check for degenerate regimes
-    if np.any(trans_matrix > 0.99):
-        st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
+        # Check for degenerate regimes
+        if np.any(trans_matrix > 0.99):
+            st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
     
-    # ===== REGIME CHARACTERIZATION =====
-    regime_stats = []
-    for i in range(n_regimes):
-        # Handle case where switching_trend=False (single 'const')
-        if f'const[{i}]' in res_markov.params:
-            mean_val = res_markov.params[f'const[{i}]']
-        else:
-            mean_val = res_markov.params.get('const', 0.0)
+        # ===== REGIME CHARACTERIZATION =====
+        regime_stats = []
+        for i in range(n_regimes):
+            # Handle case where switching_trend=False (single 'const')
+            if f'const[{i}]' in res_markov.params:
+                mean_val = res_markov.params[f'const[{i}]']
+            else:
+                mean_val = res_markov.params.get('const', 0.0)
         
-        # Handle case where switching_variance=False (single 'sigma2')
-        if f'sigma2[{i}]' in res_markov.params:
-            vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
-        else:
-            vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
+            # Handle case where switching_variance=False (single 'sigma2')
+            if f'sigma2[{i}]' in res_markov.params:
+                vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
+            else:
+                vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
             
-        regime_stats.append({
-            'regime': i,
-            'mean': float(mean_val),
-            'vol': float(vol_val),
-            'persistence': float(trans_matrix[i, i])
-        })
+            regime_stats.append({
+                'regime': i,
+                'mean': float(mean_val),
+                'vol': float(vol_val),
+                'persistence': float(trans_matrix[i, i])
+            })
     
-    # Sort by mean (high to low)
-    regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
+        # Sort by mean (high to low)
+        regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
     
-    # ===== DISPLAY REGIMES =====
-    st.write("### 📊 Identified Regimes")
+        # ===== DISPLAY REGIMES =====
+        st.write("### 📊 Identified Regimes")
     
-    cols = st.columns(n_regimes)
-    labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
+        cols = st.columns(n_regimes)
+        labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
     
-    for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
-        with col:
-            st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
-            st.metric("Mean Return", f"{regime['mean']:.2f}%")
-            st.metric("Volatility", f"{regime['vol']:.2f}%")
-            st.metric("Persistence", f"{regime['persistence']:.1%}")
+        for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
+            with col:
+                st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
+                st.metric("Mean Return", f"{regime['mean']:.2f}%")
+                st.metric("Volatility", f"{regime['vol']:.2f}%")
+                st.metric("Persistence", f"{regime['persistence']:.1%}")
             
-            avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
-            st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
+                avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
+                st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
     
-    safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
+        safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
     
-    # ===== CURRENT STATE =====
-    # Use .iloc[-1] to get the probabilities at the LAST time step
-    last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
-    current_regime = np.argmax(last_probs)
-    current_prob = last_probs.iloc[current_regime]
+        # ===== CURRENT STATE =====
+        # Use .iloc[-1] to get the probabilities at the LAST time step
+        last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
+        current_regime = np.argmax(last_probs)
+        current_prob = last_probs.iloc[current_regime]
     
-    regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
+        regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
     
-    # Conviction Logic
-    is_conviction = current_prob >= conviction_thresh
+        # Conviction Logic
+        is_conviction = current_prob >= conviction_thresh
     
-    # Calculate Stability Score (Mean Persistence)
-    stability_score = np.mean([r['persistence'] for r in regime_stats])
+        # Calculate Stability Score (Mean Persistence)
+        stability_score = np.mean([r['persistence'] for r in regime_stats])
     
-    # Display Dashboard
-    st.divider()
-    c_dash1, c_dash2, c_dash3 = st.columns(3)
+        # Display Dashboard
+        st.divider()
+        c_dash1, c_dash2, c_dash3 = st.columns(3)
     
-    with c_dash1:
-        st.caption("Current State")
-        if is_conviction:
-            st.subheader(f"{regime_label}")
-            st.success(f"High Conviction ({current_prob:.1%})")
-        else:
-            st.subheader("⚪ Mixed / Uncertain")
-            st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
+        with c_dash1:
+            st.caption("Current State")
+            if is_conviction:
+                st.subheader(f"{regime_label}")
+                st.success(f"High Conviction ({current_prob:.1%})")
+            else:
+                st.subheader("⚪ Mixed / Uncertain")
+                st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
     
-    with c_dash2:
-        st.caption("Dominance Score (Confidence)")
-        # Spread between 1st and 2nd highest probability
-        sorted_probs = sorted(last_probs.values, reverse=True)
-        spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+        with c_dash2:
+            st.caption("Dominance Score (Confidence)")
+            # Spread between 1st and 2nd highest probability
+            sorted_probs = sorted(last_probs.values, reverse=True)
+            spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
         
-        st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
-        st.progress(max(0.0, min(1.0, float(spread))))
+            st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
+            st.progress(max(0.0, min(1.0, float(spread))))
         
-    with c_dash3:
-        st.caption("Regime Stability Metrics")
-        st.metric("Avg Persistence", f"{stability_score:.1%}")
-        # Switch Frequency (proxy)
-        expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
-        st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
+        with c_dash3:
+            st.caption("Regime Stability Metrics")
+            st.metric("Avg Persistence", f"{stability_score:.1%}")
+            # Switch Frequency (proxy)
+            expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
+            st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
 
-    st.write(f"**As of:** {model_data.index[-1].date()}")
-    st.divider()
+        st.write(f"**As of:** {model_data.index[-1].date()}")
+        st.divider()
     
-    # ===== VISUALIZATION =====
-    st.write("### 📈 Regime Analysis (Real-time / Filtered)")
+        # ===== VISUALIZATION =====
+        st.write("### 📈 Regime Analysis (Real-time / Filtered)")
     
-    fig_m = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
-                          subplot_titles=("Returns", "Regime Probabilities (Filtered/Real-time)", "Regime-Weighted Expected Return"))
+        fig_m = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                              subplot_titles=("Returns", "Regime Probabilities (Filtered/Real-time)", "Regime-Weighted Expected Return"))
     
-    fig_m.add_trace(go.Scatter(x=model_data.index, y=model_data, mode='lines', line=dict(color='gray', width=1), name='Return (%)'), row=1, col=1)
+        fig_m.add_trace(go.Scatter(x=model_data.index, y=model_data, mode='lines', line=dict(color='gray', width=1), name='Return (%)'), row=1, col=1)
     
-    import matplotlib.colors as mcolors
-    for i, regime in enumerate(regime_stats):
-        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-        hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
-        probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-        # Shading regions where prob > 0.6
-        mask = probs > 0.6
-        highlight_plotly_zones(fig_m, mask, hex_color, opacity=0.15, row=1, col=1)
+        import matplotlib.colors as mcolors
+        for i, regime in enumerate(regime_stats):
+            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+            hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
+            probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+            # Shading regions where prob > 0.6
+            mask = probs > 0.6
+            highlight_plotly_zones(fig_m, mask, hex_color, opacity=0.15, row=1, col=1)
 
-    smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
+        smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
     
-    for i, regime in enumerate(regime_stats):
-        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-        hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
-        raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-        if smooth_probs:
-            plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
-        else:
-            plot_probs = raw_probs
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=plot_probs, mode='lines', line=dict(color=hex_color, width=1.5), fill='tozeroy', name=labels[i]), row=2, col=1)
+        for i, regime in enumerate(regime_stats):
+            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+            hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
+            raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+            if smooth_probs:
+                plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
+            else:
+                plot_probs = raw_probs
+            fig_m.add_trace(go.Scatter(x=model_data.index, y=plot_probs, mode='lines', line=dict(color=hex_color, width=1.5), fill='tozeroy', name=labels[i]), row=2, col=1)
 
-    fig_m.add_hline(y=1/n_regimes, line_dash="dash", line_color="gray", opacity=0.4, row=2, col=1)
+        fig_m.add_hline(y=1/n_regimes, line_dash="dash", line_color="gray", opacity=0.4, row=2, col=1)
     
-    def get_const(i):
-        if f'const[{i}]' in res_markov.params: return float(res_markov.params[f'const[{i}]'])
-        return float(res_markov.params.get('const', 0.0))
+        def get_const(i):
+            if f'const[{i}]' in res_markov.params: return float(res_markov.params[f'const[{i}]'])
+            return float(res_markov.params.get('const', 0.0))
 
-    expected_ret = pd.Series(0.0, index=model_data.index)
-    for i in range(n_regimes):
-        prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
-        expected_ret += prob * get_const(i)
+        expected_ret = pd.Series(0.0, index=model_data.index)
+        for i in range(n_regimes):
+            prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
+            expected_ret += prob * get_const(i)
     
-    fig_m.add_trace(go.Scatter(x=model_data.index, y=expected_ret, mode='lines', line=dict(color='#00f2ff', width=2), name="Expected Return"), row=3, col=1)
-    fig_m.add_hline(y=0, line_dash="solid", line_color="white", opacity=0.3, row=3, col=1)
+        fig_m.add_trace(go.Scatter(x=model_data.index, y=expected_ret, mode='lines', line=dict(color='#00f2ff', width=2), name="Expected Return"), row=3, col=1)
+        fig_m.add_hline(y=0, line_dash="solid", line_color="white", opacity=0.3, row=3, col=1)
     
-    # Fill Expected return green and red
-    exp_pos = expected_ret.copy()
-    exp_pos[exp_pos < 0] = 0
-    fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_pos, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.3, name="Positive Exp Ret", showlegend=False), row=3, col=1)
+        # Fill Expected return green and red
+        exp_pos = expected_ret.copy()
+        exp_pos[exp_pos < 0] = 0
+        fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_pos, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.3, name="Positive Exp Ret", showlegend=False), row=3, col=1)
     
-    exp_neg = expected_ret.copy()
-    exp_neg[exp_neg > 0] = 0
-    fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_neg, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.3, name="Negative Exp Ret", showlegend=False), row=3, col=1)
+        exp_neg = expected_ret.copy()
+        exp_neg[exp_neg > 0] = 0
+        fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_neg, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.3, name="Negative Exp Ret", showlegend=False), row=3, col=1)
     
-    fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
-    st.plotly_chart(fig_m, use_container_width=True)
-    safe_report_add("Regime Switching Analysis", fig_m)
+        fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
+        st.plotly_chart(fig_m, use_container_width=True)
+        safe_report_add("Regime Switching Analysis", fig_m)
     
-    # ===== PARAMETERS TABLE =====
-    with st.expander("📋 Technical Parameters"):
-        summary_data = {
-            "Parameter": res_markov.params.index,
-            "Value": res_markov.params.values.astype(float),
-            "Std Error": res_markov.bse.values.astype(float),
-            "P-Value": res_markov.pvalues.values.astype(float)
-        }
-        df_summary = pd.DataFrame(summary_data)
-        # Format only numeric columns to avoid error with "Parameter" string column
-        st.dataframe(df_summary.style.format({
-            "Value": "{:.4f}",
-            "Std Error": "{:.4f}",
-            "P-Value": "{:.4f}"
-        }))
+        # ===== PARAMETERS TABLE =====
+        with st.expander("📋 Technical Parameters"):
+            summary_data = {
+                "Parameter": res_markov.params.index,
+                "Value": res_markov.params.values.astype(float),
+                "Std Error": res_markov.bse.values.astype(float),
+                "P-Value": res_markov.pvalues.values.astype(float)
+            }
+            df_summary = pd.DataFrame(summary_data)
+            # Format only numeric columns to avoid error with "Parameter" string column
+            st.dataframe(df_summary.style.format({
+                "Value": "{:.4f}",
+                "Std Error": "{:.4f}",
+                "P-Value": "{:.4f}"
+            }))
         
-        st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
+            st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
     
-
 
 
 # ==========================================
@@ -12066,11 +11976,9 @@ with tab4:
             with ks2:
                 kalman_confirm_bars = st.slider(
                     "Confirm bars",
-                    1, 10, 1, step=1,
+                    1, 10, 3, step=1,
                     key="kalman_strategy_confirm_bars",
-                    help="How many CLOSED 15m bars must agree before the signal fires. "
-                         "1 = fire on the first closed bar (~15 min, fastest). Higher = fewer "
-                         "false starts but slower. Non-repainting at any value."
+                    help="Signal must persist for this many bars before acting."
                 )
             with ks3:
                 kalman_min_hold = st.slider(
@@ -12093,31 +12001,6 @@ with tab4:
                 key="kalman_strategy_slope_confirm",
                 help="Entry prefers rising trend; exit prefers falling trend. This reduces overtrading."
             )
-
-            # Tickers you've already run saved their own confirm-bars value to the
-            # per-ticker params file, so changing the slider above won't affect them
-            # until you re-apply. This button pushes the current Confirm bars value
-            # to every saved ticker so the watchlist/scanner use it immediately.
-            _cc1, _cc2 = st.columns([3, 1])
-            with _cc2:
-                if st.button("Apply confirm to all saved tickers", key="apply_confirm_all", use_container_width=True):
-                    try:
-                        _store = _load_main_kalman_opt_params()
-                        _n = 0
-                        for _tk, _p in list(_store.items()):
-                            if isinstance(_p, dict):
-                                _p["confirm_bars"] = int(kalman_confirm_bars)
-                                _store[_tk] = _p
-                                _n += 1
-                        _main_kalman_opt_params_path().write_text(json.dumps(_store, indent=2))
-                        # Clearing the signal lock lets the faster signal re-baseline cleanly.
-                        try:
-                            _save_main_kalman_signal_lock({})
-                        except Exception:
-                            pass
-                        st.success(f"Applied Confirm bars = {int(kalman_confirm_bars)} to {_n} saved ticker(s) and reset the signal lock.")
-                    except Exception as _e:
-                        st.error(f"Could not apply: {_e}")
             use_atr_safety = st.checkbox(
                 "Use ATR safety exit",
                 value=True,
@@ -12504,31 +12387,6 @@ with tab4:
                     if _main_status_row:
                         st.markdown("#### ✅ Main Kalman Current Status")
                         st.dataframe(pd.DataFrame([_main_status_row]), use_container_width=True, hide_index=True)
-
-                        # ---- Live "signal building" indicator (display only) ----
-                        try:
-                            _prog = _main_kalman_signal_progress(TICKER, bt_px)
-                            if _prog:
-                                _have, _need = _prog["have"], _prog["need"]
-                                _dir = _prog["direction"]
-                                if _prog["ready"] and _dir:
-                                    st.success(f"🟢 {_dir} confirmed on the last closed bar ({_have}/{_need}). "
-                                               f"Bar closed {_prog['last_close_ct']}.")
-                                elif _prog["building"] and _dir:
-                                    _emoji = "🟡" if _dir == "BUY" else "🟠"
-                                    st.warning(f"{_emoji} {_dir} signal building: **{_have} of {_need}** bars confirmed. "
-                                               f"{_need - _have} more closed 15m bar(s) (~{(_need-_have)*15} min) "
-                                               f"needed before it fires.")
-                                    try:
-                                        st.progress(min(1.0, _have / max(1, _need)))
-                                    except Exception:
-                                        pass
-                                else:
-                                    st.caption("⚪ No new BUY/SELL setup forming on the latest closed bar.")
-                                st.caption("This shows a signal forming in real time. The actual signal still only "
-                                           "fires on a fully closed bar after full confirmation — so it never repaints.")
-                        except Exception:
-                            pass
                 except Exception:
                     pass
 
