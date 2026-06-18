@@ -11074,6 +11074,64 @@ with tab7:
         strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
         bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
         total_pnl_return_pct = total_trade_pnl_return_pct(bt_results.get('trades', pd.DataFrame()))
+
+        # CUMULATIVE RETURN DISPLAY FIX:
+        # For Regime Switching, the visible trade log now uses real market prices.
+        # Therefore the visible Cumulative Return metric must use the SAME visible
+        # real-price trade log, not the old internal/smoothed equity-curve value.
+        metric_cumulative_return_pct = (bt_results['equity_curve'].iloc[-1] / initial_cap - 1) * 100
+        metric_total_pnl_return_pct = total_pnl_return_pct
+        try:
+            if strategy_type == "Regime Switching (Trend Following)":
+                _metric_real_trades = bt_results.get('trades', pd.DataFrame()).copy()
+                if _metric_real_trades is not None and not _metric_real_trades.empty:
+                    try:
+                        if bt_freq == "Weekly":
+                            _metric_real_trades = map_weekly_trade_log_dates_only(_metric_real_trades, df_bt)
+                        _metric_real_trades = apply_weekly_live_trigger_display_overrides(
+                            _metric_real_trades, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        _metric_real_trades = _mark_latest_regime_trade_open_if_signal_long(_metric_real_trades)
+                        _metric_real_trades = _reconcile_latest_daily_regime_exit_price(_metric_real_trades)
+                        _metric_real_trades = _metric_real_trades.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+                    except Exception:
+                        pass
+                    try:
+                        _metric_real_trades = _apply_real_market_prices_to_regime_display_log(_metric_real_trades, prices_bt_resampled)
+                    except Exception:
+                        pass
+
+                    if "PnL (%)" in _metric_real_trades.columns:
+                        _pnl_vals = pd.to_numeric(_metric_real_trades["PnL (%)"], errors="coerce").dropna()
+                        if len(_pnl_vals):
+                            metric_total_pnl_return_pct = float(_pnl_vals.sum())
+
+                    if "Cumulative Return (%)" in _metric_real_trades.columns:
+                        _cum_df = _metric_real_trades.copy()
+                        _entry_col = "Entry Date" if "Entry Date" in _cum_df.columns else ("Entry CT" if "Entry CT" in _cum_df.columns else None)
+                        if _entry_col is not None:
+                            def _metric_entry_sort_ts(v):
+                                try:
+                                    s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                                    if s.lower() in {"", "nan", "nat", "none", "open"}:
+                                        return pd.NaT
+                                    ts = pd.Timestamp(s)
+                                    if getattr(ts, "tzinfo", None) is not None:
+                                        ts = ts.tz_convert(None)
+                                    return ts
+                                except Exception:
+                                    return pd.NaT
+                            _cum_df["__metric_entry_sort__"] = _cum_df[_entry_col].apply(_metric_entry_sort_ts)
+                            _cum_df = _cum_df.sort_values("__metric_entry_sort__", ascending=True, na_position="last")
+                        _cum_vals = pd.to_numeric(_cum_df["Cumulative Return (%)"], errors="coerce").dropna()
+                        if len(_cum_vals):
+                            metric_cumulative_return_pct = float(_cum_vals.iloc[-1])
+        except Exception:
+            pass
+
         
         # Display Metrics
         st.write("#### 📊 Performance Metrics")
@@ -11081,9 +11139,9 @@ with tab7:
         if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
             met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
             with met_col1:
-                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
+                st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Compounded visible trade-log return using the same displayed real prices.")
             with met_col2:
-                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+                st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each displayed trade PnL %. This does not compound.")
             with met_col3:
                 st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
@@ -11092,7 +11150,7 @@ with tab7:
                 help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
             with met_col6:
-                strategy_pct_now = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
+                strategy_pct_now = metric_cumulative_return_pct
                 if benchmark_label_for_metrics == "Full Benchmark":
                     st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
                 else:
@@ -11100,9 +11158,9 @@ with tab7:
         else:
             met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
             with met_col1:
-                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
+                st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Compounded visible trade-log return using the same displayed real prices.")
             with met_col2:
-                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+                st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each displayed trade PnL %. This does not compound.")
             with met_col3:
                 st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
