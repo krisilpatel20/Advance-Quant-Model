@@ -11014,39 +11014,14 @@ with tab7:
 
         
         # Display Metrics
-        st.write("#### 📊 Performance Metrics")
+        # IMPORTANT FIX:
+        # The metric cards are rendered into this placeholder AFTER the final visible
+        # trade log is built. This guarantees:
+        #   Cumulative Return metric == final visible trade-log cumulative return
+        #   Total Trade PnL metric == sum of final visible trade-log PnL values
+        # while keeping this section visually in the same location.
         current_benchmark_pct = (bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100
-        if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
-            met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
-            with met_col1:
-                st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Compounded from the same trade-log PnL values.")
-            with met_col2:
-                st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of the same trade-log PnL values.")
-            with met_col3:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
-            with met_col4:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
-            with met_col5:
-                help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
-                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
-            with met_col6:
-                strategy_pct_now = metric_cumulative_return_pct
-                if benchmark_label_for_metrics == "Full Benchmark":
-                    st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
-                else:
-                    st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
-        else:
-            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
-            with met_col1:
-                st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Compounded from the same trade-log PnL values.")
-            with met_col2:
-                st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of the same trade-log PnL values.")
-            with met_col3:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
-            with met_col4:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
-            with met_col5:
-                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
+        _perf_metrics_placeholder = st.empty()
 
         def _latest_display_price_and_time_for_regime():
             """Get the freshest available close for display-only marking."""
@@ -12136,6 +12111,76 @@ with tab7:
             # FIX: left PnL (%) = single trade return; right Cumulative Return (%)
             # = compounded from those PnL values, oldest-to-newest.
             trades_df = recalc_trade_log_cumulative_from_pnl(trades_df)
+
+            # Render performance metrics from the EXACT SAME final visible trade log.
+            # This fixes the mismatch where trade log showed 69.17% but the metric
+            # still showed 100.99% from the earlier/raw internal trade set.
+            try:
+                metric_cumulative_return_pct = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
+                metric_total_pnl_return_pct = total_pnl_return_pct
+
+                if strategy_type == "Regime Switching (Trend Following)" and trades_df is not None and not trades_df.empty:
+                    if "PnL (%)" in trades_df.columns:
+                        _final_pnl_vals = pd.to_numeric(trades_df["PnL (%)"], errors="coerce").dropna()
+                        if len(_final_pnl_vals):
+                            metric_total_pnl_return_pct = float(_final_pnl_vals.sum())
+
+                    if "Cumulative Return (%)" in trades_df.columns:
+                        _final_metric_log = trades_df.copy()
+                        _entry_col_metric = "Entry Date" if "Entry Date" in _final_metric_log.columns else ("Entry CT" if "Entry CT" in _final_metric_log.columns else None)
+                        if _entry_col_metric:
+                            def _final_metric_sort_entry(v):
+                                try:
+                                    s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                                    if s.lower() in {"", "open", "nan", "nat", "none", "intraday unavailable"}:
+                                        return pd.NaT
+                                    ts = pd.Timestamp(s)
+                                    if getattr(ts, "tzinfo", None) is not None:
+                                        ts = ts.tz_convert(None)
+                                    return ts
+                                except Exception:
+                                    return pd.NaT
+                            _final_metric_log["__final_metric_entry_sort__"] = _final_metric_log[_entry_col_metric].apply(_final_metric_sort_entry)
+                            _final_metric_log = _final_metric_log.sort_values("__final_metric_entry_sort__", ascending=True, na_position="last", kind="mergesort")
+                        _final_cum_vals = pd.to_numeric(_final_metric_log["Cumulative Return (%)"], errors="coerce").dropna()
+                        if len(_final_cum_vals):
+                            metric_cumulative_return_pct = float(_final_cum_vals.iloc[-1])
+
+                with _perf_metrics_placeholder.container():
+                    st.write("#### 📊 Performance Metrics")
+                    if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
+                        met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
+                        with met_col1:
+                            st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Matches the final visible trade-log cumulative return.")
+                        with met_col2:
+                            st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Sum of the final visible trade-log PnL values. This does not compound.")
+                        with met_col3:
+                            st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                        with met_col4:
+                            st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                        with met_col5:
+                            help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
+                            st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
+                        with met_col6:
+                            strategy_pct_now = metric_cumulative_return_pct
+                            if benchmark_label_for_metrics == "Full Benchmark":
+                                st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
+                            else:
+                                st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
+                    else:
+                        met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
+                        with met_col1:
+                            st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Matches the final visible trade-log cumulative return.")
+                        with met_col2:
+                            st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Sum of the final visible trade-log PnL values. This does not compound.")
+                        with met_col3:
+                            st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                        with met_col4:
+                            st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                        with met_col5:
+                            st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
+            except Exception:
+                pass
 
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
