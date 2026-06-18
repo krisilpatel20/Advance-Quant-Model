@@ -1325,6 +1325,66 @@ def clean_overlapping_duplicate_trades(trades_df):
         except Exception:
             return trades_df
 
+
+def recalc_trade_log_cumulative_from_pnl(trades_df):
+    """
+    Display/log fix only.
+
+    Left column PnL (%) = single trade return.
+    Cumulative Return (%) = compounded from those visible PnL values,
+    calculated oldest-to-newest, while preserving the current display row order.
+
+    This does not change signals, dates, buy/sell prices, equity curve, or graph logic.
+    """
+    try:
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return trades_df
+        if "PnL (%)" not in trades_df.columns or "Cumulative Return (%)" not in trades_df.columns:
+            return trades_df
+
+        out = trades_df.copy()
+        entry_col = "Entry Date" if "Entry Date" in out.columns else ("Entry CT" if "Entry CT" in out.columns else None)
+
+        def _parse_entry_for_cum(v):
+            try:
+                if v is None:
+                    return pd.NaT
+                s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                if s.lower() in {"", "open", "nan", "nat", "none", "intraday unavailable"}:
+                    return pd.NaT
+                ts = pd.Timestamp(s)
+                if pd.isna(ts):
+                    return pd.NaT
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert(None)
+                return ts
+            except Exception:
+                return pd.NaT
+
+        if entry_col is not None:
+            out["__cum_entry_sort__"] = out[entry_col].apply(_parse_entry_for_cum)
+        else:
+            out["__cum_entry_sort__"] = np.arange(len(out))
+
+        calc = out.sort_values("__cum_entry_sort__", ascending=True, na_position="last", kind="mergesort")
+
+        cumulative_multiplier = 1.0
+        for idx, row in calc.iterrows():
+            pnl = pd.to_numeric(pd.Series([row.get("PnL (%)")]), errors="coerce").iloc[0]
+            if pd.isna(pnl) or not np.isfinite(float(pnl)):
+                continue
+            cumulative_multiplier *= (1.0 + float(pnl) / 100.0)
+            out.at[idx, "Cumulative Return (%)"] = (cumulative_multiplier - 1.0) * 100.0
+
+        out = out.drop(columns=["__cum_entry_sort__"], errors="ignore")
+        return out
+    except Exception:
+        try:
+            return trades_df.drop(columns=["__cum_entry_sort__"], errors="ignore")
+        except Exception:
+            return trades_df
+
+
 def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
@@ -10918,6 +10978,40 @@ with tab7:
         strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
         bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
         total_pnl_return_pct = total_trade_pnl_return_pct(bt_results.get('trades', pd.DataFrame()))
+
+        metric_cumulative_return_pct = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
+        metric_total_pnl_return_pct = total_pnl_return_pct
+        try:
+            if strategy_type == "Regime Switching (Trend Following)":
+                _metric_log = recalc_trade_log_cumulative_from_pnl(bt_results.get('trades', pd.DataFrame()).copy())
+                if _metric_log is not None and not _metric_log.empty:
+                    if "PnL (%)" in _metric_log.columns:
+                        _metric_pnl_vals = pd.to_numeric(_metric_log["PnL (%)"], errors="coerce").dropna()
+                        if len(_metric_pnl_vals):
+                            metric_total_pnl_return_pct = float(_metric_pnl_vals.sum())
+
+                    if "Cumulative Return (%)" in _metric_log.columns:
+                        _entry_col_metric = "Entry Date" if "Entry Date" in _metric_log.columns else ("Entry CT" if "Entry CT" in _metric_log.columns else None)
+                        if _entry_col_metric:
+                            def _metric_sort_entry(v):
+                                try:
+                                    s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                                    if s.lower() in {"", "open", "nan", "nat", "none", "intraday unavailable"}:
+                                        return pd.NaT
+                                    ts = pd.Timestamp(s)
+                                    if getattr(ts, "tzinfo", None) is not None:
+                                        ts = ts.tz_convert(None)
+                                    return ts
+                                except Exception:
+                                    return pd.NaT
+                            _metric_log["__metric_entry_sort__"] = _metric_log[_entry_col_metric].apply(_metric_sort_entry)
+                            _metric_log = _metric_log.sort_values("__metric_entry_sort__", ascending=True, na_position="last", kind="mergesort")
+                        _metric_cum_vals = pd.to_numeric(_metric_log["Cumulative Return (%)"], errors="coerce").dropna()
+                        if len(_metric_cum_vals):
+                            metric_cumulative_return_pct = float(_metric_cum_vals.iloc[-1])
+        except Exception:
+            pass
+
         
         # Display Metrics
         st.write("#### 📊 Performance Metrics")
@@ -10925,9 +11019,9 @@ with tab7:
         if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
             met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
             with met_col1:
-                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
+                st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Compounded from the same trade-log PnL values.")
             with met_col2:
-                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+                st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of the same trade-log PnL values.")
             with met_col3:
                 st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
@@ -10936,7 +11030,7 @@ with tab7:
                 help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
                 st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
             with met_col6:
-                strategy_pct_now = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
+                strategy_pct_now = metric_cumulative_return_pct
                 if benchmark_label_for_metrics == "Full Benchmark":
                     st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
                 else:
@@ -10944,9 +11038,9 @@ with tab7:
         else:
             met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
             with met_col1:
-                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
+                st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Compounded from the same trade-log PnL values.")
             with met_col2:
-                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
+                st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of the same trade-log PnL values.")
             with met_col3:
                 st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
             with met_col4:
@@ -11295,6 +11389,10 @@ with tab7:
                                 if _col in plot_trades_df.columns:
                                     _mask_3pm = plot_trades_df[_col].astype(str).str.contains("15:00:00 CT", na=False)
                                     plot_trades_df.loc[_mask_3pm, _col] = "Intraday unavailable"
+
+                        # Keep graph-side trade data internally consistent:
+                        # Cumulative Return (%) is compounded from the same PnL (%) values.
+                        plot_trades_df = recalc_trade_log_cumulative_from_pnl(plot_trades_df)
                 except Exception:
                     pass
 
@@ -12034,6 +12132,10 @@ with tab7:
                             trades_df.loc[_mask_3pm, _col] = "Intraday unavailable"
             except Exception:
                 pass
+
+            # FIX: left PnL (%) = single trade return; right Cumulative Return (%)
+            # = compounded from those PnL values, oldest-to-newest.
+            trades_df = recalc_trade_log_cumulative_from_pnl(trades_df)
 
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
