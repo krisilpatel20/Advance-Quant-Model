@@ -1407,20 +1407,9 @@ def _apply_real_market_prices_to_regime_display_log(trades_df, real_prices):
                 pass
             return np.nan
 
-        # Preserve the old internal/model cumulative return before display-only price correction.
-        # This helps diagnose differences without mixing fake/model cumulative with real displayed prices.
-        try:
-            if "Cumulative Return (%)" in out.columns and "Model Cumulative Return (%)" not in out.columns:
-                out["Model Cumulative Return (%)"] = out["Cumulative Return (%)"]
-        except Exception:
-            pass
-
-        entry_col_global = "Entry Date" if "Entry Date" in out.columns else ("Entry CT" if "Entry CT" in out.columns else None)
-        exit_col_global = "Exit Date" if "Exit Date" in out.columns else ("Exit CT" if "Exit CT" in out.columns else None)
-
         for i, row in out.iterrows():
-            entry_col = entry_col_global
-            exit_col = exit_col_global
+            entry_col = "Entry Date" if "Entry Date" in out.columns else ("Entry CT" if "Entry CT" in out.columns else None)
+            exit_col = "Exit Date" if "Exit Date" in out.columns else ("Exit CT" if "Exit CT" in out.columns else None)
 
             if entry_col and "Buy Price" in out.columns:
                 rp = _real_price_at_or_near(row.get(entry_col))
@@ -1451,12 +1440,15 @@ def _apply_real_market_prices_to_regime_display_log(trades_df, real_prices):
             except Exception:
                 pass
 
-        # Recompute visible cumulative return from the visible real-price PnL column.
-        # This fixes impossible rows like Real PnL +29% but Cumulative +2313%.
+        # Recompute the EXISTING visible cumulative column from the visible real PnL.
+        # No extra columns. This is display-only; it does not change strategy logic,
+        # signals, equity curve, or the performance metrics above the table.
         try:
             if "PnL (%)" in out.columns and "Cumulative Return (%)" in out.columns:
                 tmp = out.copy()
-                if entry_col_global:
+                _entry_col = "Entry Date" if "Entry Date" in tmp.columns else ("Entry CT" if "Entry CT" in tmp.columns else None)
+
+                if _entry_col:
                     def _cum_sort_ts(v):
                         try:
                             s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
@@ -1468,7 +1460,7 @@ def _apply_real_market_prices_to_regime_display_log(trades_df, real_prices):
                             return ts
                         except Exception:
                             return pd.NaT
-                    tmp["__cum_sort_ts__"] = tmp[entry_col_global].apply(_cum_sort_ts)
+                    tmp["__cum_sort_ts__"] = tmp[_entry_col].apply(_cum_sort_ts)
                     tmp = tmp.sort_values("__cum_sort_ts__", ascending=True, na_position="last")
                 else:
                     tmp["__cum_sort_ts__"] = range(len(tmp))
@@ -1479,6 +1471,7 @@ def _apply_real_market_prices_to_regime_display_log(trades_df, real_prices):
                     if pd.notna(pnl) and np.isfinite(float(pnl)):
                         cum *= (1.0 + float(pnl) / 100.0)
                         out.at[idx, "Cumulative Return (%)"] = (cum - 1.0) * 100.0
+
                 out = out.drop(columns=["__cum_sort_ts__"], errors="ignore")
         except Exception:
             pass
@@ -4783,8 +4776,7 @@ def display_strategy_vs_buyhold_backtest(title, prices, signals, initial_capital
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
                 "PnL (%)": "{:.2f}%",
-                "Cumulative Return (%)": "{:.2f}",
-                "Model Cumulative Return (%)": "{:.2f}"
+                "Cumulative Return (%)": "{:.2f}"
             }), use_container_width=True)
             st.download_button(
                 f"📥 Download {title} Trade Log",
