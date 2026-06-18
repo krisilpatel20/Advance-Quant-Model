@@ -1325,6 +1325,126 @@ def clean_overlapping_duplicate_trades(trades_df):
         except Exception:
             return trades_df
 
+
+def _apply_real_market_prices_to_regime_display_log(trades_df, real_prices):
+    """
+    DISPLAY-ONLY FIX for Regime Switching trade logs.
+
+    Keeps original strategy returns/equity curve/signals untouched.
+    Only replaces visible Buy Price / Sell Price / PnL (%) with real market
+    prices from the raw price series so the displayed trade log and graph do
+    not show smoothed/model prices.
+
+    Cumulative Return (%) is intentionally NOT changed because that belongs to
+    the original backtest account/equity logic.
+    """
+    try:
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return trades_df
+        if real_prices is None:
+            return trades_df
+
+        p = pd.Series(real_prices).replace([np.inf, -np.inf], np.nan).dropna()
+        if p.empty:
+            return trades_df
+
+        p_idx = pd.DatetimeIndex(p.index)
+        try:
+            if getattr(p_idx, "tz", None) is not None:
+                p.index = p_idx.tz_convert(None)
+            else:
+                p.index = p_idx
+        except Exception:
+            p.index = pd.to_datetime(p.index, errors="coerce")
+
+        p = p[~pd.isna(p.index)].sort_index()
+        if p.empty:
+            return trades_df
+
+        out = trades_df.copy()
+
+        def _parse_trade_dt(x):
+            try:
+                if x is None:
+                    return pd.NaT
+                s = str(x).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                if s.lower() in {"", "open", "nan", "nat", "none"}:
+                    return pd.NaT
+                ts = pd.Timestamp(s)
+                if pd.isna(ts):
+                    return pd.NaT
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert(None)
+                # For date-only/daily display timestamps, match by calendar date.
+                return ts
+            except Exception:
+                return pd.NaT
+
+        def _real_price_at_or_near(x, prefer_latest_if_open=False):
+            try:
+                if prefer_latest_if_open:
+                    return float(p.iloc[-1])
+                ts = _parse_trade_dt(x)
+                if pd.isna(ts):
+                    return np.nan
+
+                # First: exact date match for daily/weekly logs.
+                date_mask = pd.Series(p.index.date, index=p.index) == ts.date()
+                if bool(date_mask.any()):
+                    # For daily data there is one value; for intraday, use nearest timestamp within same date.
+                    same_day = p.loc[date_mask.values]
+                    if len(same_day) == 1:
+                        return float(same_day.iloc[0])
+                    loc = same_day.index.get_indexer([ts], method="nearest")[0]
+                    if loc >= 0:
+                        return float(same_day.iloc[loc])
+
+                # Fallback: nearest available bar.
+                loc = p.index.get_indexer([ts], method="nearest")[0]
+                if loc >= 0:
+                    return float(p.iloc[loc])
+            except Exception:
+                pass
+            return np.nan
+
+        for i, row in out.iterrows():
+            entry_col = "Entry Date" if "Entry Date" in out.columns else ("Entry CT" if "Entry CT" in out.columns else None)
+            exit_col = "Exit Date" if "Exit Date" in out.columns else ("Exit CT" if "Exit CT" in out.columns else None)
+
+            if entry_col and "Buy Price" in out.columns:
+                rp = _real_price_at_or_near(row.get(entry_col))
+                if np.isfinite(rp):
+                    out.at[i, "Buy Price"] = float(rp)
+
+            # Open rows: mark Sell Price to latest real price. Closed rows: use exit date real price.
+            is_open = False
+            try:
+                if "Status" in out.columns and str(row.get("Status", "")).strip().lower() == "open":
+                    is_open = True
+                elif exit_col and str(row.get(exit_col, "")).strip().lower() == "open":
+                    is_open = True
+            except Exception:
+                is_open = False
+
+            if "Sell Price" in out.columns:
+                rp = _real_price_at_or_near(row.get(exit_col) if exit_col else None, prefer_latest_if_open=is_open)
+                if np.isfinite(rp):
+                    out.at[i, "Sell Price"] = float(rp)
+
+            # Recompute visible single-trade PnL from visible real prices only.
+            try:
+                bp = float(out.at[i, "Buy Price"])
+                sp = float(out.at[i, "Sell Price"])
+                if np.isfinite(bp) and np.isfinite(sp) and bp != 0 and "PnL (%)" in out.columns:
+                    out.at[i, "PnL (%)"] = ((sp / bp) - 1.0) * 100.0
+            except Exception:
+                pass
+
+        return out
+    except Exception:
+        return trades_df
+
+
 def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
@@ -8984,23 +9104,17 @@ with tab7:
         else:
             prices_bt_resampled = regime_source_prices.dropna()
 
-        # IMPORTANT PRICE FIX:
-        # Smoothing is allowed ONLY for the regime MODEL input.
-        # Trade execution, graph price, Buy Price, Sell Price, PnL, and trade log
-        # must use REAL raw market closes from prices_bt_resampled.
-        # Previous code used smoothed prices as strat_prices, which made trade-log
-        # prices disagree with real CRWV/GLXY market prices.
-        strat_prices = prices_bt_resampled.dropna().copy()
-
-        raw_returns_for_model = strat_prices.pct_change().dropna()
+        # Apply smoothing consistently to prices first, then calculate returns from those same prices.
+        # This fixes the old mismatch where model data was smoothed but execution prices were raw.
         if bt_stability > 0:
-            model_returns_for_fit = raw_returns_for_model.ewm(span=bt_stability, adjust=False).mean().dropna()
-            st.caption(f"ℹ️ Regime smoothing applied to MODEL RETURNS only (span={bt_stability}). Trade log uses real market prices.")
+            prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
+            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
         else:
-            model_returns_for_fit = raw_returns_for_model.copy()
+            prices_bt_model = prices_bt_resampled.copy()
 
-        returns_bt_resampled = raw_returns_for_model
-        model_data_bt = model_returns_for_fit.dropna() * 100
+        strat_prices = prices_bt_model
+        returns_bt_resampled = prices_bt_model.pct_change().dropna()
+        model_data_bt = returns_bt_resampled.dropna() * 100
 
         # FIX: Robust 1D Series reconstruction
         if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
@@ -11181,7 +11295,7 @@ with tab7:
         if strategy_type == "Regime Switching (Trend Following)":
             st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
             st.write("#### 📈 Regime Switching Price Graph")
-            st.caption("Default view is the real asset price with markers from the finalized trade log. Trade-log prices use real market closes, not smoothed model prices.")
+            st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
 
             pgc1, pgc2, pgc3 = st.columns(3)
             with pgc1:
@@ -11245,6 +11359,15 @@ with tab7:
                     plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
                     plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
                     plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+                except Exception:
+                    pass
+
+                # DISPLAY-ONLY REAL PRICE FIX:
+                # Keep old strategy/equity/returns exactly as before, but make chart markers
+                # use real raw market prices instead of smoothed model prices.
+                try:
+                    if strategy_type == "Regime Switching (Trend Following)":
+                        plot_trades_df = _apply_real_market_prices_to_regime_display_log(plot_trades_df, prices_bt_resampled)
                 except Exception:
                     pass
 
@@ -11975,6 +12098,15 @@ with tab7:
                 except Exception:
                     pass
             
+            # DISPLAY-ONLY REAL PRICE FIX:
+            # Do not alter original backtest/equity metrics. Only visible Regime
+            # trade-log Buy/Sell prices and visible PnL use real raw market prices.
+            try:
+                if strategy_type == "Regime Switching (Trend Following)":
+                    trades_df = _apply_real_market_prices_to_regime_display_log(trades_df, prices_bt_resampled)
+            except Exception:
+                pass
+
             trades_df = trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
             try:
                 if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now):
