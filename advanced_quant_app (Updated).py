@@ -22,1641 +22,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import json
-import urllib.request
-import urllib.error
-from pathlib import Path as _Path
 import smtplib
 import os
 from email.message import EmailMessage
 import os
-
-# Streamlit runs scripts in a ScriptRunner thread. ib_insync/eventkit expects
-# an asyncio event loop to exist in the current thread at import time.
-# Create one safely before importing ib_insync.
-import asyncio
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-
-# ---------- Local Telegram Settings Persistence ----------
-def _telegram_settings_path():
-    try:
-        return _Path.home() / ".pinehurst_quant_telegram.json"
-    except Exception:
-        return _Path(".pinehurst_quant_telegram.json")
-
-def load_telegram_settings():
-    try:
-        p = _telegram_settings_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def save_telegram_settings(bot_token: str, chat_id: str, enabled: bool, auto_kalman: bool, **extra):
-    try:
-        p = _telegram_settings_path()
-        data = load_telegram_settings()
-        data.update({
-            "bot_token": str(bot_token).strip(),
-            "chat_id": str(chat_id).strip(),
-            "enabled": bool(enabled),
-            "auto_kalman": bool(auto_kalman),
-        })
-        for k, v in extra.items():
-            try:
-                if isinstance(v, (str, int, float, bool)) or v is None:
-                    data[k] = v
-                else:
-                    data[k] = str(v)
-            except Exception:
-                pass
-        p.write_text(json.dumps(data, indent=2))
-        return True, str(p)
-    except Exception as e:
-        return False, str(e)
-# --------------------------------------------------------
-
-
-
-def _clean_trade_log_numbers(df):
-    """Round numeric trade-log columns for clean display."""
-    try:
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            return df
-        out = df.copy()
-        for c in out.columns:
-            # Round all numeric columns to 2 decimals.
-            if pd.api.types.is_numeric_dtype(out[c]):
-                out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
-            else:
-                # Try converting object columns that are numeric-looking.
-                converted = pd.to_numeric(out[c], errors="coerce")
-                if converted.notna().sum() >= max(1, int(len(out) * 0.50)):
-                    out[c] = converted.round(2)
-        return out
-    except Exception:
-        return df
-
-
-def _trade_row_is_open(last_row, columns=None):
-    """
-    Canonical open/closed resolver for the last trade-log row.
-
-    Priority:
-      1. An explicit Status column ("Open"/"Closed") is authoritative.
-      2. Otherwise, an Exit field that is empty / NaN / literally "Open"
-         means the trade is still open.
-      3. Last fallback: substring scan of the row text.
-
-    This single helper is used by every status path (visible log, watchlist,
-    telegram, sidebar) so they can never disagree on open vs. closed.
-    """
-    try:
-        # 1) Explicit Status column wins.
-        try:
-            status_val = str(last_row.get("Status", "")).strip().upper()
-        except Exception:
-            status_val = ""
-        if status_val in ("OPEN", "LONG"):
-            return True
-        if status_val in ("CLOSED", "CLOSE", "STOP LOSS", "TRAILING STOP", "CASH"):
-            return False
-
-        # 2) Exit field check. Only true exit-time columns are reliable here:
-        #    Sell Price / Exit Price are populated even for OPEN trades (current
-        #    price), so they must NOT be treated as evidence of a close.
-        for c in ("Exit CT", "Exit Date", "Exit Time", "Exit"):
-            present = (columns is None) or (c in columns)
-            if not present:
-                continue
-            try:
-                v = last_row.get(c, "__MISSING__")
-            except Exception:
-                v = "__MISSING__"
-            if isinstance(v, str) and v == "__MISSING__":
-                # Column not actually retrievable on this row.
-                continue
-            # Column is present. Empty / NaN / None / "Open" => still open.
-            try:
-                if v is None or (pd.isna(v) if np.isscalar(v) or v is None else False):
-                    return True
-            except Exception:
-                pass
-            sv = str(v).strip()
-            if sv == "" or sv.lower() in ("nan", "none", "nat"):
-                return True
-            if sv.lower() == "open":
-                return True
-            # A real exit value present -> closed.
-            return False
-
-        # 3) Fallback: substring scan.
-        try:
-            row_txt = " ".join([str(x) for x in last_row.values]).upper()
-        except Exception:
-            row_txt = ""
-        return ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
-    except Exception:
-        return False
-
-
-
-
-def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
-    """
-    Save visible main Kalman status so the sidebar/scanner mirrors the MAIN TAB.
-
-    SOURCE OF TRUTH = the executed trade log (BacktestEngine output). Its last
-    row's Open/Closed reflects whether the strategy is actually holding the
-    position right now, after cooldown/min-hold/stop logic. The raw kalman_signal
-    series can differ from the executed position (e.g. signal drops to 0 during
-    min-hold while the trade is still open), so it must NOT override an explicit
-    Open/Closed trade-log row.
-
-    signal_state is used ONLY as a fallback when the trade log is empty/missing,
-    so a brand-new in-position bar with no recorded trade still shows LONG.
-    """
-    try:
-        row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
-
-        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
-        if not _have_trades and signal_state is not None:
-            try:
-                _is_long = int(round(float(signal_state))) == 1
-            except Exception:
-                _is_long = bool(signal_state)
-            row["Trade Position"] = "LONG" if _is_long else "CASH"
-            row["Alert"] = "No trade log row — position from main kalman_signal"
-
-        key = f"main_kalman_status_{str(ticker).upper()}"
-        st.session_state[key] = row
-        return row
-    except Exception:
-        return None
-
-
-
-
-
-def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest_price=None):
-    """
-    Sync watchlist ledger from the visible MAIN Kalman Trade Log.
-    This fixes cases where main trade log says Open/Long but Thesis Parameters shows CASH.
-    """
-    try:
-        sym = str(ticker).upper()
-        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-            return None
-
-        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
-        row_txt = " ".join([str(x) for x in last.values]).upper()
-
-        is_open = _trade_row_is_open(last, columns=t.columns)
-        position = "LONG" if is_open else "CASH"
-
-        entry_time = ""
-        exit_time = "Open" if is_open else ""
-        entry_price = None
-        current_price = latest_price
-        pnl_pct = None
-
-        for c in ["Entry CT", "Entry Time", "Entry"]:
-            if c in t.columns:
-                v = str(last.get(c, ""))
-                if v and v.lower() != "nan":
-                    entry_time = v
-                    break
-
-        for c in ["Exit CT", "Exit Time", "Exit"]:
-            if c in t.columns:
-                v = str(last.get(c, ""))
-                if v and v.lower() != "nan":
-                    exit_time = v
-                    break
-
-        for c in ["Entry Price", "Entry"]:
-            if c in t.columns:
-                try:
-                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
-                    if pd.notna(vv):
-                        entry_price = round(float(vv), 2)
-                        break
-                except Exception:
-                    pass
-
-        for c in ["Current Price", "Current", "Exit/Current Price", "Exit Price", "Exit", "Price", "Close"]:
-            if c in t.columns:
-                try:
-                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
-                    if pd.notna(vv):
-                        current_price = round(float(vv), 2)
-                        break
-                except Exception:
-                    pass
-
-        # Last fallback: pick last reasonable numeric value as current price.
-        if current_price is None:
-            try:
-                nums = []
-                for v in list(last.values):
-                    vv = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
-                    if pd.notna(vv) and 1 < float(vv) < 100000:
-                        nums.append(float(vv))
-                if nums:
-                    current_price = round(float(nums[-1]), 2)
-            except Exception:
-                pass
-
-        for c in ["PnL (%)", "Return (%)", "Return", "Trade Return", "Pnl", "PnL"]:
-            if c in t.columns:
-                try:
-                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
-                    if pd.notna(vv):
-                        pnl_pct = round(float(vv), 2)
-                        break
-                except Exception:
-                    pass
-
-        if pnl_pct is None and entry_price and current_price:
-            try:
-                pnl_pct = round(((float(current_price) / float(entry_price)) - 1.0) * 100.0, 2)
-            except Exception:
-                pnl_pct = None
-
-        event_time = entry_time if is_open else (exit_time or entry_time)
-        state_key = f"{sym}|VISIBLE_MAIN|{'BUY' if is_open else 'SELL'}|{event_time}|{position}|{entry_price}|{current_price}"
-
-        ledger = _load_main_kalman_watchlist_ledger()
-        old = ledger.get(sym, {})
-        # Visible main trade log has priority. If it says OPEN, force ledger LONG.
-        ledger[sym] = {
-            "ticker": sym,
-            "position": position,
-            "entry_time": entry_time,
-            "exit_time": "Open" if is_open else exit_time,
-            "event_time": event_time,
-            "state_key": state_key,
-            "price": current_price,
-            "entry_price": entry_price,
-            "exit_current_price": current_price,
-            "pnl_pct": pnl_pct,
-            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            "source": "Synced from visible Main Kalman Trade Log",
-        }
-        _save_main_kalman_watchlist_ledger(ledger)
-
-        row = {
-            "Ticker": sym,
-            "Alert Signal": "NO NEW ALERT",
-            "Trade Position": position,
-            "Price": current_price,
-            "Entry CT": entry_time,
-            "Exit CT": "Open" if is_open else exit_time,
-            "PnL (%)": pnl_pct,
-            "Source": "Visible Main Kalman Trade Log",
-        }
-
-        # Update sidebar verify placeholder if available.
-        try:
-            slot = globals().get("main_kalman_verify_slot", None)
-            if slot is not None:
-                with slot.container():
-                    st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
-        except Exception:
-            pass
-
-        return row
-    except Exception as e:
-        return None
-
-
-def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
-    """Show the exact main Kalman status back in Thesis Parameters.
-
-    Source of truth is the executed trade log. signal_state is only a fallback
-    when there is no trade-log row, matching _save_main_kalman_status_to_session.
-    """
-    try:
-        row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
-        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
-        if not _have_trades and signal_state is not None:
-            try:
-                _is_long = int(round(float(signal_state))) == 1
-            except Exception:
-                _is_long = bool(signal_state)
-            row["Trade Position"] = "LONG" if _is_long else "CASH"
-        row["Source"] = "Main Institutional Trend Rail Graph + Main Kalman Trade Log"
-        st.session_state[f"main_kalman_verified_{str(ticker).upper()}"] = row
-
-        slot = globals().get("main_kalman_verify_slot", None)
-        if slot is not None:
-            with slot.container():
-                st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
-        return row
-    except Exception as e:
-        try:
-            slot = globals().get("main_kalman_verify_slot", None)
-            if slot is not None:
-                slot.warning(f"Main Kalman verify not available yet: {e}")
-        except Exception:
-            pass
-        return None
-
-
-def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, token="", chat_id="", enabled=False):
-    """
-    Send Telegram only from the main Kalman trade log.
-    No separate scanner logic. No separate 15m helper logic.
-    """
-    try:
-        if not enabled:
-            return False, "Telegram main-log alerts OFF."
-        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-            return False, "No main Kalman trade row."
-
-        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
-        row_txt = " ".join([str(x) for x in last.values]).upper()
-
-        is_open = _trade_row_is_open(last, columns=t.columns)
-        signal = "BUY" if is_open else "SELL"
-
-        # Pull event time from the visible main trade log row.
-        event_time = ""
-        for c in ["Entry CT", "Exit CT", "Entry Time", "Exit Time", "Entry", "Exit"]:
-            if c in t.columns:
-                val = str(last.get(c, ""))
-                if val and val.lower() != "nan":
-                    event_time = val
-                    # For closed trade, prefer exit time if available.
-                    if signal == "SELL" and "Exit" in c:
-                        break
-                    if signal == "BUY" and "Entry" in c:
-                        break
-
-        if not event_time:
-            event_time = str(pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"))
-
-        px = latest_price
-        for c in ["Current Price", "Current", "Exit Price", "Entry Price", "Price", "Close"]:
-            if c in t.columns:
-                try:
-                    v = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
-                    if pd.notna(v):
-                        px = float(v)
-                        break
-                except Exception:
-                    pass
-
-        px_txt = "N/A" if px is None else f"{float(px):.2f}"
-
-        ledger = _load_kalman_alert_ledger()
-        ledger_key = f"{ticker}|MAIN_KALMAN_TRADE_LOG|{signal}|{event_time}|{px_txt}"
-        if ledger.get(str(ticker).upper()) == ledger_key:
-            return True, "Already sent/synced."
-
-        msg = (
-            "PINEHURST MAIN KALMAN ALERT\n"
-            f"Ticker: {str(ticker).upper()}\n"
-            f"Signal: {signal}\n"
-            f"Price: {px_txt}\n"
-            f"Time: {event_time}\n"
-            "Source: Main Institutional Trend Rail Graph + Main Kalman Trade Log\n"
-            "Action: Notification only — no IBKR order sent."
-        )
-
-        ok, resp = send_telegram_alert(token, chat_id, msg)
-        if ok:
-            ledger[str(ticker).upper()] = ledger_key
-            _save_kalman_alert_ledger(ledger)
-            return True, "Sent."
-        return False, resp
-    except Exception as e:
-        return False, str(e)
-
-
-def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
-    """Copy main BUY/SELL trade-log state into scanner row. No separate signal math."""
-    try:
-        tkr = str(ticker).upper()
-        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-            return {
-                "Ticker": tkr,
-                "Alert Signal": "NO NEW ALERT",
-                "Trade Position": "CASH",
-                "Price": round(float(latest_price), 2) if latest_price is not None else None,
-                "Candle Close CT": str(latest_time) if latest_time is not None else "",
-                "Alert": "No trade log row",
-            }
-
-        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
-        is_open = _trade_row_is_open(last, columns=t.columns)
-        is_long = is_open
-
-        px = latest_price
-        for c in ["Current Price", "Exit Price", "Exit", "Last Price", "Price"]:
-            if c in t.columns:
-                try:
-                    v = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
-                    if pd.notna(v):
-                        px = float(v)
-                        break
-                except Exception:
-                    pass
-
-        tm = latest_time
-        for c in ["Entry CT", "Entry Time", "Entry", "Date", "Time"]:
-            if c in t.columns:
-                try:
-                    val = str(last[c])
-                    if val and val.lower() != "nan":
-                        tm = val
-                        break
-                except Exception:
-                    pass
-
-        return {
-            "Ticker": tkr,
-            "Alert Signal": "NO NEW ALERT",
-            "Trade Position": "LONG" if is_long else "CASH",
-            "Price": round(float(px), 2) if px is not None and str(px) != "" else None,
-            "Candle Close CT": str(tm) if tm is not None else "",
-            "Alert": "Copied from visible main Kalman trade log",
-        }
-    except Exception as e:
-        return {
-            "Ticker": str(ticker).upper(),
-            "Alert Signal": "ERROR",
-            "Trade Position": "UNKNOWN",
-            "Price": None,
-            "Candle Close CT": "",
-            "Alert": str(e)[:120],
-        }
-
-# ---------- Kalman 15m Watchlist Telegram Scanner ----------
-def _kalman_alert_ledger_path():
-    try:
-        return _Path.home() / ".pinehurst_kalman_15m_alert_ledger.json"
-    except Exception:
-        return _Path(".pinehurst_kalman_15m_alert_ledger.json")
-
-def _load_kalman_alert_ledger():
-    try:
-        p = _kalman_alert_ledger_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_kalman_alert_ledger(data):
-    try:
-        _kalman_alert_ledger_path().write_text(json.dumps(data, indent=2))
-    except Exception:
-        pass
-
-def _normalize_watchlist(raw):
-    try:
-        return [x.strip().upper() for x in str(raw).replace("\n", ",").split(",") if x.strip()]
-    except Exception:
-        return []
-
-def _fetch_15m_completed_bars(ticker, period="5d"):
-    """Fetch 15m bars and drop the currently-forming bar to avoid repaint-like alerts."""
-    df = yf.download(
-        ticker,
-        period=period,
-        interval="15m",
-        progress=False,
-        auto_adjust=True,
-        prepost=False,
-        threads=False,
-    )
-    if df is None or len(df) < 60:
-        return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
-    close_col = "Close" if "Close" in df.columns else df.columns[-1]
-    px = pd.Series(df[close_col]).dropna().astype(float)
-    if len(px) < 60:
-        return None
-
-    # yfinance intraday is normally US/Eastern. Convert to CT, then remove tz for display.
-    try:
-        if px.index.tz is None:
-            px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
-        px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
-    except Exception:
-        pass
-
-    # Drop latest bar ONLY if that 15m candle is still forming.
-    # yfinance labels intraday bars by candle START time.
-    # Example: 2:30 PM CT bar closes at 2:45 PM CT.
-    try:
-        now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
-        latest_start = pd.Timestamp(px.index[-1])
-        latest_close = latest_start + pd.Timedelta(minutes=15)
-        if latest_close > now_ct and len(px) > 2:
-            px = px.iloc[:-1]
-    except Exception:
-        # Safety fallback: if time comparison fails, stay conservative.
-        if len(px) > 2:
-            px = px.iloc[:-1]
-
-    return px.dropna()
-
-def _kalman_15m_signal_from_prices(px):
-    """
-    Scanner signal aligned to main Kalman 15m trade-log behavior.
-
-    Key fix:
-    - Alert Signal = only fresh BUY/SELL transition.
-    - Trade Position = current open trade state.
-    So if DELL has an open Long, scanner shows LONG even when there is NO NEW ALERT.
-    Risk Firewall stays OFF.
-    """
-    rail, center, long_state = institutional_trend_rail(
-        px,
-        fast_gain=0.34,
-        slow_gain=0.055,
-        polish_span=3,
-        atr_window=14,
-        atr_mult=1.35,
-    )
-    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
-    state_s = pd.Series(long_state, index=px.index).astype(bool)
-
-    # Main Kalman-style defaults; same family as the primary graph/trade-log logic.
-    buffer_pct = 0.0125
-    confirm_bars = 3
-    min_hold = 5
-    cooldown_bars = 3
-
-    above = ((px > rail_s * (1.0 + buffer_pct)) & state_s).astype(int)
-    below = ((px < rail_s * (1.0 - buffer_pct)) | (~state_s)).astype(int)
-
-    confirmed_buy = above.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
-    confirmed_sell = below.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
-
-    sig = pd.Series(0, index=px.index, dtype=int)
-    in_pos = False
-    hold_count = 0
-    cooldown = 0
-
-    for dt in px.index:
-        if cooldown > 0:
-            cooldown -= 1
-
-        if not in_pos:
-            if cooldown == 0 and bool(confirmed_buy.loc[dt]):
-                in_pos = True
-                hold_count = 0
-                sig.loc[dt] = 1
-            else:
-                sig.loc[dt] = 0
-        else:
-            hold_count += 1
-            if hold_count >= min_hold and bool(confirmed_sell.loc[dt]):
-                in_pos = False
-                cooldown = cooldown_bars
-                sig.loc[dt] = 0
-            else:
-                sig.loc[dt] = 1
-
-    changes = sig.diff().fillna(sig.iloc[0])
-    latest = int(sig.iloc[-1])
-    prev = int(sig.iloc[-2]) if len(sig) >= 2 else latest
-    alert_signal = "BUY" if float(changes.iloc[-1]) > 0 else ("SELL" if float(changes.iloc[-1]) < 0 else "NO NEW ALERT")
-    trade_position = "LONG" if latest == 1 else "CASH"
-
-    return alert_signal, float(px.iloc[-1]), px.index[-1], prev, latest, trade_position
-
-
-
-def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, show_table=True):
-    """
-    Separate 15m scanner calculations are disabled.
-    Main Kalman Trade Log is the only source of truth.
-    """
-    symbols = _normalize_watchlist(watchlist)
-    rows = []
-    for sym in symbols:
-        rows.append({
-            "Ticker": sym,
-            "Status": "USE MAIN KALMAN TAB",
-            "Source": "Main Buy/Sell Graph + Main Trade Log only",
-            "Note": "Separate 15m scanner disabled to avoid mismatched signals."
-        })
-    if show_table:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    return rows
-
-
-
-def _kalman_15m_trend_rail_report(ticker):
-    """Create Institutional Trend Rail 15m chart + trade log using completed 15m candles only."""
-    px = _fetch_15m_completed_bars(ticker, period="5d")
-    if px is None or len(px) < 60:
-        return None, pd.DataFrame(), None
-
-    rail, center, long_state = institutional_trend_rail(
-        px,
-        fast_gain=0.34,
-        slow_gain=0.055,
-        polish_span=3,
-        atr_window=14,
-        atr_mult=1.35,
-    )
-    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
-    state_s = pd.Series(long_state, index=px.index).astype(bool)
-    signal = ((px > rail_s) & state_s).astype(int)
-    changes = signal.diff().fillna(signal.iloc[0])
-
-    buys = changes[changes > 0].index
-    sells = changes[changes < 0].index
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=px.index, y=px.values, mode="lines", name="Price"))
-    fig.add_trace(go.Scatter(x=rail_s.index, y=rail_s.values, mode="lines", name="Institutional Trend Rail"))
-
-    if len(buys) > 0:
-        fig.add_trace(go.Scatter(
-            x=buys,
-            y=px.loc[buys],
-            mode="markers",
-            name="BUY",
-            marker=dict(symbol="triangle-up", size=12),
-        ))
-    if len(sells) > 0:
-        fig.add_trace(go.Scatter(
-            x=sells,
-            y=px.loc[sells],
-            mode="markers",
-            name="SELL",
-            marker=dict(symbol="triangle-down", size=12),
-        ))
-
-    fig.update_layout(
-        title=f"{ticker.upper()} — Kalman 15m Institutional Trend Rail",
-        xaxis_title="CT time",
-        yaxis_title="Price",
-        height=520,
-        hovermode="x unified",
-        margin=dict(l=20, r=20, t=55, b=35),
-    )
-
-    trades = []
-    in_trade = False
-    entry_time = None
-    entry_price = None
-
-    for dt in px.index:
-        ch = float(changes.loc[dt])
-        if ch > 0 and not in_trade:
-            in_trade = True
-            entry_time = dt
-            entry_price = float(px.loc[dt])
-        elif ch < 0 and in_trade:
-            exit_time = dt
-            exit_price = float(px.loc[dt])
-            ret = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
-            trades.append({
-                "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %I:%M %p CT"),
-                "Entry Price": round(entry_price, 2),
-                "Exit CT": pd.Timestamp(exit_time).strftime("%Y-%m-%d %I:%M %p CT"),
-                "Exit Price": round(exit_price, 2),
-                "Trade Return %": round(ret, 2),
-                "Status": "Closed",
-            })
-            in_trade = False
-            entry_time = None
-            entry_price = None
-
-    if in_trade and entry_time is not None:
-        last_time = px.index[-1]
-        last_price = float(px.iloc[-1])
-        ret = (last_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
-        trades.append({
-            "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %I:%M %p CT"),
-            "Entry Price": round(entry_price, 2),
-            "Exit CT": "",
-            "Exit Price": "",
-            "Trade Return %": round(ret, 2),
-            "Status": "Open",
-        })
-
-    trades_df = pd.DataFrame(trades)
-    latest_signal = "LONG" if int(signal.iloc[-1]) == 1 else "CASH"
-    latest_info = {
-        "Ticker": ticker.upper(),
-        "Latest Position": latest_signal,
-        "Latest Price": round(float(px.iloc[-1]), 2),
-        "Latest Completed Candle CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
-    }
-    return fig, trades_df, latest_info
-
-
-
-# ---------- Main Kalman Trade-Log Watchlist Monitor ----------
-
-def _get_query_param_value(name, default=""):
-    try:
-        qp = getattr(st, "query_params", {})
-        v = qp.get(name, default)
-        if isinstance(v, list):
-            return v[0] if v else default
-        return v if v is not None else default
-    except Exception:
-        try:
-            v = st.experimental_get_query_params().get(name, [default])
-            return v[0] if isinstance(v, list) and v else default
-        except Exception:
-            return default
-
-def _set_query_param_value(name, value):
-    try:
-        st.query_params[name] = str(value)
-        return True
-    except Exception:
-        try:
-            qp = st.experimental_get_query_params()
-            qp[name] = [str(value)]
-            st.experimental_set_query_params(**qp)
-            return True
-        except Exception:
-            return False
-
-def _main_kalman_monitor_settings_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_monitor.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_monitor.json")
-
-def _load_main_kalman_monitor_settings():
-    try:
-        p = _main_kalman_monitor_settings_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_monitor_settings(data):
-    try:
-        p = _main_kalman_monitor_settings_path()
-        p.write_text(json.dumps(data, indent=2))
-        return True, str(p)
-    except Exception as e:
-        return False, str(e)
-
-def _main_monitor_fetch_15m(ticker, period="60d"):
-    df = yf.download(
-        str(ticker).upper(),
-        period=period,
-        interval="15m",
-        auto_adjust=True,
-        progress=False,
-        prepost=False,
-        threads=False,
-    )
-    if df is None or df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    close_col = "Close" if "Close" in df.columns else df.columns[-1]
-    px = pd.Series(df[close_col]).dropna().astype(float)
-    if len(px) < 80:
-        return None
-    try:
-        if px.index.tz is None:
-            px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
-        px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
-    except Exception:
-        pass
-
-    # Drop only if the latest 15m candle is still forming.
-    try:
-        now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
-        latest_start = pd.Timestamp(px.index[-1])
-        latest_close = latest_start + pd.Timedelta(minutes=15)
-        if latest_close > now_ct and len(px) > 2:
-            px = px.iloc[:-1]
-    except Exception:
-        if len(px) > 2:
-            px = px.iloc[:-1]
-    return px.dropna()
-
-
-def _get_current_main_kalman_params():
-    """Read current Main Kalman tab settings from Streamlit session_state."""
-    try:
-        rail_mult = float(st.session_state.get("kalman_trend_rail_distance", 1.35))
-    except Exception:
-        rail_mult = 1.35
-    try:
-        buffer_pct = float(st.session_state.get("kalman_strategy_cross_buffer_pct", 1.25)) / 100.0
-    except Exception:
-        buffer_pct = 0.0125
-    try:
-        confirm_bars = int(st.session_state.get("kalman_strategy_confirm_bars", 3))
-    except Exception:
-        confirm_bars = 3
-    try:
-        min_hold_bars = int(st.session_state.get("kalman_strategy_min_hold", 5))
-    except Exception:
-        min_hold_bars = 5
-    try:
-        cooldown_bars = int(st.session_state.get("kalman_strategy_cooldown", 3))
-    except Exception:
-        cooldown_bars = 3
-    try:
-        slope_confirm = bool(st.session_state.get("kalman_strategy_slope_confirm", True))
-    except Exception:
-        slope_confirm = True
-    try:
-        atr_safety = bool(st.session_state.get("kalman_strategy_atr_safety", True))
-    except Exception:
-        atr_safety = True
-    try:
-        fast_gain = float(st.session_state.get("kalman_fast_reaction", 0.34))
-    except Exception:
-        fast_gain = 0.34
-    try:
-        slow_gain = float(st.session_state.get("kalman_slow_smoothing", 0.055))
-    except Exception:
-        slow_gain = 0.055
-    try:
-        polish_span = int(st.session_state.get("kalman_polish_span", 3))
-    except Exception:
-        polish_span = 3
-
-    return {
-        "rail_mult": rail_mult,
-        "buffer_pct": buffer_pct,
-        "confirm_bars": confirm_bars,
-        "min_hold_bars": min_hold_bars,
-        "cooldown_bars": cooldown_bars,
-        "slope_confirm": slope_confirm,
-        "atr_safety": atr_safety,
-        "fast_gain": fast_gain,
-        "slow_gain": slow_gain,
-        "polish_span": polish_span,
-    }
-
-def _main_kalman_params_label(params=None):
-    if params is None:
-        params = _get_current_main_kalman_params()
-    return (
-        f"Trend Rail {params['rail_mult']:.2f}, "
-        f"buffer {params['buffer_pct']*100:.2f}%, "
-        f"confirm {params['confirm_bars']}, "
-        f"min-hold {params['min_hold_bars']}, "
-        f"cooldown {params['cooldown_bars']}, "
-        f"slope {'ON' if params['slope_confirm'] else 'OFF'}, "
-        f"ATR safety {'ON' if params['atr_safety'] else 'OFF'}, "
-        "risk firewall OFF"
-    )
-
-
-def _build_main_kalman_trade_log_from_prices(ticker, px):
-    """
-    Watchlist version using the SAME CURRENT main Kalman controls from session_state.
-    This is the correct source for watchlist/telegram, not hardcoded buffer/hold values.
-    """
-    ticker = str(ticker).upper()
-    px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 80:
-        return pd.DataFrame(), None
-
-    params = _get_current_main_kalman_params()
-
-    rail, center, long_state = institutional_trend_rail(
-        px,
-        fast_gain=float(params["fast_gain"]),
-        slow_gain=float(params["slow_gain"]),
-        polish_span=int(params["polish_span"]),
-        atr_window=14,
-        atr_mult=float(params["rail_mult"]),
-    )
-    bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
-
-    # If the main tab saved optimizer-chosen params for THIS ticker, use them so
-    # the watchlist reproduces the main-tab signal exactly. Otherwise fall back
-    # to the current slider params.
-    _opt = _get_main_kalman_opt_params_for_ticker(ticker)
-    if isinstance(_opt, dict):
-        buffer_pct = float(_opt.get("buffer_pct", params["buffer_pct"]))
-        confirm_bars = int(_opt.get("confirm_bars", params["confirm_bars"]))
-        min_hold_bars = int(_opt.get("min_hold_bars", params["min_hold_bars"]))
-        cooldown_bars = int(_opt.get("cooldown_bars", params["cooldown_bars"]))
-        _slope_confirm = bool(_opt.get("slope_confirm", params["slope_confirm"]))
-        _atr_safety = bool(_opt.get("atr_safety", params["atr_safety"]))
-        params = dict(params)
-        params["buffer_pct"] = buffer_pct
-        params["confirm_bars"] = confirm_bars
-        params["min_hold_bars"] = min_hold_bars
-        params["cooldown_bars"] = cooldown_bars
-        params["slope_confirm"] = _slope_confirm
-        params["atr_safety"] = _atr_safety
-    else:
-        buffer_pct = float(params["buffer_pct"])
-        confirm_bars = int(params["confirm_bars"])
-        min_hold_bars = int(params["min_hold_bars"])
-        cooldown_bars = int(params["cooldown_bars"])
-
-    trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
-
-    close_above = px > bt_trend * (1.0 + buffer_pct)
-    close_below = px < bt_trend * (1.0 - buffer_pct)
-
-    if bool(params["slope_confirm"]):
-        entry_cond = close_above & (trend_slope >= 0)
-        exit_cond = close_below & (trend_slope <= 0)
-    else:
-        entry_cond = close_above
-        exit_cond = close_below
-
-    if bool(params["atr_safety"]):
-        atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-        safety_exit = px < (bt_trend - 1.25 * atr_proxy)
-        exit_cond = exit_cond | safety_exit.fillna(False)
-
-    entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-    exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-
-    # ---- Build the position signal EXACTLY like the visible main Kalman log ----
-    # The signal here uses the same entry/exit/confirm/min-hold/cooldown rules as
-    # _build_kalman_signal_for_params in the main tab. We then run that signal
-    # through the SAME BacktestEngine.run_strategy the visible log uses, and apply
-    # the SAME risk firewall when it is enabled. This guarantees the watchlist
-    # open/closed status matches the Main Kalman Trade Log for every stock.
-    sig = pd.Series(0.0, index=px.index)
-    in_pos = False
-    bars_held = 0
-    cooldown_left = 0
-
-    for dt in px.index:
-        if cooldown_left > 0:
-            cooldown_left -= 1
-
-        if not in_pos:
-            if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
-                in_pos = True
-                bars_held = 0
-                sig.loc[dt] = 1.0
-            else:
-                sig.loc[dt] = 0.0
-        else:
-            bars_held += 1
-            if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
-                in_pos = False
-                cooldown_left = cooldown_bars
-                bars_held = 0
-                sig.loc[dt] = 0.0
-            else:
-                sig.loc[dt] = 1.0
-
-    sig = sig.ffill().fillna(0).clip(0, 1)
-
-    # Apply the Main Kalman risk firewall when the user has it enabled, using the
-    # same session-state settings as the main chart, so a firewall-forced exit
-    # closes the watchlist trade exactly as it closes the visible log trade.
-    try:
-        use_firewall = bool(st.session_state.get("kalman_use_risk_firewall", False))
-    except Exception:
-        use_firewall = False
-    if use_firewall and "apply_kalman_risk_firewall" in globals():
-        try:
-            sig = apply_kalman_risk_firewall(
-                px, sig, bt_trend,
-                max_trade_loss_pct=float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-                trail_stop_pct=float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-                equity_dd_stop_pct=float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-                cooldown_bars=int(st.session_state.get("kalman_firewall_cooldown", 8)),
-            )
-        except Exception:
-            pass
-
-    # ---- NON-REPAINT LOCK (final, post-firewall) -----------------------
-    # Freeze the FINAL executed per-bar signal so re-running never rewrites
-    # history. Only new completed bars are appended. The firewall runs first so
-    # its stop-outs are captured in the frozen value, then nothing downstream
-    # can change a past bar. Controlled by session_state flag (default ON).
-    try:
-        _freeze = bool(st.session_state.get("kalman_non_repaint_lock", True))
-    except Exception:
-        _freeze = True
-    sig = _apply_signal_lock(ticker, sig, freeze_enabled=_freeze)
-
-    # Run the identical backtest engine the visible Main Kalman Trade Log uses.
-    try:
-        initial_cap = float(st.session_state.get("initial_cap", 10000.0))
-    except Exception:
-        initial_cap = 10000.0
-
-    try:
-        bt = BacktestEngine.run_strategy(px, sig, initial_cap)
-        engine_trades = bt.get("trades", pd.DataFrame())
-    except Exception:
-        engine_trades = pd.DataFrame()
-
-    last_price = round(float(px.iloc[-1]), 2)
-
-    # Convert the engine trade log (Entry Date/Exit Date/Buy Price/Sell Price/Status)
-    # into the watchlist schema, preserving the engine's authoritative Status.
-    trades = []
-    if isinstance(engine_trades, pd.DataFrame) and not engine_trades.empty:
-        for _, tr in engine_trades.iterrows():
-            status_txt = str(tr.get("Status", "")).strip()
-            is_open_row = status_txt.upper() == "OPEN"
-
-            entry_dt = tr.get("Entry Date", None)
-            exit_dt = tr.get("Exit Date", None)
-            try:
-                entry_ct = pd.Timestamp(entry_dt).strftime("%Y-%m-%d %H:%M:%S CT") if entry_dt is not None and pd.notna(entry_dt) else ""
-            except Exception:
-                entry_ct = str(entry_dt) if entry_dt is not None else ""
-
-            if is_open_row:
-                exit_ct = "Open"
-            else:
-                try:
-                    exit_ct = pd.Timestamp(exit_dt).strftime("%Y-%m-%d %H:%M:%S CT") if exit_dt is not None and pd.notna(exit_dt) else ""
-                except Exception:
-                    exit_ct = str(exit_dt) if exit_dt is not None else ""
-
-            try:
-                entry_px = round(float(tr.get("Buy Price")), 2)
-            except Exception:
-                entry_px = None
-            try:
-                exit_px = round(float(tr.get("Sell Price")), 2)
-            except Exception:
-                exit_px = last_price if is_open_row else None
-            try:
-                pnl = round(float(tr.get("PnL (%)")), 2)
-            except Exception:
-                pnl = None
-
-            trades.append({
-                "Ticker": ticker,
-                "Side": "Long",
-                "Entry CT": entry_ct,
-                "Exit CT": exit_ct,
-                "Entry Price": entry_px,
-                "Exit/Current Price": exit_px,
-                "PnL (%)": pnl,
-                "Status": "Open" if is_open_row else "Closed",
-            })
-
-    trades_df = pd.DataFrame(trades)
-    status = "LONG" if (not trades_df.empty and str(trades_df.iloc[-1].get("Status", "")).lower() == "open") else "CASH"
-
-    latest = {
-        "Ticker": ticker,
-        "Alert Signal": "NO NEW ALERT",
-        "Trade Position": status,
-        "Price": last_price,
-        "Candle Close CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
-        "Source": "Current Main Kalman Controls (same engine + firewall as visible log)",
-        "Settings": _main_kalman_params_label(params),
-    }
-    return trades_df, latest
-
-def _main_kalman_watchlist_ledger_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_watchlist_ledger.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_watchlist_ledger.json")
-
-def _load_main_kalman_watchlist_ledger():
-    try:
-        p = _main_kalman_watchlist_ledger_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_watchlist_ledger(data):
-    try:
-        _main_kalman_watchlist_ledger_path().write_text(json.dumps(data, indent=2))
-    except Exception:
-        pass
-
-
-# ---- Per-ticker optimized Kalman params store -----------------------------
-# When the Benchmark-aware optimizer is ON, the main tab chooses per-ticker
-# buffer/confirm/hold/cooldown that differ from the sliders. The watchlist must
-# use those SAME per-ticker params, or it will recompute with slider defaults
-# and disagree (e.g. ELF Long in main tab, CASH in watchlist). We persist the
-# chosen params per ticker so the watchlist can reproduce the main-tab signal.
-def _main_kalman_opt_params_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_opt_params_V2_CLEAN.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_opt_params_V2_CLEAN.json")
-
-def _load_main_kalman_opt_params():
-    try:
-        p = _main_kalman_opt_params_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
-                                            slope_confirm=True, atr_safety=True):
-    """Persist the exact params the main tab used for a ticker (optimizer or sliders)."""
-    try:
-        store = _load_main_kalman_opt_params()
-        store[str(ticker).upper()] = {
-            "buffer_pct": float(buffer_pct),
-            "confirm_bars": int(confirm_bars),
-            "min_hold_bars": int(min_hold_bars),
-            "cooldown_bars": int(cooldown_bars),
-            "slope_confirm": bool(slope_confirm),
-            "atr_safety": bool(atr_safety),
-            "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-        }
-        _main_kalman_opt_params_path().write_text(json.dumps(store, indent=2))
-    except Exception:
-        pass
-
-def _get_main_kalman_opt_params_for_ticker(ticker):
-    try:
-        return _load_main_kalman_opt_params().get(str(ticker).upper())
-    except Exception:
-        return None
-
-
-# ---- Non-repaint signal lock --------------------------------------------
-# To guarantee the signal NEVER repaints, we freeze the per-bar signal value
-# once a completed bar has been seen. Each run may only APPEND signal values
-# for new completed-bar timestamps; it can never rewrite the signal of a bar
-# that was already locked. This removes repaint from the rolling data window
-# and from any later parameter changes.
-def _main_kalman_signal_lock_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_signal_lock_V2_CLEAN.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_signal_lock_V2_CLEAN.json")
-
-def _load_main_kalman_signal_lock():
-    try:
-        p = _main_kalman_signal_lock_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_signal_lock(store):
-    try:
-        _main_kalman_signal_lock_path().write_text(json.dumps(store, indent=2))
-    except Exception:
-        pass
-
-def _apply_signal_lock(ticker, sig, freeze_enabled=True, interval="15m"):
-    """
-    Merge a freshly computed causal signal with the locked history so the result
-    is append-only (non-repainting).
-
-    For every bar timestamp already in the lock, the LOCKED value is used (the
-    fresh recompute can never change history). New completed-bar timestamps are
-    added to the lock. Keyed by ticker+interval so 15m and daily signals never
-    mix.
-    """
-    try:
-        if sig is None or len(sig) == 0:
-            return sig
-        tkey = f"{str(ticker).upper()}|{str(interval)}"
-        store = _load_main_kalman_signal_lock()
-        locked = dict(store.get(tkey, {})) if isinstance(store.get(tkey), dict) else {}
-
-        out = sig.copy()
-        changed = False
-        for dt in out.index:
-            key = pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M:%S")
-            if freeze_enabled and key in locked:
-                # Use the frozen historical value; do not repaint.
-                try:
-                    out.loc[dt] = float(locked[key])
-                except Exception:
-                    pass
-            else:
-                # New bar -> record it (lock it going forward).
-                try:
-                    locked[key] = float(out.loc[dt])
-                    changed = True
-                except Exception:
-                    pass
-
-        if changed and freeze_enabled:
-            # Cap stored history so the file cannot grow without bound.
-            if len(locked) > 6000:
-                for k in sorted(locked.keys())[: len(locked) - 6000]:
-                    locked.pop(k, None)
-            store[tkey] = locked
-            _save_main_kalman_signal_lock(store)
-        return out
-    except Exception:
-        return sig
-
-def _parse_ct_time_safe(x):
-    try:
-        s = str(x).replace(" CT", "").strip()
-        if not s or s.lower() == "open" or s.lower() == "nan":
-            return None
-        return pd.to_datetime(s, errors="coerce")
-    except Exception:
-        return None
-
-def _candidate_from_main_watchlist_trades(sym, trades_df, row):
-    """Convert recalculated trade log into a candidate state. Candidate is NOT truth."""
-    sym = str(sym).upper()
-    if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-        return {
-            "position": "CASH",
-            "signal": "NONE",
-            "entry_time": "",
-            "exit_time": "",
-            "event_time": "",
-            "price": row.get("Price") if isinstance(row, dict) else None,
-            "state_key": f"{sym}|CASH|NO_TRADES",
-            "raw_status": "NO_TRADES",
-        }
-
-    last = trades_df.iloc[-1]
-    _is_open_row = _trade_row_is_open(last, columns=trades_df.columns)
-    status = "OPEN" if _is_open_row else "CLOSED"
-    entry_time = str(last.get("Entry CT", ""))
-    exit_time = str(last.get("Exit CT", ""))
-    price = row.get("Price") if isinstance(row, dict) else None
-
-    if _is_open_row:
-        position = "LONG"
-        signal = "BUY"
-        event_time = entry_time
-    else:
-        position = "CASH"
-        signal = "SELL"
-        event_time = exit_time if exit_time and exit_time.upper() != "OPEN" else entry_time
-
-    state_key = f"{sym}|{signal}|{event_time}|{status}|{last.get('Entry Price')}|{last.get('Exit/Current Price')}"
-    return {
-        "position": position,
-        "signal": signal,
-        "entry_time": entry_time,
-        "exit_time": exit_time,
-        "event_time": event_time,
-        "price": price,
-        "state_key": state_key,
-        "raw_status": status,
-        "entry_price": last.get("Entry Price", None),
-        "exit_current_price": last.get("Exit/Current Price", None),
-        "pnl_pct": last.get("PnL (%)", None),
-    }
-
-def _parse_watchlist_ct_time(x):
-    try:
-        s = str(x).replace(" CT", "").strip()
-        if not s or s.lower() in ["open", "nan", "none"]:
-            return None
-        v = pd.to_datetime(s, errors="coerce")
-        if pd.isna(v):
-            return None
-        return v
-    except Exception:
-        return None
-
-def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50, allow_sell_alerts=False):
-    """
-    Watchlist monitor using current Main Kalman controls.
-    First scan baselines. Future changes alert. This avoids separate hardcoded logic.
-    """
-    symbols = _normalize_watchlist(raw_watchlist)
-    try:
-        max_stocks = int(max_stocks)
-    except Exception:
-        max_stocks = 50
-    if max_stocks > 0:
-        symbols = symbols[:max_stocks]
-
-    params = _get_current_main_kalman_params()
-    model_version = "CURRENT_MAIN_CONTROLS|" + _main_kalman_params_label(params)
-
-    ledger = _load_main_kalman_watchlist_ledger()
-    rows = []
-
-    for sym in symbols:
-        sym = str(sym).upper()
-        try:
-            px = _main_monitor_fetch_15m(sym, period="60d")
-            if px is None or len(px) < 80:
-                rows.append({
-                    "Ticker": sym,
-                    "Alert Signal": "NO DATA",
-                    "Trade Position": "UNKNOWN",
-                    "Price": None,
-                    "Candle Close CT": "",
-                    "Ledger Note": "Not enough 15m data",
-                    "Settings": _main_kalman_params_label(params),
-                })
-                continue
-
-            trades_df, raw_row = _build_main_kalman_trade_log_from_prices(sym, px)
-            candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
-            price_now = round(float(px.iloc[-1]), 2)
-
-            # ---- Authoritative override -------------------------------------
-            # If the Main Kalman tab has already computed and saved a status for
-            # this exact ticker, that visible trade log is the source of truth.
-            # The watchlist must mirror it instead of its own 60d/15m recompute,
-            # otherwise the sidebar can disagree with the main tab (e.g. ELF
-            # showing CASH here while the main tab shows an Open position).
-            _visible_status = None
-            try:
-                _visible_status = st.session_state.get(f"main_kalman_status_{sym}")
-            except Exception:
-                _visible_status = None
-
-            _used_visible = False
-            if isinstance(_visible_status, dict) and _visible_status.get("Trade Position") in ("LONG", "CASH"):
-                position = str(_visible_status.get("Trade Position"))
-                is_open = position == "LONG"
-                signal_state = "BUY" if is_open else "SELL"
-                # Prefer prices/times from the recomputed log when present, else
-                # fall back to the saved visible row / current price.
-                if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                    last = trades_df.iloc[-1]
-                    entry_time = str(last.get("Entry CT", ""))
-                    exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
-                    entry_price = last.get("Entry Price", None)
-                    curr_exit_price = last.get("Exit/Current Price", price_now)
-                    pnl_pct = last.get("PnL (%)", None)
-                else:
-                    entry_time = str(_visible_status.get("Candle Close CT", ""))
-                    exit_time = "Open" if is_open else ""
-                    entry_price = None
-                    curr_exit_price = _visible_status.get("Price", price_now)
-                    pnl_pct = None
-                event_time = entry_time if is_open else (exit_time or candle_ct)
-                _used_visible = True
-            elif trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                last = trades_df.iloc[-1]
-                is_open = _trade_row_is_open(last, columns=trades_df.columns)
-                position = "LONG" if is_open else "CASH"
-                signal_state = "BUY" if is_open else "SELL"
-                entry_time = str(last.get("Entry CT", ""))
-                exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
-                event_time = entry_time if is_open else exit_time
-                entry_price = last.get("Entry Price", None)
-                curr_exit_price = last.get("Exit/Current Price", price_now)
-                pnl_pct = last.get("PnL (%)", None)
-            else:
-                position = "CASH"
-                signal_state = "CASH"
-                entry_time = ""
-                exit_time = ""
-                event_time = candle_ct
-                entry_price = None
-                curr_exit_price = price_now
-                pnl_pct = None
-
-            state_key = f"{model_version}|{sym}|{position}|{signal_state}|{event_time}|{entry_price}|{curr_exit_price}"
-            saved = ledger.get(sym)
-            saved_key = saved.get("state_key") if isinstance(saved, dict) else saved
-            saved_model = saved.get("model_version") if isinstance(saved, dict) else None
-
-            alert_signal = "NO NEW ALERT"
-            note = "No change since last scan"
-
-            if not saved_key or saved_model != model_version:
-                note = "Baseline synced for current main controls — no alert sent"
-            elif saved_key != state_key:
-                alert_signal = "BUY" if position == "LONG" else "SELL"
-                note = "State changed"
-                if alert_signal == "SELL" and not bool(allow_sell_alerts):
-                    note = "SELL detected but Telegram SELL alerts are OFF"
-                elif send_telegram:
-                    msg = (
-                        "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
-                        f"Ticker: {sym}\n"
-                        f"Signal: {alert_signal}\n"
-                        f"Trade Position: {position}\n"
-                        f"Price: {price_now}\n"
-                        f"Event Time: {event_time}\n"
-                        f"Settings: {_main_kalman_params_label(params)}\n"
-                        "Source: Watchlist monitor using current Main Kalman controls\n"
-                        "Action: Notification only — no IBKR order sent."
-                    )
-                    ok, resp = send_telegram_alert(token, chat_id, msg)
-                    note = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
-
-            ledger[sym] = {
-                "ticker": sym,
-                "model_version": model_version,
-                "position": position,
-                "state_key": state_key,
-                "event_time": event_time,
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "price": price_now,
-                "entry_price": entry_price,
-                "exit_current_price": curr_exit_price,
-                "pnl_pct": pnl_pct,
-                "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            }
-            _save_main_kalman_watchlist_ledger(ledger)
-
-            rows.append({
-                "Ticker": sym,
-                "Alert Signal": alert_signal,
-                "Trade Position": position,
-                "Price": price_now,
-                "Candle Close CT": candle_ct,
-                "Entry CT": entry_time,
-                "Exit CT": exit_time,
-                "Entry Price": entry_price,
-                "Current/Exit Price": curr_exit_price,
-                "PnL (%)": pnl_pct,
-                "Ledger Note": note,
-                "Status Source": "Visible Main Kalman tab" if _used_visible else "Watchlist recompute (60d/15m)",
-                "Settings": _main_kalman_params_label(params),
-            })
-
-        except Exception as e:
-            rows.append({
-                "Ticker": sym,
-                "Alert Signal": "ERROR",
-                "Trade Position": "UNKNOWN",
-                "Price": None,
-                "Candle Close CT": "",
-                "Ledger Note": str(e)[:120],
-                "Settings": _main_kalman_params_label(params),
-            })
-
-    df_rows = pd.DataFrame(rows)
-    if show_table:
-        st.dataframe(df_rows, use_container_width=True, hide_index=True)
-    return df_rows
-
-# --------------------------------------------------------
-
-
-# ---------- Telegram Alert Helpers ----------
-def send_telegram_alert(bot_token: str, chat_id: str, message: str):
-    """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
-    try:
-        bot_token = str(bot_token).strip()
-        chat_id = str(chat_id).strip()
-        if not bot_token or not chat_id:
-            return False, "Missing bot token or chat ID."
-
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return True, body
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        return False, body
-    except Exception as e:
-        return False, str(e)
-
-
-def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: str):
-    """Prevent repeated alerts on Streamlit reruns."""
-    try:
-        sent = st.session_state.setdefault("_telegram_alerts_sent", set())
-        if alert_key in sent:
-            return True, "Already sent this alert."
-        ok, resp = send_telegram_alert(bot_token, chat_id, message)
-        if ok:
-            sent.add(alert_key)
-        return ok, resp
-    except Exception as e:
-        return False, str(e)
-# -------------------------------------------
-
-
-# ---------- Auto Kalman Telegram Alert Helper ----------
-def maybe_send_kalman_live_telegram_alert(
-    tg_alerts_on: bool,
-    tg_bot_token: str,
-    tg_chat_id: str,
-    symbol_hint=None,
-    signal_hint=None,
-    price_hint=None,
-    strategy_hint="Kalman Live Decision",
-    reason_hint="Kalman live signal changed.",
-):
-    """Send one Telegram alert when Kalman live BUY/SELL signal changes. Notification only."""
-    try:
-        if not tg_alerts_on:
-            return
-
-        # Try to infer values from explicit hints first, then from globals.
-        g = globals()
-
-        ticker = symbol_hint
-        if ticker is None:
-            for k in ["ticker", "symbol", "selected_ticker", "kalman_ticker", "live_ticker", "asset"]:
-                v = g.get(k)
-                if isinstance(v, str) and v.strip():
-                    ticker = v.strip().upper()
-                    break
-        if ticker is None:
-            ticker = "UNKNOWN"
-
-        signal = signal_hint
-        if signal is None:
-            for k in [
-                "kalman_live_signal",
-                "live_signal",
-                "latest_signal",
-                "current_signal",
-                "signal",
-                "decision",
-                "trade_signal",
-            ]:
-                v = g.get(k)
-                if isinstance(v, str) and v.strip():
-                    signal = v.strip().upper()
-                    break
-
-        if signal is None:
-            return
-
-        signal_upper = str(signal).strip().upper()
-        if "BUY" in signal_upper:
-            clean_signal = "BUY"
-        elif "SELL" in signal_upper or "EXIT" in signal_upper:
-            clean_signal = "SELL"
-        else:
-            return
-
-        price = price_hint
-        if price is None:
-            for k in ["latest_price", "current_price", "live_price", "last_price", "price", "close"]:
-                v = g.get(k)
-                try:
-                    if v is not None:
-                        price = float(v)
-                        break
-                except Exception:
-                    pass
-
-        price_txt = "N/A" if price is None else f"{float(price):.2f}"
-
-        now_ct = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
-        key = f"KALMAN_LIVE::{ticker}::{clean_signal}::{price_txt}"
-
-        msg = (
-            "PINEHURST KALMAN LIVE ALERT\n"
-            f"Ticker: {ticker}\n"
-            f"Signal: {clean_signal}\n"
-            f"Price: {price_txt}\n"
-            f"Time: {now_ct}\n"
-            f"Strategy: {strategy_hint}\n"
-            f"Reason: {reason_hint}\n"
-            "Action: Notification only — no IBKR order sent."
-        )
-
-        ok, resp = telegram_alert_once(key, tg_bot_token, tg_chat_id, msg)
-        if ok:
-            st.toast(f"Telegram Kalman alert sent: {ticker} {clean_signal}", icon="📲")
-        else:
-            st.warning(f"Telegram Kalman alert failed: {resp}")
-
-    except Exception as e:
-        st.warning(f"Telegram Kalman alert skipped: {e}")
-# ------------------------------------------------------
-
-
 
 
 # Databento is optional and lazy-loaded only when the user clicks the pull button.
@@ -1687,18 +56,6 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-# Try importing IBKR connection library
-try:
-    from ib_insync import IB, Stock, MarketOrder, LimitOrder
-    IBKR_AVAILABLE = True
-except ImportError:
-    IB = None
-    Stock = None
-    MarketOrder = None
-    LimitOrder = None
-    IBKR_AVAILABLE = False
-
-
 
 # Statsmodels Diagnostic Imports
 
@@ -1708,234 +65,6 @@ from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 # 1. CONFIGURATION & STYLING
 # ==========================================
 st.set_page_config(page_title="Quant Thesis: Advanced Models (Filtered)", layout="wide")
-
-# ==========================================
-# PINEHURST CLEAN WHITE/GREEN UI BRANDING
-# ==========================================
-PINEHURST_LOGO_BASE64 = """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"""
-
-def render_pinehurst_clean_white_green_branding():
-    """
-    Visual-only Pinehurst branding for the Advanced Quant App.
-    White + deep green style using the original logo feel.
-    No model, signal, ledger, trade-log, WFO, scanner, or pricing logic is changed.
-    """
-    try:
-        logo_uri = "data:image/jpeg;base64," + PINEHURST_LOGO_BASE64
-        st.markdown(f"""
-        <style>
-        :root {
-            --pine-green: #06351f;
-            --pine-green-2: #0b4a2e;
-            --pine-soft-green: #edf6f1;
-            --pine-border: rgba(6, 53, 31, 0.14);
-            --pine-gold-soft: rgba(176, 149, 82, 0.22);
-            --pine-text: #10251b;
-        }
-
-        [data-testid="stAppViewContainer"] {
-            background:
-                radial-gradient(circle at 50% 0%, rgba(6,53,31,0.055) 0%, rgba(6,53,31,0.018) 38%, rgba(255,255,255,0) 68%),
-                linear-gradient(180deg, #ffffff 0%, #f7faf8 46%, #eef5f1 100%) !important;
-            color: var(--pine-text);
-        }
-
-        [data-testid="stHeader"] {
-            background: rgba(255,255,255,0.86) !important;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(6,53,31,0.10);
-        }
-
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #ffffff 0%, #f2f8f4 100%) !important;
-            border-right: 1px solid rgba(6,53,31,0.13);
-        }
-
-        [data-testid="stSidebar"] > div:first-child {
-            background: transparent !important;
-        }
-
-        .pinehurst-hero {
-            margin: 0.25rem 0 1.20rem 0;
-            padding: 1.35rem 1.30rem;
-            border: 1px solid rgba(6,53,31,0.13);
-            border-radius: 22px;
-            background:
-                linear-gradient(135deg, rgba(255,255,255,0.98), rgba(240,248,244,0.94)),
-                radial-gradient(circle at 78% 10%, rgba(6,53,31,0.08), rgba(255,255,255,0) 34%);
-            box-shadow: 0 18px 46px rgba(6,53,31,0.10);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .pinehurst-hero:before {
-            content: "";
-            position: absolute;
-            inset: 0;
-            background:
-                linear-gradient(115deg, rgba(6,53,31,0.07), rgba(255,255,255,0) 24%),
-                repeating-linear-gradient(155deg, rgba(6,53,31,0.045) 0px, rgba(6,53,31,0.045) 1px, transparent 1px, transparent 15px);
-            opacity: 0.42;
-            pointer-events: none;
-        }
-
-        .pinehurst-hero-inner {
-            position: relative;
-            display: flex;
-            align-items: center;
-            gap: 1.15rem;
-            z-index: 2;
-        }
-
-        .pinehurst-logo-box {
-            width: 116px;
-            min-width: 116px;
-            height: 116px;
-            border-radius: 20px;
-            padding: 7px;
-            background: #ffffff;
-            box-shadow: 0 12px 28px rgba(6,53,31,0.13);
-            border: 1px solid rgba(6,53,31,0.12);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .pinehurst-logo-box img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            border-radius: 14px;
-        }
-
-        .pinehurst-title {
-            font-size: 2.08rem;
-            font-weight: 780;
-            letter-spacing: 0.075em;
-            color: var(--pine-green);
-            line-height: 1.05;
-            margin-bottom: 0.33rem;
-        }
-
-        .pinehurst-subtitle {
-            font-size: 0.90rem;
-            letter-spacing: 0.18em;
-            text-transform: uppercase;
-            color: rgba(6,53,31,0.72);
-            margin-bottom: 0.48rem;
-            font-weight: 650;
-        }
-
-        .pinehurst-small {
-            font-size: 0.91rem;
-            color: rgba(16,37,27,0.66);
-        }
-
-        .pinehurst-sidebar-logo {
-            text-align: center;
-            padding: 0.85rem 0.55rem 1rem 0.55rem;
-            margin-bottom: 0.75rem;
-            border: 1px solid rgba(6,53,31,0.12);
-            border-radius: 18px;
-            background: #ffffff;
-            box-shadow: 0 10px 26px rgba(6,53,31,0.08);
-        }
-
-        .pinehurst-sidebar-logo img {
-            max-width: 165px;
-            width: 86%;
-            border-radius: 14px;
-            background: #ffffff;
-            padding: 5px;
-        }
-
-        .stMetric, [data-testid="stMetric"] {
-            background: rgba(255,255,255,0.92);
-            border: 1px solid rgba(6,53,31,0.12);
-            border-radius: 16px;
-            padding: 0.72rem 0.82rem;
-            box-shadow: 0 10px 28px rgba(6,53,31,0.07);
-        }
-
-        div[data-testid="stExpander"] {
-            border: 1px solid rgba(6,53,31,0.12) !important;
-            border-radius: 14px !important;
-            background: rgba(255,255,255,0.82) !important;
-            box-shadow: 0 8px 22px rgba(6,53,31,0.045);
-        }
-
-        .stButton > button, .stDownloadButton > button {
-            border-radius: 12px !important;
-            border: 1px solid rgba(6,53,31,0.25) !important;
-            background: linear-gradient(135deg, #0b4a2e, #06351f) !important;
-            color: #ffffff !important;
-            box-shadow: 0 9px 20px rgba(6,53,31,0.18);
-        }
-
-        .stButton > button:hover, .stDownloadButton > button:hover {
-            border-color: rgba(6,53,31,0.65) !important;
-            box-shadow: 0 12px 28px rgba(6,53,31,0.25);
-            transform: translateY(-1px);
-        }
-
-        div[data-testid="stDataFrame"] {
-            border: 1px solid rgba(6,53,31,0.12);
-            border-radius: 14px;
-            overflow: hidden;
-            box-shadow: 0 12px 34px rgba(6,53,31,0.07);
-        }
-
-        h1, h2, h3, h4 {
-            color: var(--pine-green) !important;
-        }
-
-        hr {
-            border-color: rgba(6,53,31,0.14) !important;
-        }
-
-        p, label, span, div {
-            color: inherit;
-        }
-        </style>
-
-        <div class="pinehurst-hero">
-            <div class="pinehurst-hero-inner">
-                <div class="pinehurst-logo-box">
-                    <img src="{logo_uri}" alt="Pinehurst Capital logo" />
-                </div>
-                <div>
-                    <div class="pinehurst-subtitle">Advanced Quant Dashboard</div>
-                    <div class="pinehurst-title">PINEHURST CAPITAL</div>
-                    <div class="pinehurst-small">Clean regime research • capital rotation • risk-first signal dashboard</div>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        with st.sidebar:
-
-            # Kalman Risk Firewall default OFF everywhere.
-
-            try:
-
-                if "kalman_use_risk_firewall" not in st.session_state:
-
-                    st.session_state["kalman_use_risk_firewall"] = False
-
-            except Exception:
-
-                pass
-
-            st.markdown(f"""
-            <div class="pinehurst-sidebar-logo">
-                <img src="{logo_uri}" alt="Pinehurst Capital logo" />
-            </div>
-            """, unsafe_allow_html=True)
-    except Exception:
-        pass
-
-render_pinehurst_clean_white_green_branding()
-
 plt.style.use('ggplot')
 
 st.title("Results of Advanced Quantitative Thesis (Filtered Probabilities)")
@@ -2172,213 +301,6 @@ class KalmanFilterTrend:
             smoothed_covs[t] = filtered_covs[t] + J**2 * (smoothed_covs[t+1] - P_pred)
         
         return smoothed_means, smoothed_covs
-
-
-def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055, vol_window=20, polish_span=3):
-    """
-    Causal adaptive Kalman-style trend line for the Single Asset Trend tab.
-    It turns faster in strong moves while still smoothing chop. Uses current/past bars only.
-    """
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        if px.empty:
-            return np.array([])
-        ret = px.pct_change().abs()
-        vol = ret.rolling(int(vol_window), min_periods=max(3, int(vol_window)//3)).median().replace(0, np.nan)
-        shock = (ret / (vol + 1e-12)).replace([np.inf, -np.inf], np.nan).fillna(0).clip(0, 3) / 3.0
-        fast_gain = float(fast_gain)
-        slow_gain = float(slow_gain)
-        gains = (slow_gain + (fast_gain - slow_gain) * shock).clip(min(slow_gain, fast_gain), max(slow_gain, fast_gain))
-        out = np.zeros(len(px), dtype=float)
-        out[0] = float(px.iloc[0])
-        for i in range(1, len(px)):
-            out[i] = out[i-1] + float(gains.iloc[i]) * (float(px.iloc[i]) - out[i-1])
-        if int(polish_span) > 1:
-            out = pd.Series(out, index=px.index).ewm(span=int(polish_span), adjust=False).mean().values
-        return out
-    except Exception:
-        try:
-            return pd.Series(prices).ewm(span=8, adjust=False).mean().values
-        except Exception:
-            return np.array(prices, dtype=float)
-
-
-def zero_lag_ema_trend(prices, span=10):
-    """Causal zero-lag EMA style trend."""
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        lag = max(1, int((int(span) - 1) / 2))
-        adj = px + (px - px.shift(lag))
-        return adj.ewm(span=int(span), adjust=False).mean().ffill().bfill().values
-    except Exception:
-        return pd.Series(prices).ewm(span=max(2, int(span)), adjust=False).mean().values
-
-
-def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_span=3, atr_window=14, atr_mult=1.35):
-    """
-    Directional trend rail for the Kalman tab.
-
-    This is what the user wants visually:
-    - In an uptrend, the line behaves like a smooth support rail below price.
-    - In a downtrend, the line behaves like a smooth resistance rail above price.
-    - It avoids constantly cutting through the middle of price like a centerline filter.
-
-    Causal only: uses current/past bars, no backward smoothing.
-    """
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        if px.empty:
-            return np.array([]), np.array([]), pd.Series(dtype=float)
-
-        center = pd.Series(
-            institutional_adaptive_kalman_trend(
-                px.values,
-                fast_gain=float(fast_gain),
-                slow_gain=float(slow_gain),
-                vol_window=20,
-                polish_span=int(polish_span)
-            ),
-            index=px.index
-        )
-
-        # Close-only ATR proxy, robust when only close data is available in this tab.
-        atr = px.diff().abs().ewm(span=int(atr_window), adjust=False).mean()
-        atr = atr.replace(0, np.nan).ffill().bfill()
-        if atr.isna().all():
-            atr = pd.Series(px.std() * 0.02 if len(px) > 2 else 1.0, index=px.index)
-        atr = atr.fillna(float(px.iloc[-1]) * 0.015)
-
-        slope = center.diff().ewm(span=5, adjust=False).mean().fillna(0)
-        long_state = pd.Series(False, index=px.index)
-        rail = pd.Series(index=px.index, dtype=float)
-
-        state = True
-        rail.iloc[0] = float(center.iloc[0] - float(atr.iloc[0]) * float(atr_mult))
-        long_state.iloc[0] = state
-
-        for i in range(1, len(px)):
-            p = float(px.iloc[i])
-            c = float(center.iloc[i])
-            a = float(atr.iloc[i]) * float(atr_mult)
-            sl = float(slope.iloc[i])
-
-            # Switch logic with a small buffer so it does not flip every tiny cross.
-            if state:
-                candidate = c - a
-                # Trailing support should generally rise/hold in an uptrend.
-                if sl >= 0:
-                    candidate = max(candidate, float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate)
-                # Flip bearish only when price loses the prior support rail.
-                if p < (float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate):
-                    state = False
-                    candidate = c + a
-            else:
-                candidate = c + a
-                # Trailing resistance should generally fall/hold in a downtrend.
-                if sl <= 0:
-                    candidate = min(candidate, float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate)
-                # Flip bullish only when price clears the prior resistance rail.
-                if p > (float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate):
-                    state = True
-                    candidate = c - a
-
-            rail.iloc[i] = candidate
-            long_state.iloc[i] = state
-
-        # Light causal polish to make it visually smooth without turning it into a centerline.
-        rail = rail.ewm(span=2, adjust=False).mean()
-        return rail.values, center.values, long_state
-    except Exception:
-        base = institutional_adaptive_kalman_trend(prices, fast_gain=fast_gain, slow_gain=slow_gain, polish_span=polish_span)
-        return base, base, pd.Series([True] * len(base))
-
-
-def apply_kalman_risk_firewall(prices, signal, trend, max_trade_loss_pct=18.0, trail_stop_pct=22.0, equity_dd_stop_pct=30.0, cooldown_bars=8):
-    """
-    Risk overlay for Kalman strategy.
-
-    It does not change the trend/entry model. It only applies capital protection:
-    - hard trade stop from entry
-    - trailing stop from highest close since entry
-    - equity drawdown circuit breaker
-    - cooldown after forced exit
-
-    Causal only: current/past bars.
-    """
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        sig = pd.Series(signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0, 1)
-        tr = pd.Series(trend).reindex(px.index).ffill().bfill().astype(float)
-
-        out = pd.Series(0.0, index=px.index)
-        in_pos = False
-        entry = 0.0
-        peak_price = 0.0
-        eq = 1.0
-        peak_eq = 1.0
-        cooldown = 0
-        prev_price = None
-
-        max_trade_loss = float(max_trade_loss_pct) / 100.0
-        trail_stop = float(trail_stop_pct) / 100.0
-        equity_dd_stop = float(equity_dd_stop_pct) / 100.0
-        cooldown_bars = int(cooldown_bars)
-
-        for i, dt in enumerate(px.index):
-            p = float(px.loc[dt])
-            desired = float(sig.loc[dt])
-
-            if prev_price is not None and in_pos:
-                eq *= (p / float(prev_price))
-                peak_eq = max(peak_eq, eq)
-
-            if cooldown > 0:
-                cooldown -= 1
-
-            forced_exit = False
-            if in_pos:
-                peak_price = max(peak_price, p)
-
-                if max_trade_loss > 0 and p <= entry * (1.0 - max_trade_loss):
-                    forced_exit = True
-
-                if (not forced_exit) and trail_stop > 0 and p <= peak_price * (1.0 - trail_stop):
-                    forced_exit = True
-
-                if (not forced_exit) and equity_dd_stop > 0 and eq <= peak_eq * (1.0 - equity_dd_stop):
-                    forced_exit = True
-
-                # Secondary structural fail-safe: if price loses trend after being in position.
-                if (not forced_exit) and p < float(tr.loc[dt]) * 0.985:
-                    forced_exit = True
-
-                if forced_exit:
-                    in_pos = False
-                    cooldown = cooldown_bars
-                    out.loc[dt] = 0.0
-                elif desired >= 0.5:
-                    out.loc[dt] = 1.0
-                else:
-                    in_pos = False
-                    out.loc[dt] = 0.0
-            else:
-                if cooldown <= 0 and desired >= 0.5:
-                    in_pos = True
-                    entry = p
-                    peak_price = p
-                    out.loc[dt] = 1.0
-                else:
-                    out.loc[dt] = 0.0
-
-            prev_price = p
-
-        return out.ffill().fillna(0).clip(0, 1)
-    except Exception:
-        return pd.Series(signal).ffill().fillna(0).clip(0, 1)
-
-
-
-
 
 def simulate_heston(S0, T, r, kappa, theta, sigma, rho, v0, steps, paths):
     """
@@ -3403,88 +1325,44 @@ def clean_overlapping_duplicate_trades(trades_df):
         except Exception:
             return trades_df
 
-
-def _to_ct_naive_timestamp(x, default_bar_time="16:00", assume_naive_intraday_is_ct=True):
-    """
-    Convert timestamps to Central Time, then remove tz for consistent Plotly/table display.
-
-    Critical rule for this app:
-    - Intraday/live data is already converted to CT earlier in the pipeline.
-    - If an intraday timestamp is naive, treat it as CT, not New York.
-    - Date-only daily/weekly bars are treated as Eastern close and converted to CT.
-    """
-    try:
-        if x is None:
-            return pd.NaT
-        ts = pd.Timestamp(x)
-        if pd.isna(ts):
-            return pd.NaT
-
-        eastern_tz = "America/New_York"
-        central_tz = "America/Chicago"
-
-        # Date-only rows: assume regular market close in Eastern then convert to CT.
-        if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
-            try:
-                hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
-            except Exception:
-                hh, mm = 16, 0
-            ts = ts.replace(hour=hh, minute=mm, second=0)
-            if getattr(ts, "tzinfo", None) is None:
-                ts = ts.tz_localize(eastern_tz)
-            else:
-                ts = ts.tz_convert(eastern_tz)
-            return ts.tz_convert(central_tz).tz_localize(None)
-
-        # Intraday rows.
-        if getattr(ts, "tzinfo", None) is None:
-            # Already CT inside this app after live-data conversion; do NOT subtract an hour again.
-            if bool(assume_naive_intraday_is_ct):
-                return ts
-            return ts.tz_localize(eastern_tz).tz_convert(central_tz).tz_localize(None)
-
-        return ts.tz_convert(central_tz).tz_localize(None)
-    except Exception:
-        try:
-            return pd.Timestamp(x)
-        except Exception:
-            return pd.NaT
-
-
-def _ct_naive_index(idx, default_bar_time="16:00"):
-    try:
-        return pd.DatetimeIndex([_to_ct_naive_timestamp(v, default_bar_time=default_bar_time) for v in idx])
-    except Exception:
-        try:
-            return pd.to_datetime(idx)
-        except Exception:
-            return idx
-
-
-def _ct_display_str(x, default_bar_time="16:00"):
-    try:
-        ts = _to_ct_naive_timestamp(x, default_bar_time=default_bar_time)
-        if pd.isna(ts):
-            return x
-        return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
-    except Exception:
-        return x
-
-
 def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
 
-    Everything displays in Central Time (CT). Intraday naive timestamps are treated
-    as already-CT because live data is converted to CT earlier. This prevents the
-    table from showing 11:30 CT while the chart hover shows 12:30/13:30.
+    Shows all trade timestamps in Central Time (CT).
+    Intraday/live bars keep seconds. Daily/weekly/date-only rows use the
+    assumed market close time, converted from Eastern market time to Central Time.
+    Open trades show Exit Date as "Open" instead of NaT.
+
+    This does not change strategy logic, prices, equity curves, or metrics.
     """
     try:
         if trades_df is None or trades_df.empty:
             return trades_df
         out = trades_df.copy()
 
+        eastern_tz = "America/New_York"
+        central_tz = "America/Chicago"
+
+        def _to_central_display(ts):
+            # Naive timestamps from Yahoo/pandas are treated as exchange/New York time.
+            # Timezone-aware Databento/UTC timestamps are converted directly to Central.
+            try:
+                if getattr(ts, "tzinfo", None) is None:
+                    ts = ts.tz_localize(eastern_tz)
+                else:
+                    ts = ts.tz_convert(central_tz)
+                    return ts.strftime("%Y-%m-%d %H:%M:%S CT")
+                ts = ts.tz_convert(central_tz)
+                return ts.strftime("%Y-%m-%d %H:%M:%S CT")
+            except Exception:
+                try:
+                    return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+                except Exception:
+                    return ts
+
         def _format_one(x, is_exit=False, status=None):
+            # Open positions should not display NaT in the exit column.
             try:
                 if is_exit and str(status).strip().lower() == "open":
                     return "Open"
@@ -3497,12 +1375,17 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
                 xl = x.strip().lower()
                 if xl in {"open", "", "nan", "none", "nat"}:
                     return "Open" if is_exit else x
-
             try:
-                ts = _to_ct_naive_timestamp(x, default_bar_time=default_bar_time, assume_naive_intraday_is_ct=True)
+                ts = pd.Timestamp(x)
                 if pd.isna(ts):
                     return "Open" if is_exit else x
-                return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+
+                # If data is daily/weekly/date-only, assume regular market close in Eastern time.
+                if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
+                    hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
+                    ts = ts.replace(hour=hh, minute=mm, second=0)
+
+                return _to_central_display(ts)
             except Exception:
                 return x
 
@@ -4027,49 +1910,6 @@ def _save_regime_locked_ledger(df):
         return True
     except Exception:
         return False
-
-
-
-def _safe_filename_part(x):
-    try:
-        s = str(x).strip().replace(" ", "_")
-        keep = []
-        for ch in s:
-            if ch.isalnum() or ch in ["_", "-", "."]:
-                keep.append(ch)
-            else:
-                keep.append("_")
-        s = "".join(keep).strip("_")
-        return s or "NA"
-    except Exception:
-        return "NA"
-
-
-def build_trade_log_csv_with_info(trades_df, info_dict):
-    """
-    Builds a CSV with a simple INFO section first, then the trade log below.
-    This stays Excel-compatible while preserving context for future verification.
-    """
-    try:
-        info_rows = []
-        for k, v in (info_dict or {}).items():
-            info_rows.append({"Section": "INFO", "Field": str(k), "Value": "" if v is None else str(v)})
-        info_df = pd.DataFrame(info_rows, columns=["Section", "Field", "Value"])
-        blank_df = pd.DataFrame([{"Section": "", "Field": "", "Value": ""}])
-        header_df = pd.DataFrame([{"Section": "TRADE_LOG", "Field": "Data starts below", "Value": ""}])
-        trade = trades_df.copy() if isinstance(trades_df, pd.DataFrame) else pd.DataFrame()
-        # Put trade log under the same CSV by writing manually; easier for Excel/users.
-        buf = io.StringIO()
-        info_df.to_csv(buf, index=False)
-        blank_df.to_csv(buf, index=False, header=False)
-        header_df.to_csv(buf, index=False, header=False)
-        trade.to_csv(buf, index=False)
-        return buf.getvalue().encode("utf-8")
-    except Exception:
-        try:
-            return trades_df.to_csv(index=False).encode("utf-8")
-        except Exception:
-            return b""
 
 
 def reset_regime_locked_ledger_for_key(lock_key: str):
@@ -7184,92 +5024,6 @@ def _market_close_realtime_daily_patch(ticker: str, daily_df: pd.DataFrame) -> p
 
 
 @st.cache_data(ttl=60) # Cache live data for 1 minute
-
-# ==========================================
-# IBKR READ-ONLY BRIDGE HELPERS
-# ==========================================
-def ibkr_readonly_status(host="127.0.0.1", port=7497, client_id=101):
-    """
-    Safe IBKR read-only connection test.
-    No orders. No execution. Only connects, reads accounts/positions/account summary,
-    then disconnects.
-    """
-    if not IBKR_AVAILABLE:
-        return {
-            "ok": False,
-            "error": "ib_insync is not installed in this Python environment. Run: python3 -m pip install ib_insync",
-            "accounts": [],
-            "positions": pd.DataFrame(),
-            "summary": pd.DataFrame()
-        }
-
-    ib = IB()
-    try:
-        ib.connect(str(host), int(port), clientId=int(client_id), readonly=True, timeout=8)
-        accounts = ib.managedAccounts()
-
-        summary_rows = []
-        try:
-            summary = ib.accountSummary()
-            for row in summary:
-                try:
-                    summary_rows.append({
-                        "Account": row.account,
-                        "Tag": row.tag,
-                        "Value": row.value,
-                        "Currency": row.currency
-                    })
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        summary_df = pd.DataFrame(summary_rows)
-
-        pos_rows = []
-        try:
-            positions = ib.positions()
-            for p in positions:
-                try:
-                    con = p.contract
-                    pos_rows.append({
-                        "Account": p.account,
-                        "Symbol": getattr(con, "symbol", ""),
-                        "SecType": getattr(con, "secType", ""),
-                        "Exchange": getattr(con, "exchange", ""),
-                        "Currency": getattr(con, "currency", ""),
-                        "Position": float(p.position),
-                        "Avg Cost": float(p.avgCost)
-                    })
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        pos_df = pd.DataFrame(pos_rows)
-
-        ib.disconnect()
-        return {
-            "ok": True,
-            "error": "",
-            "accounts": accounts,
-            "positions": pos_df,
-            "summary": summary_df
-        }
-    except Exception as e:
-        try:
-            if ib.isConnected():
-                ib.disconnect()
-        except Exception:
-            pass
-        return {
-            "ok": False,
-            "error": str(e),
-            "accounts": [],
-            "positions": pd.DataFrame(),
-            "summary": pd.DataFrame()
-        }
-
-
-
 def load_data(ticker, start, end, interval='1d'):
     try:
         # yfinance's `end` date is EXCLUSIVE for daily bars. If the user selects
@@ -7288,30 +5042,9 @@ def load_data(ticker, start, end, interval='1d'):
 
         df = _flatten_yfinance_columns(df, ticker)
             
-        # NORMALIZE TIMEZONE
-        # Critical for live intraday Kalman:
-        # yfinance intraday bars are normally timestamped in the exchange timezone
-        # (US equities = New York / Eastern). The app displays and trade logs in CT.
-        # Previously we stripped timezone without converting, so a 10:00 ET bar could
-        # appear as 10:00 CT, creating impossible price/time mismatches.
-        try:
-            idx = pd.DatetimeIndex(df.index)
-            is_intraday_interval = str(interval).lower() not in ["1d", "1wk", "1mo"]
-            if is_intraday_interval:
-                if idx.tz is not None:
-                    df.index = idx.tz_convert("America/Chicago").tz_localize(None)
-                else:
-                    # If yfinance returns naive intraday timestamps, treat them as
-                    # exchange/New York time first, then convert to CT.
-                    df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago").tz_localize(None)
-            else:
-                if idx.tz is not None:
-                    df.index = idx.tz_localize(None)
-                else:
-                    df.index = idx
-        except Exception:
-            if getattr(df.index, "tz", None) is not None:
-                df.index = df.index.tz_localize(None)
+        # NORMALIZE TIMEZONE: Ensure all data is timezone-naive to avoid join errors
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
 
         # Standard cleaning
         if 'Close' not in df.columns and 'Adj Close' in df.columns:
@@ -8156,12 +5889,6 @@ with st.sidebar:
     PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
-    st.success("Live Mode default: ON with 15m. Use Enable Live Data toggle to turn OFF when needed. Institutional Trend Rail ATR multiplier: 1.35")
-
-    st.divider()
-    st.subheader("✅ Main Kalman Signal Verify")
-    main_kalman_verify_slot = st.empty()
-    main_kalman_verify_slot.info("Load the Kalman Filter tab to sync the main trade-log signal here.")
     
     # DEBUG: Temporary visualization to prove logic
     with st.expander("🛠️ Debug Info (Remove Later)", expanded=True):
@@ -8223,492 +5950,18 @@ with st.sidebar:
 
     st.divider()
     st.header("⚡ Live Decision Mode")
-    live_mode = st.toggle("Enable Live Data", value=True, help="Default ON with 15m. Turn OFF when you want normal historical/daily mode. Ignored when Fast intraday-only startup is ON.")
+    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support. Ignored when Fast intraday-only startup is ON.")
     if live_mode:
-        data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=2)
+        data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
         st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
-        kalman_fast_live_mode = st.toggle(
-            "Kalman-only fast live mode",
-            value=True,
-            help="ON skips the heavy full-dashboard models and renders only the Kalman tab for live 5/15m work. Kalman logic itself is unchanged."
-        )
         if st.button("🔄 Refresh Live Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
     else:
         data_interval = '1d'
-        kalman_fast_live_mode = False
-
-    st.divider()
-    show_ibkr_bridge = st.checkbox("Show IBKR Paper Bridge", value=False, help="Keep this OFF unless you are testing/using IBKR Paper. No connection is attempted while OFF.")
-    if show_ibkr_bridge:
-        st.header("🔌 IBKR Paper Bridge")
-        st.caption("Safe read-only connection test. No orders are sent from this panel.")
-
-        ibkr_enable_panel = st.toggle(
-            "Show IBKR connection panel",
-            value=True,
-            help="Uses TWS/IB Gateway Paper API. Keep TWS Paper open on port 7497."
-        )
-
-        if ibkr_enable_panel:
-            ibkr_host = st.text_input("IBKR Host", value="127.0.0.1", key="ibkr_host")
-            ibkr_port = st.number_input("IBKR Paper Port", min_value=1, max_value=9999, value=7497, step=1, key="ibkr_port")
-            ibkr_client_id = st.number_input("IBKR Client ID", min_value=1, max_value=999999, value=101, step=1, key="ibkr_client_id")
-
-            st.info("Paper default: Host 127.0.0.1 | Port 7497 | Client ID 101. Keep TWS Paper open.")
-            if not IBKR_AVAILABLE:
-                st.warning("ib_insync is not available inside this app environment. Install it with: python3 -m pip install ib_insync")
-
-            if st.button("Test IBKR Paper Connection", use_container_width=True, key="test_ibkr_connection_button"):
-                result = ibkr_readonly_status(ibkr_host, int(ibkr_port), int(ibkr_client_id))
-                st.session_state["ibkr_last_connection_result"] = result
-
-            result = st.session_state.get("ibkr_last_connection_result", None)
-            if result is not None:
-                if result.get("ok"):
-                    st.success("✅ IBKR Paper connected safely in read-only mode.")
-                    st.write("Accounts:", result.get("accounts", []))
-
-                    pos_df = result.get("positions", pd.DataFrame())
-                    if isinstance(pos_df, pd.DataFrame) and not pos_df.empty:
-                        st.write("Positions")
-                        st.dataframe(pos_df, use_container_width=True)
-                    else:
-                        st.caption("No open positions found.")
-
-                    summary_df = result.get("summary", pd.DataFrame())
-                    if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
-                        show_tags = ["NetLiquidation", "TotalCashValue", "AvailableFunds", "BuyingPower", "EquityWithLoanValue"]
-                        small_summary = summary_df[summary_df["Tag"].isin(show_tags)].copy()
-                        if not small_summary.empty:
-                            st.write("Account Summary")
-                            st.dataframe(small_summary, use_container_width=True)
-                else:
-                    st.error(f"❌ IBKR connection failed: {result.get('error', 'Unknown error')}")
-
 
     st.divider()
     st.header("🔔 Live Buy/Sell Alerts")
-
-    st.divider()
-    st.header("📲 Telegram Signal Alerts")
-    with st.expander("Keep Telegram settings after Streamlit Cloud reboot", expanded=False):
-        st.markdown("""
-        **Local Mac:** this app auto-saves settings to a local file.
-
-        **Streamlit Cloud/personal website:** app files can reset after reboot/redeploy.  
-        Put these in **App settings → Secrets**:
-
-        ```toml
-        TELEGRAM_BOT_TOKEN = "your_bot_token"
-        TELEGRAM_CHAT_ID = "your_chat_id"
-        ```
-
-        Then the app will prefill them even after cloud reboot.
-        """)
-    _tg_saved = load_telegram_settings()
-    try:
-        _tg_saved["enabled"] = True
-        _tg_saved["auto_kalman"] = True
-    except Exception:
-        pass
-
-    tg_alerts_on = st.checkbox(
-        "Enable Telegram Alerts",
-        value=True,
-        help="Always ON by default so Telegram notifications are active after refresh/reboot."
-    )
-    # Force ON so refresh/reboot or an old saved file cannot silently disable Telegram alerts.
-    tg_alerts_on = True
-    tg_bot_token = st.text_input(
-        "Telegram Bot Token",
-        value=_tg_saved.get("bot_token", st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else ""),
-        type="password",
-        help="Paste BotFather token here. You can save it locally below so you do not retype it."
-    )
-    tg_chat_id = st.text_input(
-        "Telegram Chat ID",
-        value=_tg_saved.get("chat_id", st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else ""),
-        help="Paste your Telegram chat ID here. You can save it locally below so you do not retype it."
-    )
-
-    if st.button("Send Test Telegram Alert", use_container_width=True):
-        test_msg = (
-            "PINEHURST QUANT TEST ALERT\n"
-            "Status: Telegram alerts are connected.\n"
-            "Mode: Notification only — no order sent."
-        )
-        ok, resp = send_telegram_alert(tg_bot_token, tg_chat_id, test_msg)
-        if ok:
-            st.success("Telegram test alert sent.")
-        else:
-            st.error(f"Telegram test failed: {resp}")
-
-    st.caption("Alerts are notification-only. No IBKR order is sent from Telegram alerts.")
-
-    auto_kalman_alerts_on = st.checkbox(
-        "Auto-alert Kalman Live BUY/SELL",
-        value=bool(_tg_saved.get("auto_kalman", True)),
-        help="Kept ON for Telegram system readiness. Actual automatic alerts are sent only by the Main Kalman Watchlist Monitor."
-    )
-
-    if st.button("Save Telegram Settings on This Mac", use_container_width=True):
-        _ok_save, _save_msg = save_telegram_settings(
-            tg_bot_token,
-            tg_chat_id,
-            True,
-            True,
-            kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
-            auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", False))),
-            auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", False))),
-        )
-        if _ok_save:
-            st.success("Telegram settings saved on this Mac. Enable Telegram Alerts will stay ON after refresh/reboot.")
-        else:
-            st.error(f"Could not save Telegram settings: {_save_msg}")
-
-    # Auto-save Telegram settings on each rerun so reboot keeps the selected options.
-    try:
-        save_telegram_settings(
-            tg_bot_token,
-            tg_chat_id,
-            True,
-            True,
-            kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
-            auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", True))),
-            auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", True))),
-        )
-    except Exception:
-        pass
-
-    st.divider()
-    st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Watchlist uses the CURRENT Main Kalman controls from the sliders/settings, not a separate hardcoded logic. Auto-refresh is OFF by default.")
-    _mon_saved = _load_main_kalman_monitor_settings()
-    _watchlist_from_url = _get_query_param_value("watchlist", "")
-    _watchlist_default = str(_watchlist_from_url or _mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL") or "DELL, NBIS, PLTR, AAPL")
-    main_kalman_monitor_watchlist = st.text_area(
-        "Stocks to monitor with Main Kalman Trade-Log model",
-        value=_watchlist_default,
-        height=70,
-        help="Add/delete tickers here. The app saves this exact list into the URL and local settings so refresh/reboot keeps it."
-    )
-    try:
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
-        _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "enabled": True,
-            "refresh": False,
-        })
-    except Exception:
-        pass
-
-    st.caption("Watchlist persistence: saved into browser URL + local settings. On Streamlit Cloud, bookmark/copy the current URL after editing.")
-
-    main_kalman_monitor_max_stocks = st.number_input(
-        "Max stocks to monitor",
-        min_value=1,
-        max_value=200,
-        value=int(_mon_saved.get("max_stocks", 50) or 50),
-        step=1,
-        help="Higher number checks more tickers but can load slower. Default 50. Increase this if you want more symbols shown in open/closed status and trade-log monitor."
-    )
-
-    # Auto-lock current watchlist on every rerun so refresh/reboot keeps your latest edits.
-    try:
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
-        _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "enabled": True,
-            "refresh": False,
-        })
-    except Exception:
-        pass
-
-    main_kalman_monitor_on = st.checkbox(
-        "Enable Main Kalman Watchlist Auto Telegram",
-        value=True,
-        help="Only watchlist tickers send Telegram. Main Ticker is view-only. First scan baselines current state; alerts only after a future change."
-    )
-    main_kalman_monitor_refresh = st.checkbox(
-        "Auto-refresh Main Kalman Monitor every 60 seconds",
-        value=False,
-        help="Default OFF. Turn ON only when you actively want the page to refresh every 60 seconds."
-    )
-    main_kalman_monitor_sell_alerts = st.checkbox(
-        "Enable Telegram SELL alerts",
-        value=False,
-        help="Default OFF to prevent false SELL blasts. BUY alerts still work. Turn ON only after the watchlist table matches your main trade logs."
-    )
-
-    # Continuously persist the FULL monitor config to disk so the standalone
-    # background scanner (telegram_watchlist_scanner.py) can run with the app
-    # closed and use the same firewall + sell-alert settings.
-    try:
-        _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "sell_alerts": bool(main_kalman_monitor_sell_alerts),
-            "enabled": bool(locals().get("main_kalman_monitor_on", True)),
-            "refresh": bool(locals().get("main_kalman_monitor_refresh", False)),
-            "kalman_use_risk_firewall": bool(st.session_state.get("kalman_use_risk_firewall", False)),
-            "kalman_trade_stop_pct": float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-            "kalman_trail_stop_pct": float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-            "kalman_equity_dd_stop_pct": float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-            "kalman_firewall_cooldown": int(st.session_state.get("kalman_firewall_cooldown", 8)),
-            "initial_cap": float(st.session_state.get("initial_cap", 10000.0)),
-            "kalman_trend_rail_distance": float(st.session_state.get("kalman_trend_rail_distance", 1.35)),
-            "kalman_strategy_cross_buffer_pct": float(st.session_state.get("kalman_strategy_cross_buffer_pct", 1.25)),
-            "kalman_strategy_confirm_bars": int(st.session_state.get("kalman_strategy_confirm_bars", 3)),
-            "kalman_strategy_min_hold": int(st.session_state.get("kalman_strategy_min_hold", 5)),
-            "kalman_strategy_cooldown": int(st.session_state.get("kalman_strategy_cooldown", 3)),
-            "kalman_strategy_slope_confirm": bool(st.session_state.get("kalman_strategy_slope_confirm", True)),
-            "kalman_strategy_atr_safety": bool(st.session_state.get("kalman_strategy_atr_safety", True)),
-            "kalman_fast_reaction": float(st.session_state.get("kalman_fast_reaction", 0.34)),
-            "kalman_slow_smoothing": float(st.session_state.get("kalman_slow_smoothing", 0.055)),
-            "kalman_polish_span": int(st.session_state.get("kalman_polish_span", 3)),
-        })
-    except Exception:
-        pass
-
-    if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
-        _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "sell_alerts": bool(main_kalman_monitor_sell_alerts),
-            "enabled": True,
-            "refresh": False,
-            "kalman_use_risk_firewall": bool(st.session_state.get("kalman_use_risk_firewall", False)),
-            "kalman_trade_stop_pct": float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-            "kalman_trail_stop_pct": float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-            "kalman_equity_dd_stop_pct": float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-            "kalman_firewall_cooldown": int(st.session_state.get("kalman_firewall_cooldown", 8)),
-            "initial_cap": float(st.session_state.get("initial_cap", 10000.0)),
-        })
-        if _ok_mon:
-            st.success("Watchlist saved. It is locked in the URL + local settings until you edit it again.")
-        else:
-            st.error(f"Could not save monitor settings: {_msg_mon}")
-
-
-    if st.button("Reset/Baseline Watchlist Alerts Now", use_container_width=True):
-        try:
-            _save_main_kalman_watchlist_ledger({})
-            st.success("Watchlist alert baseline cleared. Next scan will sync current guarded states without sending alerts.")
-        except Exception as _e:
-            st.error(f"Could not reset baseline: {_e}")
-
-    with st.expander("Manual ledger correction", expanded=False):
-        st.caption("Use only if the main trade log already showed an open position and a refresh wrongly removed it.")
-        _ov_ticker = st.text_input("Override ticker", value="DELL").upper()
-        _ov_entry = st.text_input("Open entry time CT", value="2026-06-11 14:30:00 CT")
-        _ov_entry_price = st.number_input("Open entry price", value=391.75, step=0.01)
-        _ov_current_price = st.number_input("Current price", value=395.58, step=0.01)
-        if st.button("Force ledger to OPEN/LONG", use_container_width=True):
-            try:
-                _ledger = _load_main_kalman_watchlist_ledger()
-                _pnl = ((_ov_current_price / _ov_entry_price) - 1.0) * 100.0 if _ov_entry_price else 0.0
-                _ledger[_ov_ticker] = {
-                    "ticker": _ov_ticker,
-                    "position": "LONG",
-                    "entry_time": _ov_entry,
-                    "exit_time": "Open",
-                    "event_time": _ov_entry,
-                    "state_key": f"{_ov_ticker}|BUY|{_ov_entry}|OPEN|{_ov_entry_price}|{_ov_current_price}",
-                    "price": round(float(_ov_current_price), 2),
-                    "entry_price": round(float(_ov_entry_price), 2),
-                    "exit_current_price": round(float(_ov_current_price), 2),
-                    "pnl_pct": round(float(_pnl), 2),
-                    "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-                }
-                _save_main_kalman_watchlist_ledger(_ledger)
-                st.success(f"{_ov_ticker} ledger forced to OPEN/LONG. Future valid SELL only will close it.")
-            except Exception as _e:
-                st.error(f"Override failed: {_e}")
-
-    # ---- Auto-run / persistent results so you don't re-click every load ----
-    if "auto_run_main_kalman_monitor" not in st.session_state:
-        st.session_state["auto_run_main_kalman_monitor"] = False
-    auto_run_monitor = st.checkbox(
-        "Auto-run watchlist monitor on page load",
-        key="auto_run_main_kalman_monitor",
-        help="When ON, the watchlist runs automatically each time the app loads/reruns. When OFF you can run it manually with the button. Either way, the last results stay shown below until you run it again.",
-    )
-
-    if auto_run_monitor:
-        st.caption("Auto-run is ON: the watchlist runs on each page load. Turn it OFF to use Safe Load (manual) mode.")
-    else:
-        st.warning("SAFE LOAD MODE: watchlist does not auto-run on page load. Click the button below, or enable Auto-run above.")
-
-    def _render_open_closed_status(_rows, _source_label=""):
-        """Render the Open/Closed split table. Used for manual, auto, and cached results."""
-        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
-        if _source_label:
-            st.caption(_source_label)
-        try:
-            _df = pd.DataFrame(_rows)
-            if not _df.empty and "Trade Position" in _df.columns:
-                _open_df = _df[_df["Trade Position"].astype(str).str.upper().eq("LONG")].copy()
-                _closed_df = _df[_df["Trade Position"].astype(str).str.upper().ne("LONG")].copy()
-                _cols = ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal", "Status Source"]
-                c_open, c_closed = st.columns(2)
-                with c_open:
-                    st.metric("Open / Long", int(len(_open_df)))
-                    if len(_open_df):
-                        st.dataframe(_open_df[[c for c in _cols if c in _open_df.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No open Long positions.")
-                with c_closed:
-                    st.metric("Closed / Cash", int(len(_closed_df)))
-                    if len(_closed_df):
-                        st.dataframe(_closed_df[[c for c in _cols if c in _closed_df.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No closed/cash tickers.")
-            else:
-                st.caption("No watchlist rows to show yet.")
-        except Exception as _e:
-            st.caption(f"Open/Closed status unavailable: {_e}")
-
-    def _run_monitor_and_store():
-        try:
-            _max_stocks = int(main_kalman_monitor_max_stocks)
-        except Exception:
-            _max_stocks = 50
-        try:
-            _sell_alerts = bool(main_kalman_monitor_sell_alerts)
-        except Exception:
-            _sell_alerts = False
-        _rows = run_main_kalman_watchlist_monitor(
-            main_kalman_monitor_watchlist,
-            send_telegram=bool(tg_alerts_on and main_kalman_monitor_on),
-            token=tg_bot_token,
-            chat_id=tg_chat_id,
-            show_table=True,
-            max_stocks=_max_stocks,
-            allow_sell_alerts=_sell_alerts,
-        )
-        st.session_state["last_main_kalman_monitor_rows"] = _rows
-        st.session_state["last_main_kalman_monitor_ct"] = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
-        return _rows
-
-    _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
-
-    if _clicked_run:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, "Just ran (manual).")
-    elif auto_run_monitor:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, f"Auto-run on page load — {st.session_state.get('last_main_kalman_monitor_ct', '')}.")
-    elif st.session_state.get("last_main_kalman_monitor_rows"):
-        # Show the last result without re-running, so the table persists across reruns.
-        _render_open_closed_status(
-            st.session_state["last_main_kalman_monitor_rows"],
-            f"Showing last run from {st.session_state.get('last_main_kalman_monitor_ct', '')}. Click the button to refresh.",
-        )
-
-    with st.expander("📡 Background Telegram alerts (works with app CLOSED)", expanded=False):
-        st.caption(
-            "The watchlist above only sends Telegram while this app is open. To receive BUY/SELL "
-            "alerts when the app is closed, run the standalone scanner on a schedule. It reuses the "
-            "exact settings you've saved here."
-        )
-        st.markdown("**Step 1 — Save your settings** (so the scanner can read them):")
-        st.caption("Make sure you've clicked *Save Telegram Settings* and *Save Main Kalman Monitor Settings* above at least once.")
-
-        _home = str(_Path.home())
-        _script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else _home
-        _script_path = os.path.join(_script_dir, "telegram_watchlist_scanner.py")
-        _py = "python3"
-
-        st.markdown("**Step 2 — Test it** (sends one Telegram message now):")
-        st.code(f'{_py} "{_script_path}" --test', language="bash")
-
-        st.markdown("**Step 3 — Run continuously** (scan every 15 min while it stays open in a terminal):")
-        st.code(f'{_py} "{_script_path}" --loop --interval 900 --market-hours-only', language="bash")
-
-        st.markdown("**Step 4 (optional) — Auto-run via cron** (Mac/Linux; survives reboots, no terminal needed).")
-        st.caption("Runs every 15 min, 8:30am–3:00pm CT, Mon–Fri. Paste into your terminal:")
-        _cron_line = (
-            f"*/15 8-15 * * 1-5 {_py} \"{_script_path}\" --market-hours-only "
-            f">> \"{os.path.join(_script_dir, 'telegram_scanner.log')}\" 2>&1"
-        )
-        st.code(
-            "( crontab -l 2>/dev/null | grep -v telegram_watchlist_scanner.py ; "
-            f"echo '{_cron_line}' ) | crontab -",
-            language="bash",
-        )
-        st.caption(
-            "To stop it later: run `crontab -e` and delete the telegram_watchlist_scanner.py line. "
-            "Windows users: use Task Scheduler to run the Step-3 command at login instead."
-        )
-        if not os.path.exists(_script_path):
-            st.warning(
-                f"Scanner file not found next to the app at:\n{_script_path}\n"
-                "Place telegram_watchlist_scanner.py in the same folder as this app."
-            )
-
-    if False:
-        st.caption("Auto monitor disabled for safe loading. Use Run Main Kalman Monitor Now.")
-        _main_mon_rows = run_main_kalman_watchlist_monitor(
-            main_kalman_monitor_watchlist,
-            send_telegram=bool(tg_alerts_on),
-            token=tg_bot_token,
-            chat_id=tg_chat_id,
-            show_table=True,
-            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
-        )
-
-        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
-        try:
-            _mon_df = pd.DataFrame(_main_mon_rows)
-            if not _mon_df.empty:
-                _pos_col = "Trade Position" if "Trade Position" in _mon_df.columns else None
-                if _pos_col:
-                    _open_df = _mon_df[_mon_df[_pos_col].astype(str).str.upper().eq("LONG")].copy()
-                    _closed_df = _mon_df[_mon_df[_pos_col].astype(str).str.upper().ne("LONG")].copy()
-
-                    c_open, c_closed = st.columns(2)
-                    with c_open:
-                        st.metric("Open / Long", int(len(_open_df)))
-                        if len(_open_df):
-                            st.dataframe(
-                                _open_df[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _open_df.columns]],
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                        else:
-                            st.caption("No open Long positions.")
-                    with c_closed:
-                        st.metric("Closed / Cash", int(len(_closed_df)))
-                        if len(_closed_df):
-                            st.dataframe(
-                                _closed_df[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _closed_df.columns]],
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                        else:
-                            st.caption("No closed/cash tickers.")
-                else:
-                    st.caption("Trade Position column not available yet.")
-            else:
-                st.caption("No monitor rows yet.")
-        except Exception as _e:
-            st.caption(f"Open/Closed status unavailable: {_e}")
-
-    if bool(main_kalman_monitor_on and main_kalman_monitor_refresh):
-        st.components.v1.html(
-            "<script>setTimeout(function(){ window.parent.location.reload(); }, 60000);</script>",
-            height=0,
-        )
-
-
-
-
     alert_enabled = st.toggle(
         "Enable live signal alerts",
         value=False,
@@ -10239,528 +7492,6 @@ if fast_intraday_mode:
 
     st.stop()
 
-
-# ==========================================================
-# FAST KALMAN-ONLY LIVE MODE
-# ==========================================================
-# Streamlit executes every tab by default. In live 5/15m Kalman work, that means
-# GARCH/Markov/Heston/scan tabs can run even when the user only needs Kalman.
-# This mode skips those heavy sections and renders only the Kalman tab.
-# Kalman math/strategy/risk logic below is the same family as the full tab.
-if bool(kalman_fast_live_mode):
-    for _t, _name in zip(
-        [tab0, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20, tab21],
-        ["Decision Summary", "GARCH", "Regime Switching", "Heston/Jump", "Macro", "Structural", "Backtest", "Vol Clustering", "Advanced Regime", "SML & Alpha", "Multi-Asset Scan", "FED", "Options", "Hurst", "Hot 10", "IV Scanner", "CVD", "VWAP", "Time Series", "Microstructure", "0.5% Live Capture"]
-    ):
-        with _t:
-            st.info(f"{_name} is paused because Kalman-only fast live mode is ON. Turn it OFF in the sidebar when you want the full dashboard.")
-
-    with tab4:
-        if df_main is None or df_main.empty:
-            st.warning("No live data loaded for Kalman fast mode.")
-        else:
-            st.write("### Kalman Filter Analysis — Fast Live Mode")
-            st.caption("Only this tab is running. Heavy GARCH/Markov/scan tabs are skipped to make 5m/15m live work load faster.")
-
-
-            kf_mode = st.radio(
-                "Analysis Mode",
-                ["Single Asset (Trend)", "Pairs Trading (Relative Value)"],
-                index=0,
-                key="kalman_analysis_mode_default_single_asset"
-            )
-
-            if kf_mode == "Pairs Trading (Relative Value)":
-                st.info("Pairs mode is available in full dashboard mode. Turn OFF Kalman-only fast live mode if you need pairs.")
-            else:
-                st.write(f"**{TICKER} Trend Detection**")
-                st.caption("Same Kalman controls/optimizer grid/risk firewall as the full tab, rendered without loading the rest of the dashboard.")
-
-                col_k1, col_k2, col_k3, col_k4 = st.columns(4)
-                with col_k1:
-                    model_mode = st.radio(
-                        "Model Type",
-                        ["Institutional Trend Rail (Default)", "Institutional Adaptive Centerline", "Zero-Lag EMA Hybrid", "Smoothed RTS (Research)", "Standard Old", "Compare All"],
-                        index=0,
-                        key="kalman_single_asset_model_type"
-                    )
-                with col_k2:
-                    fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_reaction")
-                with col_k3:
-                    slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_slow_smoothing")
-                with col_k4:
-                    polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_polish_span")
-
-                # Force default trend rail distance to 1.35. If an old session kept 1.15, reset it.
-                try:
-                    if st.session_state.get("kalman_trend_rail_distance", 1.35) == 1.15:
-                        st.session_state["kalman_trend_rail_distance"] = 1.35
-                except Exception:
-                    pass
-                rail_mult = st.slider(
-                    "Trend rail distance",
-                    0.40, 3.00, 1.35, step=0.05,
-                    key="kalman_trend_rail_distance",
-                    help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
-                )
-
-                with st.expander("Advanced old Kalman controls", expanded=False):
-                    ak1, ak2, ak3 = st.columns(3)
-                    with ak1:
-                        proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_old_proc_noise")
-                    with ak2:
-                        meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_old_meas_noise")
-                    with ak3:
-                        zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
-
-                prices = df_main["Close"].astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill().values
-                kalman_chart_x = _ct_naive_index(df_main.index)
-                kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
-
-                est_adaptive = institutional_adaptive_kalman_trend(
-                    prices,
-                    fast_gain=float(fast_gain),
-                    slow_gain=float(slow_gain),
-                    vol_window=20,
-                    polish_span=int(polish_span)
-                )
-                est_rail, est_rail_center, est_rail_state = institutional_trend_rail(
-                    prices,
-                    fast_gain=float(fast_gain),
-                    slow_gain=float(slow_gain),
-                    polish_span=int(polish_span),
-                    atr_window=14,
-                    atr_mult=float(rail_mult)
-                )
-                est_zlema = zero_lag_ema_trend(prices, span=int(zlema_span))
-                est_std, _ = kf_trend.filter(prices)
-                est_smooth, _ = kf_trend.smooth(prices)
-
-                fig_kt = go.Figure()
-                fig_kt.add_trace(go.Scatter(
-                    x=kalman_chart_x, y=prices, mode="lines",
-                    line=dict(color="white", width=1.15),
-                    opacity=0.62,
-                    name="Actual Price"
-                ))
-
-                if model_mode == "Institutional Trend Rail (Default)":
-                    active_trend_arr = est_rail
-                    active_trend_name = "Institutional Trend Rail"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name=active_trend_name))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail_center, mode="lines", line=dict(color="rgba(127,219,255,0.28)", width=1.0, dash="dot"), name="Adaptive Center Reference"))
-                elif model_mode == "Institutional Adaptive Centerline":
-                    active_trend_arr = est_adaptive
-                    active_trend_name = "Institutional Adaptive Centerline"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode="lines", line=dict(color="#7FDBFF", width=2.7), name=active_trend_name))
-                elif model_mode == "Zero-Lag EMA Hybrid":
-                    active_trend_arr = est_zlema
-                    active_trend_name = "Zero-Lag EMA Hybrid"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode="lines", line=dict(color="#7FDBFF", width=2.5), name=active_trend_name))
-                elif model_mode == "Smoothed RTS (Research)":
-                    active_trend_arr = est_smooth
-                    active_trend_name = "Smoothed RTS Research"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode="lines", line=dict(color="#7FDBFF", width=2.2), name=active_trend_name))
-                elif model_mode == "Standard Old":
-                    active_trend_arr = est_std
-                    active_trend_name = "Standard Old"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode="lines", line=dict(color="#7FDBFF", width=2.0), name=active_trend_name))
-                else:
-                    active_trend_arr = est_rail
-                    active_trend_name = "Institutional Trend Rail"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode="lines", line=dict(color="blue", dash="dash", width=1.35), name="Old Standard"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode="lines", line=dict(color="purple", width=1.55), name="RTS Smooth Research"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode="lines", line=dict(color="#00d1ff", width=1.85), name="Zero-Lag Hybrid"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode="lines", line=dict(color="rgba(127,219,255,0.35)", width=1.6), name="Adaptive Centerline"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name="Institutional Trend Rail"))
-
-                current_trend = float(pd.Series(active_trend_arr).dropna().iloc[-1])
-                current_price = float(prices[-1])
-                diff_pct = (current_price - current_trend) / current_trend * 100.0 if current_trend else 0.0
-
-                fig_kt.update_layout(
-                    title=f"Kalman Trend: {TICKER} — Fast Live",
-                    hovermode="x unified",
-                    template="plotly_dark",
-                    height=560,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                st.plotly_chart(fig_kt, use_container_width=True)
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Current Price", f"{CURRENCY}{current_price:.2f}")
-                c2.metric("Current Trend", f"{CURRENCY}{current_trend:.2f}")
-                c3.metric("Deviation", f"{diff_pct:.2f}%", delta=f"{diff_pct:.2f}%", delta_color="inverse")
-
-                st.divider()
-                st.write("#### 📒 Kalman Trend Strategy Backtest & Trade Log")
-
-                bt_px = pd.Series(prices, index=df_main.index).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-                bt_trend = pd.Series(active_trend_arr, index=df_main.index).astype(float).reindex(bt_px.index).ffill().bfill()
-                bt_plot_x = _ct_naive_index(bt_px.index)
-                bt_plot_x_series = pd.Series(bt_plot_x, index=bt_px.index)
-
-                ks1, ks2, ks3, ks4 = st.columns(4)
-                with ks1:
-                    kalman_buffer_pct = st.slider("Cross buffer (%)", 0.00, 8.00, 1.25, step=0.25, key="kalman_strategy_cross_buffer_pct") / 100.0
-                with ks2:
-                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 3, step=1, key="kalman_strategy_confirm_bars")
-                with ks3:
-                    kalman_min_hold = st.slider("Minimum hold bars", 1, 40, 5, step=1, key="kalman_strategy_min_hold")
-                with ks4:
-                    kalman_cooldown = st.slider("Cooldown after exit", 0, 30, 3, step=1, key="kalman_strategy_cooldown")
-
-                use_slope_confirm = st.checkbox("Require trend slope confirmation", value=True, key="kalman_strategy_slope_confirm")
-                use_atr_safety = st.checkbox("Use ATR safety exit", value=True, key="kalman_strategy_atr_safety")
-                benchmark_aware_kalman = st.checkbox("Benchmark-aware Kalman optimizer", value=True, key="kalman_benchmark_aware_optimizer")
-                kalman_fast_reuse_optimizer = st.checkbox(
-                    "Reuse last optimized Kalman settings for speed",
-                    value=True,
-                    key="kalman_fast_reuse_optimizer",
-                    disabled=True,
-                    help="LOCKED ON for live/source-of-truth mode. The optimizer runs once, then the exact chosen parameters are reused so performance stays stable and the trade log does not silently change every refresh."
-                )
-                kalman_force_reopt = st.button(
-                    "Re-run full Kalman optimizer now",
-                    key=f"kalman_force_reopt_{TICKER}_{data_interval}",
-                    help="Use when you changed market regime/ticker/timeframe and want a fresh full optimizer search."
-                )
-                kalman_max_dd_allowed = st.slider("Max drawdown allowed (%)", 10.0, 80.0, 35.0, step=5.0, key="kalman_max_dd_allowed")
-
-                use_kalman_risk_firewall = st.checkbox("Use Kalman risk firewall", value=False, key="kalman_use_risk_firewall")
-                rf1, rf2, rf3, rf4 = st.columns(4)
-                with rf1:
-                    kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
-                with rf2:
-                    kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_trail_stop_pct")
-                with rf3:
-                    kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_equity_dd_stop_pct")
-                with rf4:
-                    kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
-
-                nr1, nr2 = st.columns([3, 1])
-                with nr1:
-                    st.checkbox(
-                        "🔒 Non-repaint lock (freeze signals on completed bars)",
-                        value=True,
-                        key="kalman_non_repaint_lock",
-                        help="When ON, once a 15m bar closes its signal is frozen and never changes on later runs. "
-                             "Turn OFF only if you want signals to recompute freely (can repaint).",
-                    )
-                with nr2:
-                    if st.button("Reset lock", key="reset_signal_lock_fast", use_container_width=True,
-                                 help="Clear the frozen signal history and re-baseline from the current data. "
-                                      "Do this after changing strategy parameters."):
-                        try:
-                            _save_main_kalman_signal_lock({})
-                            st.success("Signal lock cleared. It will re-baseline on the next run.")
-                        except Exception as _e:
-                            st.error(f"Could not clear lock: {_e}")
-
-                trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
-
-                def _build_fast_kalman_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
-                    close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
-                    close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
-                    if bool(slope_confirm):
-                        entry_cond_i = close_above_i & (trend_slope >= 0)
-                        exit_cond_i = close_below_i & (trend_slope <= 0)
-                    else:
-                        entry_cond_i = close_above_i
-                        exit_cond_i = close_below_i
-                    if bool(atr_safety):
-                        atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-                        exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy_i)).fillna(False)
-                    confirm_bars = int(confirm_bars)
-                    entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                    exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                    sig_i = pd.Series(0.0, index=bt_px.index)
-                    in_pos_i = False
-                    bars_held_i = 0
-                    cooldown_left_i = 0
-                    for _dt in bt_px.index:
-                        if cooldown_left_i > 0:
-                            cooldown_left_i -= 1
-                        if not in_pos_i:
-                            if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
-                                in_pos_i = True
-                                bars_held_i = 0
-                                sig_i.loc[_dt] = 1.0
-                        else:
-                            bars_held_i += 1
-                            if bars_held_i >= int(min_hold_bars) and bool(exit_ready_i.loc[_dt]):
-                                in_pos_i = False
-                                cooldown_left_i = int(cooldown_bars)
-                                sig_i.loc[_dt] = 0.0
-                                bars_held_i = 0
-                            else:
-                                sig_i.loc[_dt] = 1.0
-                    return sig_i.ffill().fillna(0).clip(0, 1)
-
-                # Fast live speed rule:
-                # Running the full benchmark-aware optimizer every Streamlit rerun is slow because it tests
-                # hundreds of parameter combinations. To keep the SAME chosen logic but avoid repeated work,
-                # fast mode can reuse the last optimized parameter set for the same ticker/timeframe/model/day.
-                _kalman_fast_day = None
-                try:
-                    _kalman_fast_day = str(pd.Timestamp(bt_px.index[-1]).date())
-                except Exception:
-                    _kalman_fast_day = "unknown"
-
-                _kalman_opt_key = (
-                    f"kalman_opt::{TICKER}::{data_interval}::{_kalman_fast_day}::{active_trend_name}::"
-                    f"fg{float(fast_gain):.4f}::sg{float(slow_gain):.4f}::pol{int(polish_span)}::"
-                    f"rail{float(rail_mult):.4f}::z{int(zlema_span)}::"
-                    f"slope{bool(use_slope_confirm)}::atr{bool(use_atr_safety)}::"
-                    f"fw{bool(use_kalman_risk_firewall)}::ts{float(kalman_trade_stop_pct):.2f}::"
-                    f"tr{float(kalman_trail_stop_pct):.2f}::eq{float(kalman_equity_dd_stop_pct):.2f}::"
-                    f"fwc{int(kalman_firewall_cooldown)}::dd{float(kalman_max_dd_allowed):.2f}"
-                )
-
-                if bool(kalman_force_reopt):
-                    try:
-                        st.session_state.pop(_kalman_opt_key, None)
-                    except Exception:
-                        pass
-                    try:
-                        _opt_store = _load_main_kalman_opt_params()
-                        _opt_store.pop(str(TICKER).upper(), None)
-                        _main_kalman_opt_params_path().write_text(json.dumps(_opt_store, indent=2))
-                    except Exception:
-                        pass
-
-                if bool(benchmark_aware_kalman):
-                    _cached_params = st.session_state.get(_kalman_opt_key) if bool(kalman_fast_reuse_optimizer) else None
-
-                    # Pull persistent saved optimizer params from disk after Streamlit restart.
-                    # IMPORTANT: this uses a clean V2 cache file, so old bad/manual-locked params are ignored.
-                    if _cached_params is None and bool(kalman_fast_reuse_optimizer):
-                        try:
-                            _saved_opt = _get_main_kalman_opt_params_for_ticker(TICKER)
-                            if isinstance(_saved_opt, dict):
-                                _cached_params = {
-                                    "buffer": float(_saved_opt.get("buffer_pct")),
-                                    "confirm": int(_saved_opt.get("confirm_bars")),
-                                    "hold": int(_saved_opt.get("min_hold_bars")),
-                                    "cool": int(_saved_opt.get("cooldown_bars")),
-                                }
-                                st.session_state[_kalman_opt_key] = dict(_cached_params)
-                        except Exception:
-                            _cached_params = None
-
-                    if _cached_params is not None:
-                        kalman_signal = _build_fast_kalman_signal(
-                            float(_cached_params["buffer"]),
-                            int(_cached_params["confirm"]),
-                            int(_cached_params["hold"]),
-                            int(_cached_params["cool"]),
-                            bool(use_slope_confirm),
-                            bool(use_atr_safety)
-                        )
-                        try:
-                            _save_main_kalman_opt_params_for_ticker(
-                                TICKER, float(_cached_params["buffer"]), int(_cached_params["confirm"]),
-                                int(_cached_params["hold"]), int(_cached_params["cool"]),
-                                slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                            )
-                        except Exception:
-                            pass
-                        st.caption(
-                            f"Fast mode reused optimized settings: buffer {float(_cached_params['buffer'])*100:.2f}%, "
-                            f"confirm {int(_cached_params['confirm'])}, min-hold {int(_cached_params['hold'])}, "
-                            f"cooldown {int(_cached_params['cool'])}. Click re-optimize for a fresh full grid search."
-                        )
-                    else:
-                        # Same full benchmark-aware optimizer grid as the full Kalman tab.
-                        # Runs once, then fast mode can reuse the chosen parameters on live refresh.
-                        best_pack = None
-                        bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-
-                        with st.spinner("Running full Kalman optimizer once... future live refreshes will reuse it for speed."):
-                            for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
-                                for _conf in [3, 4, 5, 7, 10]:
-                                    for _hold in [10, 15, 21, 34, 55]:
-                                        for _cool in [5, 8, 13, 21]:
-                                            _sig = _build_fast_kalman_signal(_buf, _conf, _hold, _cool, bool(use_slope_confirm), bool(use_atr_safety))
-                                            if bool(use_kalman_risk_firewall):
-                                                _sig = apply_kalman_risk_firewall(
-                                                    bt_px, _sig, bt_trend,
-                                                    max_trade_loss_pct=float(kalman_trade_stop_pct),
-                                                    trail_stop_pct=float(kalman_trail_stop_pct),
-                                                    equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                                                    cooldown_bars=int(kalman_firewall_cooldown)
-                                                )
-                                            _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
-                                            _eq = _bt.get("equity_curve", pd.Series(dtype=float))
-                                            _rets = _bt.get("returns", pd.Series(dtype=float))
-                                            _tr = _bt.get("trades", pd.DataFrame())
-                                            if _eq is None or len(_eq) < 2:
-                                                continue
-                                            _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
-                                            _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
-                                            _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
-                                            _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
-                                            _sh = float(_mets.get("Sharpe Ratio", 0.0))
-                                            _dd_abs = abs(float(_dd))
-                                            _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
-                                            if _strat < bh_reference:
-                                                _score -= (bh_reference - _strat) * 0.85
-                                            if _dd_abs > float(kalman_max_dd_allowed):
-                                                _score -= ((_dd_abs - float(kalman_max_dd_allowed)) ** 2) * 2.0
-                                            if _dd_abs > 60:
-                                                _score -= 5000.0
-                                            if best_pack is None or _score > best_pack["score"]:
-                                                best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
-
-                        if best_pack is not None:
-                            kalman_signal = best_pack["sig"]
-                            if bool(kalman_fast_reuse_optimizer):
-                                st.session_state[_kalman_opt_key] = {
-                                    "buffer": float(best_pack["buffer"]),
-                                    "confirm": int(best_pack["confirm"]),
-                                    "hold": int(best_pack["hold"]),
-                                    "cool": int(best_pack["cool"])
-                                }
-                            try:
-                                _save_main_kalman_opt_params_for_ticker(
-                                    TICKER, float(best_pack["buffer"]), int(best_pack["confirm"]),
-                                    int(best_pack["hold"]), int(best_pack["cool"]),
-                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                                )
-                            except Exception:
-                                pass
-                            st.info(
-                                f"Fast optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
-                                f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}."
-                            )
-                        else:
-                            kalman_signal = _build_fast_kalman_signal(
-                                kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                                bool(use_slope_confirm), bool(use_atr_safety)
-                            )
-                            try:
-                                _save_main_kalman_opt_params_for_ticker(
-                                    TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
-                                    int(kalman_min_hold), int(kalman_cooldown),
-                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                                )
-                            except Exception:
-                                pass
-                else:
-                    kalman_signal = _build_fast_kalman_signal(
-                        kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                        bool(use_slope_confirm), bool(use_atr_safety)
-                    )
-                    try:
-                        _save_main_kalman_opt_params_for_ticker(
-                            TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
-                            int(kalman_min_hold), int(kalman_cooldown),
-                            slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                        )
-                    except Exception:
-                        pass
-
-                if bool(use_kalman_risk_firewall):
-                    kalman_signal = apply_kalman_risk_firewall(
-                        bt_px, kalman_signal, bt_trend,
-                        max_trade_loss_pct=float(kalman_trade_stop_pct),
-                        trail_stop_pct=float(kalman_trail_stop_pct),
-                        equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                        cooldown_bars=int(kalman_firewall_cooldown)
-                    )
-
-                # Non-repaint lock: freeze main-chart signal on completed bars.
-                try:
-                    if bool(st.session_state.get("kalman_non_repaint_lock", True)):
-                        _lk_int = str(locals().get("interval", "15m"))
-                        kalman_signal = _apply_signal_lock(TICKER, kalman_signal, freeze_enabled=True, interval=_lk_int)
-                except Exception:
-                    pass
-
-                kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
-                kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
-                kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
-                kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
-
-                # Authoritative current position from the signal series (chart source).
-                try:
-                    _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
-                except Exception:
-                    _kalman_signal_last = None
-                try:
-                    _sync_watchlist_ledger_from_visible_main_trade_log(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                    )
-                except Exception:
-                    pass
-                try:
-                    _save_main_kalman_status_to_session(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last,
-                    )
-                except Exception:
-                    pass
-                try:
-                    _update_thesis_main_kalman_verify(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last,
-                    )
-                except Exception:
-                    pass
-                k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
-                k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-                k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
-                k_total_pnl = total_trade_pnl_return_pct(kalman_trades) if isinstance(kalman_trades, pd.DataFrame) else 0.0
-
-                km1, km2, km3, km4, km5 = st.columns(5)
-                km1.metric("Kalman Strategy Return", f"{k_strat_ret:.2f}%")
-                km2.metric("Buy & Hold", f"{k_bh_ret:.2f}%")
-                km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
-                km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
-                km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + main trade log only. Fresh V2 optimizer cache + fresh V2 non-repaint lock active.")
-
-                fig_kbt = go.Figure()
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
-                changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
-                buy_idx = changes[changes > 0].index
-                sell_idx = changes[changes < 0].index
-                if len(buy_idx):
-                    fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(buy_idx), y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
-                if len(sell_idx):
-                    fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(sell_idx), y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
-                fig_kbt.update_layout(title=f"Kalman Strategy: {TICKER} — {active_trend_name}", template="plotly_dark", height=560, hovermode="x unified")
-                st.plotly_chart(fig_kbt, use_container_width=True)
-
-                st.write("##### Main Kalman Trade Log — Source of Truth")
-                if kalman_trades is None or kalman_trades.empty:
-                    st.info("No Kalman strategy trades generated with the current confirmation settings.")
-                else:
-                    try:
-                        kalman_trades = apply_trade_log_timestamp_display(kalman_trades)
-                        kalman_trades = kalman_trades.sort_values("Entry Date", ascending=False).reset_index(drop=True)
-                    except Exception:
-                        pass
-                    st.dataframe(kalman_trades, use_container_width=True)
-                    st.download_button(
-                        "📥 Download Kalman trade log",
-                        data=_clean_trade_log_numbers(kalman_trades).to_csv(index=False).encode("utf-8"),
-                        file_name=f"{_safe_filename_part(TICKER)}_Kalman_FastLive_TradeLog.csv" if "_safe_filename_part" in globals() else f"{TICKER}_Kalman_FastLive_TradeLog.csv",
-                        mime="text/csv",
-                        key=f"download_fast_kalman_trade_log_{TICKER}"
-                    )
-    st.stop()
-
-
 if df_main is not None:
     # Initialize Report Generator
     st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
@@ -11194,277 +7925,265 @@ with tab2:
         switch_vol = st.checkbox("Switching Volatility", value=True,
                                   help="Uncheck to focus ONLY on Trend (ignore volatility changes)")
     
-    # ===== LAZY LOAD GATE =====
-    # Speed-only change: regime math/logic below is unchanged.
-    # It simply will not execute until you explicitly load this tab.
-    _load_regime_switching_now = st.checkbox(
-        "Load / run Regime Switching model",
-        value=False,
-        key="lazy_load_regime_switching_tab_no_logic_change",
-        help="Keeps the full app fast. Turn ON only when you want to fit the Markov regime model."
-    )
-
-    if not _load_regime_switching_now:
-        st.info("Regime Switching is ready but not running on startup. Turn ON the checkbox above to run the exact same model.")
+    # ===== PRE-FLIGHT CHECKS =====
+    warnings = []
+    if regime_window_mode == "Rolling 1-Year":
+        st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
     else:
-        # ===== PRE-FLIGHT CHECKS =====
-        warnings = []
-        if regime_window_mode == "Rolling 1-Year":
-            st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
-        else:
-            if lookback_years <= 1:
-                warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
-                if regime_freq == "Weekly":
-                    warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
-                    regime_freq = "Daily"
+        if lookback_years <= 1:
+            warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
+            if regime_freq == "Weekly":
+                warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
+                regime_freq = "Daily"
 
-            if regime_freq == "Daily" and switch_trend and lookback_years < 3:
-                warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
-                switch_trend = False
+        if regime_freq == "Daily" and switch_trend and lookback_years < 3:
+            warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
+            switch_trend = False
 
-        if warnings:
-            for w in warnings:
-                st.warning(w)
+    if warnings:
+        for w in warnings:
+            st.warning(w)
     
-        # ===== DATA PREPARATION =====
-        if regime_window_mode == "Rolling 1-Year":
-            # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
-            _regime_end_ts = pd.Timestamp(end_date)
-            start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
-        else:
-            start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
-        df_regime = load_data(TICKER, start_dt_regime, end_date)
+    # ===== DATA PREPARATION =====
+    if regime_window_mode == "Rolling 1-Year":
+        # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
+        _regime_end_ts = pd.Timestamp(end_date)
+        start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
+    else:
+        start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
+    df_regime = load_data(TICKER, start_dt_regime, end_date)
     
-        if df_regime is None:
-            st.error("Could not load data")
+    if df_regime is None:
+        st.error("Could not load data")
+        st.stop()
+    
+    # Prepare data
+    if regime_freq == "Weekly":
+        returns = df_regime['Returns'].resample('W').sum()
+    else:
+        returns = df_regime['Returns']
+    
+    # Apply Pre-Smoothing (EWMA) if requested
+    if stability > 0:
+        returns = returns.ewm(span=stability, adjust=False).mean()
+        st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
+    
+    # FIX: Ensure data is strictly 1D Series with Float dtype
+    try:
+        model_data = returns.dropna() * 100
+        
+        # Reconstruct Series to guarantee 1D structure
+        # This handles (N,1) DataFrames, Series, etc.
+        if len(model_data) < 10:
+            st.error("Insufficient data points for modeling (>10 required).")
             st.stop()
-    
-        # Prepare data
-        if regime_freq == "Weekly":
-            returns = df_regime['Returns'].resample('W').sum()
-        else:
-            returns = df_regime['Returns']
-    
-        # Apply Pre-Smoothing (EWMA) if requested
-        if stability > 0:
-            returns = returns.ewm(span=stability, adjust=False).mean()
-            st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
-    
-        # FIX: Ensure data is strictly 1D Series with Float dtype
-        try:
-            model_data = returns.dropna() * 100
-        
-            # Reconstruct Series to guarantee 1D structure
-            # This handles (N,1) DataFrames, Series, etc.
-            if len(model_data) < 10:
-                st.error("Insufficient data points for modeling (>10 required).")
-                st.stop()
             
-            model_data = pd.Series(
-                model_data.values.flatten().astype(float), 
-                index=model_data.index
-            )
+        model_data = pd.Series(
+            model_data.values.flatten().astype(float), 
+            index=model_data.index
+        )
         
-            if model_data.ndim != 1:
-                st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
-                st.stop()
+        if model_data.ndim != 1:
+            st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
+            st.stop()
              
-        except Exception as e:
-            st.error(f"Data Prep Error: {e}")
-            st.stop()
+    except Exception as e:
+        st.error(f"Data Prep Error: {e}")
+        st.stop()
     
-        _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
-        st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
+    _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
+    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
     
-        # ===== MODEL FITTING =====
-        with st.spinner(f"Fitting {n_regimes}-regime model..."):
-            res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
+    # ===== MODEL FITTING =====
+    with st.spinner(f"Fitting {n_regimes}-regime model..."):
+        res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
         
-        if res_markov is None:
-            st.error("Model fitting failed (fit_regime_model returned None).")
-            st.stop()
+    if res_markov is None:
+        st.error("Model fitting failed (fit_regime_model returned None).")
+        st.stop()
         
-        # Verify convergence implicitly via success return
+    # Verify convergence implicitly via success return
 
         
-        # ===== CONVERGENCE CHECKS =====
-        if not res_markov.mle_retvals['converged']:
-            st.error("⛔ Model did not converge. Try longer history or simpler model.")
-            st.stop()
+    # ===== CONVERGENCE CHECKS =====
+    if not res_markov.mle_retvals['converged']:
+        st.error("⛔ Model did not converge. Try longer history or simpler model.")
+        st.stop()
     
-        trans_matrix = np.squeeze(res_markov.regime_transition)
+    trans_matrix = np.squeeze(res_markov.regime_transition)
     
-        # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
-        if trans_matrix.ndim < 2:
-             trans_matrix = np.atleast_2d(trans_matrix)
+    # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
+    if trans_matrix.ndim < 2:
+         trans_matrix = np.atleast_2d(trans_matrix)
     
-        # Check for degenerate regimes
-        if np.any(trans_matrix > 0.99):
-            st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
+    # Check for degenerate regimes
+    if np.any(trans_matrix > 0.99):
+        st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
     
-        # ===== REGIME CHARACTERIZATION =====
-        regime_stats = []
-        for i in range(n_regimes):
-            # Handle case where switching_trend=False (single 'const')
-            if f'const[{i}]' in res_markov.params:
-                mean_val = res_markov.params[f'const[{i}]']
-            else:
-                mean_val = res_markov.params.get('const', 0.0)
+    # ===== REGIME CHARACTERIZATION =====
+    regime_stats = []
+    for i in range(n_regimes):
+        # Handle case where switching_trend=False (single 'const')
+        if f'const[{i}]' in res_markov.params:
+            mean_val = res_markov.params[f'const[{i}]']
+        else:
+            mean_val = res_markov.params.get('const', 0.0)
         
-            # Handle case where switching_variance=False (single 'sigma2')
-            if f'sigma2[{i}]' in res_markov.params:
-                vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
-            else:
-                vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
+        # Handle case where switching_variance=False (single 'sigma2')
+        if f'sigma2[{i}]' in res_markov.params:
+            vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
+        else:
+            vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
             
-            regime_stats.append({
-                'regime': i,
-                'mean': float(mean_val),
-                'vol': float(vol_val),
-                'persistence': float(trans_matrix[i, i])
-            })
+        regime_stats.append({
+            'regime': i,
+            'mean': float(mean_val),
+            'vol': float(vol_val),
+            'persistence': float(trans_matrix[i, i])
+        })
     
-        # Sort by mean (high to low)
-        regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
+    # Sort by mean (high to low)
+    regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
     
-        # ===== DISPLAY REGIMES =====
-        st.write("### 📊 Identified Regimes")
+    # ===== DISPLAY REGIMES =====
+    st.write("### 📊 Identified Regimes")
     
-        cols = st.columns(n_regimes)
-        labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
+    cols = st.columns(n_regimes)
+    labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
     
-        for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
-            with col:
-                st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
-                st.metric("Mean Return", f"{regime['mean']:.2f}%")
-                st.metric("Volatility", f"{regime['vol']:.2f}%")
-                st.metric("Persistence", f"{regime['persistence']:.1%}")
+    for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
+        with col:
+            st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
+            st.metric("Mean Return", f"{regime['mean']:.2f}%")
+            st.metric("Volatility", f"{regime['vol']:.2f}%")
+            st.metric("Persistence", f"{regime['persistence']:.1%}")
             
-                avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
-                st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
+            avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
+            st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
     
-        safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
+    safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
     
-        # ===== CURRENT STATE =====
-        # Use .iloc[-1] to get the probabilities at the LAST time step
-        last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
-        current_regime = np.argmax(last_probs)
-        current_prob = last_probs.iloc[current_regime]
+    # ===== CURRENT STATE =====
+    # Use .iloc[-1] to get the probabilities at the LAST time step
+    last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
+    current_regime = np.argmax(last_probs)
+    current_prob = last_probs.iloc[current_regime]
     
-        regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
+    regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
     
-        # Conviction Logic
-        is_conviction = current_prob >= conviction_thresh
+    # Conviction Logic
+    is_conviction = current_prob >= conviction_thresh
     
-        # Calculate Stability Score (Mean Persistence)
-        stability_score = np.mean([r['persistence'] for r in regime_stats])
+    # Calculate Stability Score (Mean Persistence)
+    stability_score = np.mean([r['persistence'] for r in regime_stats])
     
-        # Display Dashboard
-        st.divider()
-        c_dash1, c_dash2, c_dash3 = st.columns(3)
+    # Display Dashboard
+    st.divider()
+    c_dash1, c_dash2, c_dash3 = st.columns(3)
     
-        with c_dash1:
-            st.caption("Current State")
-            if is_conviction:
-                st.subheader(f"{regime_label}")
-                st.success(f"High Conviction ({current_prob:.1%})")
-            else:
-                st.subheader("⚪ Mixed / Uncertain")
-                st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
+    with c_dash1:
+        st.caption("Current State")
+        if is_conviction:
+            st.subheader(f"{regime_label}")
+            st.success(f"High Conviction ({current_prob:.1%})")
+        else:
+            st.subheader("⚪ Mixed / Uncertain")
+            st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
     
-        with c_dash2:
-            st.caption("Dominance Score (Confidence)")
-            # Spread between 1st and 2nd highest probability
-            sorted_probs = sorted(last_probs.values, reverse=True)
-            spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+    with c_dash2:
+        st.caption("Dominance Score (Confidence)")
+        # Spread between 1st and 2nd highest probability
+        sorted_probs = sorted(last_probs.values, reverse=True)
+        spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
         
-            st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
-            st.progress(max(0.0, min(1.0, float(spread))))
+        st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
+        st.progress(max(0.0, min(1.0, float(spread))))
         
-        with c_dash3:
-            st.caption("Regime Stability Metrics")
-            st.metric("Avg Persistence", f"{stability_score:.1%}")
-            # Switch Frequency (proxy)
-            expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
-            st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
+    with c_dash3:
+        st.caption("Regime Stability Metrics")
+        st.metric("Avg Persistence", f"{stability_score:.1%}")
+        # Switch Frequency (proxy)
+        expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
+        st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
 
-        st.write(f"**As of:** {model_data.index[-1].date()}")
-        st.divider()
+    st.write(f"**As of:** {model_data.index[-1].date()}")
+    st.divider()
     
-        # ===== VISUALIZATION =====
-        st.write("### 📈 Regime Analysis (Real-time / Filtered)")
+    # ===== VISUALIZATION =====
+    st.write("### 📈 Regime Analysis (Real-time / Filtered)")
     
-        fig_m = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
-                              subplot_titles=("Returns", "Regime Probabilities (Filtered/Real-time)", "Regime-Weighted Expected Return"))
+    fig_m = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                          subplot_titles=("Returns", "Regime Probabilities (Filtered/Real-time)", "Regime-Weighted Expected Return"))
     
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=model_data, mode='lines', line=dict(color='gray', width=1), name='Return (%)'), row=1, col=1)
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=model_data, mode='lines', line=dict(color='gray', width=1), name='Return (%)'), row=1, col=1)
     
-        import matplotlib.colors as mcolors
-        for i, regime in enumerate(regime_stats):
-            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-            hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
-            probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-            # Shading regions where prob > 0.6
-            mask = probs > 0.6
-            highlight_plotly_zones(fig_m, mask, hex_color, opacity=0.15, row=1, col=1)
+    import matplotlib.colors as mcolors
+    for i, regime in enumerate(regime_stats):
+        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+        hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
+        probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+        # Shading regions where prob > 0.6
+        mask = probs > 0.6
+        highlight_plotly_zones(fig_m, mask, hex_color, opacity=0.15, row=1, col=1)
 
-        smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
+    smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
     
-        for i, regime in enumerate(regime_stats):
-            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-            hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
-            raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-            if smooth_probs:
-                plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
-            else:
-                plot_probs = raw_probs
-            fig_m.add_trace(go.Scatter(x=model_data.index, y=plot_probs, mode='lines', line=dict(color=hex_color, width=1.5), fill='tozeroy', name=labels[i]), row=2, col=1)
+    for i, regime in enumerate(regime_stats):
+        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+        hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
+        raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+        if smooth_probs:
+            plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
+        else:
+            plot_probs = raw_probs
+        fig_m.add_trace(go.Scatter(x=model_data.index, y=plot_probs, mode='lines', line=dict(color=hex_color, width=1.5), fill='tozeroy', name=labels[i]), row=2, col=1)
 
-        fig_m.add_hline(y=1/n_regimes, line_dash="dash", line_color="gray", opacity=0.4, row=2, col=1)
+    fig_m.add_hline(y=1/n_regimes, line_dash="dash", line_color="gray", opacity=0.4, row=2, col=1)
     
-        def get_const(i):
-            if f'const[{i}]' in res_markov.params: return float(res_markov.params[f'const[{i}]'])
-            return float(res_markov.params.get('const', 0.0))
+    def get_const(i):
+        if f'const[{i}]' in res_markov.params: return float(res_markov.params[f'const[{i}]'])
+        return float(res_markov.params.get('const', 0.0))
 
-        expected_ret = pd.Series(0.0, index=model_data.index)
-        for i in range(n_regimes):
-            prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
-            expected_ret += prob * get_const(i)
+    expected_ret = pd.Series(0.0, index=model_data.index)
+    for i in range(n_regimes):
+        prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
+        expected_ret += prob * get_const(i)
     
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=expected_ret, mode='lines', line=dict(color='#00f2ff', width=2), name="Expected Return"), row=3, col=1)
-        fig_m.add_hline(y=0, line_dash="solid", line_color="white", opacity=0.3, row=3, col=1)
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=expected_ret, mode='lines', line=dict(color='#00f2ff', width=2), name="Expected Return"), row=3, col=1)
+    fig_m.add_hline(y=0, line_dash="solid", line_color="white", opacity=0.3, row=3, col=1)
     
-        # Fill Expected return green and red
-        exp_pos = expected_ret.copy()
-        exp_pos[exp_pos < 0] = 0
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_pos, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.3, name="Positive Exp Ret", showlegend=False), row=3, col=1)
+    # Fill Expected return green and red
+    exp_pos = expected_ret.copy()
+    exp_pos[exp_pos < 0] = 0
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_pos, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.3, name="Positive Exp Ret", showlegend=False), row=3, col=1)
     
-        exp_neg = expected_ret.copy()
-        exp_neg[exp_neg > 0] = 0
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_neg, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.3, name="Negative Exp Ret", showlegend=False), row=3, col=1)
+    exp_neg = expected_ret.copy()
+    exp_neg[exp_neg > 0] = 0
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_neg, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.3, name="Negative Exp Ret", showlegend=False), row=3, col=1)
     
-        fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
-        st.plotly_chart(fig_m, use_container_width=True)
-        safe_report_add("Regime Switching Analysis", fig_m)
+    fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
+    st.plotly_chart(fig_m, use_container_width=True)
+    safe_report_add("Regime Switching Analysis", fig_m)
     
-        # ===== PARAMETERS TABLE =====
-        with st.expander("📋 Technical Parameters"):
-            summary_data = {
-                "Parameter": res_markov.params.index,
-                "Value": res_markov.params.values.astype(float),
-                "Std Error": res_markov.bse.values.astype(float),
-                "P-Value": res_markov.pvalues.values.astype(float)
-            }
-            df_summary = pd.DataFrame(summary_data)
-            # Format only numeric columns to avoid error with "Parameter" string column
-            st.dataframe(df_summary.style.format({
-                "Value": "{:.4f}",
-                "Std Error": "{:.4f}",
-                "P-Value": "{:.4f}"
-            }))
+    # ===== PARAMETERS TABLE =====
+    with st.expander("📋 Technical Parameters"):
+        summary_data = {
+            "Parameter": res_markov.params.index,
+            "Value": res_markov.params.values.astype(float),
+            "Std Error": res_markov.bse.values.astype(float),
+            "P-Value": res_markov.pvalues.values.astype(float)
+        }
+        df_summary = pd.DataFrame(summary_data)
+        # Format only numeric columns to avoid error with "Parameter" string column
+        st.dataframe(df_summary.style.format({
+            "Value": "{:.4f}",
+            "Std Error": "{:.4f}",
+            "P-Value": "{:.4f}"
+        }))
         
-            st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
+        st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
     
+
 
 
 # ==========================================
@@ -11772,7 +8491,7 @@ with tab4:
     else: st.info(f"🎯 **MODEL VERDICT**: Price is trading within **{abs(trend_diff):.1%}** of the Kalman Trend (Neutral/Consolidation).")
 
     
-    kf_mode = st.radio("Analysis Mode", ["Single Asset (Trend)", "Pairs Trading (Relative Value)"], index=0, key="kalman_analysis_mode_default_single_asset")
+    kf_mode = st.radio("Analysis Mode", ["Pairs Trading (Relative Value)", "Single Asset (Trend)"])
     
     if kf_mode == "Pairs Trading (Relative Value)":
         st.write(f"**{TICKER} vs {PAIR_TICKER}**")
@@ -11809,104 +8528,46 @@ with tab4:
             
     elif kf_mode == "Single Asset (Trend)":
         st.write(f"**{TICKER} Trend Detection**")
-        st.caption("Uses an adaptive Kalman-style trend line to separate trend from noise with less lag than the old fixed-Q/R Kalman.")
+        st.caption("Uses a Kalman Filter (Local Level Model) to separate the 'True' Price Trend from Market Noise.")
         st.markdown("[Reference: Time Series Analysis by State Space Methods (Durbin & Koopman)](https://global.oup.com/academic/product/time-series-analysis-by-state-space-methods-9780199641178)")
         
         # Parameters
-        st.caption("Mentor note: the old fixed-Q/R Kalman can lag badly on fast runners. Default below is a directional trend rail: it behaves more like support/resistance instead of cutting through the middle of price.")
-        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+        col_k1, col_k2, col_k3 = st.columns(3)
         with col_k1:
-            model_mode = st.radio(
-                "Model Type",
-                ["Institutional Trend Rail (Default)", "Institutional Adaptive Centerline", "Zero-Lag EMA Hybrid", "Smoothed RTS (Research)", "Standard Old", "Compare All"],
-                index=0,
-                key="kalman_single_asset_model_type"
-            )
+            proc_noise = st.select_slider("Trend Flexibility (Process Noise)", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-4)
         with col_k2:
-            fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_reaction")
+            meas_noise = st.select_slider("Noise Tolerance (Measurement Noise)", options=[1e-3, 1e-2, 1e-1, 1.0], value=1e-2)
         with col_k3:
-            slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_slow_smoothing")
-        with col_k4:
-            polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_polish_span")
-
-        rail_mult = st.slider(
-            "Trend rail distance",
-            0.40, 3.00, 1.35, step=0.05,
-            key="kalman_trend_rail_distance",
-            help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
-        )
-
-        with st.expander("Advanced old Kalman controls", expanded=False):
-            ak1, ak2, ak3 = st.columns(3)
-            with ak1:
-                proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_old_proc_noise")
-            with ak2:
-                meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_old_meas_noise")
-            with ak3:
-                zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
-
+            model_mode = st.radio("Model Type", ["Smoothed (New)", "Standard (Old)", "Compare Both"])
+        
         prices = df_main['Close'].values
-        kalman_chart_x = _ct_naive_index(df_main.index)
         kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
-
-        est_adaptive = institutional_adaptive_kalman_trend(
-            prices,
-            fast_gain=float(fast_gain),
-            slow_gain=float(slow_gain),
-            vol_window=20,
-            polish_span=int(polish_span)
-        )
-        est_rail, est_rail_center, est_rail_state = institutional_trend_rail(
-            prices,
-            fast_gain=float(fast_gain),
-            slow_gain=float(slow_gain),
-            polish_span=int(polish_span),
-            atr_window=14,
-            atr_mult=float(rail_mult)
-        )
-        est_zlema = zero_lag_ema_trend(prices, span=int(zlema_span))
-        est_std, _ = kf_trend.filter(prices)
-        est_smooth, _ = kf_trend.smooth(prices)
-
+        
+        # Calculate based on mode
+        if model_mode == "Standard (Old)":
+            est_trend, _ = kf_trend.filter(prices)
+            label_trend = "Kalman Trend (Standard)"
+            color_trend = "blue"
+        elif model_mode == "Smoothed (New)":
+            est_trend, _ = kf_trend.smooth(prices)
+            label_trend = "Kalman Trend (Smoothed)"
+            color_trend = "purple"
+        else: # Compare Both
+            est_trend_smooth, _ = kf_trend.smooth(prices)
+            est_trend_std, _ = kf_trend.filter(prices)
+        
         fig_kt = go.Figure()
-        fig_kt.add_trace(go.Scatter(
-            x=kalman_chart_x, y=prices, mode='lines',
-            line=dict(color='white', width=1.15),
-            opacity=0.62,
-            name='Actual Price'
-        ))
-
-        if model_mode == "Institutional Trend Rail (Default)":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail_center, mode='lines', line=dict(color='rgba(127,219,255,0.28)', width=1.0, dash='dot'), name='Adaptive Center Reference'))
-            current_trend = est_rail[-1]
-        elif model_mode == "Institutional Adaptive Centerline":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode='lines', line=dict(color='#7FDBFF', width=2.7), name='Adaptive Kalman Centerline'))
-            current_trend = est_adaptive[-1]
-        elif model_mode == "Zero-Lag EMA Hybrid":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=2.5), name='Zero-Lag EMA Hybrid'))
-            current_trend = est_zlema[-1]
-        elif model_mode == "Smoothed RTS (Research)":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode='lines', line=dict(color='purple', width=2.2), name='Smoothed RTS Research'))
-            current_trend = est_smooth[-1]
-        elif model_mode == "Standard Old":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode='lines', line=dict(color='blue', width=2.0), name='Old Standard Kalman'))
-            current_trend = est_std[-1]
+        fig_kt.add_trace(go.Scatter(x=df_main.index, y=prices, mode='lines', line=dict(color='gray'), opacity=0.5, name='Actual Price'))
+        
+        if model_mode == "Compare Both":
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend_std, mode='lines', line=dict(color='blue', dash='dash', width=1.5), name='Standard (Causal)'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend_smooth, mode='lines', line=dict(color='purple', width=2), name='Smoothed (RTS)'))
+            current_trend = est_trend_smooth[-1] # Use smooth for metrics
         else:
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode='lines', line=dict(color='blue', dash='dash', width=1.35), name='Old Standard'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode='lines', line=dict(color='purple', width=1.55), name='RTS Smooth Research'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=1.85), name='Zero-Lag Hybrid'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode='lines', line=dict(color='rgba(127,219,255,0.35)', width=1.6), name='Adaptive Centerline'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
-            current_trend = est_rail[-1]
-
-        fig_kt.update_layout(
-            title=f"Kalman Trend: {TICKER} — Institutional Rail / Lower Lag",
-            hovermode="x unified",
-            template="plotly_dark",
-            height=560,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend, mode='lines', line=dict(color=color_trend, width=2), name=label_trend))
+            current_trend = est_trend[-1]
+            
+        fig_kt.update_layout(title=f"Kalman Filter Trend: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
         st.plotly_chart(fig_kt, use_container_width=True)
         safe_report_add("Kalman Trend Analysis", fig_kt)
         
@@ -11931,574 +8592,6 @@ with tab4:
             st.success("Price significantly BELOW Trend (Potential Oversold)")
         else:
             st.info("Price near Trend (Neutral)")
-
-        # ----------------------------------------------------------
-        # Kalman Trend Strategy Backtest + Trade Log
-        # ----------------------------------------------------------
-        st.divider()
-        st.write("#### 📒 Kalman Trend Strategy Backtest & Trade Log")
-        st.caption("This adds hysteresis + confirmation so the Zero-Lag/Adaptive line does not overtrade every tiny cross.")
-
-        try:
-            # Pick the exact trend line currently selected above.
-            if model_mode == "Institutional Trend Rail (Default)":
-                active_trend_arr = est_rail
-                active_trend_name = "Institutional Trend Rail"
-            elif model_mode == "Institutional Adaptive Centerline":
-                active_trend_arr = est_adaptive
-                active_trend_name = "Institutional Adaptive Centerline"
-            elif model_mode == "Zero-Lag EMA Hybrid":
-                active_trend_arr = est_zlema
-                active_trend_name = "Zero-Lag EMA Hybrid"
-            elif model_mode == "Smoothed RTS (Research)":
-                active_trend_arr = est_smooth
-                active_trend_name = "Smoothed RTS Research"
-            elif model_mode == "Standard Old":
-                active_trend_arr = est_std
-                active_trend_name = "Standard Old"
-            else:
-                active_trend_arr = est_rail
-                active_trend_name = "Institutional Trend Rail"
-
-            bt_px = pd.Series(prices, index=df_main.index).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-            bt_trend = pd.Series(active_trend_arr, index=df_main.index).astype(float).reindex(bt_px.index).ffill().bfill()
-            bt_plot_x = _ct_naive_index(bt_px.index)
-            bt_plot_x_series = pd.Series(bt_plot_x, index=bt_px.index)
-
-            ks1, ks2, ks3, ks4 = st.columns(4)
-            with ks1:
-                kalman_buffer_pct = st.slider(
-                    "Cross buffer (%)",
-                    0.00, 8.00, 1.25, step=0.25,
-                    key="kalman_strategy_cross_buffer_pct",
-                    help="Price must clear the trend by this % before entry/exit. Higher = fewer false flips."
-                ) / 100.0
-            with ks2:
-                kalman_confirm_bars = st.slider(
-                    "Confirm bars",
-                    1, 10, 3, step=1,
-                    key="kalman_strategy_confirm_bars",
-                    help="Signal must persist for this many bars before acting."
-                )
-            with ks3:
-                kalman_min_hold = st.slider(
-                    "Minimum hold bars",
-                    1, 40, 5, step=1,
-                    key="kalman_strategy_min_hold",
-                    help="Prevents quick exit/re-entry churn."
-                )
-            with ks4:
-                kalman_cooldown = st.slider(
-                    "Cooldown after exit",
-                    0, 30, 3, step=1,
-                    key="kalman_strategy_cooldown",
-                    help="Bars to wait after an exit before allowing a new entry."
-                )
-
-            use_slope_confirm = st.checkbox(
-                "Require trend slope confirmation",
-                value=True,
-                key="kalman_strategy_slope_confirm",
-                help="Entry prefers rising trend; exit prefers falling trend. This reduces overtrading."
-            )
-            use_atr_safety = st.checkbox(
-                "Use ATR safety exit",
-                value=True,
-                key="kalman_strategy_atr_safety",
-                help="Adds a simple safety exit if price loses the trend by a volatility-based amount."
-            )
-
-            benchmark_aware_kalman = st.checkbox(
-                "Benchmark-aware Kalman optimizer",
-                value=True,
-                key="kalman_benchmark_aware_optimizer",
-                help="ON = tests safer confirmation/buffer settings and uses the one with the best return vs buy-and-hold after drawdown/trade-count penalties."
-            )
-            kalman_max_dd_allowed = st.slider(
-                "Max drawdown allowed (%)",
-                10.0, 80.0, 35.0, step=5.0,
-                key="kalman_max_dd_allowed",
-                help="Optimizer strongly rejects settings with drawdown worse than this. Your example -76% is too dangerous."
-            )
-
-            use_kalman_risk_firewall = st.checkbox(
-                "Use Kalman risk firewall",
-                value=False,
-                key="kalman_use_risk_firewall",
-                help="Keeps the same signal logic, but adds hard loss/trailing/equity drawdown protection to reduce capital damage."
-            )
-            rf1, rf2, rf3, rf4 = st.columns(4)
-            with rf1:
-                kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
-            with rf2:
-                kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_trail_stop_pct")
-            with rf3:
-                kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_equity_dd_stop_pct")
-            with rf4:
-                kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
-
-            trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
-            def _build_kalman_signal_for_params(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
-                close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
-                close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
-
-                if bool(slope_confirm):
-                    entry_cond_i = close_above_i & (trend_slope >= 0)
-                    exit_cond_i = close_below_i & (trend_slope <= 0)
-                else:
-                    entry_cond_i = close_above_i
-                    exit_cond_i = close_below_i
-
-                if bool(atr_safety):
-                    atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-                    safety_exit_i = bt_px < (bt_trend - 1.25 * atr_proxy_i)
-                    exit_cond_i = exit_cond_i | safety_exit_i.fillna(False)
-
-                confirm_bars = int(confirm_bars)
-                min_hold_bars = int(min_hold_bars)
-                cooldown_bars = int(cooldown_bars)
-
-                entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-
-                sig_i = pd.Series(0.0, index=bt_px.index)
-                in_pos_i = False
-                bars_held_i = 0
-                cooldown_left_i = 0
-
-                for _dt in bt_px.index:
-                    if cooldown_left_i > 0:
-                        cooldown_left_i -= 1
-
-                    if not in_pos_i:
-                        if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
-                            in_pos_i = True
-                            bars_held_i = 0
-                            sig_i.loc[_dt] = 1.0
-                        else:
-                            sig_i.loc[_dt] = 0.0
-                    else:
-                        bars_held_i += 1
-                        if bars_held_i >= min_hold_bars and bool(exit_ready_i.loc[_dt]):
-                            in_pos_i = False
-                            cooldown_left_i = cooldown_bars
-                            sig_i.loc[_dt] = 0.0
-                            bars_held_i = 0
-                        else:
-                            sig_i.loc[_dt] = 1.0
-                return sig_i.ffill().fillna(0).clip(0, 1)
-
-            chosen_kalman_settings = {
-                "Buffer %": float(kalman_buffer_pct) * 100.0,
-                "Confirm Bars": int(kalman_confirm_bars),
-                "Min Hold": int(kalman_min_hold),
-                "Cooldown": int(kalman_cooldown),
-                "Optimizer": "OFF"
-            }
-
-            if bool(benchmark_aware_kalman):
-                try:
-                    bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0
-                    best_pack = None
-                    # Risk-first grid: fewer flips, more confirmation, avoids capital death by noise.
-                    # Includes much stricter settings because high-beta names can show huge returns with unacceptable DD.
-                    for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
-                        for _conf in [3, 4, 5, 7, 10]:
-                            for _hold in [10, 15, 21, 34, 55]:
-                                for _cool in [5, 8, 13, 21]:
-                                    _sig = _build_kalman_signal_for_params(
-                                        _buf, _conf, _hold, _cool,
-                                        slope_confirm=bool(use_slope_confirm),
-                                        atr_safety=bool(use_atr_safety)
-                                    )
-                                    if bool(use_kalman_risk_firewall):
-                                        _sig = apply_kalman_risk_firewall(
-                                            bt_px, _sig, bt_trend,
-                                            max_trade_loss_pct=float(kalman_trade_stop_pct),
-                                            trail_stop_pct=float(kalman_trail_stop_pct),
-                                            equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                                            cooldown_bars=int(kalman_firewall_cooldown)
-                                        )
-                                    _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
-                                    _eq = _bt.get("equity_curve", pd.Series(dtype=float))
-                                    _rets = _bt.get("returns", pd.Series(dtype=float))
-                                    _tr = _bt.get("trades", pd.DataFrame())
-                                    if _eq is None or len(_eq) < 2:
-                                        continue
-                                    _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
-                                    _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
-                                    _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
-                                    _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
-                                    _sh = float(_mets.get("Sharpe Ratio", 0.0))
-
-                                    # Mentor score: must care about beating B&H, but capital protection comes first.
-                                    _dd_abs = abs(float(_dd))
-                                    _score = (
-                                        (_strat - bh_reference)
-                                        + 0.08 * _strat
-                                        + 8.0 * _sh
-                                        - 2.20 * _dd_abs
-                                        - 0.45 * max(0, _trade_n - 10)
-                                    )
-                                    # Hard penalty if it badly underperforms B&H.
-                                    if _strat < bh_reference:
-                                        _score -= (bh_reference - _strat) * 0.85
-
-                                    # Very hard penalty if drawdown violates the user's risk cap.
-                                    if _dd_abs > float(kalman_max_dd_allowed):
-                                        _score -= ((_dd_abs - float(kalman_max_dd_allowed)) ** 2) * 2.0
-
-                                    # Extra rejection for capital-destroying drawdowns like -76%.
-                                    if _dd_abs > 60:
-                                        _score -= 5000.0
-
-                                    if best_pack is None or _score > best_pack["score"]:
-                                        best_pack = {
-                                            "score": _score,
-                                            "sig": _sig,
-                                            "buffer": _buf,
-                                            "confirm": _conf,
-                                            "hold": _hold,
-                                            "cool": _cool,
-                                            "strat": _strat,
-                                            "bh": bh_reference,
-                                            "dd": _dd,
-                                            "trades": _trade_n,
-                                            "sharpe": _sh
-                                        }
-
-                    if best_pack is not None:
-                        kalman_signal = best_pack["sig"]
-                        chosen_kalman_settings = {
-                            "Buffer %": round(best_pack["buffer"] * 100.0, 2),
-                            "Confirm Bars": int(best_pack["confirm"]),
-                            "Min Hold": int(best_pack["hold"]),
-                            "Cooldown": int(best_pack["cool"]),
-                            "Optimizer": "ON",
-                            "Optimizer Score": round(best_pack["score"], 2)
-                        }
-                        st.info(
-                            f"Benchmark-aware optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
-                            f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}. "
-                            f"Tested against B&H {bh_reference:.2f}% with DD/trade-count penalty."
-                        )
-                    else:
-                        kalman_signal = _build_kalman_signal_for_params(
-                            kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                            slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
-                        )
-                except Exception:
-                    kalman_signal = _build_kalman_signal_for_params(
-                        kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                        slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
-                    )
-            else:
-                kalman_signal = _build_kalman_signal_for_params(
-                    kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
-                )
-
-            # Persist the effective params for THIS ticker so the watchlist
-            # recompute reproduces the main-tab signal (optimizer or sliders).
-            try:
-                _cs = locals().get("chosen_kalman_settings", None)
-                if isinstance(_cs, dict) and "Buffer %" in _cs:
-                    _eff_buf = float(_cs["Buffer %"]) / 100.0
-                    _eff_conf = int(_cs.get("Confirm Bars", kalman_confirm_bars))
-                    _eff_hold = int(_cs.get("Min Hold", kalman_min_hold))
-                    _eff_cool = int(_cs.get("Cooldown", kalman_cooldown))
-                else:
-                    _eff_buf = float(kalman_buffer_pct)
-                    _eff_conf = int(kalman_confirm_bars)
-                    _eff_hold = int(kalman_min_hold)
-                    _eff_cool = int(kalman_cooldown)
-                _save_main_kalman_opt_params_for_ticker(
-                    TICKER, _eff_buf, _eff_conf, _eff_hold, _eff_cool,
-                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                )
-            except Exception:
-                pass
-
-            if bool(use_kalman_risk_firewall):
-                kalman_signal = apply_kalman_risk_firewall(
-                    bt_px, kalman_signal, bt_trend,
-                    max_trade_loss_pct=float(kalman_trade_stop_pct),
-                    trail_stop_pct=float(kalman_trail_stop_pct),
-                    equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                    cooldown_bars=int(kalman_firewall_cooldown)
-                )
-
-            # Non-repaint lock: freeze main-chart signal on completed bars.
-            try:
-                if bool(st.session_state.get("kalman_non_repaint_lock", True)):
-                    _lk_int = str(locals().get("interval", "15m"))
-                    kalman_signal = _apply_signal_lock(TICKER, kalman_signal, freeze_enabled=True, interval=_lk_int)
-            except Exception:
-                pass
-
-            kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
-            kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
-            kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
-            kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
-
-            # Authoritative current position = last value of the signal series the
-            # chart uses. This is the LONG/CASH you actually see, and what the
-            # sidebar/watchlist must mirror.
-            try:
-                _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
-            except Exception:
-                _kalman_signal_last = None
-            try:
-                _sync_watchlist_ledger_from_visible_main_trade_log(
-                    TICKER,
-                    kalman_trades,
-                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                )
-            except Exception:
-                pass
-            try:
-                _update_thesis_main_kalman_verify(
-                    TICKER,
-                    kalman_trades,
-                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                    latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                    signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
-                )
-            except Exception:
-                pass
-
-            try:
-                _save_main_kalman_status_to_session(
-                    TICKER,
-                    kalman_trades,
-                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                    latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                    signal_state=_kalman_signal_last,
-                )
-            except Exception:
-                pass
-
-            k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
-            k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-            k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
-            k_total_pnl = total_trade_pnl_return_pct(kalman_trades) if isinstance(kalman_trades, pd.DataFrame) else 0.0
-
-            km1, km2, km3, km4, km5 = st.columns(5)
-            km1.metric("Kalman Strategy Return", f"{k_strat_ret:.2f}%")
-            km2.metric("Buy & Hold", f"{k_bh_ret:.2f}%")
-            km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
-            km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
-            km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-
-            try:
-                st.caption(f"Chosen Kalman settings: {chosen_kalman_settings}")
-                if bool(use_kalman_risk_firewall):
-                    st.caption(
-                        f"Risk firewall ON: trade stop {kalman_trade_stop_pct:.0f}%, "
-                        f"trailing {kalman_trail_stop_pct:.0f}%, equity circuit {kalman_equity_dd_stop_pct:.0f}%, "
-                        f"cooldown {kalman_firewall_cooldown} bars."
-                    )
-                if k_strat_ret < k_bh_ret:
-                    st.error(
-                        f"Kalman strategy is NOT beating buy-and-hold here: {k_strat_ret:.2f}% vs B&H {k_bh_ret:.2f}%. "
-                        "Do not treat this as a capital-allocation strategy for this ticker. Use Regime/Rotation or buy-and-hold instead."
-                    )
-                elif abs(float(k_metrics.get('Max Drawdown', 0.0))*100) > float(kalman_max_dd_allowed):
-                    st.error(
-                        f"Kalman drawdown is too high: {float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}% "
-                        f"vs allowed {float(kalman_max_dd_allowed):.0f}%. This can blow up capital even if return looks big."
-                    )
-                else:
-                    st.success("Kalman strategy passes the basic benchmark/risk check for this selected window.")
-            except Exception:
-                pass
-
-            # Clean visual with entries/exits
-            fig_kbt = go.Figure()
-            fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
-            fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
-
-            changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
-            buy_idx = changes[changes > 0].index
-            sell_idx = changes[changes < 0].index
-
-
-            # Main-tab direct Telegram alert removed. Watchlist monitor is the only Telegram engine.
-
-
-            # ✅ Main Kalman graph + trade log directly inside primary Kalman screen.
-            try:
-                st.markdown("### 📈 Main Kalman Graph + BUY/SELL Signals")
-                _fig_primary = go.Figure()
-                _fig_primary.add_trace(go.Scatter(
-                    x=bt_plot_x,
-                    y=bt_px,
-                    mode="lines",
-                    name=f"{TICKER} Price",
-                    line=dict(color="white", width=1.2),
-                    opacity=0.65,
-                ))
-                _fig_primary.add_trace(go.Scatter(
-                    x=bt_plot_x,
-                    y=bt_trend,
-                    mode="lines",
-                    name=active_trend_name,
-                    line=dict(color="#7FDBFF", width=2.6),
-                ))
-
-                if len(buy_idx):
-                    _fig_primary.add_trace(go.Scatter(
-                        x=bt_plot_x_series.reindex(buy_idx),
-                        y=bt_px.reindex(buy_idx),
-                        mode="markers",
-                        name="BUY",
-                        marker=dict(symbol="triangle-up", size=13, color="lime"),
-                    ))
-                if len(sell_idx):
-                    _fig_primary.add_trace(go.Scatter(
-                        x=bt_plot_x_series.reindex(sell_idx),
-                        y=bt_px.reindex(sell_idx),
-                        mode="markers",
-                        name="SELL",
-                        marker=dict(symbol="triangle-down", size=13, color="red"),
-                    ))
-
-                _fig_primary.update_layout(
-                    title=f"Main Kalman Strategy Graph: {TICKER} — {active_trend_name}",
-                    template="plotly_dark",
-                    height=620,
-                    hovermode="x unified",
-                    xaxis_title="Time",
-                    yaxis_title="Price",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    margin=dict(l=20, r=20, t=65, b=35),
-                )
-                st.plotly_chart(_fig_primary, use_container_width=True)
-
-                st.markdown(f"### 📒 Main Kalman Trade Log — {TICKER}")
-                try:
-                    _main_status_row = _save_main_kalman_status_to_session(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
-                    )
-                    if _main_status_row:
-                        st.markdown("#### ✅ Main Kalman Current Status")
-                        st.dataframe(pd.DataFrame([_main_status_row]), use_container_width=True, hide_index=True)
-                except Exception:
-                    pass
-
-                if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty:
-                    st.dataframe(_clean_trade_log_numbers(kalman_trades), use_container_width=True, hide_index=True)
-                    try:
-                        _save_main_kalman_status_to_session(
-                            TICKER,
-                            kalman_trades,
-                            latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                            latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                            signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
-                        )
-                    except Exception:
-                        pass
-
-                    try:
-                        st.download_button(
-                            "Download Main Kalman Trade Log CSV",
-                            _clean_trade_log_numbers(kalman_trades).to_csv(index=False).encode("utf-8"),
-                            file_name=f"{TICKER}_main_kalman_trade_log.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                            key=f"main_kalman_trade_log_csv_{TICKER}_{data_interval}",
-                        )
-                    except Exception:
-                        pass
-                else:
-                    st.info("No Kalman trades generated for this selected window/settings.")
-            except Exception as _e:
-                st.warning(f"Main Kalman graph/trade log could not render: {_e}")
-
-                st.markdown("### ✅ Main Trade-Log Status / Telegram Source")
-                try:
-                    _main_status = _status_from_main_trade_log(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                    )
-                    _main_status["Alert"] = "Source of truth: Main Buy/Sell Graph + Main Kalman Trade Log only"
-                    st.dataframe(pd.DataFrame([_main_status]), use_container_width=True, hide_index=True)
-
-                    # Telegram sync from exact main trade log only.
-                    if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
-                        _is_open = _trade_row_is_open(kalman_trades.iloc[-1], columns=kalman_trades.columns) if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty else False
-                        _sig = "BUY" if _is_open else "SELL"
-                        _event_time = str(_main_status.get("Candle Close CT", ""))
-                        _ledger = _load_kalman_alert_ledger()
-                        _key = f"{TICKER}|MAIN_LOG_EXACT|{_sig}|{_event_time}|{_main_status.get('Trade Position')}"
-                        if _ledger.get(TICKER) != _key and _main_status.get("Trade Position") in ["LONG", "CASH"]:
-                            # Mark as synced so it does not spam on reload. Future fresh changes get a new key.
-                            _ledger[TICKER] = _key
-                            _save_kalman_alert_ledger(_ledger)
-                            st.caption("Telegram ledger synced from exact main trade log.")
-                except Exception as _e:
-                    st.warning(f"Could not create synced thesis status from main trade log: {_e}")
-
-            if len(buy_idx):
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(buy_idx), y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
-            if len(sell_idx):
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(sell_idx), y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
-
-            fig_kbt.update_layout(
-                title=f"Kalman Strategy: {TICKER} — {active_trend_name}",
-                template="plotly_dark",
-                height=560,
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig_kbt, use_container_width=True)
-
-            st.write("##### Main Kalman Trade Log — Source of Truth")
-            if kalman_trades is None or kalman_trades.empty:
-                st.info("No Kalman strategy trades generated with the current confirmation settings.")
-            else:
-                try:
-                    kalman_trades = apply_trade_log_timestamp_display(kalman_trades)
-                    kalman_trades = kalman_trades.sort_values("Entry Date", ascending=False).reset_index(drop=True)
-                except Exception:
-                    pass
-                st.dataframe(kalman_trades.style.format({
-                    "Buy Price": "{:.2f}",
-                    "Sell Price": "{:.2f}",
-                    "PnL (%)": "{:.2f}%",
-                    "Cumulative Return (%)": "{:.2f}"
-                }), use_container_width=True)
-
-                st.download_button(
-                    "📥 Download Kalman trade log",
-                    data=_clean_trade_log_numbers(kalman_trades).to_csv(index=False).encode("utf-8"),
-                    file_name=f"{_safe_filename_part(TICKER)}_Kalman_{_safe_filename_part(active_trend_name)}_TradeLog.csv" if "_safe_filename_part" in globals() else f"{TICKER}_Kalman_TradeLog.csv",
-                    mime="text/csv",
-                    key=f"download_kalman_trade_log_{TICKER}_{active_trend_name}"
-                )
-
-            safe_report_add("Kalman Strategy Metrics", {
-                "Strategy Return %": k_strat_ret,
-                "Buy & Hold %": k_bh_ret,
-                "Total Trade PnL %": k_total_pnl,
-                "Sharpe": float(k_metrics.get("Sharpe Ratio", 0.0)),
-                "Max Drawdown %": float(k_metrics.get("Max Drawdown", 0.0))*100.0,
-                "Trend Model": active_trend_name,
-                "Risk Firewall": bool(use_kalman_risk_firewall),
-                "Trade Stop %": float(kalman_trade_stop_pct),
-                "Trailing Stop %": float(kalman_trail_stop_pct),
-                "Equity DD Circuit %": float(kalman_equity_dd_stop_pct)
-            })
-            safe_report_add("Kalman Strategy Chart", fig_kbt)
-        except Exception as _kalman_bt_err:
-            st.warning(f"Kalman strategy backtest could not run: {_kalman_bt_err}")
-
 
 # ==========================================
 # TAB 5: MACRO FACTORS
@@ -12587,161 +8680,6 @@ with tab6:
         safe_report_add("Decomposition Period", {"Period": period})
     else:
         st.warning("Insufficient data for decomposition with selected period.")
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def scan_regime_rotation_dashboard_cached(
-    tickers, start_date, end_date, frequency, n_regimes, smoothing,
-    switch_vol, switch_trend, signal_method, conviction, min_hold,
-    confirmed_bar, max_tickers
-):
-    """
-    Regime Rotation Dashboard:
-    Finds current Regime Long tickers and ranks which ones deserve capital first.
-
-    This is scanner/ranking logic only. It does not alter the selected ticker's
-    backtest, ledger, trade log, or performance metrics.
-    """
-    rows = []
-    tickers = list(dict.fromkeys([str(t).strip().upper().replace(".", "-") for t in tickers if str(t).strip()]))
-    tickers = tickers[:int(max_tickers)]
-
-    for tk in tickers:
-        try:
-            raw = yf.download(
-                tk,
-                start=str(start_date),
-                end=(pd.Timestamp(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False
-            )
-            if raw is None or raw.empty:
-                continue
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
-            if "Close" not in raw.columns:
-                continue
-
-            px_daily = pd.to_numeric(raw["Close"], errors="coerce").dropna()
-            if len(px_daily) < 80:
-                continue
-
-            if str(frequency) == "Weekly":
-                px = resample_to_closed_weekly_friday(px_daily)
-            else:
-                px = px_daily.copy()
-
-            px = pd.Series(px).replace([np.inf, -np.inf], np.nan).dropna()
-            if len(px) < 40:
-                continue
-
-            if int(smoothing) > 0:
-                model_px = px.ewm(span=int(smoothing), adjust=False).mean().dropna()
-            else:
-                model_px = px.copy()
-
-            rets = model_px.pct_change().dropna()
-            model_data = rets * 100.0
-            if len(model_data) < max(30, int(n_regimes) * 10):
-                continue
-
-            res = fit_regime_model(model_data, int(n_regimes), bool(switch_vol), bool(switch_trend), search_reps=2)
-            if res is None:
-                continue
-
-            sig, ctx = build_regime_backtest_signal(
-                res, model_data.index, model_px.index, int(n_regimes), str(signal_method),
-                conviction=float(conviction), min_hold=int(min_hold)
-            )
-
-            sig = apply_confirmed_bar_execution_policy(
-                sig, frequency=str(frequency), confirmed_bar=bool(confirmed_bar),
-                weekly_close_updates=True, fill_value=0.0
-            ).reindex(model_px.index).ffill().fillna(0).clip(0, 1)
-
-            if sig.empty:
-                continue
-
-            current_sig = float(sig.iloc[-1])
-            last_dt = pd.Timestamp(sig.index[-1])
-
-            # Only rank current long names; cash names are useful but not capital candidates.
-            if current_sig <= 0:
-                continue
-
-            bt = BacktestEngine.run_strategy(model_px, sig, 10000.0)
-            trades = bt.get("trades", pd.DataFrame())
-            eq = bt.get("equity_curve", pd.Series(dtype=float))
-            returns = bt.get("returns", pd.Series(dtype=float))
-
-            strat_ret = (float(eq.iloc[-1]) / 10000.0 - 1.0) * 100.0 if isinstance(eq, pd.Series) and not eq.empty else np.nan
-            bh_ret = (float(model_px.iloc[-1]) / float(model_px.iloc[0]) - 1.0) * 100.0
-            max_dd = ((1 + returns).cumprod() / (1 + returns).cumprod().cummax() - 1).min() * 100 if isinstance(returns, pd.Series) and len(returns) else np.nan
-
-            changes = sig.diff().fillna(0)
-            buy_dates = changes[changes > 0].index
-            latest_buy_dt = pd.Timestamp(buy_dates[-1]) if len(buy_dates) else pd.Timestamp(sig.index[0])
-            bars_since_buy = int((sig.index.get_loc(last_dt) - sig.index.get_loc(latest_buy_dt))) if latest_buy_dt in sig.index else np.nan
-
-            try:
-                entry_px = float(model_px.loc[latest_buy_dt])
-                open_pnl = (float(model_px.iloc[-1]) / entry_px - 1.0) * 100.0 if entry_px > 0 else np.nan
-            except Exception:
-                entry_px = np.nan
-                open_pnl = np.nan
-
-            mom_21 = (float(model_px.iloc[-1]) / float(model_px.iloc[-22]) - 1.0) * 100.0 if len(model_px) > 22 else np.nan
-            mom_63 = (float(model_px.iloc[-1]) / float(model_px.iloc[-64]) - 1.0) * 100.0 if len(model_px) > 64 else np.nan
-
-            # Score: not just return. It rewards current long, momentum, alpha vs B&H, controlled DD,
-            # and penalizes being too extended far after the signal.
-            dd_penalty = abs(float(max_dd)) if pd.notna(max_dd) else 25.0
-            age_penalty = max(0.0, float(bars_since_buy) - (8 if str(frequency) == "Weekly" else 30)) * (0.4 if str(frequency) == "Weekly" else 0.08)
-            extension_penalty = max(0.0, float(open_pnl) - 35.0) * 0.25 if pd.notna(open_pnl) else 0.0
-            rotation_score = (
-                30.0
-                + 0.35 * (float(strat_ret) if pd.notna(strat_ret) else 0.0)
-                + 0.45 * (float(mom_21) if pd.notna(mom_21) else 0.0)
-                + 0.20 * (float(mom_63) if pd.notna(mom_63) else 0.0)
-                + 0.15 * ((float(strat_ret) - float(bh_ret)) if pd.notna(strat_ret) and pd.notna(bh_ret) else 0.0)
-                - 0.65 * dd_penalty
-                - age_penalty
-                - extension_penalty
-            )
-
-            rows.append({
-                "Rank Score": round(rotation_score, 2),
-                "Ticker": tk,
-                "Current Signal": "LONG",
-                "Frequency": str(frequency),
-                "Regimes": int(n_regimes),
-                "Smoothing": int(smoothing),
-                "Last Signal Date": str(last_dt.date()),
-                "Latest Buy Date": str(latest_buy_dt.date()),
-                "Bars Since Buy": bars_since_buy,
-                "Latest Price": float(model_px.iloc[-1]),
-                "Open PnL %": open_pnl,
-                "Momentum 21 %": mom_21,
-                "Momentum 63 %": mom_63,
-                "Strategy Return %": strat_ret,
-                "Buy & Hold %": bh_ret,
-                "Alpha vs B&H %": strat_ret - bh_ret if pd.notna(strat_ret) and pd.notna(bh_ret) else np.nan,
-                "Max DD %": max_dd,
-                "Closed Trades": 0 if trades is None or trades.empty else len(trades),
-                "Why": "Current Regime LONG; ranked by trend strength, open PnL, return, DD, and signal age."
-            })
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows).sort_values("Rank Score", ascending=False).reset_index(drop=True)
-    out.insert(0, "Rank", range(1, len(out) + 1))
-    return out
-
 
 # ==========================================
 # TAB 7: BACKTEST
@@ -12930,78 +8868,6 @@ with tab7:
                         mime="text/csv"
                     )
 
-        with st.expander("🔁 Regime Rotation Dashboard — where should capital go now?", expanded=False):
-            st.caption("Ranks all tickers that are currently Regime LONG. This helps avoid randomly moving money away from the stock that is about to run.")
-            rr1, rr2, rr3, rr4 = st.columns(4)
-            rotation_universe = rr1.selectbox(
-                "Rotation universe",
-                ["Current ticker", "Nasdaq 100", "S&P 500", "S&P 500 + Nasdaq 100", "Custom list"],
-                index=1,
-                key="regime_rotation_universe"
-            )
-            rotation_max = rr2.number_input("Max tickers", min_value=1, max_value=1000, value=75, step=25, key="regime_rotation_max")
-            rotation_topn = rr3.number_input("Show top N", min_value=1, max_value=50, value=10, step=1, key="regime_rotation_topn")
-            rotation_freq = rr4.selectbox("Rotation frequency", ["Daily", "Weekly"], index=0 if bt_freq == "Daily" else 1, key="regime_rotation_freq")
-
-            rotation_custom_text = ""
-            if rotation_universe == "Custom list":
-                rotation_custom_text = st.text_area(
-                    "Custom rotation tickers separated by comma / space / new line",
-                    value=TICKER,
-                    key="regime_rotation_custom"
-                )
-
-            st.caption(f"Uses current Regime settings: regimes={bt_n_regimes}, smoothing={bt_stability}, method={signal_method}, conviction={conviction}, min-hold={min_hold_period}.")
-
-            if st.button("Run Regime Rotation Ranking", key="run_regime_rotation_ranking", use_container_width=True):
-                if rotation_universe == "Current ticker":
-                    rotation_tickers = [TICKER]
-                elif rotation_universe == "Nasdaq 100":
-                    rotation_tickers = get_nasdaq100()
-                elif rotation_universe == "S&P 500":
-                    rotation_tickers = get_sp500()
-                elif rotation_universe == "S&P 500 + Nasdaq 100":
-                    rotation_tickers = sorted(set(get_sp500() + get_nasdaq100()))
-                else:
-                    rotation_tickers = [x.strip().upper() for x in rotation_custom_text.replace(',', ' ').replace('\n', ' ').split() if x.strip()]
-
-                with st.spinner(f"Ranking current Regime LONG names from {min(len(rotation_tickers), int(rotation_max))} tickers..."):
-                    rotation_df = scan_regime_rotation_dashboard_cached(
-                        tuple(rotation_tickers), str(bt_start_date), str(bt_end_date), str(rotation_freq),
-                        int(bt_n_regimes), int(bt_stability), bool(bt_switch_vol), bool(bt_switch_trend),
-                        str(signal_method), float(conviction), int(min_hold_period), bool(confirmed_regime_bar),
-                        int(rotation_max)
-                    )
-
-                if rotation_df is None or rotation_df.empty:
-                    st.warning("No current Regime LONG candidates found in this universe with the selected settings.")
-                else:
-                    top_rotation = rotation_df.head(int(rotation_topn)).copy()
-                    st.success(f"Found {len(rotation_df)} current Regime LONG candidates. Showing top {len(top_rotation)}.")
-                    st.dataframe(
-                        top_rotation.style.format({
-                            "Rank Score": "{:.2f}",
-                            "Latest Price": "{:.2f}",
-                            "Open PnL %": "{:.2f}%",
-                            "Momentum 21 %": "{:.2f}%",
-                            "Momentum 63 %": "{:.2f}%",
-                            "Strategy Return %": "{:.2f}%",
-                            "Buy & Hold %": "{:.2f}%",
-                            "Alpha vs B&H %": "{:.2f}%",
-                            "Max DD %": "{:.2f}%"
-                        }),
-                        use_container_width=True
-                    )
-                    st.download_button(
-                        "📥 Download Regime Rotation Ranking",
-                        rotation_df.to_csv(index=False).encode("utf-8"),
-                        file_name=f"Regime_Rotation_{_safe_filename_part(rotation_freq)}_Regimes{bt_n_regimes}_Smooth{bt_stability}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        key=f"download_regime_rotation_{rotation_freq}_{bt_n_regimes}_{bt_stability}"
-                    )
-
-                    st.info("Mentor rule: put capital first into the highest-ranked names where Weekly/Daily context agrees and the open PnL is not already extremely extended.")
-
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -13080,338 +8946,322 @@ with tab7:
                         st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
 
 
-        # ===== SPEED GATE FOR REGIME BACKTEST =====
-        # Speed-only change: all Regime Switching math below is unchanged.
-        # It simply will not run until you click this button.
-        _run_regime_backtest_now = st.button(
-            "▶️ Run Regime Switching Backtest",
-            key=f"run_regime_backtest_now_{TICKER}_{bt_freq}_{bt_n_regimes}_{bt_stability}_{signal_method}",
-            type="primary",
-            use_container_width=True,
-            help="Prevents Markov/WFO regime fitting from running on every Streamlit rerun. Click only when you want to compute/update this backtest."
-        )
+        try:
+            regime_run_precise_now
+        except NameError:
+            regime_run_precise_now = False
 
-        if not _run_regime_backtest_now:
-            st.info("Regime Switching Backtest is ready but not running. Click **Run Regime Switching Backtest** to fit the model and build the trade log.")
-            signals = None
-        else:
+        # Resample if Weekly
+        regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
+        live_execution_prices_for_regime = prices_bt.dropna().copy()
+        regime_source_prices = prices_bt.dropna().copy()
+        regime_model_freq = bt_freq
+
+        if regime_live_hybrid_enabled:
             try:
-                regime_run_precise_now
-            except NameError:
-                regime_run_precise_now = False
-
-            # Resample if Weekly
-            regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
-            live_execution_prices_for_regime = prices_bt.dropna().copy()
-            regime_source_prices = prices_bt.dropna().copy()
-            regime_model_freq = bt_freq
-
-            if regime_live_hybrid_enabled:
-                try:
-                    # Use longer 1D history for the regime brain so live mode does not fit
-                    # Markov states on only a noisy 7-30 day intraday window.
-                    anchor_df = load_data(TICKER, start_date, datetime.now(), interval='1d')
-                    if anchor_df is not None and not anchor_df.empty and len(anchor_df) >= 80:
-                        regime_source_prices = anchor_df['Close'].dropna().copy()
-                        regime_model_freq = str(live_regime_anchor_freq)
-                        st.caption(f"ℹ️ Live Regime Stabilizer ON: fitting regime brain on {regime_model_freq} historical 1D data, then mapping to live {data_interval} candles.")
-                    else:
-                        st.warning("Live Regime Stabilizer could not load enough historical anchor data. Falling back to normal live intraday regime fitting.")
-                        regime_live_hybrid_enabled = False
-                except Exception as e:
-                    st.warning(f"Live Regime Stabilizer failed to load anchor data: {e}. Falling back to normal live intraday regime fitting.")
+                # Use longer 1D history for the regime brain so live mode does not fit
+                # Markov states on only a noisy 7-30 day intraday window.
+                anchor_df = load_data(TICKER, start_date, datetime.now(), interval='1d')
+                if anchor_df is not None and not anchor_df.empty and len(anchor_df) >= 80:
+                    regime_source_prices = anchor_df['Close'].dropna().copy()
+                    regime_model_freq = str(live_regime_anchor_freq)
+                    st.caption(f"ℹ️ Live Regime Stabilizer ON: fitting regime brain on {regime_model_freq} historical 1D data, then mapping to live {data_interval} candles.")
+                else:
+                    st.warning("Live Regime Stabilizer could not load enough historical anchor data. Falling back to normal live intraday regime fitting.")
                     regime_live_hybrid_enabled = False
+            except Exception as e:
+                st.warning(f"Live Regime Stabilizer failed to load anchor data: {e}. Falling back to normal live intraday regime fitting.")
+                regime_live_hybrid_enabled = False
 
-            if regime_model_freq == "Weekly":
-                # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
-                prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
-                try:
-                    if len(prices_bt_resampled):
-                        st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
-                except Exception:
-                    pass
-            else:
-                prices_bt_resampled = regime_source_prices.dropna()
+        if regime_model_freq == "Weekly":
+            # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
+            prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
+            try:
+                if len(prices_bt_resampled):
+                    st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
+            except Exception:
+                pass
+        else:
+            prices_bt_resampled = regime_source_prices.dropna()
 
-            # Apply smoothing consistently to prices first, then calculate returns from those same prices.
-            # This fixes the old mismatch where model data was smoothed but execution prices were raw.
-            if bt_stability > 0:
-                prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
-                st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
-            else:
-                prices_bt_model = prices_bt_resampled.copy()
+        # Apply smoothing consistently to prices first, then calculate returns from those same prices.
+        # This fixes the old mismatch where model data was smoothed but execution prices were raw.
+        if bt_stability > 0:
+            prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
+            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
+        else:
+            prices_bt_model = prices_bt_resampled.copy()
 
-            strat_prices = prices_bt_model
-            returns_bt_resampled = prices_bt_model.pct_change().dropna()
-            model_data_bt = returns_bt_resampled.dropna() * 100
+        strat_prices = prices_bt_model
+        returns_bt_resampled = prices_bt_model.pct_change().dropna()
+        model_data_bt = returns_bt_resampled.dropna() * 100
 
-            # FIX: Robust 1D Series reconstruction
-            if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
-                model_data_bt = pd.Series(
-                    model_data_bt.values.flatten().astype(float),
-                    index=model_data_bt.index
-                )
+        # FIX: Robust 1D Series reconstruction
+        if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
+            model_data_bt = pd.Series(
+                model_data_bt.values.flatten().astype(float),
+                index=model_data_bt.index
+            )
         
-            if len(model_data_bt) < 10:
-                 st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
-                 st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
-                 if live_mode and bt_freq == "Weekly":
-                     st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
-                 elif not live_mode:
-                     st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
-            else:
-                with st.spinner("Fitting Regime Model..."):
-                    # Fit Model
-                    res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
+        if len(model_data_bt) < 10:
+             st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
+             st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
+             if live_mode and bt_freq == "Weekly":
+                 st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
+             elif not live_mode:
+                 st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
+        else:
+            with st.spinner("Fitting Regime Model..."):
+                # Fit Model
+                res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
                 
-                    if res_bt:
-                        # --- DISPLAY FITNESS METRICS ---
-                        fit_col1, fit_col2 = st.columns(2)
-                        with fit_col1:
-                            st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
-                        with fit_col2:
-                            st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
-                        st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
+                if res_bt:
+                    # --- DISPLAY FITNESS METRICS ---
+                    fit_col1, fit_col2 = st.columns(2)
+                    with fit_col1:
+                        st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
+                    with fit_col2:
+                        st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
+                    st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
                     
-                        # Build selected-method full-history signal using conviction + min-hold logic
-                        signals, regime_context = build_regime_backtest_signal(
-                            res_bt,
-                            model_data_bt.index,
-                            strat_prices.index,
-                            int(bt_n_regimes),
-                            signal_method,
-                            conviction=float(conviction),
-                            min_hold=int(min_hold_period)
-                        )
+                    # Build selected-method full-history signal using conviction + min-hold logic
+                    signals, regime_context = build_regime_backtest_signal(
+                        res_bt,
+                        model_data_bt.index,
+                        strat_prices.index,
+                        int(bt_n_regimes),
+                        signal_method,
+                        conviction=float(conviction),
+                        min_hold=int(min_hold_period)
+                    )
 
-                        # Price trend override for strong runners
-                        price_override = get_price_trend_override(
-                            strat_prices.index,
-                            model_data_bt.index,
-                            strat_prices
-                        )
-                        signals = pd.Series(
-                            np.maximum(signals.values, price_override.reindex(signals.index).fillna(0).values),
-                            index=signals.index
-                        ).clip(0, 1)
+                    # Price trend override for strong runners
+                    price_override = get_price_trend_override(
+                        strat_prices.index,
+                        model_data_bt.index,
+                        strat_prices
+                    )
+                    signals = pd.Series(
+                        np.maximum(signals.values, price_override.reindex(signals.index).fillna(0).values),
+                        index=signals.index
+                    ).clip(0, 1)
 
-                        signals = apply_confirmed_bar_execution_policy(
-                            signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
-                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
-                        )
+                    signals = apply_confirmed_bar_execution_policy(
+                        signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                        weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                    )
 
-                        # --- Walk-forward validation / primary signal ---
-                        if enable_regime_wfo:
-                            with st.spinner("Running Regime Walk-Forward Optimization..."):
-                                wf_regime = walk_forward_regime_selection(
-                                    strat_prices,
-                                    returns_bt_resampled,
-                                    n_regimes="Auto" if bool(auto_wfo_regimes) else int(bt_n_regimes),
-                                    switch_vol=bool(bt_switch_vol),
-                                    switch_trend=bool(bt_switch_trend),
-                                    train_window=int(regime_wf_train),
-                                    forward_window=int(regime_wf_forward),
-                                    conviction=float(conviction),
-                                    min_hold=int(min_hold_period),
-                                    initial_capital=initial_cap,
-                                    trailing_stop_pct=trailing_stop,
-                                    stop_loss_pct=stop_loss,
-                                    confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
-                                    use_strong_runner_override=bool(use_regime_runner_override),
-                                    activity_mode=str(regime_activity_mode),
-                                    use_return_booster=bool(use_regime_return_booster),
-                                    return_booster_mode=str(regime_return_booster_mode)
-                                )
+                    # --- Walk-forward validation / primary signal ---
+                    if enable_regime_wfo:
+                        with st.spinner("Running Regime Walk-Forward Optimization..."):
+                            wf_regime = walk_forward_regime_selection(
+                                strat_prices,
+                                returns_bt_resampled,
+                                n_regimes="Auto" if bool(auto_wfo_regimes) else int(bt_n_regimes),
+                                switch_vol=bool(bt_switch_vol),
+                                switch_trend=bool(bt_switch_trend),
+                                train_window=int(regime_wf_train),
+                                forward_window=int(regime_wf_forward),
+                                conviction=float(conviction),
+                                min_hold=int(min_hold_period),
+                                initial_capital=initial_cap,
+                                trailing_stop_pct=trailing_stop,
+                                stop_loss_pct=stop_loss,
+                                confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
+                                use_strong_runner_override=bool(use_regime_runner_override),
+                                activity_mode=str(regime_activity_mode),
+                                use_return_booster=bool(use_regime_return_booster),
+                                return_booster_mode=str(regime_return_booster_mode)
+                            )
 
-                            st.write("#### 🧭 Regime Walk-Forward Result")
-                            if wf_regime is None or wf_regime.get("overall") is None:
-                                st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
-                                using_wfo_primary_for_metrics = False
+                        st.write("#### 🧭 Regime Walk-Forward Result")
+                        if wf_regime is None or wf_regime.get("overall") is None:
+                            st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
+                            using_wfo_primary_for_metrics = False
+                        else:
+                            wf_overall = wf_regime["overall"]
+                            eff_train = wf_regime.get("effective_train_window", regime_wf_train)
+                            eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
+                            if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
+                                st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
+                            full_bh = buy_hold_return_pct(strat_prices)
+                            wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
+                            wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
+                            wfc2.metric("WF Test Benchmark", f"{wf_overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample WFO test window.")
+                            wfc3.metric("Full Benchmark", f"{full_bh:.2f}%" if pd.notna(full_bh) else "N/A", help="Buy & hold over the full selected period. Reference only.")
+                            wfc4.metric("WF Difference", f"{wf_overall['Difference %']:+.2f}%")
+                            wfc5.metric("WF Stability", f"{wf_regime['stability_score']:.0f}/100")
+
+                            if wf_overall['Difference %'] > 0 and wf_regime['stability_score'] >= 60:
+                                st.success("Regime WFO is positive and reasonably stable.")
+                            elif wf_overall['Difference %'] > 0:
+                                st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
                             else:
-                                wf_overall = wf_regime["overall"]
-                                eff_train = wf_regime.get("effective_train_window", regime_wf_train)
-                                eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
-                                if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
-                                    st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
-                                full_bh = buy_hold_return_pct(strat_prices)
-                                wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
-                                wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
-                                wfc2.metric("WF Test Benchmark", f"{wf_overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample WFO test window.")
-                                wfc3.metric("Full Benchmark", f"{full_bh:.2f}%" if pd.notna(full_bh) else "N/A", help="Buy & hold over the full selected period. Reference only.")
-                                wfc4.metric("WF Difference", f"{wf_overall['Difference %']:+.2f}%")
-                                wfc5.metric("WF Stability", f"{wf_regime['stability_score']:.0f}/100")
+                                st.warning("Regime WFO did not beat buy & hold on unseen windows. If the benchmark is extremely high, the stock is a strong runner and defensive regime exits may still lag buy-and-hold.")
 
-                                if wf_overall['Difference %'] > 0 and wf_regime['stability_score'] >= 60:
-                                    st.success("Regime WFO is positive and reasonably stable.")
-                                elif wf_overall['Difference %'] > 0:
-                                    st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
+                            wf_rows = wf_regime["rows"].copy()
+                            if not wf_rows.empty:
+                                for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
+                                    wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
+                                st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
+
+                            if use_regime_wfo:
+                                first_forward_start = wf_regime["first_forward_start"]
+                                full_wfo_prices = strat_prices.copy()
+
+                                if bool(regime_full_benchmark_mode):
+                                    # Full-benchmark mode: compare the strategy against buy & hold from the
+                                    # selected start date, not only after the WFO training window.
+                                    # WFO cannot produce a model-selected signal before the first forward period,
+                                    # so the pre-WFO section uses a causal trend bridge. This is clearly labeled
+                                    # as a bridge, not as out-of-sample WFO validation.
+                                    wf_only_signal = wf_regime["signal"].reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                    bridge_signal = benchmark_aware_trend_participation_signal(
+                                        full_wfo_prices, mode=str(regime_return_booster_mode)
+                                    ).reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                    if bool(confirmed_regime_bar):
+                                        bridge_signal = bridge_signal.shift(1).ffill().fillna(0).clip(0, 1)
+
+                                    signals = wf_only_signal.copy()
+                                    pre_wfo_mask = signals.index < first_forward_start
+                                    signals.loc[pre_wfo_mask] = bridge_signal.loc[pre_wfo_mask]
+                                    strat_prices = full_wfo_prices
+                                    benchmark_label_for_metrics = "Full Benchmark"
+                                    full_period_benchmark_pct_for_metrics = full_bh
+                                    using_wfo_primary_for_metrics = True
+                                    try:
+                                        st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
+                                    except Exception:
+                                        pass
                                 else:
-                                    st.warning("Regime WFO did not beat buy & hold on unseen windows. If the benchmark is extremely high, the stock is a strong runner and defensive regime exits may still lag buy-and-hold.")
-
-                                wf_rows = wf_regime["rows"].copy()
-                                if not wf_rows.empty:
-                                    for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
-                                        wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
-                                    st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
-
-                                if use_regime_wfo:
-                                    first_forward_start = wf_regime["first_forward_start"]
-                                    full_wfo_prices = strat_prices.copy()
-
-                                    if bool(regime_full_benchmark_mode):
-                                        # Full-benchmark mode: compare the strategy against buy & hold from the
-                                        # selected start date, not only after the WFO training window.
-                                        # WFO cannot produce a model-selected signal before the first forward period,
-                                        # so the pre-WFO section uses a causal trend bridge. This is clearly labeled
-                                        # as a bridge, not as out-of-sample WFO validation.
-                                        wf_only_signal = wf_regime["signal"].reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
-                                        bridge_signal = benchmark_aware_trend_participation_signal(
-                                            full_wfo_prices, mode=str(regime_return_booster_mode)
-                                        ).reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
-                                        if bool(confirmed_regime_bar):
-                                            bridge_signal = bridge_signal.shift(1).ffill().fillna(0).clip(0, 1)
-
-                                        signals = wf_only_signal.copy()
-                                        pre_wfo_mask = signals.index < first_forward_start
-                                        signals.loc[pre_wfo_mask] = bridge_signal.loc[pre_wfo_mask]
-                                        strat_prices = full_wfo_prices
-                                        benchmark_label_for_metrics = "Full Benchmark"
-                                        full_period_benchmark_pct_for_metrics = full_bh
-                                        using_wfo_primary_for_metrics = True
-                                        try:
-                                            st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
-                                        except Exception:
-                                            pass
-                                    else:
-                                        # Pure WFO-test mode: compare only over the out-of-sample forward-test window.
-                                        strat_prices = strat_prices.loc[first_forward_start:]
-                                        signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                        benchmark_label_for_metrics = "WFO Test Benchmark"
-                                        full_period_benchmark_pct_for_metrics = full_bh
-                                        using_wfo_primary_for_metrics = True
-
-                                    # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
-                                    # Previous versions could show identical results because the booster was only
-                                    # a WFO candidate or overlay inside each block. If WFO selected the same
-                                    # base regime exposure, the final BacktestEngine.run_strategy() still received
-                                    # the old signal. This block applies the booster to the exact `signals` series
-                                    # used by the performance metrics and trade log below.
-                                    if bool(use_regime_return_booster):
-                                        try:
-                                            booster_full = benchmark_aware_trend_participation_signal(
-                                                strat_prices, mode=str(regime_return_booster_mode)
-                                            ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                            booster_full = apply_confirmed_bar_execution_policy(
-                                                booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
-                                                weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
-                                            )
-
-                                            mode_l = str(regime_return_booster_mode or "Balanced").lower()
-                                            original_signals = signals.copy()
-                                            if ("optimized" in mode_l) or ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
-                                                # Full Benchmark Capture / Maximum Capture must become the primary
-                                                # final signal, otherwise the WFO signal can still keep returns far
-                                                # below the full buy-and-hold benchmark.
-                                                signals = booster_full
-                                            elif mode_l == "conservative":
-                                                # Conservative only adds high-confidence exposure.
-                                                high_conf = booster_full.where(booster_full >= 0.75, 0.0)
-                                                signals = pd.concat([signals, high_conf], axis=1).max(axis=1).clip(0, 1)
-                                            else:
-                                                # Balanced: combine WFO regime signal with benchmark-aware trend hold.
-                                                signals = pd.concat([signals, booster_full], axis=1).max(axis=1).clip(0, 1)
-
-                                                # If the max overlay is still identical, force the booster as the
-                                                # final signal because the user explicitly enabled the return booster.
-                                                # This prevents the exact same metrics problem.
-                                                changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
-                                                if changed_bars == 0:
-                                                    signals = booster_full
-                                                    st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
-                                                else:
-                                                    st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
-
-                                            signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                            try:
-                                                st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
-                                            except Exception:
-                                                pass
-                                        except Exception as e:
-                                            st.warning(f"Return booster final overlay could not be applied: {e}")
-
-                                    # benchmark_label_for_metrics / full_period_benchmark_pct_for_metrics
-                                    # are set above depending on whether full-benchmark mode is ON.
+                                    # Pure WFO-test mode: compare only over the out-of-sample forward-test window.
+                                    strat_prices = strat_prices.loc[first_forward_start:]
+                                    signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                    benchmark_label_for_metrics = "WFO Test Benchmark"
+                                    full_period_benchmark_pct_for_metrics = full_bh
                                     using_wfo_primary_for_metrics = True
 
-                        # Live Regime Hybrid final mapping
-                        # Keeps the stable daily/weekly regime brain but lets live mode update on intraday candles.
-                        if bool(regime_live_hybrid_enabled):
-                            try:
-                                anchor_signal_for_live = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                live_px_for_regime = pd.Series(live_execution_prices_for_regime).replace([np.inf, -np.inf], np.nan).dropna()
-                                if not live_px_for_regime.empty:
-                                    signals = build_live_regime_hybrid_signal(
-                                        anchor_signal_for_live,
-                                        strat_prices,
-                                        live_px_for_regime,
-                                        enable_overlay=bool(live_regime_overlay),
-                                        mode=str(live_regime_sensitivity)
-                                    )
-                                    strat_prices = live_px_for_regime.reindex(signals.index).ffill().dropna()
-                                    signals = signals.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                    benchmark_label_for_metrics = f"Live {data_interval} Benchmark"
-                                    using_wfo_primary_for_metrics = False
-                                    st.caption(f"ℹ️ Live hybrid mapped stable regime signal to {len(signals)} live candles. Current live exposure: {signals.iloc[-1]*100:.0f}%")
-                            except Exception as e:
-                                st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
+                                # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
+                                # Previous versions could show identical results because the booster was only
+                                # a WFO candidate or overlay inside each block. If WFO selected the same
+                                # base regime exposure, the final BacktestEngine.run_strategy() still received
+                                # the old signal. This block applies the booster to the exact `signals` series
+                                # used by the performance metrics and trade log below.
+                                if bool(use_regime_return_booster):
+                                    try:
+                                        booster_full = benchmark_aware_trend_participation_signal(
+                                            strat_prices, mode=str(regime_return_booster_mode)
+                                        ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        booster_full = apply_confirmed_bar_execution_policy(
+                                            booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                                        )
 
-                        # TRUE NON-REPAINT LEDGER
-                        # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
-                        # cannot rewrite already recorded signals for this ticker/frequency/settings.
+                                        mode_l = str(regime_return_booster_mode or "Balanced").lower()
+                                        original_signals = signals.copy()
+                                        if ("optimized" in mode_l) or ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
+                                            # Full Benchmark Capture / Maximum Capture must become the primary
+                                            # final signal, otherwise the WFO signal can still keep returns far
+                                            # below the full buy-and-hold benchmark.
+                                            signals = booster_full
+                                        elif mode_l == "conservative":
+                                            # Conservative only adds high-confidence exposure.
+                                            high_conf = booster_full.where(booster_full >= 0.75, 0.0)
+                                            signals = pd.concat([signals, high_conf], axis=1).max(axis=1).clip(0, 1)
+                                        else:
+                                            # Balanced: combine WFO regime signal with benchmark-aware trend hold.
+                                            signals = pd.concat([signals, booster_full], axis=1).max(axis=1).clip(0, 1)
+
+                                            # If the max overlay is still identical, force the booster as the
+                                            # final signal because the user explicitly enabled the return booster.
+                                            # This prevents the exact same metrics problem.
+                                            changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
+                                            if changed_bars == 0:
+                                                signals = booster_full
+                                                st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
+                                            else:
+                                                st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
+
+                                        signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        try:
+                                            st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
+                                        except Exception:
+                                            pass
+                                    except Exception as e:
+                                        st.warning(f"Return booster final overlay could not be applied: {e}")
+
+                                # benchmark_label_for_metrics / full_period_benchmark_pct_for_metrics
+                                # are set above depending on whether full-benchmark mode is ON.
+                                using_wfo_primary_for_metrics = True
+
+                    # Live Regime Hybrid final mapping
+                    # Keeps the stable daily/weekly regime brain but lets live mode update on intraday candles.
+                    if bool(regime_live_hybrid_enabled):
                         try:
-                            if bool(lock_regime_ledger):
-                                signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
-                                    signals, regime_lock_key, enabled=True
+                            anchor_signal_for_live = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                            live_px_for_regime = pd.Series(live_execution_prices_for_regime).replace([np.inf, -np.inf], np.nan).dropna()
+                            if not live_px_for_regime.empty:
+                                signals = build_live_regime_hybrid_signal(
+                                    anchor_signal_for_live,
+                                    strat_prices,
+                                    live_px_for_regime,
+                                    enable_overlay=bool(live_regime_overlay),
+                                    mode=str(live_regime_sensitivity)
                                 )
-                                if _ledger_ok:
-                                    st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
-                                else:
-                                    st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
-                        except Exception as _lock_e:
-                            st.warning(f"Locked Regime Ledger failed: {_lock_e}")
+                                strat_prices = live_px_for_regime.reindex(signals.index).ffill().dropna()
+                                signals = signals.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                benchmark_label_for_metrics = f"Live {data_interval} Benchmark"
+                                using_wfo_primary_for_metrics = False
+                                st.caption(f"ℹ️ Live hybrid mapped stable regime signal to {len(signals)} live candles. Current live exposure: {signals.iloc[-1]*100:.0f}%")
+                        except Exception as e:
+                            st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
 
-                        # Plot Context
-                        with st.expander("See Strategy Context"):
-                            fig_ctx = go.Figure()
-                            if signal_method == "Regime Weighted Expected Return" and "expected_ret" in regime_context:
-                                expected_ret = regime_context["expected_ret"].reindex(strat_prices.index).ffill()
-                                fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
-                                fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
-                                highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.2)
-                                highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.2)
-                                fig_ctx.update_layout(title="Regime-Weighted Expected Return + Conviction Filter", hovermode="x unified", template="plotly_dark", height=400)
+                    # TRUE NON-REPAINT LEDGER
+                    # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
+                    # cannot rewrite already recorded signals for this ticker/frequency/settings.
+                    try:
+                        if bool(lock_regime_ledger):
+                            signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
+                                signals, regime_lock_key, enabled=True
+                            )
+                            if _ledger_ok:
+                                st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
                             else:
-                                bull_probs = regime_context.get("bull_probs", pd.Series(dtype=float)).reindex(strat_prices.index).ffill()
-                                fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=bull_probs, mode='lines', line=dict(color='green', width=1.5), name='Bull Probability'))
-                                fig_ctx.add_hline(y=float(conviction), line_dash="dash", line_color="white", annotation_text="Min Bull Probability")
-                                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.15)
-                                fig_ctx.update_layout(title=f"{signal_method} (Conviction={conviction:.0%}, Min Hold={int(min_hold_period)})", hovermode="x unified", template="plotly_dark", height=400)
-                            st.plotly_chart(fig_ctx, use_container_width=True)
+                                st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
+                    except Exception as _lock_e:
+                        st.warning(f"Locked Regime Ledger failed: {_lock_e}")
 
-                        # Debug Dataframe
-                        with st.expander("🔍 Debug: Signal Details"):
-                            debug_df = pd.DataFrame({
-                                "Price": strat_prices,
-                                "Alert Signal": signals
-                            }).dropna()
-                            st.dataframe(debug_df.style.format({
-                                "Price": "{:.2f}",
-                                "Signal": "{:.0f}"
-                            }), use_container_width=True)
+                    # Plot Context
+                    with st.expander("See Strategy Context"):
+                        fig_ctx = go.Figure()
+                        if signal_method == "Regime Weighted Expected Return" and "expected_ret" in regime_context:
+                            expected_ret = regime_context["expected_ret"].reindex(strat_prices.index).ffill()
+                            fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
+                            fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
+                            highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.2)
+                            highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.2)
+                            fig_ctx.update_layout(title="Regime-Weighted Expected Return + Conviction Filter", hovermode="x unified", template="plotly_dark", height=400)
+                        else:
+                            bull_probs = regime_context.get("bull_probs", pd.Series(dtype=float)).reindex(strat_prices.index).ffill()
+                            fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=bull_probs, mode='lines', line=dict(color='green', width=1.5), name='Bull Probability'))
+                            fig_ctx.add_hline(y=float(conviction), line_dash="dash", line_color="white", annotation_text="Min Bull Probability")
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.15)
+                            fig_ctx.update_layout(title=f"{signal_method} (Conviction={conviction:.0%}, Min Hold={int(min_hold_period)})", hovermode="x unified", template="plotly_dark", height=400)
+                        st.plotly_chart(fig_ctx, use_container_width=True)
+
+                    # Debug Dataframe
+                    with st.expander("🔍 Debug: Signal Details"):
+                        debug_df = pd.DataFrame({
+                            "Price": strat_prices,
+                            "Signal": signals
+                        }).dropna()
+                        st.dataframe(debug_df.style.format({
+                            "Price": "{:.2f}",
+                            "Signal": "{:.0f}"
+                        }), use_container_width=True)
                         
-                    else:
-                        st.error("Regime model fitting failed.")
-
+                else:
+                    st.error("Regime model fitting failed.")
 
     elif strategy_type == "Kalman Filter (Trend Crossover)":
         st.markdown("**Strategy:** Long when Price crosses **ABOVE** Kalman Trend. Sell when Price crosses **BELOW**.")
@@ -13709,7 +9559,7 @@ with tab7:
                     "Volume OK": volume_ok,
                     "Entry": entry_marks,
                     "Exit": exit_marks,
-                    "Alert Signal": signals
+                    "Signal": signals
                 })
                 st.dataframe(diag_scalp.tail(150), use_container_width=True)
 
@@ -14142,7 +9992,7 @@ with tab7:
                     "Flip Count": flip_count,
                     "Long Condition": long_cond,
                     "Exit/Avoid Condition": exit_cond,
-                    "Alert Signal": signals
+                    "Signal": signals
                 })
                 st.dataframe(diag.tail(120), use_container_width=True)
 
@@ -15325,7 +11175,7 @@ with tab7:
         if strategy_type == "Regime Switching (Trend Following)":
             st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
             st.write("#### 📈 Regime Switching Price Graph")
-            st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
+            st.caption("Default view is the asset price with small buy/sell markers. Markers are built from the SAME finalized trade log displayed below, so graph and table match.")
 
             pgc1, pgc2, pgc3 = st.columns(3)
             with pgc1:
@@ -15350,7 +11200,7 @@ with tab7:
                     "Precise intraday times for old trades",
                     value=True,
                     key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
-                    help="Keeps the option OFF by default. For speed, exact mapping only runs when you click the button below."
+                    help="Keeps the option ON by default. For speed, exact mapping only runs when you click the button below."
                 )
                 regime_precise_time_rows = st.number_input(
                     "Precise-time rows to process",
@@ -15387,8 +11237,64 @@ with tab7:
                         pass
                 try:
                     plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
-                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
-                    plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+                    # Match the exact table logic: do NOT overwrite natural intraday Daily rows
+                    # with latest/daily reconciliation when the precise intraday button was used.
+                    if not (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now)):
+                        plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
+                except Exception:
+                    pass
+
+                # FINAL DISPLAY NORMALIZATION FOR THE GRAPH:
+                # The chart markers must use the SAME finalized trade log as the table below.
+                # Previously, the graph used semi-processed plot_trades_df while the table
+                # later applied sorting, overlap cleanup, timestamp formatting, final regime
+                # display cleanup, and daily reconciliation. That caused marker/log mismatch.
+                try:
+                    if plot_trades_df is not None and not plot_trades_df.empty:
+                        if 'Entry Date' in plot_trades_df.columns:
+                            try:
+                                def _entry_sort_key_for_graph_display(v):
+                                    try:
+                                        if v is None:
+                                            return pd.NaT
+                                        s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                                        if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                                            return pd.NaT
+                                        ts = pd.Timestamp(s)
+                                        if pd.isna(ts):
+                                            return pd.NaT
+                                        if getattr(ts, 'tzinfo', None) is not None:
+                                            ts = ts.tz_convert(None)
+                                        return ts
+                                    except Exception:
+                                        return pd.NaT
+                                plot_trades_df['__entry_sort_key__'] = plot_trades_df['Entry Date'].apply(_entry_sort_key_for_graph_display)
+                                plot_trades_df = (
+                                    plot_trades_df.sort_values('__entry_sort_key__', ascending=False, na_position='last')
+                                                  .drop(columns=['__entry_sort_key__'], errors='ignore')
+                                                  .reset_index(drop=True)
+                                )
+                            except Exception:
+                                plot_trades_df = plot_trades_df.reset_index(drop=True)
+
+                        plot_trades_df = clean_overlapping_duplicate_trades(plot_trades_df)
+                        plot_trades_df = apply_trade_log_timestamp_display(plot_trades_df)
+
+                        if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
+                            plot_trades_df = finalize_regime_trade_time_display(plot_trades_df)
+                            try:
+                                if bt_freq == "Daily":
+                                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
+                            except Exception:
+                                pass
+
+                        plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+
+                        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now):
+                            for _col in ["Entry Date", "Exit Date"]:
+                                if _col in plot_trades_df.columns:
+                                    _mask_3pm = plot_trades_df[_col].astype(str).str.contains("15:00:00 CT", na=False)
+                                    plot_trades_df.loc[_mask_3pm, _col] = "Intraday unavailable"
                 except Exception:
                     pass
 
@@ -16135,43 +12041,6 @@ with tab7:
                 "PnL (%)": "{:.2f}%",
                 "Cumulative Return (%)": "{:.2f}"
             }), use_container_width=True)
-
-            # Downloadable trade log with verification info section.
-            try:
-                _trade_info = {
-                    "Ticker": TICKER,
-                    "Strategy": strategy_type,
-                    "Frequency": bt_freq if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Number of Regimes": bt_n_regimes if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Signal Stability / Smoothing": bt_stability if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Signal Method": signal_method if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Start Date": bt_start_date,
-                    "End Date": bt_end_date,
-                    "Confirmed-Bar Execution": confirmed_regime_bar if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Locked Non-Repaint Ledger": lock_regime_ledger if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Ledger Setup Key": regime_lock_key if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Exported At": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                _freq_part = _safe_filename_part(bt_freq if strategy_type == "Regime Switching (Trend Following)" else "NA")
-                _regime_part = _safe_filename_part(bt_n_regimes if strategy_type == "Regime Switching (Trend Following)" else "NA")
-                _smooth_part = _safe_filename_part(bt_stability if strategy_type == "Regime Switching (Trend Following)" else "NA")
-                _strategy_part = _safe_filename_part(strategy_type.replace("(Trend Following)", "").replace("/", "_"))
-                _ticker_part = _safe_filename_part(TICKER)
-                _csv_name = f"{_ticker_part}_{_strategy_part}_{_freq_part}_Regimes{_regime_part}_Smooth{_smooth_part}_TradeLog.csv"
-                st.download_button(
-                    "📥 Download trade log CSV with setup info",
-                    data=build_trade_log_csv_with_info(trades_df, _trade_info),
-                    file_name=_csv_name,
-                    mime="text/csv",
-                    key=f"download_trade_log_with_info_{_ticker_part}_{_strategy_part}_{_freq_part}_{_regime_part}_{_smooth_part}"
-                )
-            except Exception:
-                st.download_button(
-                    "📥 Download trade log CSV",
-                    data=trades_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{_safe_filename_part(TICKER)}_TradeLog.csv",
-                    mime="text/csv"
-                )
         else:
             st.info("No closed trades generated by the strategy.")
 
