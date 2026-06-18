@@ -1875,6 +1875,120 @@ def apply_confirmed_bar_execution_policy(signals, frequency="Daily", confirmed_b
     return s.shift(1).ffill().fillna(fill_value).clip(0, 1)
 
 
+
+def _regime_locked_ledger_path():
+    """Local persistent ledger file for non-repainting Regime signals."""
+    try:
+        base = Path(__file__).resolve().parent
+    except Exception:
+        base = Path(".")
+    return base / "regime_locked_signal_ledger.csv"
+
+
+def _load_regime_locked_ledger():
+    try:
+        p = _regime_locked_ledger_path()
+        if not p.exists():
+            return pd.DataFrame(columns=["key", "bar_time", "signal", "created_at"])
+        df = pd.read_csv(p)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["key", "bar_time", "signal", "created_at"])
+        for c in ["key", "bar_time", "signal", "created_at"]:
+            if c not in df.columns:
+                df[c] = np.nan
+        return df[["key", "bar_time", "signal", "created_at"]].copy()
+    except Exception:
+        return pd.DataFrame(columns=["key", "bar_time", "signal", "created_at"])
+
+
+def _save_regime_locked_ledger(df):
+    try:
+        p = _regime_locked_ledger_path()
+        df = df.copy()
+        df = df.drop_duplicates(subset=["key", "bar_time"], keep="last")
+        df.to_csv(p, index=False)
+        return True
+    except Exception:
+        return False
+
+
+def reset_regime_locked_ledger_for_key(lock_key: str):
+    """Delete locked records for one ticker/frequency/settings key."""
+    try:
+        df = _load_regime_locked_ledger()
+        if df.empty:
+            return 0
+        mask = df["key"].astype(str).eq(str(lock_key))
+        removed = int(mask.sum())
+        df = df.loc[~mask].copy()
+        _save_regime_locked_ledger(df)
+        return removed
+    except Exception:
+        return 0
+
+
+def apply_regime_locked_signal_ledger(signals, lock_key: str, enabled=True):
+    """
+    True non-repaint ledger for Regime Switching.
+
+    Once a signal for a daily/weekly closed bar is written, future model refits cannot
+    rewrite that bar. New bars are appended only when they appear.
+
+    This prevents model-refit repainting. It does not change how the model calculates
+    the new bar signal; it only freezes already recorded signals.
+    """
+    try:
+        s = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(0).clip(0, 1)
+        if not bool(enabled) or s.empty:
+            return s, 0, 0, False
+
+        # Normalize timestamps to stable strings so Streamlit/cloud reruns match.
+        idx = pd.to_datetime(s.index)
+        bar_keys = [pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S") for x in idx]
+
+        ledger = _load_regime_locked_ledger()
+        key = str(lock_key)
+
+        if ledger.empty:
+            locked_map = {}
+        else:
+            sub = ledger.loc[ledger["key"].astype(str).eq(key)].copy()
+            if sub.empty:
+                locked_map = {}
+            else:
+                sub["signal"] = pd.to_numeric(sub["signal"], errors="coerce")
+                locked_map = dict(zip(sub["bar_time"].astype(str), sub["signal"].astype(float)))
+
+        out_vals = []
+        new_rows = []
+        locked_count = 0
+        appended_count = 0
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for bar_key, val in zip(bar_keys, s.values):
+            if bar_key in locked_map and np.isfinite(locked_map[bar_key]):
+                out_vals.append(float(locked_map[bar_key]))
+                locked_count += 1
+            else:
+                v = float(val)
+                out_vals.append(v)
+                new_rows.append({"key": key, "bar_time": bar_key, "signal": v, "created_at": now_str})
+                appended_count += 1
+
+        if new_rows:
+            ledger = pd.concat([ledger, pd.DataFrame(new_rows)], ignore_index=True)
+            _save_regime_locked_ledger(ledger)
+
+        out = pd.Series(out_vals, index=s.index, dtype=float).ffill().fillna(0).clip(0, 1)
+        return out, locked_count, appended_count, True
+    except Exception:
+        try:
+            return pd.Series(signals), 0, 0, False
+        except Exception:
+            return signals, 0, 0, False
+
+
+
 def _nearest_price_at_or_before(price_series, target_date):
     """Return last available raw market close at or before target_date."""
     try:
@@ -2617,6 +2731,419 @@ def finalize_weekly_regime_trade_time_display(trades_df):
             return trades_df.drop(columns=['__Entry Time Source__', '__Exit Time Source__'], errors='ignore')
         except Exception:
             return trades_df
+
+
+def apply_regime_intraday_time_display(trades_df, ticker=""):
+    """
+    DISPLAY ONLY.
+    Same timestamp refinement as weekly, but usable for both Daily and Weekly Regime Switching.
+    It maps Entry/Exit Date + Buy/Sell Price to the first 5-minute CT candle where price was touched.
+    If historical intraday is unavailable, it keeps the date clean instead of falsely showing 15:00 CT.
+    """
+    return apply_weekly_regime_intraday_time_display(trades_df, ticker=ticker)
+
+
+def finalize_regime_trade_time_display(trades_df):
+    """
+    DISPLAY ONLY final formatter for Daily/Weekly Regime Switching trade logs.
+    Reuses the weekly formatter because the same source columns are produced.
+    """
+    return finalize_weekly_regime_trade_time_display(trades_df)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_regime_intraday_time_display_csv(trades_csv: str, ticker: str):
+    """
+    Performance-only cache for Daily/Weekly precise intraday display mapping.
+    Same logic/output as apply_regime_intraday_time_display(), but avoids redoing
+    every 5m intraday lookup on each Streamlit rerun.
+    """
+    try:
+        from io import StringIO
+        df = pd.read_csv(StringIO(trades_csv))
+        return apply_regime_intraday_time_display(df, ticker=ticker)
+    except Exception:
+        try:
+            from io import StringIO
+            return pd.read_csv(StringIO(trades_csv))
+        except Exception:
+            return pd.DataFrame()
+
+
+def apply_regime_intraday_time_display_fast(trades_df, ticker=""):
+    """
+    Performance-only wrapper. No strategy/model/metric logic change.
+    Uses Streamlit cache so Daily timeframe with smoothing=10 does not recompute
+    the same old-trade intraday timestamps on every app refresh.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        # CSV keeps this cache key stable across reruns and avoids hashing large object internals.
+        csv_payload = trades_df.to_csv(index=False)
+        cached = _cached_regime_intraday_time_display_csv(csv_payload, str(ticker).strip().upper())
+        if cached is None or cached.empty:
+            return trades_df
+        return cached
+    except Exception:
+        return apply_regime_intraday_time_display(trades_df, ticker=ticker)
+
+
+
+def _regime_sort_latest_first_for_mapping(df):
+    try:
+        if df is None or df.empty or "Entry Date" not in df.columns:
+            return df
+        out = df.copy()
+        def _k(v):
+            try:
+                s = str(v).replace(" CT", "").replace(" CST", "").replace("CDT", "").strip()
+                ts = pd.Timestamp(s)
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert(None)
+                return ts
+            except Exception:
+                return pd.NaT
+        out["__map_sort__"] = out["Entry Date"].apply(_k)
+        out = out.sort_values("__map_sort__", ascending=False, na_position="last").drop(columns=["__map_sort__"], errors="ignore")
+        return out
+    except Exception:
+        return df
+
+def apply_regime_intraday_time_display_limited(trades_df, ticker="", max_rows=60):
+    """
+    DISPLAY SPEED FIX ONLY.
+    Exact intraday mapping can require many 5m data fetches on long anchors.
+    This maps the latest max_rows shown trades and leaves older rows as date-only.
+    Strategy/model/metrics are unchanged.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        max_rows = int(max(1, max_rows))
+        ordered = _regime_sort_latest_first_for_mapping(trades_df)
+        recent = ordered.head(max_rows).copy()
+        older = ordered.iloc[max_rows:].copy()
+        recent_mapped = apply_regime_intraday_time_display_fast(recent, ticker=ticker)
+        if older is None or older.empty:
+            return recent_mapped
+        # Older rows keep date-only display and skip expensive intraday fetches.
+        return pd.concat([recent_mapped, older], axis=0)
+    except Exception:
+        return apply_regime_intraday_time_display_fast(trades_df, ticker=ticker)
+
+
+
+def _first_regular_session_5m_close_for_daily_signal(ticker: str, signal_date):
+    """
+    DISPLAY ONLY.
+    Robust Daily Regime natural intraday timestamp helper.
+
+    Uses real 5-minute regular-session candles.
+    It tries multiple fetch methods because Yahoo 5m start/end requests can fail even
+    when period-based 5m data exists.
+
+    Output rule:
+    - Real 5m timestamp + real 5m close price, OR
+    - Intraday unavailable. No fake daily 15:00 fallback.
+    """
+    try:
+        if signal_date is None or pd.isna(signal_date) or str(signal_date).strip().lower() == "open":
+            return "Open", np.nan, "open"
+
+        t = str(ticker).strip().upper().replace(".", "-")
+        day = pd.Timestamp(signal_date).date()
+        intraday = pd.DataFrame()
+
+        def _clean_5m(raw):
+            try:
+                if raw is None or raw.empty:
+                    return pd.DataFrame()
+                df = raw.copy()
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+                if "Close" not in df.columns:
+                    return pd.DataFrame()
+                try:
+                    idx = pd.DatetimeIndex(df.index)
+                    if getattr(idx, "tz", None) is None:
+                        df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago").tz_localize(None)
+                    else:
+                        df.index = idx.tz_convert("America/Chicago").tz_localize(None)
+                except Exception:
+                    pass
+                df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+                df = df.dropna(subset=["Close"])
+                if df.empty:
+                    return pd.DataFrame()
+                idx = pd.DatetimeIndex(df.index)
+                df = df[idx.date == day]
+                if df.empty:
+                    return pd.DataFrame()
+                idx = pd.DatetimeIndex(df.index)
+                try:
+                    df = df[(idx.time >= pd.Timestamp("08:35").time()) & (idx.time <= pd.Timestamp("15:00").time())]
+                except Exception:
+                    pass
+                return df.dropna(subset=["Close"])
+            except Exception:
+                return pd.DataFrame()
+
+        # 1) Best recent intraday fetch: period-based. This is usually more reliable for Yahoo 5m.
+        for _period in ["60d", "30d", "10d", "5d"]:
+            try:
+                raw = yf.download(
+                    t,
+                    period=_period,
+                    interval="5m",
+                    auto_adjust=True,
+                    progress=False,
+                    prepost=False,
+                    threads=False
+                )
+                intraday = _clean_5m(raw)
+                if intraday is not None and not intraday.empty:
+                    break
+            except Exception:
+                pass
+
+        # 2) Fallback to start/end fetch for that exact day.
+        if intraday is None or intraday.empty:
+            try:
+                start_dt = pd.Timestamp(day)
+                end_dt = start_dt + pd.Timedelta(days=1)
+                raw = yf.download(
+                    t,
+                    start=start_dt.strftime("%Y-%m-%d"),
+                    end=end_dt.strftime("%Y-%m-%d"),
+                    interval="5m",
+                    auto_adjust=True,
+                    progress=False,
+                    prepost=False,
+                    threads=False
+                )
+                intraday = _clean_5m(raw)
+            except Exception:
+                intraday = pd.DataFrame()
+
+        # 3) Existing helper fallback. Accept only real multiple intraday rows, not a single daily close-style row.
+        if intraday is None or intraday.empty:
+            try:
+                raw = _get_intraday_for_weekly_trade_time(t, str(day), interval="5m")
+                intraday = _clean_5m(raw)
+            except Exception:
+                intraday = pd.DataFrame()
+
+        if intraday is None or intraday.empty:
+            return "Intraday unavailable", np.nan, "no_real_5m_data"
+
+        # If only one row and it is 15:00, that is likely a daily-close fallback, not usable.
+        try:
+            if len(intraday) <= 1 and pd.Timestamp(intraday.index[0]).time() >= pd.Timestamp("15:00").time():
+                return "Intraday unavailable", np.nan, "only_close_bar_available"
+        except Exception:
+            pass
+
+        # Natural execution: first completed real 5m bar after session open.
+        ts = intraday.index[0]
+        px = float(intraday["Close"].iloc[0])
+        return ts, px, "real_5m_period_fetch"
+    except Exception:
+        return "Intraday unavailable", np.nan, "natural_daily_failed"
+
+
+def build_daily_regime_natural_intraday_trade_log(signals, ticker="", max_rows=10):
+    """
+    DISPLAY ONLY for Daily Regime.
+    Rebuilds latest N trade-log rows from Daily signal flips using real 5m candle closes.
+    This avoids fake touched prices and avoids daily open/close fill assumptions.
+    """
+    try:
+        sig = pd.Series(signals).replace([np.inf, -np.inf], np.nan).ffill().fillna(0).clip(0, 1)
+        if sig.empty:
+            return pd.DataFrame()
+        sig.index = pd.to_datetime(sig.index)
+
+        prev = sig.shift(1).fillna(0)
+        entry_dates = list(sig.index[(prev <= 0) & (sig > 0)])
+        exit_dates = list(sig.index[(prev > 0) & (sig <= 0)])
+
+        pairs = []
+        for ed in entry_dates:
+            xd = None
+            for cand in exit_dates:
+                if cand > ed:
+                    xd = cand
+                    break
+            pairs.append((ed, xd))
+
+        if not pairs:
+            return pd.DataFrame()
+
+        pairs = pairs[-int(max(1, max_rows)):]
+        rows = []
+        cum = 0.0
+
+        for ed, xd in pairs:
+            ets, ep, esrc = _first_regular_session_5m_close_for_daily_signal(ticker, ed)
+            if xd is None or pd.isna(xd):
+                xts, xp, xsrc = "Open", np.nan, "open"
+                status = "Open"
+            else:
+                xts, xp, xsrc = _first_regular_session_5m_close_for_daily_signal(ticker, xd)
+                status = "Closed"
+
+            pnl = np.nan
+            if np.isfinite(ep) and ep > 0 and np.isfinite(xp) and xp > 0:
+                pnl = (float(xp) / float(ep) - 1.0) * 100.0
+                cum += float(pnl)
+
+            rows.append({
+                "Side": "Long",
+                "Entry Date": (pd.Timestamp(ets).strftime("%Y-%m-%d %H:%M:%S CT") if hasattr(ets, "strftime") else str(ets)),
+                "Exit Date": "Open" if status == "Open" else (pd.Timestamp(xts).strftime("%Y-%m-%d %H:%M:%S CT") if hasattr(xts, "strftime") else str(xts)),
+                "Buy Price": float(ep) if np.isfinite(ep) else np.nan,
+                "Sell Price": float(xp) if np.isfinite(xp) else np.nan,
+                "PnL (%)": float(pnl) if np.isfinite(pnl) else np.nan,
+                "Cumulative Return (%)": round(float(cum), 2) if np.isfinite(cum) else np.nan,
+                "Status": status,
+                "Intraday Time Source": f"Entry {esrc}; Exit {xsrc}"
+            })
+
+        return pd.DataFrame(rows).sort_values("Entry Date", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+
+def _daily_exact_intraday_timestamp_and_price(ticker: str, dt, reference_price, side: str = "entry"):
+    """
+    DISPLAY ONLY for Daily Regime.
+    Find a real 5-minute candle on the signal date and return BOTH its timestamp and
+    real close price. This prevents fake rows like timestamp=12:35 but price was never
+    near that level in the market.
+    """
+    try:
+        if dt is None or pd.isna(dt) or str(dt).strip().lower() == "open":
+            return dt, np.nan, "open"
+        day = pd.Timestamp(dt).date()
+        intraday = _get_intraday_for_weekly_trade_time(str(ticker), str(day), interval="5m")
+        if intraday is None or intraday.empty:
+            return dt, np.nan, "needs_intraday_history"
+
+        intraday = intraday.copy()
+        for c in ["Open", "High", "Low", "Close"]:
+            if c in intraday.columns:
+                intraday[c] = pd.to_numeric(intraday[c], errors="coerce")
+        intraday = intraday.dropna(subset=["Close"])
+        if intraday.empty:
+            return dt, np.nan, "needs_intraday_history"
+
+        try:
+            px = float(reference_price)
+        except Exception:
+            px = np.nan
+
+        lows = intraday["Low"] if "Low" in intraday.columns else intraday["Close"]
+        highs = intraday["High"] if "High" in intraday.columns else intraday["Close"]
+        closes = intraday["Close"]
+
+        # If the displayed daily price was actually inside a real 5m candle range,
+        # use the first such candle timestamp, but display the real candle close price.
+        # This keeps timestamp and price honest.
+        if np.isfinite(px) and px > 0:
+            touched = intraday[(lows <= px) & (px <= highs)]
+            if touched is not None and not touched.empty:
+                ts = touched.index[0]
+                real_px = float(touched["Close"].iloc[0])
+                return ts, real_px, "real_5m_touch_close"
+
+            # If it was not touched, use the nearest real 5m close.
+            dist = (closes - px).abs()
+            if dist.notna().any():
+                ts = dist.idxmin()
+                real_px = float(closes.loc[ts])
+                return ts, real_px, "nearest_real_5m_close"
+
+        # If no usable reference price, use final available regular-session candle.
+        ts = intraday.index[-1]
+        real_px = float(closes.iloc[-1])
+        return ts, real_px, "latest_real_5m_close"
+    except Exception:
+        return dt, np.nan, "daily_exact_failed"
+
+
+def apply_daily_regime_exact_intraday_prices_limited(trades_df, ticker="", max_rows=10):
+    """
+    DISPLAY ONLY for Daily Regime.
+    Maps latest N trades to real 5m timestamps AND replaces Buy/Sell Price with
+    the real 5m close at those timestamps. No fake timestamp/price mismatch.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+
+        max_rows = int(max(1, max_rows))
+        ordered = _regime_sort_latest_first_for_mapping(trades_df)
+        recent_idx = list(ordered.head(max_rows).index)
+
+        out = ordered.copy()
+        source_notes = []
+
+        for idx in out.index:
+            source_notes.append("")
+        source_map = pd.Series(source_notes, index=out.index, dtype=object)
+
+        for idx in recent_idx:
+            try:
+                if "Entry Date" in out.columns and ("Buy Price" in out.columns or "Entry Price" in out.columns):
+                    buy_col = "Buy Price" if "Buy Price" in out.columns else "Entry Price"
+                    ts, real_px, src = _daily_exact_intraday_timestamp_and_price(
+                        ticker, out.loc[idx, "Entry Date"], out.loc[idx, buy_col], side="entry"
+                    )
+                    if pd.notna(ts):
+                        try:
+                            out.loc[idx, "Entry Date"] = pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+                        except Exception:
+                            out.loc[idx, "Entry Date"] = ts
+                    if np.isfinite(real_px) and real_px > 0:
+                        out.loc[idx, buy_col] = float(real_px)
+                    source_map.loc[idx] = (str(source_map.loc[idx]) + f"Entry {src}; ").strip()
+
+                if "Exit Date" in out.columns and ("Sell Price" in out.columns or "Exit Price" in out.columns):
+                    if str(out.loc[idx, "Exit Date"]).strip().lower() != "open":
+                        sell_col = "Sell Price" if "Sell Price" in out.columns else "Exit Price"
+                        ts, real_px, src = _daily_exact_intraday_timestamp_and_price(
+                            ticker, out.loc[idx, "Exit Date"], out.loc[idx, sell_col], side="exit"
+                        )
+                        if pd.notna(ts):
+                            try:
+                                out.loc[idx, "Exit Date"] = pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+                            except Exception:
+                                out.loc[idx, "Exit Date"] = ts
+                        if np.isfinite(real_px) and real_px > 0:
+                            out.loc[idx, sell_col] = float(real_px)
+                        source_map.loc[idx] = (str(source_map.loc[idx]) + f"Exit {src}; ").strip()
+
+                # Recalculate displayed PnL using the displayed real prices.
+                buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+                sell_col = "Sell Price" if "Sell Price" in out.columns else ("Exit Price" if "Exit Price" in out.columns else None)
+                if buy_col is not None and sell_col is not None and "PnL (%)" in out.columns:
+                    bp = pd.to_numeric(out.loc[idx, buy_col], errors="coerce")
+                    sp = pd.to_numeric(out.loc[idx, sell_col], errors="coerce")
+                    if pd.notna(bp) and pd.notna(sp) and float(bp) > 0 and str(out.get("Status", pd.Series(index=out.index)).get(idx, "")).lower() != "open":
+                        out.loc[idx, "PnL (%)"] = (float(sp) / float(bp) - 1.0) * 100.0
+            except Exception:
+                continue
+
+        out["Intraday Time Source"] = source_map.replace("", np.nan)
+        return out
+    except Exception:
+        return trades_df
+
+
+
+
 
 def apply_weekly_live_trigger_display_overrides(trades_df, raw_prices, signals, ticker="", strategy_name=""):
     """
@@ -5415,8 +5942,8 @@ with st.sidebar:
     st.header("🚀 Fast Startup")
     fast_intraday_mode = st.toggle(
         "Fast intraday-only startup",
-        value=True,
-        help="ON = skip heavy GARCH/Markov/full-dashboard calculations so the app opens fast. Use the final 0.5% Live Capture tab for today's intraday trades. Turn OFF when you want the full thesis dashboard."
+        value=False,
+        help="OFF by default. Turn ON only when you want to skip heavy GARCH/Markov/full-dashboard calculations and go straight to the final 0.5% Live Capture tab."
     )
     if fast_intraday_mode:
         st.success("Fast mode ON: heavy models skipped. Go straight to ⚡ 0.5% Live Capture.")
@@ -7142,7 +7669,7 @@ with tab1:
                 fig_v.add_trace(go.Scatter(x=returns_pct.index, y=res.conditional_volatility, mode='lines', line=dict(color='#00f2ff', width=1.5), name=f'{vol_model_type} Vol'))
                 fig_v.update_layout(title=f"{vol_model_type} ({dist_type}) Conditional Volatility", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_v, use_container_width=True)
-                st.session_state.report_gen.add_plot("GARCH Volatility", fig_v)
+                safe_report_add("GARCH Volatility", fig_v)
                 
             with col_res2:
                 params_df = pd.DataFrame({
@@ -7636,7 +8163,7 @@ with tab2:
     
     fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
     st.plotly_chart(fig_m, use_container_width=True)
-    st.session_state.report_gen.add_plot("Regime Switching Analysis", fig_m)
+    safe_report_add("Regime Switching Analysis", fig_m)
     
     # ===== PARAMETERS TABLE =====
     with st.expander("📋 Technical Parameters"):
@@ -7715,7 +8242,17 @@ with tab3:
         st.caption(f"Using Custom Drift: {custom_ret*100:.2f}%")
 
     # Helper to generate future dates
-    last_date = df_main.index[-1]
+    # SAFE FIX: df_main can be empty/unavailable after some tab/data reloads.
+    # Do not crash the full app at df_main.index[-1].
+    try:
+        if df_main is None or getattr(df_main, "empty", True) or len(df_main.index) == 0:
+            st.warning("Simulation skipped because no loaded price data is available. Load a ticker/date range first.")
+            st.stop()
+        last_date = pd.Timestamp(df_main.index[-1])
+    except Exception:
+        st.warning("Simulation skipped because latest data date could not be read. Reload the ticker and try again.")
+        st.stop()
+
     future_dates = [last_date + timedelta(days=i) for i in range(253)] # 0 to 252
     
     import plotly.graph_objects as go
@@ -7804,7 +8341,7 @@ with tab3:
                 hovermode="x unified"
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.session_state.report_gen.add_plot("Merton Jump Diffusion", fig)
+            safe_report_add("Merton Jump Diffusion", fig)
             safe_report_add("Merton Metrics", {"Mean": final_mean, "Median": final_median})
 
     elif sim_type == "Heston Stochastic Volatility":
@@ -7916,7 +8453,7 @@ with tab3:
                 hovermode="x unified"
             )
             st.plotly_chart(fig_h, use_container_width=True)
-            st.session_state.report_gen.add_plot("Heston Price Simulation", fig_h)
+            safe_report_add("Heston Price Simulation", fig_h)
             safe_report_add("Heston Metrics", {"Mean": final_mean, "Median": final_median})
             
             # Volatility Plot (Optional, keep simple or upgrade too)
@@ -7938,7 +8475,7 @@ with tab3:
                 height=300
             )
             st.plotly_chart(fig_v, use_container_width=True)
-            st.session_state.report_gen.add_plot("Heston Volatility Process", fig_v)
+            safe_report_add("Heston Volatility Process", fig_v)
 
 # ==========================================
 # TAB 4: KALMAN FILTER
@@ -7981,7 +8518,7 @@ with tab4:
                 fig_k.add_hline(y=-2.0, line_dash="dash", line_color="green", row=2, col=1)
                 fig_k.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_k, use_container_width=True)
-                st.session_state.report_gen.add_plot("Kalman Pairs Analysis", fig_k)
+                safe_report_add("Kalman Pairs Analysis", fig_k)
                 safe_report_add("Kalman Hedge Ratio", {"Beta": beta[-1]})
                 st.write(f"Current Hedge Ratio: **{beta[-1]:.4f}** (Long 1 {TICKER}, Short {beta[-1]:.4f} {PAIR_TICKER})")
             else:
@@ -8032,7 +8569,7 @@ with tab4:
             
         fig_kt.update_layout(title=f"Kalman Filter Trend: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
         st.plotly_chart(fig_kt, use_container_width=True)
-        st.session_state.report_gen.add_plot("Kalman Trend Analysis", fig_kt)
+        safe_report_add("Kalman Trend Analysis", fig_kt)
         
         # Signal & Metrics
         current_price = prices[-1]
@@ -8099,7 +8636,7 @@ with tab5:
                    hoverinfo="x+y+z"))
         fig_hm.update_layout(title="Asset Class Correlations", template="plotly_dark", width=600, height=600)
         st.plotly_chart(fig_hm, use_container_width=True)
-        st.session_state.report_gen.add_plot("Macro Correlations", fig_hm)
+        safe_report_add("Macro Correlations", fig_hm)
         safe_report_add("Correlation Matrix", corr_matrix)
         
         st.write(f"**Structural Thesis Check:**")
@@ -8139,7 +8676,7 @@ with tab6:
         fig_dec.add_trace(go.Scatter(x=decomp.resid.index, y=decomp.resid, mode='lines', name='Residuals'), row=3, col=1)
         fig_dec.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Structural Decomposition")
         st.plotly_chart(fig_dec, use_container_width=True)
-        st.session_state.report_gen.add_plot("Structural Decomposition", fig_dec)
+        safe_report_add("Structural Decomposition", fig_dec)
         safe_report_add("Decomposition Period", {"Period": period})
     else:
         st.warning("Insufficient data for decomposition with selected period.")
@@ -8154,7 +8691,7 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "1M 5m VWAP EMA Scalper", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
     
     # Date Selection
     col_b3 = st.container()
@@ -8238,6 +8775,24 @@ with tab7:
             min_hold_period = st.number_input("Minimum Hold Period", min_value=1, max_value=60, value=3, step=1, key="bt_regime_min_hold")
         with col_sig3:
             confirmed_regime_bar = st.checkbox("Confirmed-bar execution", value=True, key="bt_regime_confirmed_bar")
+
+        lock_regime_ledger = st.checkbox(
+            "Locked daily/weekly signal ledger (true non-repaint)",
+            value=True,
+            key=f"bt_regime_locked_ledger_{TICKER}_{bt_freq}",
+            help="ON = once a closed Daily/Weekly signal is recorded, future model refits cannot rewrite that bar."
+        )
+
+        regime_lock_key = (
+            f"{str(TICKER).upper()}|{str(bt_freq)}|start={pd.Timestamp(bt_start_date).date()}|"
+            f"n={int(bt_n_regimes)}|smooth={int(bt_stability)}|method={str(signal_method)}|"
+            f"conv={float(conviction):.2f}|minhold={int(min_hold_period)}|"
+            f"switchmean={bool(bt_switch_trend)}|switchvol={bool(bt_switch_vol)}|confirmed={bool(confirmed_regime_bar)}"
+        )
+
+        if st.button("Reset locked ledger for this Regime setup", key=f"reset_regime_locked_ledger_{TICKER}_{bt_freq}"):
+            _removed = reset_regime_locked_ledger_for_key(regime_lock_key)
+            st.warning(f"Reset locked ledger for this setup. Removed {_removed} saved signal rows. Run the backtest again to rebuild the ledger.")
 
         weekly_close_same_bar = True
         if str(bt_freq) == "Weekly":
@@ -8390,6 +8945,11 @@ with tab7:
                     if best_bic != best_pnl:
                         st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
 
+
+        try:
+            regime_run_precise_now
+        except NameError:
+            regime_run_precise_now = False
 
         # Resample if Weekly
         regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
@@ -8656,6 +9216,21 @@ with tab7:
                         except Exception as e:
                             st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
 
+                    # TRUE NON-REPAINT LEDGER
+                    # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
+                    # cannot rewrite already recorded signals for this ticker/frequency/settings.
+                    try:
+                        if bool(lock_regime_ledger):
+                            signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
+                                signals, regime_lock_key, enabled=True
+                            )
+                            if _ledger_ok:
+                                st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
+                            else:
+                                st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
+                    except Exception as _lock_e:
+                        st.warning(f"Locked Regime Ledger failed: {_lock_e}")
+
                     # Plot Context
                     with st.expander("See Strategy Context"):
                         fig_ctx = go.Figure()
@@ -8774,6 +9349,220 @@ with tab7:
                 
                 fig_ctx.update_layout(title="Momentum Hedge Signal (EMA/SMA Cross)", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
+
+    elif strategy_type == "1M 5m VWAP EMA Scalper":
+        st.markdown("### ⚡ 1-Month 5m VWAP EMA Scalper")
+        st.caption("Final settings: 1-month view, 5-minute candles, Session VWAP, EMA 9 / EMA 21, Volume MA 20, ATR 14, long only above VWAP.")
+
+        st.info("This strategy is fixed to your final settings. It is long-only and uses 5-minute candles over the most recent 1-month window.")
+
+        scalper_interval = "5m"
+        scalper_period = "1mo"
+        scalper_ema_fast_len = 9
+        scalper_ema_slow_len = 21
+        scalper_vol_len = 20
+        scalper_atr_len = 14
+
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            scalper_stop_atr = st.number_input("ATR stop multiplier", min_value=0.25, max_value=10.0, value=1.20, step=0.05, key="scalp_vwap_stop_atr")
+        with sc2:
+            scalper_target_atr = st.number_input("ATR target multiplier", min_value=0.25, max_value=20.0, value=2.00, step=0.05, key="scalp_vwap_target_atr")
+        with sc3:
+            scalper_require_volume = st.checkbox("Require volume above Volume MA20", value=True, key="scalp_vwap_require_vol")
+
+        sc4, sc5 = st.columns(2)
+        with sc4:
+            scalper_exit_mode = st.selectbox(
+                "Exit mode",
+                ["VWAP or EMA21 break", "EMA21 break only", "ATR stop/target only"],
+                index=0,
+                key="scalp_vwap_exit_mode"
+            )
+        with sc5:
+            scalper_cooldown = st.number_input("Cooldown bars after exit", min_value=0, max_value=100, value=3, step=1, key="scalp_vwap_cooldown")
+
+        def _fetch_1m_5m_scalper_data(ticker):
+            try:
+                df0 = yf.download(
+                    str(ticker).strip().upper(),
+                    period=scalper_period,
+                    interval=scalper_interval,
+                    auto_adjust=True,
+                    progress=False,
+                    prepost=False,
+                    threads=False
+                )
+                if df0 is None or df0.empty:
+                    return pd.DataFrame()
+                if isinstance(df0.columns, pd.MultiIndex):
+                    df0.columns = [c[0] if isinstance(c, tuple) else c for c in df0.columns]
+                df0 = df0.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+                try:
+                    idx = pd.DatetimeIndex(df0.index)
+                    if idx.tz is None:
+                        df0.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago")
+                    else:
+                        df0.index = idx.tz_convert("America/Chicago")
+                except Exception:
+                    pass
+                return df0
+            except Exception:
+                return pd.DataFrame()
+
+        scalp_df = _fetch_1m_5m_scalper_data(TICKER)
+
+        if scalp_df is None or scalp_df.empty or "Close" not in scalp_df.columns:
+            st.error("Could not load 1-month 5-minute data for this ticker. Yahoo may be rate-limited or the ticker may not support 5m data.")
+            signals = None
+        else:
+            scalp_df = scalp_df.copy()
+            for _c in ["Open", "High", "Low"]:
+                if _c not in scalp_df.columns:
+                    scalp_df[_c] = scalp_df["Close"]
+            if "Volume" not in scalp_df.columns:
+                scalp_df["Volume"] = 1.0
+
+            typical_price = (scalp_df["High"] + scalp_df["Low"] + scalp_df["Close"]) / 3.0
+            volume_series = scalp_df["Volume"].replace(0, np.nan).fillna(1.0)
+
+            # Session VWAP resets every trading day.
+            try:
+                session_key = pd.DatetimeIndex(scalp_df.index).date
+                session_vwap = ((typical_price * volume_series).groupby(session_key).cumsum()) / (volume_series.groupby(session_key).cumsum() + 1e-9)
+            except Exception:
+                session_vwap = (typical_price * volume_series).cumsum() / (volume_series.cumsum() + 1e-9)
+
+            ema9 = scalp_df["Close"].ewm(span=scalper_ema_fast_len, adjust=False).mean()
+            ema21 = scalp_df["Close"].ewm(span=scalper_ema_slow_len, adjust=False).mean()
+            volume_ma20 = scalp_df["Volume"].rolling(scalper_vol_len, min_periods=5).mean()
+
+            high_low = scalp_df["High"] - scalp_df["Low"]
+            high_close_prev = (scalp_df["High"] - scalp_df["Close"].shift(1)).abs()
+            low_close_prev = (scalp_df["Low"] - scalp_df["Close"].shift(1)).abs()
+            true_range = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+            atr14 = true_range.rolling(scalper_atr_len, min_periods=5).mean()
+
+            above_vwap = scalp_df["Close"] > session_vwap
+            ema_bull = ema9 > ema21
+            price_above_ema = scalp_df["Close"] > ema9
+            volume_ok = scalp_df["Volume"] > volume_ma20
+            volume_filter_ok = volume_ok if bool(scalper_require_volume) else pd.Series(True, index=scalp_df.index)
+
+            # Entry: long only above Session VWAP, EMA9 > EMA21, price above EMA9, optional volume confirmation.
+            raw_entry = above_vwap & ema_bull & price_above_ema & volume_filter_ok
+
+            if str(scalper_exit_mode) == "VWAP or EMA21 break":
+                raw_exit = (scalp_df["Close"] < session_vwap) | (scalp_df["Close"] < ema21) | (ema9 < ema21)
+            elif str(scalper_exit_mode) == "EMA21 break only":
+                raw_exit = (scalp_df["Close"] < ema21) | (ema9 < ema21)
+            else:
+                raw_exit = pd.Series(False, index=scalp_df.index)
+
+            # Stateful long-only signal with cooldown.
+            signals = pd.Series(0.0, index=scalp_df.index)
+            entry_marks = pd.Series(False, index=scalp_df.index)
+            exit_marks = pd.Series(False, index=scalp_df.index)
+
+            in_pos = False
+            cooldown_left = 0
+            entry_price = np.nan
+            stop_price = np.nan
+            target_price = np.nan
+
+            for _i, _dt in enumerate(scalp_df.index):
+                close_i = float(scalp_df["Close"].iloc[_i])
+                atr_i = float(atr14.iloc[_i]) if pd.notna(atr14.iloc[_i]) else np.nan
+
+                if cooldown_left > 0:
+                    cooldown_left -= 1
+
+                if in_pos:
+                    signals.iloc[_i] = 1.0
+                    atr_stop_hit = np.isfinite(stop_price) and close_i <= stop_price
+                    atr_target_hit = np.isfinite(target_price) and close_i >= target_price
+                    logic_exit = bool(raw_exit.loc[_dt])
+                    if atr_stop_hit or atr_target_hit or logic_exit:
+                        in_pos = False
+                        signals.iloc[_i] = 0.0
+                        exit_marks.loc[_dt] = True
+                        cooldown_left = int(scalper_cooldown)
+                        entry_price = np.nan
+                        stop_price = np.nan
+                        target_price = np.nan
+                else:
+                    if cooldown_left == 0 and bool(raw_entry.loc[_dt]):
+                        in_pos = True
+                        signals.iloc[_i] = 1.0
+                        entry_marks.loc[_dt] = True
+                        entry_price = close_i
+                        if np.isfinite(atr_i):
+                            stop_price = entry_price - atr_i * float(scalper_stop_atr)
+                            target_price = entry_price + atr_i * float(scalper_target_atr)
+                        else:
+                            stop_price = np.nan
+                            target_price = np.nan
+
+            strat_prices = scalp_df["Close"].dropna()
+            prices_bt = strat_prices
+            returns_bt = strat_prices.pct_change().fillna(0)
+            df_bt = scalp_df
+            benchmark_label_for_metrics = "Buy & Hold (1M 5m)"
+
+            with st.expander("See 1M 5m VWAP EMA Scalper Chart", expanded=True):
+                fig_scalp = go.Figure()
+                fig_scalp.add_trace(go.Candlestick(
+                    x=scalp_df.index,
+                    open=scalp_df["Open"],
+                    high=scalp_df["High"],
+                    low=scalp_df["Low"],
+                    close=scalp_df["Close"],
+                    name="Price"
+                ))
+                fig_scalp.add_trace(go.Scatter(x=scalp_df.index, y=session_vwap, mode="lines", name="Session VWAP"))
+                fig_scalp.add_trace(go.Scatter(x=scalp_df.index, y=ema9, mode="lines", name="EMA 9"))
+                fig_scalp.add_trace(go.Scatter(x=scalp_df.index, y=ema21, mode="lines", name="EMA 21"))
+
+                buys = scalp_df[entry_marks]
+                sells = scalp_df[exit_marks]
+                if not buys.empty:
+                    fig_scalp.add_trace(go.Scatter(
+                        x=buys.index, y=buys["Close"], mode="markers", name="Long Entry",
+                        marker=dict(size=10, symbol="triangle-up", color="lime")
+                    ))
+                if not sells.empty:
+                    fig_scalp.add_trace(go.Scatter(
+                        x=sells.index, y=sells["Close"], mode="markers", name="Exit",
+                        marker=dict(size=9, symbol="x", color="red")
+                    ))
+
+                highlight_plotly_zones(fig_scalp, signals == 1, "green", opacity=0.08)
+                fig_scalp.update_layout(
+                    title=f"{TICKER} 1M 5m VWAP EMA Scalper",
+                    template="plotly_dark",
+                    height=650,
+                    hovermode="x unified",
+                    xaxis_rangeslider_visible=False
+                )
+                st.plotly_chart(fig_scalp, use_container_width=True)
+
+                diag_scalp = pd.DataFrame({
+                    "Close": scalp_df["Close"],
+                    "Session VWAP": session_vwap,
+                    "EMA 9": ema9,
+                    "EMA 21": ema21,
+                    "Volume": scalp_df["Volume"],
+                    "Volume MA20": volume_ma20,
+                    "ATR 14": atr14,
+                    "Above VWAP": above_vwap,
+                    "EMA9 > EMA21": ema_bull,
+                    "Volume OK": volume_ok,
+                    "Entry": entry_marks,
+                    "Exit": exit_marks,
+                    "Signal": signals
+                })
+                st.dataframe(diag_scalp.tail(150), use_container_width=True)
+
 
     elif strategy_type == "VWAP/TWAP Swing Filter":
         st.markdown("### 🧭 VWAP/TWAP Benchmark-Aware Swing Filter")
@@ -10106,7 +10895,7 @@ with tab7:
         # strategy logic intact, but make the displayed performance metrics use that
         # same latest open-trade mark so Total Return matches the trade log.
         try:
-            if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+            if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
                 _metric_trades = bt_results['trades'].copy()
                 if not _metric_trades.empty:
                     _metric_trades = map_weekly_trade_log_dates_only(_metric_trades, df_bt)
@@ -10237,6 +11026,92 @@ with tab7:
             except Exception:
                 return pd.NaT, np.nan, "none"
 
+        def _reconcile_latest_daily_regime_exit_price(trades_in):
+            """
+            DISPLAY ONLY safety fix for Daily Regime Switching.
+
+            Problem fixed:
+            During the current trading day, a daily-bar exit can show a daily/backtest sell price
+            that was not actually tradable intraday yet. Example: trade log showed a sell around
+            18.55 while fresh AMPX intraday was around 16.6-16.7.
+
+            This does NOT change model fitting, signals, equity curve, or metrics.
+            It only makes the latest Daily trade-log row honest by replacing an impossible
+            current-day exit price with the freshest available live/intraday close.
+            """
+            try:
+                if trades_in is None or trades_in.empty:
+                    return trades_in
+                if strategy_type != "Regime Switching (Trend Following)" or str(bt_freq) != "Daily":
+                    return trades_in
+
+                latest_dt, latest_px, latest_src = _latest_display_price_and_time_for_regime()
+                if pd.isna(latest_dt) or not np.isfinite(latest_px) or latest_px <= 0:
+                    return trades_in
+
+                out = trades_in.copy()
+                if "Exit Date" not in out.columns or "Sell Price" not in out.columns:
+                    return out
+
+                def _parse_dt(v):
+                    try:
+                        s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                        if s.lower() in {"", "nan", "nat", "none", "open"}:
+                            return pd.NaT
+                        ts = pd.Timestamp(s)
+                        if getattr(ts, "tzinfo", None) is not None:
+                            ts = ts.tz_convert("America/Chicago").tz_localize(None)
+                        return ts
+                    except Exception:
+                        return pd.NaT
+
+                exit_dt = out["Exit Date"].apply(_parse_dt)
+                if exit_dt.dropna().empty:
+                    return out
+
+                idx_latest_exit = exit_dt.sort_values(ascending=False, na_position="last").index[0]
+                row_exit_dt = exit_dt.loc[idx_latest_exit]
+                if pd.isna(row_exit_dt):
+                    return out
+
+                # Only correct the current/latest displayed trading day, not old historical trades.
+                if pd.Timestamp(row_exit_dt).date() != pd.Timestamp(latest_dt).date():
+                    return out
+
+                old_sell = pd.to_numeric(out.loc[idx_latest_exit, "Sell Price"], errors="coerce")
+                if pd.isna(old_sell) or float(old_sell) <= 0:
+                    return out
+
+                # If the displayed sell differs materially from fresh current price, it is not an
+                # honest current-day executable sell. Replace display with latest actual price.
+                diff_pct = abs(float(old_sell) / float(latest_px) - 1.0) * 100.0
+                if diff_pct < 0.75:
+                    return out
+
+                out.loc[idx_latest_exit, "Sell Price"] = float(latest_px)
+                if "Exit Price" in out.columns:
+                    out.loc[idx_latest_exit, "Exit Price"] = float(latest_px)
+                if "Exit Date" in out.columns:
+                    try:
+                        out.loc[idx_latest_exit, "Exit Date"] = pd.Timestamp(latest_dt).strftime("%Y-%m-%d %H:%M:%S CT")
+                    except Exception:
+                        pass
+                if "PnL (%)" in out.columns:
+                    buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+                    if buy_col is not None:
+                        buy_px = pd.to_numeric(out.loc[idx_latest_exit, buy_col], errors="coerce")
+                        if pd.notna(buy_px) and float(buy_px) > 0:
+                            out.loc[idx_latest_exit, "PnL (%)"] = (float(latest_px) / float(buy_px) - 1.0) * 100.0
+
+                if "Latest Price Reconciliation" not in out.columns:
+                    out["Latest Price Reconciliation"] = ""
+                out["Latest Price Reconciliation"] = out["Latest Price Reconciliation"].fillna("").astype(str)
+                out.loc[idx_latest_exit, "Latest Price Reconciliation"] = f"Sell display corrected from {float(old_sell):.2f} to {float(latest_px):.2f} using {latest_src}"
+                return out
+            except Exception:
+                return trades_in
+
+
         def _mark_latest_regime_trade_open_if_signal_long(trades_in):
             """
             Display-only fix:
@@ -10298,6 +11173,7 @@ with tab7:
 
         # Price / Equity Graphs
         if strategy_type == "Regime Switching (Trend Following)":
+            st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
             st.write("#### 📈 Regime Switching Price Graph")
             st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
 
@@ -10322,25 +11198,47 @@ with tab7:
             with pgc3:
                 regime_precise_old_times = st.checkbox(
                     "Precise intraday times for old trades",
-                    value=False,
+                    value=True,
                     key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
-                    help="OFF is faster. ON can be slow for old anchors because it tries to map historical trade times."
+                    help="Keeps the option ON by default. For speed, exact mapping only runs when you click the button below."
                 )
+                regime_precise_time_rows = st.number_input(
+                    "Precise-time rows to process",
+                    min_value=1,
+                    max_value=100,
+                    value=10,
+                    step=1,
+                    key=f"regime_precise_time_rows_{TICKER}_{bt_freq}",
+                    help="Speed control only. Exact intraday mapping is expensive. Use 5-10 for fast loading."
+                )
+                regime_run_precise_now = st.button(
+                    "Run natural intraday trade log now",
+                    key=f"regime_run_precise_time_now_{TICKER}_{bt_freq}",
+                    help="For Daily: rebuilds latest trade-log rows using real first completed 5-minute candle closes. No daily open/close and no fake touched prices."
+                )
+                if bt_freq == "Daily":
+                    st.caption("Daily natural mode: latest selected rows use real 5-minute candle closes after signal day begins. If Yahoo/Databento cannot return 5m data for that date, it shows Intraday unavailable instead of faking 15:00 CT.")
 
             try:
                 plot_trades_df = bt_results['trades'].copy()
-                if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
+                if not plot_trades_df.empty and strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
                     try:
-                        plot_trades_df = map_weekly_trade_log_dates_only(plot_trades_df, df_bt)
+                        if bt_freq == "Weekly":
+                            plot_trades_df = map_weekly_trade_log_dates_only(plot_trades_df, df_bt)
                         plot_trades_df = apply_weekly_live_trigger_display_overrides(
                             plot_trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                         )
-                        if bool(regime_precise_old_times):
-                            plot_trades_df = apply_weekly_regime_intraday_time_display(plot_trades_df, ticker=TICKER)
+                        if bool(regime_precise_old_times) and bool(regime_run_precise_now):
+                            if bt_freq == "Weekly":
+                                plot_trades_df = apply_regime_intraday_time_display_limited(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                            elif bt_freq == "Daily":
+                                plot_trades_df = naturalize_existing_daily_regime_trade_log(plot_trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
                     except Exception:
                         pass
                 try:
                     plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
+                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
+                    plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
                 except Exception:
                     pass
 
@@ -10956,6 +11854,7 @@ with tab7:
             except Exception as plot_err:
                 st.warning(f"Could not render regime price entry/exit graph: {plot_err}")
 
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
             show_equity_curve_secondary = st.checkbox(
                 "Show strategy performance / equity curve",
                 value=False,
@@ -10974,7 +11873,7 @@ with tab7:
                     use_container_width=True,
                     config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"]}
                 )
-                st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+                safe_report_add("Backtest Performance", fig_bt)
         else:
             # Equity Curve Plot
             st.write("#### 📈 Equity Curve")
@@ -10983,35 +11882,46 @@ with tab7:
             fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label_for_metrics))
             fig_bt.update_layout(title=f"Strategy Performance: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
             st.plotly_chart(fig_bt, use_container_width=True)
-            st.session_state.report_gen.add_plot("Backtest Performance", fig_bt)
+            safe_report_add("Backtest Performance", fig_bt)
 
         safe_report_add("Backtest Metrics", strat_metrics)
 
         # Trade Log
+        st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
         st.write("#### 📝 Trade Log")
         if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
-            st.caption("Weekly trade times: exact intraday times are shown when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly/daily candles alone cannot produce precise intraday time.")
+            st.caption("Weekly trade times: exact intraday times are shown only when recent Yahoo intraday data or DATABENTO_API_KEY historical data is available. Weekly candles alone cannot produce precise intraday time.")
+        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily":
+            st.caption("Daily exact-time button is display-only. It maps selected rows to real 5-minute candles and uses the real 5-minute close price, so timestamp and price match.")
         trades_df = bt_results['trades'].copy()
         if not trades_df.empty:
             # DISPLAY ONLY: weekly Regime Switching dates are mapped to the
             # actual raw trading date in that week. Returns/metrics are unchanged.
             try:
-                if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
-                    trades_df = map_weekly_trade_log_dates_only(trades_df, df_bt)
+                if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
+                    if bt_freq == "Weekly":
+                        trades_df = map_weekly_trade_log_dates_only(trades_df, df_bt)
                     trades_df = apply_weekly_live_trigger_display_overrides(
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
                     try:
                         _precise_ok = bool(regime_precise_old_times)
                     except Exception:
-                        _precise_ok = False
-                    if _precise_ok:
-                        trades_df = apply_weekly_regime_intraday_time_display(trades_df, ticker=TICKER)
+                        _precise_ok = True
+                    if _precise_ok and bool(regime_run_precise_now):
+                        if bt_freq == "Weekly":
+                            trades_df = apply_regime_intraday_time_display_limited(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
+                        elif bt_freq == "Daily":
+                            trades_df = naturalize_existing_daily_regime_trade_log(trades_df, ticker=TICKER, max_rows=int(regime_precise_time_rows))
             except Exception:
                 pass
 
             try:
                 trades_df = _mark_latest_regime_trade_open_if_signal_long(trades_df)
+                # Do not run daily latest-price reconciliation after natural intraday mode,
+                # because it can overwrite real 5m display rows back toward daily/latest values.
+                if not (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now)):
+                    trades_df = _reconcile_latest_daily_regime_exit_price(trades_df)
             except Exception:
                 pass
 
@@ -11049,9 +11959,26 @@ with tab7:
             trades_df = clean_overlapping_duplicate_trades(trades_df)
             # Format dates
             trades_df = apply_trade_log_timestamp_display(trades_df)
-            if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Weekly":
-                trades_df = finalize_weekly_regime_trade_time_display(trades_df)
+            if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
+                trades_df = finalize_regime_trade_time_display(trades_df)
+                # Exact intraday mapping can restore the current-day Daily row's
+                # model/backtest Sell Price. Reconcile again as the final display step.
+                try:
+                    if bt_freq == "Daily":
+                        trades_df = _reconcile_latest_daily_regime_exit_price(trades_df)
+                except Exception:
+                    pass
             
+            trades_df = trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+            try:
+                if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now):
+                    for _col in ["Entry Date", "Exit Date"]:
+                        if _col in trades_df.columns:
+                            _mask_3pm = trades_df[_col].astype(str).str.contains("15:00:00 CT", na=False)
+                            trades_df.loc[_mask_3pm, _col] = "Intraday unavailable"
+            except Exception:
+                pass
+
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
@@ -11137,7 +12064,7 @@ with tab8:
     fig_vol.add_hline(y=threshold, line_dash="dash", line_color="red", row=2, col=1, annotation_text="2-Sigma Threshold")
     fig_vol.update_layout(height=600, hovermode="x unified", template="plotly_dark")
     st.plotly_chart(fig_vol, use_container_width=True)
-    st.session_state.report_gen.add_plot("Volatility Clustering Visuals", fig_vol)
+    safe_report_add("Volatility Clustering Visuals", fig_vol)
 
 # ==========================================
 # TAB 9: INSTITUTIONAL REGIME DETECTION
@@ -11173,7 +12100,7 @@ with tab9:
             fig_pro.add_trace(go.Scatter(x=df_main.index, y=probs[:, i], mode='lines', line=dict(width=0), fill='tonexty' if i > 0 else 'tozeroy', stackgroup='one', name=labels[i]))
         fig_pro.update_layout(title="Multi-Factor Regime Probabilities", hovermode="x unified", template="plotly_dark", height=400)
         st.plotly_chart(fig_pro, use_container_width=True)
-        st.session_state.report_gen.add_plot("Institutional Regime Probabilities", fig_pro)
+        safe_report_add("Institutional Regime Probabilities", fig_pro)
         
         # Feature breakdown
         st.write("#### 📊 Institutional Feature Space")
@@ -11187,7 +12114,7 @@ with tab9:
         fig_feat.add_hline(y=0, line_dash="solid", line_color="white", line_width=1, row=3, col=1)
         fig_feat.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Institutional Feature Space")
         st.plotly_chart(fig_feat, use_container_width=True)
-        st.session_state.report_gen.add_plot("Regime Feature Space", fig_feat)
+        safe_report_add("Regime Feature Space", fig_feat)
 
 
 # ==========================================
@@ -11281,7 +12208,7 @@ with tab10:
                 
                 fig_dyn.update_layout(height=600, hovermode="x unified", template="plotly_dark")
                 st.plotly_chart(fig_dyn, use_container_width=True)
-                st.session_state.report_gen.add_plot("SML Factor Dynamics", fig_dyn)
+                safe_report_add("SML Factor Dynamics", fig_dyn)
                 safe_report_add("SML Analysis Results", res_sml.tail(100))
                 safe_report_add("Current SML Metrics", last_row.to_dict())
 
@@ -13783,7 +14710,7 @@ with tab18:
                 display_adaptive_strategy_lab("VWAP", cl, vwap_candidates, file_prefix="VWAP_Adaptive_Strategy")
 
                 if st.session_state.report_gen:
-                    st.session_state.report_gen.add_plot("VWAP Suite", fig_vwap)
+                    safe_report_add("VWAP Suite", fig_vwap)
                     if vwap_log:
                         st.session_state.report_gen.add_data("VWAP Touch Log", vlog_df)
 
