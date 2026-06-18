@@ -8984,17 +8984,23 @@ with tab7:
         else:
             prices_bt_resampled = regime_source_prices.dropna()
 
-        # Apply smoothing consistently to prices first, then calculate returns from those same prices.
-        # This fixes the old mismatch where model data was smoothed but execution prices were raw.
-        if bt_stability > 0:
-            prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
-            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
-        else:
-            prices_bt_model = prices_bt_resampled.copy()
+        # IMPORTANT PRICE FIX:
+        # Smoothing is allowed ONLY for the regime MODEL input.
+        # Trade execution, graph price, Buy Price, Sell Price, PnL, and trade log
+        # must use REAL raw market closes from prices_bt_resampled.
+        # Previous code used smoothed prices as strat_prices, which made trade-log
+        # prices disagree with real CRWV/GLXY market prices.
+        strat_prices = prices_bt_resampled.dropna().copy()
 
-        strat_prices = prices_bt_model
-        returns_bt_resampled = prices_bt_model.pct_change().dropna()
-        model_data_bt = returns_bt_resampled.dropna() * 100
+        raw_returns_for_model = strat_prices.pct_change().dropna()
+        if bt_stability > 0:
+            model_returns_for_fit = raw_returns_for_model.ewm(span=bt_stability, adjust=False).mean().dropna()
+            st.caption(f"ℹ️ Regime smoothing applied to MODEL RETURNS only (span={bt_stability}). Trade log uses real market prices.")
+        else:
+            model_returns_for_fit = raw_returns_for_model.copy()
+
+        returns_bt_resampled = raw_returns_for_model
+        model_data_bt = model_returns_for_fit.dropna() * 100
 
         # FIX: Robust 1D Series reconstruction
         if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
@@ -11175,7 +11181,7 @@ with tab7:
         if strategy_type == "Regime Switching (Trend Following)":
             st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
             st.write("#### 📈 Regime Switching Price Graph")
-            st.caption("Default view is the asset price with small buy/sell markers. Markers are built from the SAME finalized trade log displayed below, so graph and table match.")
+            st.caption("Default view is the real asset price with markers from the finalized trade log. Trade-log prices use real market closes, not smoothed model prices.")
 
             pgc1, pgc2, pgc3 = st.columns(3)
             with pgc1:
@@ -11237,64 +11243,8 @@ with tab7:
                         pass
                 try:
                     plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
-                    # Match the exact table logic: do NOT overwrite natural intraday Daily rows
-                    # with latest/daily reconciliation when the precise intraday button was used.
-                    if not (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now)):
-                        plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
-                except Exception:
-                    pass
-
-                # FINAL DISPLAY NORMALIZATION FOR THE GRAPH:
-                # The chart markers must use the SAME finalized trade log as the table below.
-                # Previously, the graph used semi-processed plot_trades_df while the table
-                # later applied sorting, overlap cleanup, timestamp formatting, final regime
-                # display cleanup, and daily reconciliation. That caused marker/log mismatch.
-                try:
-                    if plot_trades_df is not None and not plot_trades_df.empty:
-                        if 'Entry Date' in plot_trades_df.columns:
-                            try:
-                                def _entry_sort_key_for_graph_display(v):
-                                    try:
-                                        if v is None:
-                                            return pd.NaT
-                                        s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
-                                        if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
-                                            return pd.NaT
-                                        ts = pd.Timestamp(s)
-                                        if pd.isna(ts):
-                                            return pd.NaT
-                                        if getattr(ts, 'tzinfo', None) is not None:
-                                            ts = ts.tz_convert(None)
-                                        return ts
-                                    except Exception:
-                                        return pd.NaT
-                                plot_trades_df['__entry_sort_key__'] = plot_trades_df['Entry Date'].apply(_entry_sort_key_for_graph_display)
-                                plot_trades_df = (
-                                    plot_trades_df.sort_values('__entry_sort_key__', ascending=False, na_position='last')
-                                                  .drop(columns=['__entry_sort_key__'], errors='ignore')
-                                                  .reset_index(drop=True)
-                                )
-                            except Exception:
-                                plot_trades_df = plot_trades_df.reset_index(drop=True)
-
-                        plot_trades_df = clean_overlapping_duplicate_trades(plot_trades_df)
-                        plot_trades_df = apply_trade_log_timestamp_display(plot_trades_df)
-
-                        if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
-                            plot_trades_df = finalize_regime_trade_time_display(plot_trades_df)
-                            try:
-                                if bt_freq == "Daily":
-                                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
-                            except Exception:
-                                pass
-
-                        plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
-
-                        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now):
-                            for _col in ["Entry Date", "Exit Date"]:
-                                if _col in plot_trades_df.columns:
-                                    _mask_3pm = plot_trades_df[_col].astype(str).str.contains("15:00:00 CT", na=False)
-                                    plot_trades_df.loc[_mask_3pm, _col] = "Intraday unavailable"
+                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
+                    plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
                 except Exception:
                     pass
 
