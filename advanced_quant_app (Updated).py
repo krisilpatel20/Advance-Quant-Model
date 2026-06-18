@@ -596,7 +596,7 @@ def _kalman_15m_signal_from_prices(px):
 
     # Main Kalman-style defaults; same family as the primary graph/trade-log logic.
     buffer_pct = 0.0125
-    confirm_bars = 3
+    confirm_bars = 1
     min_hold = 5
     cooldown_bars = 3
 
@@ -866,9 +866,9 @@ def _get_current_main_kalman_params():
     except Exception:
         buffer_pct = 0.0125
     try:
-        confirm_bars = int(st.session_state.get("kalman_strategy_confirm_bars", 3))
+        confirm_bars = int(st.session_state.get("kalman_strategy_confirm_bars", 1))
     except Exception:
-        confirm_bars = 3
+        confirm_bars = 1
     try:
         min_hold_bars = int(st.session_state.get("kalman_strategy_min_hold", 5))
     except Exception:
@@ -1131,7 +1131,109 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     }
     return trades_df, latest
 
-def _main_kalman_watchlist_ledger_path():
+
+def _main_kalman_signal_progress(ticker, px):
+    """
+    Live 'signal building' indicator. Computes how many consecutive recent bars
+    are stacking toward a BUY (entry) or SELL (exit), out of the confirm_bars
+    required to fire. This is DISPLAY ONLY — it never changes the actual signal,
+    so it cannot affect the zero-repaint guarantee.
+
+    Returns a dict: {position, building, need, have, direction, note} or None.
+    """
+    try:
+        ticker = str(ticker).upper()
+        px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(px) < 80:
+            return None
+
+        params = _get_current_main_kalman_params()
+        _opt = _get_main_kalman_opt_params_for_ticker(ticker)
+        if isinstance(_opt, dict):
+            buffer_pct = float(_opt.get("buffer_pct", params["buffer_pct"]))
+            confirm_bars = int(_opt.get("confirm_bars", params["confirm_bars"]))
+            slope_confirm = bool(_opt.get("slope_confirm", params["slope_confirm"]))
+            atr_safety = bool(_opt.get("atr_safety", params["atr_safety"]))
+        else:
+            buffer_pct = float(params["buffer_pct"])
+            confirm_bars = int(params["confirm_bars"])
+            slope_confirm = bool(params["slope_confirm"])
+            atr_safety = bool(params["atr_safety"])
+
+        rail, center, long_state = institutional_trend_rail(
+            px,
+            fast_gain=float(params["fast_gain"]),
+            slow_gain=float(params["slow_gain"]),
+            polish_span=int(params["polish_span"]),
+            atr_window=14,
+            atr_mult=float(params["rail_mult"]),
+        )
+        bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
+        trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
+
+        close_above = px > bt_trend * (1.0 + buffer_pct)
+        close_below = px < bt_trend * (1.0 - buffer_pct)
+        if slope_confirm:
+            entry_cond = close_above & (trend_slope >= 0)
+            exit_cond = close_below & (trend_slope <= 0)
+        else:
+            entry_cond = close_above
+            exit_cond = close_below
+        if atr_safety:
+            atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+            exit_cond = exit_cond | (px < (bt_trend - 1.25 * atr_proxy)).fillna(False)
+
+        # Count consecutive True at the most recent completed bar.
+        def _trailing_run(cond):
+            run = 0
+            for v in reversed(list(cond.values)):
+                if bool(v):
+                    run += 1
+                else:
+                    break
+            return run
+
+        entry_run = _trailing_run(entry_cond)
+        exit_run = _trailing_run(exit_cond)
+
+        # Current position from the frozen signal (source of truth).
+        pos_long = bool(long_state.iloc[-1]) if len(long_state) else False
+        # Determine which direction is currently building (the one relevant to a flip).
+        if entry_run > 0 and entry_run >= exit_run:
+            direction = "BUY"
+            have = min(entry_run, confirm_bars)
+        elif exit_run > 0:
+            direction = "SELL"
+            have = min(exit_run, confirm_bars)
+        else:
+            direction = None
+            have = 0
+
+        building = direction is not None and have < confirm_bars and have > 0
+        ready = have >= confirm_bars and direction is not None
+
+        if ready:
+            note = f"{direction} confirmed ({have}/{confirm_bars}) on the latest closed bar."
+        elif building:
+            bars_left = confirm_bars - have
+            note = (f"{direction} building: {have} of {confirm_bars} bars confirmed — "
+                    f"{bars_left} more closed bar(s) (~{bars_left*15} min) needed to fire.")
+        else:
+            note = "No setup forming on the latest closed bar."
+
+        return {
+            "direction": direction,
+            "have": int(have),
+            "need": int(confirm_bars),
+            "building": bool(building),
+            "ready": bool(ready),
+            "last_close_ct": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
+            "note": note,
+        }
+    except Exception:
+        return None
+
+
     try:
         return _Path.home() / ".pinehurst_main_kalman_watchlist_ledger.json"
     except Exception:
@@ -8462,7 +8564,7 @@ with st.sidebar:
             "initial_cap": float(st.session_state.get("initial_cap", 10000.0)),
             "kalman_trend_rail_distance": float(st.session_state.get("kalman_trend_rail_distance", 1.35)),
             "kalman_strategy_cross_buffer_pct": float(st.session_state.get("kalman_strategy_cross_buffer_pct", 1.25)),
-            "kalman_strategy_confirm_bars": int(st.session_state.get("kalman_strategy_confirm_bars", 3)),
+            "kalman_strategy_confirm_bars": int(st.session_state.get("kalman_strategy_confirm_bars", 1)),
             "kalman_strategy_min_hold": int(st.session_state.get("kalman_strategy_min_hold", 5)),
             "kalman_strategy_cooldown": int(st.session_state.get("kalman_strategy_cooldown", 3)),
             "kalman_strategy_slope_confirm": bool(st.session_state.get("kalman_strategy_slope_confirm", True)),
@@ -10404,7 +10506,7 @@ if bool(kalman_fast_live_mode):
                 with ks1:
                     kalman_buffer_pct = st.slider("Cross buffer (%)", 0.00, 8.00, 1.25, step=0.25, key="kalman_strategy_cross_buffer_pct") / 100.0
                 with ks2:
-                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 3, step=1, key="kalman_strategy_confirm_bars")
+                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 1, step=1, key="kalman_strategy_confirm_bars", help="Closed 15m bars that must agree before firing. 1 = fastest (~15 min), non-repainting at any value.")
                 with ks3:
                     kalman_min_hold = st.slider("Minimum hold bars", 1, 40, 5, step=1, key="kalman_strategy_min_hold")
                 with ks4:
@@ -11964,9 +12066,11 @@ with tab4:
             with ks2:
                 kalman_confirm_bars = st.slider(
                     "Confirm bars",
-                    1, 10, 3, step=1,
+                    1, 10, 1, step=1,
                     key="kalman_strategy_confirm_bars",
-                    help="Signal must persist for this many bars before acting."
+                    help="How many CLOSED 15m bars must agree before the signal fires. "
+                         "1 = fire on the first closed bar (~15 min, fastest). Higher = fewer "
+                         "false starts but slower. Non-repainting at any value."
                 )
             with ks3:
                 kalman_min_hold = st.slider(
@@ -11989,6 +12093,31 @@ with tab4:
                 key="kalman_strategy_slope_confirm",
                 help="Entry prefers rising trend; exit prefers falling trend. This reduces overtrading."
             )
+
+            # Tickers you've already run saved their own confirm-bars value to the
+            # per-ticker params file, so changing the slider above won't affect them
+            # until you re-apply. This button pushes the current Confirm bars value
+            # to every saved ticker so the watchlist/scanner use it immediately.
+            _cc1, _cc2 = st.columns([3, 1])
+            with _cc2:
+                if st.button("Apply confirm to all saved tickers", key="apply_confirm_all", use_container_width=True):
+                    try:
+                        _store = _load_main_kalman_opt_params()
+                        _n = 0
+                        for _tk, _p in list(_store.items()):
+                            if isinstance(_p, dict):
+                                _p["confirm_bars"] = int(kalman_confirm_bars)
+                                _store[_tk] = _p
+                                _n += 1
+                        _main_kalman_opt_params_path().write_text(json.dumps(_store, indent=2))
+                        # Clearing the signal lock lets the faster signal re-baseline cleanly.
+                        try:
+                            _save_main_kalman_signal_lock({})
+                        except Exception:
+                            pass
+                        st.success(f"Applied Confirm bars = {int(kalman_confirm_bars)} to {_n} saved ticker(s) and reset the signal lock.")
+                    except Exception as _e:
+                        st.error(f"Could not apply: {_e}")
             use_atr_safety = st.checkbox(
                 "Use ATR safety exit",
                 value=True,
@@ -12375,6 +12504,31 @@ with tab4:
                     if _main_status_row:
                         st.markdown("#### ✅ Main Kalman Current Status")
                         st.dataframe(pd.DataFrame([_main_status_row]), use_container_width=True, hide_index=True)
+
+                        # ---- Live "signal building" indicator (display only) ----
+                        try:
+                            _prog = _main_kalman_signal_progress(TICKER, bt_px)
+                            if _prog:
+                                _have, _need = _prog["have"], _prog["need"]
+                                _dir = _prog["direction"]
+                                if _prog["ready"] and _dir:
+                                    st.success(f"🟢 {_dir} confirmed on the last closed bar ({_have}/{_need}). "
+                                               f"Bar closed {_prog['last_close_ct']}.")
+                                elif _prog["building"] and _dir:
+                                    _emoji = "🟡" if _dir == "BUY" else "🟠"
+                                    st.warning(f"{_emoji} {_dir} signal building: **{_have} of {_need}** bars confirmed. "
+                                               f"{_need - _have} more closed 15m bar(s) (~{(_need-_have)*15} min) "
+                                               f"needed before it fires.")
+                                    try:
+                                        st.progress(min(1.0, _have / max(1, _need)))
+                                    except Exception:
+                                        pass
+                                else:
+                                    st.caption("⚪ No new BUY/SELL setup forming on the latest closed bar.")
+                                st.caption("This shows a signal forming in real time. The actual signal still only "
+                                           "fires on a fully closed bar after full confirmation — so it never repaints.")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
