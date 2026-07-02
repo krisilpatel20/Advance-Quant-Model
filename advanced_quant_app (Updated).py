@@ -22093,3 +22093,21 @@ except Exception as e:
 
 st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
+import streamlit as st
+import os
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 Bot Exporter")
+file_path = os.path.expanduser("~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json")
+
+if os.path.exists(file_path):
+    with open(file_path, "r") as f:
+        json_data = f.read()
+    st.sidebar.download_button(
+        label="⬇️ Download params.json for Render",
+        data=json_data,
+        file_name="params.json",
+        mime="application/json"
+    )
+else:
+    st.sidebar.warning("No optimized parameters found yet. Run the optimizer first!")
