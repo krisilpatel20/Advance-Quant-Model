@@ -29,7 +29,11 @@ import smtplib
 import os
 from email.message import EmailMessage
 import os
-
+import os, shutil
+try:
+    shutil.copy(os.path.expanduser("~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json"), "params.json")
+except Exception:
+    pass
 # Streamlit runs scripts in a ScriptRunner thread. ib_insync/eventkit expects
 # an asyncio event loop to exist in the current thread at import time.
 # Create one safely before importing ib_insync.
