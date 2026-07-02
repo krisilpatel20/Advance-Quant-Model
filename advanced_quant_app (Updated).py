@@ -22115,3 +22115,12 @@ if os.path.exists(file_path):
     )
 else:
     st.sidebar.warning("No optimized parameters found yet. Run the optimizer first!")
+    import streamlit as st
+import os
+
+st.error("🚨 YOUR RENDER PARAMS ARE BELOW 🚨")
+try:
+    with open(os.path.expanduser("~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json"), "r") as f:
+        st.code(f.read(), language="json")
+except Exception as e:
+    st.write("Could not find the file:", e)
