@@ -22124,3 +22124,7 @@ try:
         st.code(f.read(), language="json")
 except Exception as e:
     st.write("Could not find the file:", e)
+import streamlit as st
+import json
+# ... existing code ...
+st.write(f"DEBUG: Current tickers in JSON: {len(list(TICKER_PROFILES.keys()))}")
