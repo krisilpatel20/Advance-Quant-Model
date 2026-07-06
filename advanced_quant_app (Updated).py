@@ -12086,6 +12086,53 @@ with tab3:
 # TAB 4: KALMAN FILTER
 # ==========================================
 with tab4:
+    # ------------------------------------------------------------------
+    # ONE-CLICK EXPORT — ALL SAVED MAIN KALMAN TICKER PARAMS
+    # This reads the complete persistent per-ticker parameter store and
+    # downloads every saved ticker in one JSON file. No need to open or
+    # download tickers one by one.
+    # ------------------------------------------------------------------
+    try:
+        _all_kalman_saved_params_global = _load_main_kalman_opt_params()
+        if not isinstance(_all_kalman_saved_params_global, dict):
+            _all_kalman_saved_params_global = {}
+
+        with st.expander("📦 Export ALL saved Main Kalman ticker parameters — ONE JSON FILE", expanded=True):
+            st.markdown(
+                f"**Saved ticker-specific parameter sets: {len(_all_kalman_saved_params_global)}**  "
+                "\n\nThis button exports the entire saved store in one file. You do **not** need to open or download each ticker separately."
+            )
+
+            if _all_kalman_saved_params_global:
+                _all_kalman_export_json = json.dumps(
+                    dict(sorted(_all_kalman_saved_params_global.items())),
+                    indent=2,
+                )
+
+                _ex1, _ex2 = st.columns([2, 1])
+                with _ex1:
+                    st.download_button(
+                        "⬇️ DOWNLOAD ALL SAVED TICKER PARAMS — ONE JSON",
+                        data=_all_kalman_export_json,
+                        file_name="pinehurst_main_kalman_ALL_saved_ticker_params.json",
+                        mime="application/json",
+                        key="download_all_main_kalman_params_global_one_click",
+                        use_container_width=True,
+                    )
+                with _ex2:
+                    st.metric("Tickers in JSON", len(_all_kalman_saved_params_global))
+
+                with st.expander("Preview tickers included", expanded=False):
+                    _saved_ticker_names = sorted(str(_t).upper() for _t in _all_kalman_saved_params_global.keys())
+                    st.write(", ".join(_saved_ticker_names))
+            else:
+                st.warning(
+                    "No saved ticker-specific Kalman parameters were found yet. "
+                    "Once the optimizer saves ticker settings, this single button will export all of them together."
+                )
+    except Exception as _all_params_export_error:
+        st.warning(f"Could not load the all-ticker Kalman parameter store: {_all_params_export_error}")
+
     if df_main is None:
         st.warning("Please load a ticker to view Kalman Filter dynamics.")
     else:
