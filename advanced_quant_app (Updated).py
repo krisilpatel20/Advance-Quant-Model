@@ -29,11 +29,7 @@ import smtplib
 import os
 from email.message import EmailMessage
 import os
-import os, shutil
-try:
-    shutil.copy(os.path.expanduser("~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json"), "params.json")
-except Exception:
-    pass
+
 # Streamlit runs scripts in a ScriptRunner thread. ib_insync/eventkit expects
 # an asyncio event loop to exist in the current thread at import time.
 # Create one safely before importing ib_insync.
@@ -12657,6 +12653,67 @@ with tab4:
 
             try:
                 st.caption(f"Chosen Kalman settings: {chosen_kalman_settings}")
+
+                # -------------------------------------------------------------
+                # MAIN KALMAN — exact per-ticker settings viewer
+                # Makes hidden JSON parameters visible inside Streamlit.
+                # -------------------------------------------------------------
+                try:
+                    _exact_saved = _get_main_kalman_opt_params_for_ticker(TICKER) or {}
+                    _source_label = "Saved ticker-specific settings" if _exact_saved else "Current Main Kalman controls"
+
+                    _exact_settings_view = {
+                        "Ticker": str(TICKER).upper(),
+                        "Source": _source_label,
+                        "Buffer %": round(float(_exact_saved.get("buffer_pct", _eff_buf)) * 100.0, 4),
+                        "Confirm Bars": int(_exact_saved.get("confirm_bars", _eff_conf)),
+                        "Min Hold Bars": int(_exact_saved.get("min_hold_bars", _eff_hold)),
+                        "Cooldown Bars": int(_exact_saved.get("cooldown_bars", _eff_cool)),
+                        "Slope Confirm": bool(_exact_saved.get("slope_confirm", use_slope_confirm)),
+                        "ATR Safety": bool(_exact_saved.get("atr_safety", use_atr_safety)),
+                        "Saved CT": str(_exact_saved.get("saved_ct", "This run")),
+                    }
+
+                    with st.expander(f"⚙️ Exact Main Kalman settings used for {str(TICKER).upper()}", expanded=True):
+                        _sv1, _sv2, _sv3, _sv4 = st.columns(4)
+                        _sv1.metric("Buffer", f"{_exact_settings_view['Buffer %']:.4f}%")
+                        _sv2.metric("Confirm", str(_exact_settings_view["Confirm Bars"]))
+                        _sv3.metric("Min Hold", str(_exact_settings_view["Min Hold Bars"]))
+                        _sv4.metric("Cooldown", str(_exact_settings_view["Cooldown Bars"]))
+                        st.json(_exact_settings_view)
+
+                        _all_saved_params = _load_main_kalman_opt_params()
+                        if isinstance(_all_saved_params, dict) and _all_saved_params:
+                            _rows = []
+                            for _tk, _pp in sorted(_all_saved_params.items()):
+                                if not isinstance(_pp, dict):
+                                    continue
+                                _rows.append({
+                                    "Ticker": str(_tk).upper(),
+                                    "Buffer %": round(float(_pp.get("buffer_pct", 0.0)) * 100.0, 4),
+                                    "Confirm Bars": int(_pp.get("confirm_bars", 0)),
+                                    "Min Hold Bars": int(_pp.get("min_hold_bars", 0)),
+                                    "Cooldown Bars": int(_pp.get("cooldown_bars", 0)),
+                                    "Slope Confirm": bool(_pp.get("slope_confirm", True)),
+                                    "ATR Safety": bool(_pp.get("atr_safety", True)),
+                                    "Saved CT": str(_pp.get("saved_ct", "")),
+                                })
+
+                            _all_saved_df = pd.DataFrame(_rows)
+                            st.markdown(f"**All saved ticker-specific parameters: {len(_all_saved_df)} tickers**")
+                            st.dataframe(_all_saved_df, use_container_width=True, hide_index=True)
+
+                            st.download_button(
+                                "⬇️ Download all Main Kalman params as JSON",
+                                data=json.dumps(_all_saved_params, indent=2),
+                                file_name="pinehurst_main_kalman_params.json",
+                                mime="application/json",
+                                key=f"download_main_kalman_params_{str(TICKER).upper()}",
+                            )
+                        else:
+                            st.info("No saved ticker-specific Main Kalman parameters exist yet.")
+                except Exception as _settings_view_e:
+                    st.warning(f"Could not show exact Main Kalman settings: {_settings_view_e}")
                 if bool(use_kalman_risk_firewall):
                     st.caption(
                         f"Risk firewall ON: trade stop {kalman_trade_stop_pct:.0f}%, "
@@ -22097,34 +22154,3 @@ except Exception as e:
 
 st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
-import streamlit as st
-import os
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🤖 Bot Exporter")
-file_path = os.path.expanduser("~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json")
-
-if os.path.exists(file_path):
-    with open(file_path, "r") as f:
-        json_data = f.read()
-    st.sidebar.download_button(
-        label="⬇️ Download params.json for Render",
-        data=json_data,
-        file_name="params.json",
-        mime="application/json"
-    )
-else:
-    st.sidebar.warning("No optimized parameters found yet. Run the optimizer first!")
-    import streamlit as st
-import os
-
-st.error("🚨 YOUR RENDER PARAMS ARE BELOW 🚨")
-try:
-    with open(os.path.expanduser("~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json"), "r") as f:
-        st.code(f.read(), language="json")
-except Exception as e:
-    st.write("Could not find the file:", e)
-import streamlit as st
-import json
-# ... existing code ...
-st.write(f"DEBUG: Current tickers in JSON: {len(list(TICKER_PROFILES.keys()))}")
