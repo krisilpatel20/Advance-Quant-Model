@@ -1199,6 +1199,208 @@ def _get_main_kalman_opt_params_for_ticker(ticker):
         return None
 
 
+# ---- One-click batch parameter builder for the Render watchlist ------------
+# The normal Main Kalman tab only saves a ticker after that ticker is opened/run.
+# This utility runs the SAME optimizer grid across the whole Render watchlist so
+# one combined JSON can be created without opening 150 tickers manually.
+MAIN_KALMAN_RENDER_WATCHLIST = [
+    "AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR", "AMZN", "APEI", "APLD", "APP", "APPF", "APPS", "ARQQ", "ASTS", "AVGO", "AXON", "AXP", "AZZ", "BABA", "BBAI", "BE", "BR", "BROS", "BTBT", "BULL", "CCL", "CDE", "CEG", "CELC", "CGNX", "CIFR", "CLSK", "CMG", "COIN", "CORT", "CPB", "CRCL", "CRM", "CRML", "CRWD", "CRWV", "CSGP", "DAL", "DELL", "EFX", "ELF", "ETN", "EXK", "FSLR", "FVRR", "GLXY", "GOOGL", "GTES", "HCC", "HIMS", "HOOD", "HPE", "HTZ", "HUT", "IHS", "INGR", "INTC", "INTU", "IONQ", "IREN", "IRON", "JKHY", "KKR", "LULU", "LUNR", "MARA", "META", "MOS", "MRK", "MRVL", "MSFT", "MSTR", "MTZ", "MU", "NBIS", "NEE", "NEGG", "NFLX", "NIO", "NNE", "NVAX", "NVDA", "NVTS", "ONDS", "OPEN", "ORCL", "OUST", "PGY", "PINS", "PLTR", "PNRG", "PRCH", "QBTS", "QCOM", "QS", "QUBT", "RBLX", "RDDT", "RDW", "RELX", "RELY", "RGTI", "RIOT", "RIVN", "RKLB", "ROK", "S", "SAP", "SBUX", "SCHW", "SEDG", "SG", "SHAK", "SHOP", "SMR", "SNDK", "SNOW", "SOFI", "SOUN", "SPCX", "SYM", "T", "TOST", "TPR", "TRI", "TSLA", "UA", "UAL", "UBER", "UFPT", "ULTA", "UNH", "UPST", "V", "VST", "WING", "WMT", "WULF", "XYZ"
+]
+
+
+def _main_kalman_fast_signal_numpy(entry_ready, exit_ready, min_hold_bars, cooldown_bars):
+    """Exact long/cash state machine used by the Main Kalman tab, in a faster array loop."""
+    n = len(entry_ready)
+    sig = np.zeros(n, dtype=float)
+    in_pos = False
+    bars_held = 0
+    cooldown_left = 0
+    min_hold_bars = int(min_hold_bars)
+    cooldown_bars = int(cooldown_bars)
+
+    for i in range(n):
+        if cooldown_left > 0:
+            cooldown_left -= 1
+
+        if not in_pos:
+            if cooldown_left <= 0 and bool(entry_ready[i]):
+                in_pos = True
+                bars_held = 0
+                sig[i] = 1.0
+            else:
+                sig[i] = 0.0
+        else:
+            bars_held += 1
+            if bars_held >= min_hold_bars and bool(exit_ready[i]):
+                in_pos = False
+                cooldown_left = cooldown_bars
+                sig[i] = 0.0
+                bars_held = 0
+            else:
+                sig[i] = 1.0
+    return sig
+
+
+def _main_kalman_fast_score_numpy(px_values, sig_values, bh_reference, rf_rate, max_dd_allowed):
+    """Same benchmark-aware optimizer score as the Main Kalman tab, without building a full trade DataFrame."""
+    p = np.asarray(px_values, dtype=float)
+    s = np.asarray(sig_values, dtype=float)
+    if len(p) < 2 or len(s) != len(p):
+        return None
+
+    asset_ret = np.zeros(len(p), dtype=float)
+    asset_ret[1:] = p[1:] / p[:-1] - 1.0
+
+    strat_ret = np.zeros(len(p), dtype=float)
+    # BacktestEngine enters/exits at the current close, so the bar return belongs
+    # to the position that was held on the previous bar.
+    strat_ret[1:] = asset_ret[1:] * s[:-1]
+
+    equity = np.cumprod(1.0 + strat_ret)
+    if not np.isfinite(equity[-1]):
+        return None
+
+    strat_pct = (float(equity[-1]) - 1.0) * 100.0
+    peaks = np.maximum.accumulate(equity)
+    dd_series = equity / np.where(peaks == 0, 1.0, peaks) - 1.0
+    dd_pct = float(np.nanmin(dd_series) * 100.0) if len(dd_series) else -99.0
+
+    prev = np.r_[0.0, s[:-1]]
+    trade_n = int(np.sum((s > 0.5) & (prev <= 0.5)))
+
+    if len(strat_ret) > 2:
+        std = float(np.std(strat_ret, ddof=1))
+        excess_mean = float(np.mean(strat_ret - (float(rf_rate) / 252.0)))
+        sharpe = float(np.sqrt(252.0) * excess_mean / (std + 1e-9))
+    else:
+        sharpe = 0.0
+
+    dd_abs = abs(float(dd_pct))
+    score = (
+        (strat_pct - float(bh_reference))
+        + 0.08 * strat_pct
+        + 8.0 * sharpe
+        - 2.20 * dd_abs
+        - 0.45 * max(0, trade_n - 10)
+    )
+    if strat_pct < float(bh_reference):
+        score -= (float(bh_reference) - strat_pct) * 0.85
+    if dd_abs > float(max_dd_allowed):
+        score -= ((dd_abs - float(max_dd_allowed)) ** 2) * 2.0
+    if dd_abs > 60.0:
+        score -= 5000.0
+
+    return {
+        "score": float(score),
+        "strat": float(strat_pct),
+        "bh": float(bh_reference),
+        "dd": float(dd_pct),
+        "trades": int(trade_n),
+        "sharpe": float(sharpe),
+    }
+
+
+def _optimize_main_kalman_params_batch_one(ticker, engine_params, rf_rate=0.0, max_dd_allowed=35.0):
+    """
+    Run the SAME Main Kalman benchmark-aware grid for one ticker on the monitor's
+    exact 60d/15m completed-bar data. Returns one JSON-ready parameter record.
+    """
+    ticker = str(ticker).upper().strip()
+    px = _main_monitor_fetch_15m(ticker, period="60d")
+    if px is None or len(px) < 80:
+        return None, "No usable 60d/15m data"
+
+    px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(px) < 80:
+        return None, "Not enough clean bars"
+
+    rail, _center, _rail_state = institutional_trend_rail(
+        px,
+        fast_gain=float(engine_params.get("fast_gain", 0.34)),
+        slow_gain=float(engine_params.get("slow_gain", 0.055)),
+        polish_span=int(engine_params.get("polish_span", 3)),
+        atr_window=14,
+        atr_mult=float(engine_params.get("rail_mult", 1.35)),
+    )
+    bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
+    trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
+    atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+
+    p = px.to_numpy(dtype=float)
+    tr = bt_trend.to_numpy(dtype=float)
+    sl = trend_slope.to_numpy(dtype=float)
+    atr = atr_proxy.to_numpy(dtype=float)
+
+    bh_reference = (float(p[-1]) / float(p[0]) - 1.0) * 100.0
+    slope_confirm = bool(engine_params.get("slope_confirm", True))
+    atr_safety = bool(engine_params.get("atr_safety", True))
+
+    best = None
+    buffers = [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]
+    confirms = [3, 4, 5, 7, 10]
+    holds = [10, 15, 21, 34, 55]
+    cools = [5, 8, 13, 21]
+
+    for buf in buffers:
+        close_above = p > tr * (1.0 + float(buf))
+        close_below = p < tr * (1.0 - float(buf))
+
+        if slope_confirm:
+            entry_cond = close_above & (sl >= 0.0)
+            exit_cond = close_below & (sl <= 0.0)
+        else:
+            entry_cond = close_above
+            exit_cond = close_below
+
+        if atr_safety:
+            exit_cond = exit_cond | (p < (tr - 1.25 * atr))
+
+        entry_series = pd.Series(entry_cond, index=px.index)
+        exit_series = pd.Series(exit_cond, index=px.index)
+
+        for conf in confirms:
+            entry_ready = entry_series.rolling(conf, min_periods=conf).sum().eq(conf).fillna(False).to_numpy(dtype=bool)
+            exit_ready = exit_series.rolling(conf, min_periods=conf).sum().eq(conf).fillna(False).to_numpy(dtype=bool)
+
+            for hold in holds:
+                for cool in cools:
+                    sig = _main_kalman_fast_signal_numpy(entry_ready, exit_ready, hold, cool)
+                    scored = _main_kalman_fast_score_numpy(
+                        p, sig, bh_reference, float(rf_rate), float(max_dd_allowed)
+                    )
+                    if scored is None:
+                        continue
+                    if best is None or scored["score"] > best["score"]:
+                        best = dict(scored)
+                        best.update({
+                            "buffer_pct": float(buf),
+                            "confirm_bars": int(conf),
+                            "min_hold_bars": int(hold),
+                            "cooldown_bars": int(cool),
+                        })
+
+    if best is None:
+        return None, "Optimizer produced no valid result"
+
+    record = {
+        "buffer_pct": float(best["buffer_pct"]),
+        "confirm_bars": int(best["confirm_bars"]),
+        "min_hold_bars": int(best["min_hold_bars"]),
+        "cooldown_bars": int(best["cooldown_bars"]),
+        "slope_confirm": bool(slope_confirm),
+        "atr_safety": bool(atr_safety),
+        "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+        "source": "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M",
+        "optimizer_score": round(float(best["score"]), 6),
+        "strategy_return_pct": round(float(best["strat"]), 6),
+        "buy_hold_pct": round(float(best["bh"]), 6),
+        "max_drawdown_pct": round(float(best["dd"]), 6),
+        "trade_count": int(best["trades"]),
+        "sharpe": round(float(best["sharpe"]), 6),
+    }
+    return record, None
+
+
 # ---- Non-repaint signal lock --------------------------------------------
 # To guarantee the signal NEVER repaints, we freeze the per-bar signal value
 # once a completed bar has been seen. Each run may only APPEND signal values
@@ -12087,51 +12289,145 @@ with tab3:
 # ==========================================
 with tab4:
     # ------------------------------------------------------------------
-    # ONE-CLICK EXPORT — ALL SAVED MAIN KALMAN TICKER PARAMS
-    # This reads the complete persistent per-ticker parameter store and
-    # downloads every saved ticker in one JSON file. No need to open or
-    # download tickers one by one.
+    # ONE-CLICK BUILD + EXPORT — ALL 150 MAIN KALMAN TICKER PARAMS
+    # The old exporter only exported what had already been saved by manually
+    # opening tickers. This one can generate every missing ticker automatically.
     # ------------------------------------------------------------------
     try:
-        _all_kalman_saved_params_global = _load_main_kalman_opt_params()
-        if not isinstance(_all_kalman_saved_params_global, dict):
-            _all_kalman_saved_params_global = {}
-
-        with st.expander("📦 Export ALL saved Main Kalman ticker parameters — ONE JSON FILE", expanded=True):
+        with st.expander("📦 Build + Download ALL 150 Main Kalman ticker parameters", expanded=True):
             st.markdown(
-                f"**Saved ticker-specific parameter sets: {len(_all_kalman_saved_params_global)}**  "
-                "\n\nThis button exports the entire saved store in one file. You do **not** need to open or download each ticker separately."
+                "**No more opening tickers one by one.**  "
+                "Click the build button once. The app runs the same Main Kalman optimizer grid "
+                "for the full Render watchlist on 60d / 15m completed candles, saves each ticker "
+                "immediately, then gives you one combined JSON file."
             )
 
-            if _all_kalman_saved_params_global:
-                _all_kalman_export_json = json.dumps(
-                    dict(sorted(_all_kalman_saved_params_global.items())),
-                    indent=2,
-                )
+            _batch_store_before = _load_main_kalman_opt_params()
+            if not isinstance(_batch_store_before, dict):
+                _batch_store_before = {}
 
-                _ex1, _ex2 = st.columns([2, 1])
-                with _ex1:
+            _batch_existing = sorted(set(str(x).upper() for x in _batch_store_before.keys()) & set(MAIN_KALMAN_RENDER_WATCHLIST))
+            _batch_missing = [x for x in MAIN_KALMAN_RENDER_WATCHLIST if x not in _batch_store_before]
+
+            _bm1, _bm2, _bm3 = st.columns(3)
+            _bm1.metric("Render watchlist", len(MAIN_KALMAN_RENDER_WATCHLIST))
+            _bm2.metric("Already saved", len(_batch_existing))
+            _bm3.metric("Missing", len(_batch_missing))
+
+            _rebuild_all_params = st.checkbox(
+                "Rebuild existing tickers too",
+                value=False,
+                key="main_kalman_batch_rebuild_all_150",
+                help="OFF = only calculate missing tickers. ON = re-optimize all 150 from scratch."
+            )
+
+            _engine_for_batch = _get_current_main_kalman_params()
+            _batch_max_dd = float(st.session_state.get("kalman_max_dd_allowed", 35.0))
+            st.caption(
+                f"Batch engine: rail {_engine_for_batch['rail_mult']:.2f}, fast {_engine_for_batch['fast_gain']:.3f}, "
+                f"slow {_engine_for_batch['slow_gain']:.3f}, polish {_engine_for_batch['polish_span']}, "
+                f"slope {'ON' if _engine_for_batch['slope_confirm'] else 'OFF'}, "
+                f"ATR safety {'ON' if _engine_for_batch['atr_safety'] else 'OFF'}, max DD {_batch_max_dd:.0f}%."
+            )
+
+            if st.button(
+                "🚀 BUILD / UPDATE ALL 150 PARAMETER SETS",
+                key="build_all_150_main_kalman_params",
+                type="primary",
+                use_container_width=True,
+            ):
+                _targets = list(MAIN_KALMAN_RENDER_WATCHLIST) if _rebuild_all_params else list(_batch_missing)
+                if not _targets:
+                    st.success("All 150 ticker parameter sets are already saved. Use the download button below.")
+                else:
+                    _progress = st.progress(0.0)
+                    _status_box = st.empty()
+                    _success_n = 0
+                    _failed = {}
+
+                    # Load once and write after every ticker so a rerun/restart can resume.
+                    _batch_store = _load_main_kalman_opt_params()
+                    if not isinstance(_batch_store, dict):
+                        _batch_store = {}
+
+                    for _i, _sym in enumerate(_targets, start=1):
+                        _status_box.info(f"Optimizing {_sym} — {_i}/{len(_targets)}")
+                        try:
+                            _rec, _err = _optimize_main_kalman_params_batch_one(
+                                _sym,
+                                _engine_for_batch,
+                                rf_rate=float(rf_rate),
+                                max_dd_allowed=float(_batch_max_dd),
+                            )
+                            if isinstance(_rec, dict):
+                                _batch_store[str(_sym).upper()] = _rec
+                                _main_kalman_opt_params_path().write_text(json.dumps(_batch_store, indent=2))
+                                _success_n += 1
+                            else:
+                                _failed[_sym] = str(_err or "Unknown error")
+                        except Exception as _e:
+                            _failed[_sym] = str(_e)
+
+                        _progress.progress(float(_i) / float(max(1, len(_targets))))
+
+                    st.session_state["main_kalman_batch_last_result"] = {
+                        "success": int(_success_n),
+                        "failed": dict(_failed),
+                        "finished_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                    }
+                    _status_box.success(
+                        f"Finished. Saved/updated {_success_n} ticker parameter sets. Failed: {len(_failed)}."
+                    )
+
+            _last_batch = st.session_state.get("main_kalman_batch_last_result")
+            if isinstance(_last_batch, dict):
+                st.caption(
+                    f"Last batch: {_last_batch.get('success', 0)} saved, "
+                    f"{len(_last_batch.get('failed', {}) or {})} failed — {_last_batch.get('finished_ct', '')}"
+                )
+                if _last_batch.get("failed"):
+                    with st.expander("Show failed tickers", expanded=False):
+                        st.json(_last_batch.get("failed"))
+
+            # Reload AFTER any batch run so the download contains everything just built.
+            _all_kalman_saved_params_global = _load_main_kalman_opt_params()
+            if not isinstance(_all_kalman_saved_params_global, dict):
+                _all_kalman_saved_params_global = {}
+
+            _render_only_export = {
+                str(k).upper(): v
+                for k, v in _all_kalman_saved_params_global.items()
+                if str(k).upper() in set(MAIN_KALMAN_RENDER_WATCHLIST)
+            }
+            _missing_after = [x for x in MAIN_KALMAN_RENDER_WATCHLIST if x not in _render_only_export]
+
+            st.divider()
+            _de1, _de2, _de3 = st.columns([2, 1, 1])
+            with _de1:
+                if _render_only_export:
                     st.download_button(
-                        "⬇️ DOWNLOAD ALL SAVED TICKER PARAMS — ONE JSON",
-                        data=_all_kalman_export_json,
-                        file_name="pinehurst_main_kalman_ALL_saved_ticker_params.json",
+                        "⬇️ DOWNLOAD ONE JSON — ALL AVAILABLE RENDER TICKERS",
+                        data=json.dumps(dict(sorted(_render_only_export.items())), indent=2),
+                        file_name="pinehurst_main_kalman_ALL_150_render_ticker_params.json",
                         mime="application/json",
-                        key="download_all_main_kalman_params_global_one_click",
+                        key="download_all_150_main_kalman_params_one_json",
                         use_container_width=True,
                     )
-                with _ex2:
-                    st.metric("Tickers in JSON", len(_all_kalman_saved_params_global))
+                else:
+                    st.info("Build parameters first, then the one-file download appears here.")
+            with _de2:
+                st.metric("In JSON", len(_render_only_export))
+            with _de3:
+                st.metric("Still missing", len(_missing_after))
 
-                with st.expander("Preview tickers included", expanded=False):
-                    _saved_ticker_names = sorted(str(_t).upper() for _t in _all_kalman_saved_params_global.keys())
-                    st.write(", ".join(_saved_ticker_names))
+            if _missing_after:
+                with st.expander("Missing ticker names", expanded=False):
+                    st.write(", ".join(_missing_after))
             else:
-                st.warning(
-                    "No saved ticker-specific Kalman parameters were found yet. "
-                    "Once the optimizer saves ticker settings, this single button will export all of them together."
-                )
+                st.success("✅ All 150 Render tickers are in the combined JSON.")
+
     except Exception as _all_params_export_error:
-        st.warning(f"Could not load the all-ticker Kalman parameter store: {_all_params_export_error}")
+        st.warning(f"Could not build/export the all-ticker Kalman parameter store: {_all_params_export_error}")
 
     if df_main is None:
         st.warning("Please load a ticker to view Kalman Filter dynamics.")
