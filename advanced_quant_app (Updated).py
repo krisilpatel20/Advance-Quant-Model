@@ -1174,45 +1174,6 @@ def _load_main_kalman_opt_params():
         pass
     return {}
 
-# ---- Render mirror live-params capture ------------------------------------
-# This is a SEPARATE, additive store. It never changes optimizer logic,
-# signal math, locks, or trade ledgers. Every time the Main Kalman tab actually
-# uses a parameter set, the exact values are copied here for Render export.
-def _main_kalman_render_mirror_params_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_RENDER_MIRROR_PARAMS.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_RENDER_MIRROR_PARAMS.json")
-
-def _load_main_kalman_render_mirror_params():
-    try:
-        p = _main_kalman_render_mirror_params_path()
-        if p.exists():
-            data = json.loads(p.read_text())
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_render_mirror_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
-                                                       slope_confirm=True, atr_safety=True):
-    try:
-        store = _load_main_kalman_render_mirror_params()
-        sym = str(ticker).upper()
-        store[sym] = {
-            "buffer_pct": float(buffer_pct),
-            "confirm_bars": int(confirm_bars),
-            "min_hold_bars": int(min_hold_bars),
-            "cooldown_bars": int(cooldown_bars),
-            "slope_confirm": bool(slope_confirm),
-            "atr_safety": bool(atr_safety),
-            "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            "_sync_source": "LIVE_STREAMLIT_USED",
-        }
-        _main_kalman_render_mirror_params_path().write_text(json.dumps(store, indent=2))
-    except Exception:
-        pass
-
 def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
                                             slope_confirm=True, atr_safety=True):
     """Persist the exact params the main tab used for a ticker (optimizer or sliders)."""
@@ -1231,20 +1192,15 @@ def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, mi
     except Exception:
         pass
 
-    # Additive Render mirror capture only. This does not feed back into the
-    # strategy and cannot change the trade log. It simply records what the
-    # Main Kalman tab actually used on this run.
-    try:
-        _save_main_kalman_render_mirror_params_for_ticker(
-            ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
-            slope_confirm=slope_confirm, atr_safety=atr_safety,
-        )
-    except Exception:
-        pass
-
 def _get_main_kalman_opt_params_for_ticker(ticker):
+    """Return only trusted live/interactive params; ignore the old 150-ticker batch seed."""
     try:
-        return _load_main_kalman_opt_params().get(str(ticker).upper())
+        rec = _load_main_kalman_opt_params().get(str(ticker).upper())
+        if not isinstance(rec, dict):
+            return None
+        if str(rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M":
+            return None
+        return rec
     except Exception:
         return None
 
@@ -1336,9 +1292,9 @@ def _apply_signal_lock(ticker, sig, freeze_enabled=True, interval="15m"):
 # ============================================================================
 def _main_kalman_institutional_ledger_path():
     try:
-        return _Path.home() / ".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER.json"
+        return _Path.home() / ".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER_V3_BY_INTERVAL.json"
     except Exception:
-        return _Path(".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER.json")
+        return _Path(".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER_V3_BY_INTERVAL.json")
 
 def _load_main_kalman_institutional_ledger():
     try:
@@ -1422,6 +1378,7 @@ def _institutional_settings_from_locals(ticker, locs):
         "polish_span": _get_int("polish_span", 3),
         "rail_mult": _get_num("rail_mult", 1.35),
         "trend_name": str(locs.get("active_trend_name", "Institutional Trend Rail")),
+        "interval": str(locs.get("data_interval", locs.get("interval", "15m"))),
         "source": "Visible sliders",
     }
 
@@ -1470,7 +1427,7 @@ def _institutional_settings_from_locals(ticker, locs):
         pass
 
     settings["model_version"] = (
-        f"{ticker}|{settings['trend_name']}|"
+        f"{ticker}|{settings.get('interval', '15m')}|{settings['trend_name']}|"
         f"buf{settings['buffer_pct']*100:.2f}|conf{int(settings['confirm_bars'])}|"
         f"hold{int(settings['min_hold_bars'])}|cool{int(settings['cooldown_bars'])}|"
         f"fg{settings['fast_gain']:.3f}|sg{settings['slow_gain']:.3f}|rail{settings['rail_mult']:.2f}|"
@@ -1546,7 +1503,9 @@ def _main_kalman_apply_institutional_trade_ledger(ticker, candidate_trades, px, 
             pass
 
         ledger = _load_main_kalman_institutional_ledger()
-        book = ledger.get(ticker, {"trades": [], "last_update_ct": ""})
+        interval = str(settings.get("interval", "15m"))
+        ledger_key = f"{ticker}|{interval}"
+        book = ledger.get(ledger_key, {"trades": [], "last_update_ct": "", "interval": interval})
         rows = book.get("trades", []) if isinstance(book, dict) else []
         if not isinstance(rows, list):
             rows = []
@@ -1611,13 +1570,14 @@ def _main_kalman_apply_institutional_trade_ledger(ticker, candidate_trades, px, 
 
         book = {
             "ticker": ticker,
+            "interval": interval,
             "trades": rows,
             "last_update_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
             "latest_price": latest_price,
             "latest_time": latest_time,
             "current_settings_seen": settings,
         }
-        ledger[ticker] = book
+        ledger[ledger_key] = book
         _save_main_kalman_institutional_ledger(ledger)
         out = pd.DataFrame(rows)
         return out
@@ -12420,7 +12380,7 @@ with tab4:
             if st.button("Reset institutional ledger for this ticker", key=f"reset_inst_ledger_{TICKER}"):
                 try:
                     _lg = _load_main_kalman_institutional_ledger()
-                    _lg.pop(str(TICKER).upper(), None)
+                    _lg.pop(f"{str(TICKER).upper()}|{str(locals().get('data_interval', locals().get('interval', '15m')))}", None)
                     _save_main_kalman_institutional_ledger(_lg)
                     st.success(f"Institutional ledger reset for {str(TICKER).upper()}.")
                 except Exception as _e:
@@ -22143,263 +22103,3 @@ except Exception as e:
 
 st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
-
-# ============================================================================
-# RENDER MIRROR SYNC EXPORT — ADDITIVE ONLY
-# ----------------------------------------------------------------------------
-# Purpose:
-#   Export the exact Main Kalman state that THIS running Streamlit session uses.
-#   Strategy math is untouched. Nothing is optimized, reset, deleted, or changed.
-# Priority for each ticker:
-#   1) active Streamlit Fast-mode session cache
-#   2) live Render-mirror capture written when the Main tab actually used params
-#   3) trusted persistent Main Kalman params (batch-tagged records excluded)
-#   4) optional uploaded 150-ticker JSON as fallback only
-# ============================================================================
-try:
-    import re as _render_sync_re
-
-    def _render_sync_normalize_param_store(_data):
-        if not isinstance(_data, dict):
-            return {}
-        _nested = _data.get("per_ticker_params")
-        if isinstance(_nested, dict):
-            _data = _nested
-        return {
-            str(_k).upper(): dict(_v)
-            for _k, _v in _data.items()
-            if isinstance(_v, dict)
-        }
-
-    def _render_sync_active_session_params():
-        _best = {}
-        _best_day = {}
-        try:
-            for _key, _val in list(st.session_state.items()):
-                _ks = str(_key)
-                if not _ks.startswith("kalman_opt::") or not isinstance(_val, dict):
-                    continue
-                if not all(_x in _val for _x in ("buffer", "confirm", "hold", "cool")):
-                    continue
-                _parts = _ks.split("::")
-                if len(_parts) < 4:
-                    continue
-                _sym = str(_parts[1]).upper().strip()
-                _day = str(_parts[3])
-                if not _sym:
-                    continue
-                _m_slope = _render_sync_re.search(r"::slope(True|False)::", _ks)
-                _m_atr = _render_sync_re.search(r"::atr(True|False)::", _ks)
-                _rec = {
-                    "buffer_pct": float(_val["buffer"]),
-                    "confirm_bars": int(_val["confirm"]),
-                    "min_hold_bars": int(_val["hold"]),
-                    "cooldown_bars": int(_val["cool"]),
-                    "slope_confirm": True if _m_slope is None else (_m_slope.group(1) == "True"),
-                    "atr_safety": True if _m_atr is None else (_m_atr.group(1) == "True"),
-                    "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-                    "_sync_source": "ACTIVE_STREAMLIT_FAST_CACHE",
-                    "_cache_day": _day,
-                    "_cache_key": _ks,
-                }
-                if _sym not in _best or _day >= _best_day.get(_sym, ""):
-                    _best[_sym] = _rec
-                    _best_day[_sym] = _day
-        except Exception:
-            pass
-        return _best
-
-    def _render_sync_open_tickers(_institutional_ledger):
-        _opens = set()
-        try:
-            for _key, _val in list(st.session_state.items()):
-                _ks = str(_key)
-                if _ks.startswith("main_kalman_status_") and isinstance(_val, dict):
-                    if str(_val.get("Trade Position", "")).upper() == "LONG":
-                        _opens.add(_ks.replace("main_kalman_status_", "", 1).upper())
-        except Exception:
-            pass
-        try:
-            if isinstance(_institutional_ledger, dict):
-                for _sym, _book in _institutional_ledger.items():
-                    _rows = _book.get("trades", []) if isinstance(_book, dict) else []
-                    if isinstance(_rows, list) and any(str(_r.get("Status", "")).lower() == "open" for _r in _rows if isinstance(_r, dict)):
-                        _opens.add(str(_sym).upper())
-        except Exception:
-            pass
-        try:
-            _wl = _load_main_kalman_watchlist_ledger()
-            if isinstance(_wl, dict):
-                for _sym, _row in _wl.items():
-                    if isinstance(_row, dict) and str(_row.get("position", "")).upper() == "LONG":
-                        _opens.add(str(_sym).upper())
-        except Exception:
-            pass
-        return sorted(_opens)
-
-    with st.sidebar.expander("🔗 Render Mirror Sync", expanded=False):
-        st.caption("Read/export only. It does not optimize, reset, delete, or change Kalman strategy logic.")
-        _render_seed_upload = st.file_uploader(
-            "Optional 150-ticker fallback JSON",
-            type=["json"],
-            key="render_mirror_seed_json_upload",
-            help="Use your 150-ticker JSON only as fallback. Active Streamlit values override it.",
-        )
-
-        _seed_params = {}
-        if _render_seed_upload is not None:
-            try:
-                _seed_raw = json.loads(_render_seed_upload.getvalue().decode("utf-8"))
-                _seed_params = _render_sync_normalize_param_store(_seed_raw)
-            except Exception as _e:
-                st.error(f"Could not read fallback JSON: {_e}")
-
-        # Lowest priority: optional batch/seed JSON.
-        _merged_params = {}
-        for _sym, _rec in _seed_params.items():
-            _x = dict(_rec)
-            _x["_sync_source"] = "BATCH_SEED_FALLBACK"
-            _merged_params[_sym] = _x
-
-        # Trusted persistent live params. Explicit batch-tagged records are skipped.
-        _trusted_disk = {}
-        try:
-            _raw_disk = _load_main_kalman_opt_params()
-            if isinstance(_raw_disk, dict):
-                for _sym, _rec in _raw_disk.items():
-                    if not isinstance(_rec, dict):
-                        continue
-                    if str(_rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M":
-                        continue
-                    _x = dict(_rec)
-                    _x["_sync_source"] = "TRUSTED_STREAMLIT_SAVED_PARAMS"
-                    _trusted_disk[str(_sym).upper()] = _x
-        except Exception:
-            _trusted_disk = {}
-        _merged_params.update(_trusted_disk)
-
-        # Exact values captured when this Main Kalman app actually used them.
-        _live_mirror = _load_main_kalman_render_mirror_params()
-        if isinstance(_live_mirror, dict):
-            _merged_params.update(_render_sync_normalize_param_store(_live_mirror))
-
-        # Highest priority: exact in-memory Fast-mode cache from this running session.
-        _active_cache = _render_sync_active_session_params()
-        _merged_params.update(_active_cache)
-
-        try:
-            _signal_lock_export = _load_main_kalman_signal_lock()
-        except Exception:
-            _signal_lock_export = {}
-        try:
-            _institutional_export = _load_main_kalman_institutional_ledger()
-        except Exception:
-            _institutional_export = {}
-        try:
-            _watchlist_export = _load_main_kalman_watchlist_ledger()
-        except Exception:
-            _watchlist_export = {}
-
-        _open_export = _render_sync_open_tickers(_institutional_export)
-        _source_counts = {}
-        for _rec in _merged_params.values():
-            if isinstance(_rec, dict):
-                _src = str(_rec.get("_sync_source", "UNKNOWN"))
-                _source_counts[_src] = int(_source_counts.get(_src, 0)) + 1
-
-        _bundle = {
-            "bundle_version": 2,
-            "exported_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            "data_path": {
-                "lookback_days": 30,
-                "interval": str(locals().get("data_interval", "15m")),
-                "auto_adjust": False,
-                "prepost": False,
-                "source": "Visible Main Kalman tab",
-            },
-            "per_ticker_params": _merged_params,
-            "signal_lock": _signal_lock_export if isinstance(_signal_lock_export, dict) else {},
-            "institutional_ledger": _institutional_export if isinstance(_institutional_export, dict) else {},
-            "watchlist_ledger": _watchlist_export if isinstance(_watchlist_export, dict) else {},
-            "streamlit_open_tickers": _open_export,
-            "sync_summary": {
-                "total_params": len(_merged_params),
-                "active_session_overrides": len(_active_cache),
-                "live_mirror_captures": len(_live_mirror) if isinstance(_live_mirror, dict) else 0,
-                "trusted_saved_params": len(_trusted_disk),
-                "fallback_seed_params": len(_seed_params),
-                "source_counts": _source_counts,
-            },
-        }
-
-        st.write(f"Params ready: **{len(_merged_params)}**")
-        st.write(f"Active Fast-cache overrides: **{len(_active_cache)}**")
-        st.write(f"Live Streamlit captures: **{len(_live_mirror) if isinstance(_live_mirror, dict) else 0}**")
-        st.write(f"Signal-lock keys: **{len(_signal_lock_export) if isinstance(_signal_lock_export, dict) else 0}**")
-        st.write(f"Institutional ledger tickers: **{len(_institutional_export) if isinstance(_institutional_export, dict) else 0}**")
-        st.write(f"Open tickers exported: **{len(_open_export)}**")
-
-        _bundle_bytes = json.dumps(_bundle, indent=2, default=str).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Exact Render Mirror Bundle",
-            data=_bundle_bytes,
-            file_name="streamlit_kalman_render_bundle.json",
-            mime="application/json",
-            use_container_width=True,
-            key="download_exact_render_mirror_bundle",
-        )
-
-        # FULL 150-TICKER COVERAGE TABLE — not just active-cache overrides.
-        _coverage_rows = []
-        for _sym, _rec in sorted(_merged_params.items()):
-            if not isinstance(_rec, dict):
-                continue
-            _coverage_rows.append({
-                "Ticker": _sym,
-                "Buffer %": round(float(_rec.get("buffer_pct", 0)) * 100, 2),
-                "Confirm": int(_rec.get("confirm_bars", 0)),
-                "Min Hold": int(_rec.get("min_hold_bars", 0)),
-                "Cooldown": int(_rec.get("cooldown_bars", 0)),
-                "Source": str(_rec.get("_sync_source", _rec.get("source", "UNKNOWN"))),
-            })
-
-        _expected_symbols = sorted(set(_seed_params.keys())) if _seed_params else sorted(set(_merged_params.keys()))
-        _missing_symbols = sorted(set(_expected_symbols) - set(_merged_params.keys()))
-        _extra_symbols = sorted(set(_merged_params.keys()) - set(_expected_symbols)) if _expected_symbols else []
-
-        if len(_merged_params) == 150:
-            st.success("✅ FULL COVERAGE: 150/150 ticker parameter sets are in the Render bundle.")
-        else:
-            st.warning(f"⚠️ Coverage is {len(_merged_params)}/150. Do not deploy until all 150 are present.")
-
-        st.caption(
-            f"All merged ticker parameters used by Render — Active Fast-cache overrides: {len(_active_cache)} | "
-            f"Live captures: {len(_live_mirror) if isinstance(_live_mirror, dict) else 0} | "
-            f"Trusted saved: {len(_trusted_disk)} | Fallback seed: {len(_seed_params)}"
-        )
-        st.dataframe(pd.DataFrame(_coverage_rows), use_container_width=True, hide_index=True, height=520)
-
-        if _missing_symbols:
-            st.error("Missing tickers: " + ", ".join(_missing_symbols))
-        if _extra_symbols:
-            st.info("Extra tickers not in uploaded 150 seed: " + ", ".join(_extra_symbols))
-
-        if _active_cache:
-            with st.expander(f"Show only {len(_active_cache)} active Streamlit Fast-cache overrides", expanded=False):
-                _active_rows = []
-                for _sym, _rec in sorted(_active_cache.items()):
-                    _active_rows.append({
-                        "Ticker": _sym,
-                        "Buffer %": round(float(_rec.get("buffer_pct", 0)) * 100, 2),
-                        "Confirm": int(_rec.get("confirm_bars", 0)),
-                        "Min Hold": int(_rec.get("min_hold_bars", 0)),
-                        "Cooldown": int(_rec.get("cooldown_bars", 0)),
-                        "Source": "ACTIVE_STREAMLIT_FAST_CACHE",
-                    })
-                st.dataframe(pd.DataFrame(_active_rows), use_container_width=True, hide_index=True)
-except Exception as _render_sync_error:
-    try:
-        st.sidebar.caption(f"Render Mirror Sync unavailable: {_render_sync_error}")
-    except Exception:
-        pass
-
