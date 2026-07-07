@@ -855,6 +855,86 @@ def _main_monitor_fetch_15m(ticker, period="60d"):
     return px.dropna()
 
 
+def _clean_15m_series(px_raw):
+    """Shared cleanup: dropna/cast, tz-convert to CT, drop forming candle. Used by
+    the batched fetch below so its per-ticker output matches _main_monitor_fetch_15m."""
+    try:
+        px = pd.Series(px_raw).dropna().astype(float)
+        if len(px) < 80:
+            return None
+        try:
+            if px.index.tz is None:
+                px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
+            px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
+        except Exception:
+            pass
+        try:
+            now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
+            latest_start = pd.Timestamp(px.index[-1])
+            latest_close = latest_start + pd.Timedelta(minutes=15)
+            if latest_close > now_ct and len(px) > 2:
+                px = px.iloc[:-1]
+        except Exception:
+            if len(px) > 2:
+                px = px.iloc[:-1]
+        return px.dropna()
+    except Exception:
+        return None
+
+
+def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_chunks=2.0):
+    """
+    RATE-LIMIT FIX: fetch many tickers using a handful of batched, multi-ticker
+    yf.download() calls instead of one call per ticker. yfinance/Yahoo can block
+    the requesting IP after too many individual sequential requests in a short
+    window — this is the same fix already applied to the Render bot's scanner.
+    Cuts ~150 individual requests down to ~len(tickers)/chunk_size batched ones.
+
+    Returns {ticker: pd.Series} for every ticker that returned usable data.
+    """
+    out = {}
+    tickers = [str(t).upper() for t in tickers]
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        try:
+            raw = yf.download(
+                tickers=chunk,
+                period=period,
+                interval="15m",
+                auto_adjust=True,
+                progress=False,
+                prepost=False,
+                threads=True,
+            )
+        except Exception as e:
+            print(f"Batch fetch error for chunk {chunk}: {e}")
+            raw = None
+
+        if raw is not None and not raw.empty:
+            for t in chunk:
+                try:
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        top_level = raw.columns.get_level_values(0)
+                        if t not in top_level:
+                            continue
+                        df_t = raw[t]
+                    else:
+                        df_t = raw if len(chunk) == 1 else None
+                        if df_t is None:
+                            continue
+                    close_col = "Close" if "Close" in df_t.columns else df_t.columns[-1]
+                    px = _clean_15m_series(df_t[close_col])
+                    if px is not None:
+                        out[t] = px
+                except Exception:
+                    continue
+
+        if i + chunk_size < len(tickers):
+            time.sleep(pause_between_chunks)
+
+    return out
+
+
 def _get_current_main_kalman_params():
     """Read current Main Kalman tab settings from Streamlit session_state."""
     try:
@@ -1879,6 +1959,18 @@ def bulk_reoptimize_full_watchlist(
     results = {}
     total = len(symbols)
 
+    # RATE-LIMIT FIX: fetch all tickers up front via a handful of batched,
+    # multi-ticker requests instead of one yf.download() call per ticker inside
+    # the loop. This is the same fix already applied to the Render bot — it cuts
+    # request count by ~10-20x and is far less likely to trip Yahoo's per-IP
+    # rate limit than 150 sequential individual requests.
+    if progress_callback:
+        try:
+            progress_callback(0, total, "batch-fetching all tickers...")
+        except Exception:
+            pass
+    price_data = _bulk_fetch_15m_batch(symbols, period="60d", chunk_size=20, pause_between_chunks=2.0)
+
     for i, sym in enumerate(symbols, start=1):
         sym = str(sym).upper()
         if progress_callback:
@@ -1903,27 +1995,10 @@ def bulk_reoptimize_full_watchlist(
                 continue
 
         try:
-            px = None
-            _fetch_err = None
-            for _attempt in range(3):
-                try:
-                    px = _main_monitor_fetch_15m(sym, period="60d")
-                except Exception as _fe:
-                    _fetch_err = str(_fe)
-                    px = None
-                if px is not None and len(px) >= 80:
-                    break
-                # Back off before retrying — sequential yfinance calls across 150
-                # tickers can trip Yahoo's rate limit; a short pause + retry
-                # recovers most of these instead of silently losing the ticker.
-                time.sleep(1.5)
+            px = price_data.get(sym)
             if px is None or len(px) < 80:
-                results[sym] = {"error": f"insufficient/no data after retries" + (f" ({_fetch_err})" if _fetch_err else "")}
+                results[sym] = {"error": "insufficient/no data (batch fetch — likely rate-limited or no data for this ticker)"}
                 continue
-
-            # Small pacing delay between tickers regardless of outcome, so we
-            # don't hammer Yahoo across 150 sequential fetches in a tight loop.
-            time.sleep(0.5)
 
             rail, _center, _long_state = institutional_trend_rail(
                 px,
