@@ -2001,6 +2001,72 @@ def bulk_reoptimize_full_watchlist(
     return results
 
 
+# ============================================================================
+# RENDER BUNDLE EXPORT
+# ----------------------------------------------------------------------------
+# Packages this app's own local state (per-ticker optimizer params, watchlist
+# ledger, institutional trade ledger, signal lock) into the exact JSON schema
+# the external Render/Telegram worker reads (STREAMLIT_KALMAN_BUNDLE_FILE).
+# Each ticker's params get tagged _sync_source so Render can tell trusted
+# (live-optimized) tickers apart from any still-stale batch-seeded ones.
+# ============================================================================
+def build_render_bundle_export():
+    opt_store = _load_main_kalman_opt_params()
+    watchlist_ledger = _load_main_kalman_watchlist_ledger()
+    institutional_ledger = _load_main_kalman_institutional_ledger()
+    signal_lock = _load_main_kalman_signal_lock()
+
+    per_ticker_params = {}
+    trusted_count = 0
+    fallback_count = 0
+    for ticker, rec in opt_store.items():
+        if not isinstance(rec, dict):
+            continue
+        rec = dict(rec)
+        is_batch = str(rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M"
+        rec["_sync_source"] = "BATCH_SEED_FALLBACK" if is_batch else "ACTIVE_STREAMLIT_FAST_CACHE"
+        if is_batch:
+            fallback_count += 1
+        else:
+            trusted_count += 1
+        per_ticker_params[str(ticker).upper()] = rec
+
+    open_tickers = sorted([
+        str(t).upper() for t, v in watchlist_ledger.items()
+        if isinstance(v, dict) and str(v.get("position", "")).upper() == "LONG"
+    ])
+
+    sync_summary = {
+        "total_params": len(per_ticker_params),
+        "active_session_overrides": trusted_count,
+        "trusted_saved_params": trusted_count,
+        "fallback_seed_params": fallback_count,
+        "source_counts": {
+            "ACTIVE_STREAMLIT_FAST_CACHE": trusted_count,
+            "BATCH_SEED_FALLBACK": fallback_count,
+        },
+    }
+
+    bundle = {
+        "bundle_version": 2,
+        "exported_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+        "data_path": {
+            "lookback_days": 60,
+            "interval": "15m",
+            "auto_adjust": True,
+            "prepost": False,
+            "source": "Visible Main Kalman tab",
+        },
+        "per_ticker_params": per_ticker_params,
+        "signal_lock": signal_lock,
+        "institutional_ledger": institutional_ledger,
+        "watchlist_ledger": watchlist_ledger,
+        "streamlit_open_tickers": open_tickers,
+        "sync_summary": sync_summary,
+    }
+    return bundle
+
+
 # --------------------------------------------------------
 
 
@@ -9117,6 +9183,34 @@ with st.sidebar:
                 st.warning(f"{len(_bulk_errs)} tickers failed (data/errors): {', '.join(sorted(_bulk_errs.keys())[:30])}")
             if _bulk_ok:
                 st.dataframe(pd.DataFrame(_bulk_ok).T, use_container_width=True)
+
+    with st.expander("📤 Export bundle for Render / external Telegram bot", expanded=False):
+        st.caption(
+            "Build and download the exact JSON file your Render worker reads "
+            "(`streamlit_kalman_render_bundle.json`) — per-ticker params, watchlist ledger, "
+            "institutional trade ledger, signal lock, and a trust summary. Do this after any "
+            "bulk re-optimize or parameter change, then upload the downloaded file to Render "
+            "at the path set in `STREAMLIT_KALMAN_BUNDLE_FILE` and redeploy."
+        )
+        if st.button("🧮 Build latest bundle", use_container_width=True):
+            _bundle_now = build_render_bundle_export()
+            st.session_state["_last_render_bundle_json"] = json.dumps(_bundle_now, indent=2, default=str)
+            st.session_state["_last_render_bundle_ct"] = _bundle_now["exported_ct"]
+            _ss = _bundle_now["sync_summary"]
+            st.success(
+                f"Bundle built at {_bundle_now['exported_ct']} — {_ss['total_params']} tickers total, "
+                f"✅ {_ss['trusted_saved_params']} trusted, ⚠️ {_ss['fallback_seed_params']} still fallback."
+            )
+
+        if st.session_state.get("_last_render_bundle_json"):
+            st.caption(f"Last built: {st.session_state.get('_last_render_bundle_ct', '')}")
+            st.download_button(
+                label="⬇️ Download streamlit_kalman_render_bundle.json",
+                data=st.session_state["_last_render_bundle_json"],
+                file_name="streamlit_kalman_render_bundle.json",
+                mime="application/json",
+                use_container_width=True,
+            )
 
     if _clicked_run:
         _rows_now = _run_monitor_and_store()
