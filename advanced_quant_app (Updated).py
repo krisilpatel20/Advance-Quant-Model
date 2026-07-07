@@ -1991,18 +1991,6 @@ def bulk_reoptimize_full_watchlist(
     results = {}
     total = len(symbols)
 
-    # RATE-LIMIT FIX: fetch all tickers up front via a handful of batched,
-    # multi-ticker requests instead of one yf.download() call per ticker inside
-    # the loop. This is the same fix already applied to the Render bot — it cuts
-    # request count by ~10-20x and is far less likely to trip Yahoo's per-IP
-    # rate limit than 150 sequential individual requests.
-    if progress_callback:
-        try:
-            progress_callback(0, total, "batch-fetching all tickers...")
-        except Exception:
-            pass
-    price_data, fetch_debug = _bulk_fetch_15m_batch(symbols, period="60d", chunk_size=20, pause_between_chunks=2.0)
-
     for i, sym in enumerate(symbols, start=1):
         sym = str(sym).upper()
         if progress_callback:
@@ -2027,9 +2015,29 @@ def bulk_reoptimize_full_watchlist(
                 continue
 
         try:
-            px = price_data.get(sym)
+            # REVERTED: the multi-ticker batched yf.download() (group_by="ticker",
+            # threads=True) turned out to be unreliable specifically from Streamlit
+            # Community Cloud's shared IPs — it returned empty even on the very
+            # first request, while the plain single-ticker fetch (same one the
+            # working single-ticker tab uses) is fine. So: back to single-ticker
+            # calls here too, just paced so 150 sequential calls don't trip a
+            # volume-based limit on their own, with a light retry for genuine
+            # one-off transient hiccups (not for a systemic block).
+            px = None
+            _fetch_err = None
+            for _attempt in range(2):
+                try:
+                    px = _main_monitor_fetch_15m(sym, period="60d")
+                except Exception as _fe:
+                    _fetch_err = str(_fe)
+                    px = None
+                if px is not None and len(px) >= 80:
+                    break
+                time.sleep(1.0)
+            time.sleep(1.0)  # pacing between tickers regardless of outcome
+
             if px is None or len(px) < 80:
-                results[sym] = {"error": fetch_debug.get(sym, "insufficient/no data (unknown reason — not in fetch results at all)")}
+                results[sym] = {"error": "insufficient/no data" + (f" ({_fetch_err})" if _fetch_err else "")}
                 continue
 
             rail, _center, _long_state = institutional_trend_rail(
