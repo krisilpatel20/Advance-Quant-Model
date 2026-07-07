@@ -2318,10 +2318,43 @@ def _save_inapp_alert_positions(data):
         pass
 
 
+def _inapp_alert_lock_path():
+    try:
+        return _Path.home() / ".pinehurst_inapp_alert_lock.json"
+    except Exception:
+        return _Path(".pinehurst_inapp_alert_lock.json")
+
+
+def _try_claim_inapp_alert_lock(stale_after_seconds=600):
+    """SAFETY FIX: only one running copy of this app should be doing the
+    background checks at a time. During a Render restart/redeploy, the old
+    and new copies can briefly both be alive — without this, both would start
+    their own independent 15-minute loop, and their checks landing a few
+    minutes apart is exactly what caused a ticker to alert BUY then SELL
+    minutes later at the same price. This makes every loop "claim" a shared
+    lock file each cycle; if another copy claimed it recently, this one backs
+    off instead of running its own check that cycle."""
+    p = _inapp_alert_lock_path()
+    my_id = f"{os.getpid()}-{id(threading.current_thread())}"
+    try:
+        if p.exists():
+            data = json.loads(p.read_text())
+            owner = data.get("owner")
+            ts = float(data.get("ts", 0))
+            if owner != my_id and (time.time() - ts) < stale_after_seconds:
+                return False
+        p.write_text(json.dumps({"owner": my_id, "ts": time.time()}))
+        return True
+    except Exception:
+        return True
+
+
 def _inapp_alert_check_once():
     """One full pass over the saved watchlist: fetch each ticker one at a time
     (same method proven reliable elsewhere in this app), work out LONG/CASH,
-    and text Telegram only if it changed since the last check."""
+    and text Telegram only if it changed since the last check AND enough time
+    has passed since the last alert for that same ticker (second safety net
+    against rapid flip-flop alerts)."""
     settings = _load_main_kalman_monitor_settings()
     tickers = _normalize_watchlist(settings.get("watchlist", ""))
     if not tickers:
@@ -2334,6 +2367,7 @@ def _inapp_alert_check_once():
         return  # nothing configured to send to yet
 
     positions = _load_inapp_alert_positions()
+    MIN_SECONDS_BETWEEN_ALERTS_PER_TICKER = 600  # 10 minutes
 
     for sym in tickers:
         sym = str(sym).upper()
@@ -2348,10 +2382,19 @@ def _inapp_alert_check_once():
                 last_row = trades_df.iloc[-1]
                 new_pos = "LONG" if _trade_row_is_open(last_row, columns=trades_df.columns) else "CASH"
 
-            old_pos = positions.get(sym, {}).get("position")
+            prev = positions.get(sym, {})
+            old_pos = prev.get("position")
+            last_alert_ts = float(prev.get("last_alert_ts", 0))
             price_now = round(float(px.iloc[-1]), 2)
+            now_ts = time.time()
 
-            if old_pos is not None and old_pos != new_pos:
+            should_alert = (
+                old_pos is not None
+                and old_pos != new_pos
+                and (now_ts - last_alert_ts) >= MIN_SECONDS_BETWEEN_ALERTS_PER_TICKER
+            )
+
+            if should_alert:
                 emoji = "🟢" if new_pos == "LONG" else "🔴"
                 action = "BUY" if new_pos == "LONG" else "SELL"
                 msg = (
@@ -2362,11 +2405,13 @@ def _inapp_alert_check_once():
                     f"Time: <b>{datetime.now().strftime('%Y-%m-%d %I:%M %p')}</b>"
                 )
                 send_telegram_alert(bot_token, chat_id, msg)
+                last_alert_ts = now_ts
 
             positions[sym] = {
                 "position": new_pos,
                 "price": price_now,
                 "checked_at": datetime.now().isoformat(),
+                "last_alert_ts": last_alert_ts,
             }
         except Exception as e:
             print(f"In-app alert check error for {sym}: {e}")
@@ -2378,7 +2423,10 @@ def _inapp_alert_check_once():
 def _inapp_alert_background_loop(interval_seconds=900):
     while True:
         try:
-            _inapp_alert_check_once()
+            if _try_claim_inapp_alert_lock():
+                _inapp_alert_check_once()
+            else:
+                print("In-app alert loop: another copy of this app is already checking — skipping this cycle.")
         except Exception as e:
             print(f"In-app alert loop error: {e}")
         time.sleep(interval_seconds)
