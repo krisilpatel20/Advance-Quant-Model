@@ -1874,9 +1874,27 @@ def bulk_reoptimize_full_watchlist(
             except Exception:
                 pass
         try:
-            px = _main_monitor_fetch_15m(sym, period="60d")
+            px = None
+            _fetch_err = None
+            for _attempt in range(3):
+                try:
+                    px = _main_monitor_fetch_15m(sym, period="60d")
+                except Exception as _fe:
+                    _fetch_err = str(_fe)
+                    px = None
+                if px is not None and len(px) >= 80:
+                    break
+                # Back off before retrying — sequential yfinance calls across 150
+                # tickers can trip Yahoo's rate limit; a short pause + retry
+                # recovers most of these instead of silently losing the ticker.
+                time.sleep(1.5)
             if px is None or len(px) < 80:
+                results[sym] = {"error": f"insufficient/no data after retries" + (f" ({_fetch_err})" if _fetch_err else "")}
                 continue
+
+            # Small pacing delay between tickers regardless of outcome, so we
+            # don't hammer Yahoo across 150 sequential fetches in a tight loop.
+            time.sleep(0.5)
 
             rail, _center, _long_state = institutional_trend_rail(
                 px,
@@ -1958,6 +1976,7 @@ def bulk_reoptimize_full_watchlist(
                                 best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
 
             if best_pack is None:
+                results[sym] = {"error": "no valid backtest result across grid (data too short/flat)"}
                 continue
 
             _save_main_kalman_opt_params_for_ticker(
@@ -9174,13 +9193,17 @@ with st.sidebar:
             _bulk_results = bulk_reoptimize_full_watchlist(_bulk_tickers, progress_callback=_bulk_progress_cb)
             _bulk_ok = {k: v for k, v in _bulk_results.items() if "error" not in v}
             _bulk_errs = {k: v for k, v in _bulk_results.items() if "error" in v}
+            _bulk_missing = [t for t in _bulk_tickers if t not in _bulk_results]
             st.success(
                 f"Bulk re-optimized {len(_bulk_ok)}/{len(_bulk_tickers)} tickers. "
                 "All of these now use live-verified settings (not batch fallback) and will be treated "
                 "as trusted by the watchlist monitor and any bundle export."
             )
             if _bulk_errs:
-                st.warning(f"{len(_bulk_errs)} tickers failed (data/errors): {', '.join(sorted(_bulk_errs.keys())[:30])}")
+                st.warning(f"{len(_bulk_errs)} tickers failed (data/errors) — see table below.")
+                st.dataframe(pd.DataFrame(_bulk_errs).T, use_container_width=True)
+            if _bulk_missing:
+                st.error(f"{len(_bulk_missing)} tickers returned no result at all (unexpected): {', '.join(_bulk_missing[:30])}")
             if _bulk_ok:
                 st.dataframe(pd.DataFrame(_bulk_ok).T, use_container_width=True)
 
