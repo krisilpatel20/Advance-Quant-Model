@@ -371,9 +371,15 @@ def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, late
 
 
 def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, token="", chat_id="", enabled=False):
-    """Legacy sender disabled. Background Main Kalman worker is the only signal sender."""
-    return False, "Disabled: in-app background Main Kalman worker is the single BUY/SELL sender."
+    """
+    Send Telegram only from the main Kalman trade log.
+    No separate scanner logic. No separate 15m helper logic.
+    """
     try:
+        # Legacy direct sender disabled. The in-app background Main Kalman worker
+        # is the only BUY/SELL Telegram signal sender.
+        return False, "Disabled: single in-app Main Kalman sender only."
+
         if not enabled:
             return False, "Telegram main-log alerts OFF."
         if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
@@ -852,7 +858,6 @@ def _main_monitor_fetch_15m(ticker, period="60d"):
             px = px.iloc[:-1]
     return px.dropna()
 
-
 def _clean_15m_series(px_raw):
     """Shared cleanup: dropna/cast, tz-convert to CT, drop forming candle. Used by
     the batched fetch below so its per-ticker output matches _main_monitor_fetch_15m."""
@@ -883,7 +888,6 @@ def _clean_15m_series(px_raw):
         return px.dropna()
     except Exception:
         return None
-
 
 def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_chunks=2.0):
     """
@@ -968,6 +972,7 @@ def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_ch
             time.sleep(pause_between_chunks)
 
     return out, debug
+
 
 
 def _get_current_main_kalman_params(runtime_settings=None):
@@ -1077,6 +1082,7 @@ def _main_kalman_params_label(params=None):
         f"ATR safety {'ON' if params['atr_safety'] else 'OFF'}, "
         f"risk firewall {firewall_txt}"
     )
+
 
 
 def _build_main_kalman_trade_log_from_prices(ticker, px, runtime_settings=None):
@@ -1289,6 +1295,7 @@ def _build_main_kalman_trade_log_from_prices(ticker, px, runtime_settings=None):
     }
     return trades_df, latest
 
+
 def _main_kalman_watchlist_ledger_path():
     try:
         return _Path.home() / ".pinehurst_main_kalman_watchlist_ledger.json"
@@ -1332,6 +1339,45 @@ def _load_main_kalman_opt_params():
         pass
     return {}
 
+# ---- Render mirror live-params capture ------------------------------------
+# This is a SEPARATE, additive store. It never changes optimizer logic,
+# signal math, locks, or trade ledgers. Every time the Main Kalman tab actually
+# uses a parameter set, the exact values are copied here for Render export.
+def _main_kalman_render_mirror_params_path():
+    try:
+        return _Path.home() / ".pinehurst_main_kalman_RENDER_MIRROR_PARAMS.json"
+    except Exception:
+        return _Path(".pinehurst_main_kalman_RENDER_MIRROR_PARAMS.json")
+
+def _load_main_kalman_render_mirror_params():
+    try:
+        p = _main_kalman_render_mirror_params_path()
+        if p.exists():
+            data = json.loads(p.read_text())
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _save_main_kalman_render_mirror_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
+                                                       slope_confirm=True, atr_safety=True):
+    try:
+        store = _load_main_kalman_render_mirror_params()
+        sym = str(ticker).upper()
+        store[sym] = {
+            "buffer_pct": float(buffer_pct),
+            "confirm_bars": int(confirm_bars),
+            "min_hold_bars": int(min_hold_bars),
+            "cooldown_bars": int(cooldown_bars),
+            "slope_confirm": bool(slope_confirm),
+            "atr_safety": bool(atr_safety),
+            "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+            "_sync_source": "LIVE_STREAMLIT_USED",
+        }
+        _main_kalman_render_mirror_params_path().write_text(json.dumps(store, indent=2))
+    except Exception:
+        pass
+
 def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
                                             slope_confirm=True, atr_safety=True):
     """Persist the exact params the main tab used for a ticker (optimizer or sliders)."""
@@ -1350,15 +1396,20 @@ def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, mi
     except Exception:
         pass
 
-def _get_main_kalman_opt_params_for_ticker(ticker):
-    """Return only trusted live/interactive params; ignore the old 150-ticker batch seed."""
+    # Additive Render mirror capture only. This does not feed back into the
+    # strategy and cannot change the trade log. It simply records what the
+    # Main Kalman tab actually used on this run.
     try:
-        rec = _load_main_kalman_opt_params().get(str(ticker).upper())
-        if not isinstance(rec, dict):
-            return None
-        if str(rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M":
-            return None
-        return rec
+        _save_main_kalman_render_mirror_params_for_ticker(
+            ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
+            slope_confirm=slope_confirm, atr_safety=atr_safety,
+        )
+    except Exception:
+        pass
+
+def _get_main_kalman_opt_params_for_ticker(ticker):
+    try:
+        return _load_main_kalman_opt_params().get(str(ticker).upper())
     except Exception:
         return None
 
@@ -1450,9 +1501,9 @@ def _apply_signal_lock(ticker, sig, freeze_enabled=True, interval="15m"):
 # ============================================================================
 def _main_kalman_institutional_ledger_path():
     try:
-        return _Path.home() / ".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER_V3_BY_INTERVAL.json"
+        return _Path.home() / ".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER.json"
     except Exception:
-        return _Path(".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER_V3_BY_INTERVAL.json")
+        return _Path(".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER.json")
 
 def _load_main_kalman_institutional_ledger():
     try:
@@ -1536,7 +1587,6 @@ def _institutional_settings_from_locals(ticker, locs):
         "polish_span": _get_int("polish_span", 3),
         "rail_mult": _get_num("rail_mult", 1.35),
         "trend_name": str(locs.get("active_trend_name", "Institutional Trend Rail")),
-        "interval": str(locs.get("data_interval", locs.get("interval", "15m"))),
         "source": "Visible sliders",
     }
 
@@ -1585,7 +1635,7 @@ def _institutional_settings_from_locals(ticker, locs):
         pass
 
     settings["model_version"] = (
-        f"{ticker}|{settings.get('interval', '15m')}|{settings['trend_name']}|"
+        f"{ticker}|{settings['trend_name']}|"
         f"buf{settings['buffer_pct']*100:.2f}|conf{int(settings['confirm_bars'])}|"
         f"hold{int(settings['min_hold_bars'])}|cool{int(settings['cooldown_bars'])}|"
         f"fg{settings['fast_gain']:.3f}|sg{settings['slow_gain']:.3f}|rail{settings['rail_mult']:.2f}|"
@@ -1661,9 +1711,7 @@ def _main_kalman_apply_institutional_trade_ledger(ticker, candidate_trades, px, 
             pass
 
         ledger = _load_main_kalman_institutional_ledger()
-        interval = str(settings.get("interval", "15m"))
-        ledger_key = f"{ticker}|{interval}"
-        book = ledger.get(ledger_key, {"trades": [], "last_update_ct": "", "interval": interval})
+        book = ledger.get(ticker, {"trades": [], "last_update_ct": ""})
         rows = book.get("trades", []) if isinstance(book, dict) else []
         if not isinstance(rows, list):
             rows = []
@@ -1728,14 +1776,13 @@ def _main_kalman_apply_institutional_trade_ledger(ticker, candidate_trades, px, 
 
         book = {
             "ticker": ticker,
-            "interval": interval,
             "trades": rows,
             "last_update_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
             "latest_price": latest_price,
             "latest_time": latest_time,
             "current_settings_seen": settings,
         }
-        ledger[ledger_key] = book
+        ledger[ticker] = book
         _save_main_kalman_institutional_ledger(ledger)
         out = pd.DataFrame(rows)
         return out
@@ -1811,10 +1858,11 @@ def _parse_watchlist_ct_time(x):
 
 def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=150, allow_sell_alerts=False):
     """
-    Status-only watchlist monitor using current Main Kalman controls.
-    IMPORTANT: it never sends BUY/SELL Telegram alerts. The in-app 15-minute
-    background Main Kalman worker is the single signal sender.
+    Watchlist monitor using current Main Kalman controls.
+    First scan baselines. Future changes alert. This avoids separate hardcoded logic.
     """
+    # SINGLE-SENDER RULE: this page/manual monitor is status-only.
+    # BUY/SELL Telegram alerts come only from the in-app Main Kalman background worker.
     send_telegram = False
     symbols = _normalize_watchlist(raw_watchlist)
     try:
@@ -1982,314 +2030,6 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
     if show_table:
         st.dataframe(df_rows, use_container_width=True, hide_index=True)
     return df_rows
-
-# --------------------------------------------------------
-
-
-# ============================================================================
-# BULK WATCHLIST RE-OPTIMIZER
-# ----------------------------------------------------------------------------
-# The single-ticker Main Kalman tab runs a full grid-search optimizer and saves
-# trusted per-ticker params (via _save_main_kalman_opt_params_for_ticker) only
-# for whichever ticker is currently open in the UI. Every other ticker in the
-# watchlist falls back to the old one-time BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M
-# seed, which _get_main_kalman_opt_params_for_ticker() deliberately treats as
-# untrusted/stale. This function runs that SAME optimizer for every ticker in
-# the watchlist (not just the one open in the UI) so all of them end up with
-# fresh, trusted, live-verified params — eliminating the "only 15 trusted"
-# split and the resulting mismatches against any external mirror (e.g. Render).
-# ============================================================================
-def bulk_reoptimize_full_watchlist(
-    raw_watchlist,
-    initial_cap=10000.0,
-    rf_rate=0.0,
-    buffer_grid=(0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070),
-    confirm_grid=(3, 4, 5, 7, 10),
-    hold_grid=(10, 15, 21, 34, 55),
-    cooldown_grid=(5, 8, 13, 21),
-    progress_callback=None,
-    skip_if_trusted=True,
-):
-    """
-    Re-run the exact same benchmark-aware Kalman optimizer used by the single-
-    ticker Main Kalman tab, but looped over every ticker in the watchlist.
-    Saves each ticker's winning params via _save_main_kalman_opt_params_for_ticker
-    (no "source" tag, so it is NOT filtered out as batch/fallback afterward) and
-    seeds st.session_state["main_kalman_status_{ticker}"] so the watchlist
-    monitor's authoritative-override path treats it identically to a ticker the
-    user actually opened and viewed this session.
-
-    PERFORMANCE NOTES:
-    - The per-bar state machine now runs on plain numpy arrays (positional index)
-      instead of pandas .loc-by-label lookups inside the loop, which is the single
-      biggest cost of each grid combination — this is a pure speed fix, identical
-      logic/output to the original label-based version.
-    - skip_if_trusted=True (default) skips any ticker that already has non-batch
-      (i.e. already-trusted) saved params, so re-running this after a partial/
-      interrupted run only processes what's actually left — safe to click again.
-    - Smaller grid tuples finish much faster at the cost of slightly less
-      exhaustive search; pass a reduced grid for a "quick pass", full grid for
-      an exact match to the single-ticker tab's optimizer.
-
-    Returns a dict: {ticker: {"buffer_pct":.., "confirm_bars":.., "min_hold_bars":..,
-                              "cooldown_bars":.., "position":.., "price":.., "score":..}}
-    """
-    symbols = _normalize_watchlist(raw_watchlist)
-    params = _get_current_main_kalman_params()
-    results = {}
-    total = len(symbols)
-
-    for i, sym in enumerate(symbols, start=1):
-        sym = str(sym).upper()
-        if progress_callback:
-            try:
-                progress_callback(i, total, sym)
-            except Exception:
-                pass
-
-        if skip_if_trusted:
-            _already = _get_main_kalman_opt_params_for_ticker(sym)
-            if isinstance(_already, dict):
-                results[sym] = {
-                    "buffer_pct": float(_already.get("buffer_pct", 0)),
-                    "confirm_bars": int(_already.get("confirm_bars", 0)),
-                    "min_hold_bars": int(_already.get("min_hold_bars", 0)),
-                    "cooldown_bars": int(_already.get("cooldown_bars", 0)),
-                    "position": "n/a",
-                    "price": None,
-                    "score": None,
-                    "skipped": "already trusted — resume mode",
-                }
-                continue
-
-        try:
-            # REVERTED: the multi-ticker batched yf.download() (group_by="ticker",
-            # threads=True) turned out to be unreliable specifically from Streamlit
-            # Community Cloud's shared IPs — it returned empty even on the very
-            # first request, while the plain single-ticker fetch (same one the
-            # working single-ticker tab uses) is fine. So: back to single-ticker
-            # calls here too, just paced so 150 sequential calls don't trip a
-            # volume-based limit on their own, with a light retry for genuine
-            # one-off transient hiccups (not for a systemic block).
-            px = None
-            _fetch_err = None
-            for _attempt in range(2):
-                try:
-                    px = _main_monitor_fetch_15m(sym, period="60d")
-                except Exception as _fe:
-                    _fetch_err = str(_fe)
-                    px = None
-                if px is not None and len(px) >= 80:
-                    break
-                time.sleep(1.0)
-            time.sleep(1.0)  # pacing between tickers regardless of outcome
-
-            if px is None or len(px) < 80:
-                results[sym] = {"error": "insufficient/no data" + (f" ({_fetch_err})" if _fetch_err else "")}
-                continue
-
-            rail, _center, _long_state = institutional_trend_rail(
-                px,
-                fast_gain=float(params["fast_gain"]),
-                slow_gain=float(params["slow_gain"]),
-                polish_span=int(params["polish_span"]),
-                atr_window=14,
-                atr_mult=float(params["rail_mult"]),
-            )
-            bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
-            trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
-            bt_px = px
-            bt_px_idx = bt_px.index
-            atr_proxy = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-
-            def _build_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
-                               slope_confirm=True, atr_safety=True):
-                close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
-                close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
-                if bool(slope_confirm):
-                    entry_cond_i = close_above_i & (trend_slope >= 0)
-                    exit_cond_i = close_below_i & (trend_slope <= 0)
-                else:
-                    entry_cond_i = close_above_i
-                    exit_cond_i = close_below_i
-                if bool(atr_safety):
-                    exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy)).fillna(False)
-                confirm_bars = int(confirm_bars)
-                # PERFORMANCE FIX: keep the rolling-confirm computation vectorized
-                # (pandas .rolling is C-level and fast), but pull the result out to
-                # a plain numpy array BEFORE the per-bar loop below, so the loop
-                # itself uses cheap positional indexing instead of slow .loc-by-
-                # label lookups — same exact logic, much faster.
-                entry_ready_arr = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False).to_numpy()
-                exit_ready_arr = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False).to_numpy()
-
-                n = len(bt_px_idx)
-                sig_arr = np.zeros(n, dtype=float)
-                in_pos_i = False
-                bars_held_i = 0
-                cooldown_left_i = 0
-                min_hold_bars = int(min_hold_bars)
-                cooldown_bars = int(cooldown_bars)
-                for idx in range(n):
-                    if cooldown_left_i > 0:
-                        cooldown_left_i -= 1
-                    if not in_pos_i:
-                        if cooldown_left_i <= 0 and entry_ready_arr[idx]:
-                            in_pos_i = True
-                            bars_held_i = 0
-                            sig_arr[idx] = 1.0
-                    else:
-                        bars_held_i += 1
-                        if bars_held_i >= min_hold_bars and exit_ready_arr[idx]:
-                            in_pos_i = False
-                            cooldown_left_i = cooldown_bars
-                            sig_arr[idx] = 0.0
-                            bars_held_i = 0
-                        else:
-                            sig_arr[idx] = 1.0
-                return pd.Series(sig_arr, index=bt_px_idx)
-
-            bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-            best_pack = None
-            for _buf in buffer_grid:
-                for _conf in confirm_grid:
-                    for _hold in hold_grid:
-                        for _cool in cooldown_grid:
-                            _sig = _build_signal(_buf, _conf, _hold, _cool,
-                                                  bool(params["slope_confirm"]), bool(params["atr_safety"]))
-                            _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
-                            _eq = _bt.get("equity_curve", pd.Series(dtype=float))
-                            _rets = _bt.get("returns", pd.Series(dtype=float))
-                            _tr = _bt.get("trades", pd.DataFrame())
-                            if _eq is None or len(_eq) < 2:
-                                continue
-                            _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
-                            _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
-                            _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
-                            _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
-                            _sh = float(_mets.get("Sharpe Ratio", 0.0))
-                            _dd_abs = abs(float(_dd))
-                            _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
-                            if _strat < bh_reference:
-                                _score -= (bh_reference - _strat) * 0.85
-                            if _dd_abs > 60:
-                                _score -= 5000.0
-                            if best_pack is None or _score > best_pack["score"]:
-                                best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
-
-            if best_pack is None:
-                results[sym] = {"error": "no valid backtest result across grid (data too short/flat)"}
-                continue
-
-            _save_main_kalman_opt_params_for_ticker(
-                sym, float(best_pack["buffer"]), int(best_pack["confirm"]),
-                int(best_pack["hold"]), int(best_pack["cool"]),
-                slope_confirm=bool(params["slope_confirm"]), atr_safety=bool(params["atr_safety"]),
-            )
-
-            trades_df, raw_row = _build_main_kalman_trade_log_from_prices(sym, px)
-            position = "CASH"
-            if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                last = trades_df.iloc[-1]
-                position = "LONG" if _trade_row_is_open(last, columns=trades_df.columns) else "CASH"
-            price_now = round(float(px.iloc[-1]), 2)
-            candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
-
-            # Seed the same session_state key the single-ticker tab sets, so the
-            # watchlist monitor's authoritative-override path treats this ticker
-            # exactly like one the user actually opened this session.
-            try:
-                st.session_state[f"main_kalman_status_{sym}"] = {
-                    "Trade Position": position,
-                    "Price": price_now,
-                    "Candle Close CT": candle_ct,
-                }
-            except Exception:
-                pass
-
-            results[sym] = {
-                "buffer_pct": float(best_pack["buffer"]),
-                "confirm_bars": int(best_pack["confirm"]),
-                "min_hold_bars": int(best_pack["hold"]),
-                "cooldown_bars": int(best_pack["cool"]),
-                "position": position,
-                "price": price_now,
-                "score": float(best_pack["score"]),
-            }
-        except Exception as e:
-            results[sym] = {"error": str(e)[:200]}
-
-    return results
-
-
-# ============================================================================
-# RENDER BUNDLE EXPORT
-# ----------------------------------------------------------------------------
-# Packages this app's own local state (per-ticker optimizer params, watchlist
-# ledger, institutional trade ledger, signal lock) into the exact JSON schema
-# the external Render/Telegram worker reads (STREAMLIT_KALMAN_BUNDLE_FILE).
-# Each ticker's params get tagged _sync_source so Render can tell trusted
-# (live-optimized) tickers apart from any still-stale batch-seeded ones.
-# ============================================================================
-def build_render_bundle_export():
-    opt_store = _load_main_kalman_opt_params()
-    watchlist_ledger = _load_main_kalman_watchlist_ledger()
-    institutional_ledger = _load_main_kalman_institutional_ledger()
-    signal_lock = _load_main_kalman_signal_lock()
-
-    per_ticker_params = {}
-    trusted_count = 0
-    fallback_count = 0
-    for ticker, rec in opt_store.items():
-        if not isinstance(rec, dict):
-            continue
-        rec = dict(rec)
-        is_batch = str(rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M"
-        rec["_sync_source"] = "BATCH_SEED_FALLBACK" if is_batch else "ACTIVE_STREAMLIT_FAST_CACHE"
-        if is_batch:
-            fallback_count += 1
-        else:
-            trusted_count += 1
-        per_ticker_params[str(ticker).upper()] = rec
-
-    open_tickers = sorted([
-        str(t).upper() for t, v in watchlist_ledger.items()
-        if isinstance(v, dict) and str(v.get("position", "")).upper() == "LONG"
-    ])
-
-    main_kalman_controls = _get_current_main_kalman_params()
-
-    sync_summary = {
-        "total_params": len(per_ticker_params),
-        "active_session_overrides": trusted_count,
-        "trusted_saved_params": trusted_count,
-        "fallback_seed_params": fallback_count,
-        "source_counts": {
-            "ACTIVE_STREAMLIT_FAST_CACHE": trusted_count,
-            "BATCH_SEED_FALLBACK": fallback_count,
-        },
-    }
-
-    bundle = {
-        "bundle_version": 3,
-        "exported_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-        "main_kalman_controls": main_kalman_controls,
-        "data_path": {
-            "lookback_days": 60,
-            "interval": "15m",
-            "auto_adjust": False,
-            "prepost": False,
-            "source": "Visible Main Kalman tab",
-        },
-        "per_ticker_params": per_ticker_params,
-        "signal_lock": signal_lock,
-        "institutional_ledger": institutional_ledger,
-        "watchlist_ledger": watchlist_ledger,
-        "streamlit_open_tickers": open_tickers,
-        "sync_summary": sync_summary,
-    }
-    return bundle
-
 
 # --------------------------------------------------------
 
@@ -3050,9 +2790,9 @@ def _build_all_status_messages():
     runtime = _load_inapp_alert_runtime()
 
     rows = _status_snapshot_for_watchlist(tickers, positions)
-    n_long = sum(1 for r in rows if r["Position"] == "LONG")
-    n_cash = sum(1 for r in rows if r["Position"] == "CASH")
-    n_unknown = len(rows) - n_long - n_cash
+    long_rows = [r for r in rows if r["Position"] == "LONG"]
+    cash_rows = [r for r in rows if r["Position"] == "CASH"]
+    unknown_rows = [r for r in rows if r["Position"] not in ("LONG", "CASH")]
 
     completed = _format_ct_display(
         runtime.get("scan_completed_ct") or runtime.get("updated_ct"),
@@ -3066,33 +2806,47 @@ def _build_all_status_messages():
         f"Chicago time: <b>{html.escape(_ct_now_text())}</b>\n"
         f"Last full check: <b>{html.escape(str(completed))}</b>\n"
         f"Scanner: <b>{html.escape(scan_status)}</b> ({processed}/{len(tickers)})\n"
-        f"Total: <b>{len(tickers)}</b> | LONG: <b>{n_long}</b> | CASH: <b>{n_cash}</b> | UNKNOWN: <b>{n_unknown}</b>\n"
-        "Source: same Main Kalman engine, saved ticker params, signal lock, firewall, and institutional ledger.\n\n"
+        f"Total: <b>{len(tickers)}</b> | LONG: <b>{len(long_rows)}</b> | "
+        f"CASH/CLOSED: <b>{len(cash_rows)}</b> | UNKNOWN: <b>{len(unknown_rows)}</b>\n"
+        "Source: same Main Kalman engine, saved ticker params, signal lock, firewall, and institutional ledger.\n"
     )
 
-    lines = []
-    for r in rows:
-        pos = r["Position"]
-        icon = "🟢" if pos == "LONG" else ("⚪" if pos == "CASH" else "🟠")
-        px_txt = _format_status_price(r.get("Price"))
-        lines.append(f"{icon} <b>{html.escape(r['Ticker'])}</b> — {html.escape(pos)} — {px_txt}")
+    def _line(r, icon):
+        return f"{icon} <b>{html.escape(r['Ticker'])}</b> — {html.escape(r['Position'])} — {_format_status_price(r.get('Price'))}"
 
-    if not lines:
-        return [header + "No saved watchlist yet."]
+    sections = [
+        (f"🟢 <b>LONG POSITIONS ({len(long_rows)})</b>", [_line(r, "🟢") for r in long_rows], "No LONG positions."),
+        (f"⚪ <b>CASH / CLOSED POSITIONS ({len(cash_rows)})</b>", [_line(r, "⚪") for r in cash_rows], "No CASH/CLOSED positions."),
+    ]
+    if unknown_rows:
+        sections.append((
+            f"🟠 <b>UNKNOWN / NO DATA ({len(unknown_rows)})</b>",
+            [_line(r, "🟠") for r in unknown_rows],
+            "",
+        ))
 
+    # Keep LONG and CASH/CLOSED physically separate. A chunk never mixes sections.
     messages = []
-    current = header
     max_chars = 3600
-    for line in lines:
-        addition = line + "\n"
-        if len(current) + len(addition) > max_chars and current.strip():
-            messages.append(current.rstrip())
-            current = "<b>MAIN KALMAN STATUS — continued</b>\n" + addition
+    first_message = True
+    for title, lines, empty_text in sections:
+        prefix = (header + "\n") if first_message else ""
+        current = prefix + title + "\n"
+        first_message = False
+        if not lines:
+            current += empty_text + "\n"
         else:
-            current += addition
-    if current.strip():
-        messages.append(current.rstrip())
-    return messages
+            for line in lines:
+                addition = line + "\n"
+                if len(current) + len(addition) > max_chars:
+                    messages.append(current.rstrip())
+                    current = title.replace("</b>", " — continued</b>") + "\n" + addition
+                else:
+                    current += addition
+        if current.strip():
+            messages.append(current.rstrip())
+
+    return messages or [header + "\nNo saved watchlist yet."]
 
 
 def _build_one_ticker_status_message(ticker):
@@ -3300,7 +3054,6 @@ if INAPP_TELEGRAM_ENABLED:
         _start_inapp_alert_thread_once()
         _start_inapp_command_thread_once()
 
-
 def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: str):
     """Prevent repeated alerts on Streamlit reruns."""
     try:
@@ -3329,9 +3082,12 @@ def maybe_send_kalman_live_telegram_alert(
 ):
     """Send one Telegram alert when Kalman live BUY/SELL signal changes. Notification only."""
     try:
-        # Legacy live helper is intentionally disabled. BUY/SELL Telegram signals
-        # come only from the in-app Main Kalman 15-minute background worker.
+        # Legacy live sender disabled. BUY/SELL Telegram signals come only from
+        # the in-app Main Kalman 15-minute background worker.
         return
+
+        if not tg_alerts_on:
+            return
 
         # Try to infer values from explicit hints first, then from globals.
         g = globals()
@@ -10104,7 +9860,7 @@ with st.sidebar:
     auto_kalman_alerts_on = st.checkbox(
         "Auto-alert Kalman Live BUY/SELL",
         value=bool(_tg_saved.get("auto_kalman", True)),
-        help="Kept ON for Telegram system readiness. Actual automatic alerts are sent only by the Main Kalman Watchlist Monitor."
+        help="Kept ON for Telegram system readiness. Actual automatic BUY/SELL alerts are sent only by the in-app Main Kalman background worker."
     )
 
     if st.button("Save Telegram Settings on This Mac", use_container_width=True):
@@ -10138,7 +9894,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Watchlist uses the CURRENT Main Kalman controls from the sliders/settings, not a separate hardcoded logic. Auto-refresh is OFF by default.")
+    st.info("Main Ticker is view-only. Telegram BUY/SELL alerts come only from the in-app Main Kalman background worker, after baseline. Watchlist uses the CURRENT Main Kalman controls from the sliders/settings, not a separate hardcoded logic. Auto-refresh is OFF by default.")
     _mon_saved = _load_main_kalman_monitor_settings()
     _watchlist_from_url = _get_query_param_value("watchlist", "")
     _watchlist_default = str(_watchlist_from_url or _mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL") or "DELL, NBIS, PLTR, AAPL")
@@ -10167,7 +9923,7 @@ with st.sidebar:
         max_value=200,
         value=int(_mon_saved.get("max_stocks", 150) or 150),
         step=1,
-        help="Set to 150 for your full watchlist. Telegram /status always reads the full saved watchlist."
+        help="Higher number checks more tickers but can load slower. Set to 150 for your full watchlist. Telegram /status always reads the full saved watchlist."
     )
 
     # Auto-lock current watchlist on every rerun so refresh/reboot keeps your latest edits.
@@ -10354,11 +10110,23 @@ with st.sidebar:
 
     _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
 
+    if _clicked_run:
+        _rows_now = _run_monitor_and_store()
+        _render_open_closed_status(_rows_now, "Just ran (manual).")
+    elif auto_run_monitor:
+        _rows_now = _run_monitor_and_store()
+        _render_open_closed_status(_rows_now, f"Auto-run on page load — {st.session_state.get('last_main_kalman_monitor_ct', '')}.")
+    elif st.session_state.get("last_main_kalman_monitor_rows"):
+        # Show the last result without re-running, so the table persists across reruns.
+        _render_open_closed_status(
+            st.session_state["last_main_kalman_monitor_rows"],
+            f"Showing last run from {st.session_state.get('last_main_kalman_monitor_ct', '')}. Click the button to refresh.",
+        )
+
     st.info(
-        "📡 **In-app Telegram is ON — single sender mode.** Only the background Main Kalman worker can send BUY/SELL alerts. Render checks the full saved watchlist every 15 minutes. "
-        "Telegram `/status` answers immediately from the latest saved results; it does not wait for the next scan."
+        "📡 **In-app Telegram is ON — single sender mode.** Only the background Main Kalman worker can send BUY/SELL alerts. "
+        "Render checks the full saved watchlist every 15 minutes. Telegram `/status` answers immediately from the latest saved results."
     )
-    _bg_positions = _load_inapp_alert_positions()
     _bg_runtime = _load_inapp_alert_runtime()
     _bg_tickers = _normalize_watchlist(main_kalman_monitor_watchlist)
     _bg_done = int(_bg_runtime.get("processed_tickers", 0) or 0)
@@ -10373,128 +10141,16 @@ with st.sidebar:
         f"{_bg_unknown} unknown/no-data. Time zone: America/Chicago (CT)."
     )
     _tg_cmd_state = str(_bg_runtime.get("telegram_commands", "STARTING"))
-    st.caption(f"Telegram commands: {_tg_cmd_state}. Use `/status` for all tickers or `/status AAPL` for one ticker with all params.")
-
-    with st.expander("🔁 Bulk re-optimize ALL watchlist tickers (fix the 15-trusted / 135-fallback split)", expanded=False):
-        st.caption(
-            "Right now only tickers you've personally opened in the Main Kalman tab this session get "
-            "fresh, trusted optimizer params — every other ticker in the watchlist falls back to an old "
-            "one-time batch seed that this app itself treats as untrusted. Running this once loops the "
-            "SAME optimizer over every ticker in your full watchlist, so all of them end up trusted/live-synced "
-            "— eliminating mismatches between this app and any external mirror (e.g. a Render/Telegram bot)."
-        )
-        st.caption(
-            "⚠️ Each ticker runs a full parameter grid search. **Quick** finishes far faster with a smaller "
-            "grid (good for getting all 150 tickers trusted quickly); **Thorough** uses the exact same grid "
-            "as the single-ticker tab (slower, most precise). Results are saved to disk per-ticker as it "
-            "goes, so it's always safe to stop and resume later — the next click continues where you left off."
-        )
-        _bulk_grid_choice = st.radio(
-            "Grid size", ["Quick (fast, ~10x fewer combos)", "Thorough (exact match to single-ticker tab)"],
-            index=0, horizontal=True, key="bulk_reopt_grid_choice",
-        )
-        _bulk_resume = st.checkbox(
-            "Skip tickers that already have trusted params (resume mode)",
-            value=True, key="bulk_reopt_resume",
-            help="Turn OFF only if you want to force-recompute every ticker from scratch, including ones already trusted.",
-        )
-        if st.button("🔁 Bulk Re-Optimize ALL Watchlist Tickers Now", use_container_width=True):
-            _bulk_tickers = _normalize_watchlist(main_kalman_monitor_watchlist)
-            _bulk_prog = st.progress(0.0)
-            _bulk_status = st.empty()
-
-            def _bulk_progress_cb(i, total, ticker):
-                _bulk_status.text(f"Optimizing {ticker}... ({i}/{total})")
-                _bulk_prog.progress(min(1.0, i / max(1, total)))
-
-            if _bulk_grid_choice.startswith("Quick"):
-                _bulk_kwargs = dict(
-                    buffer_grid=(0.010, 0.020, 0.040),
-                    confirm_grid=(3, 5),
-                    hold_grid=(10, 21, 55),
-                    cooldown_grid=(5, 13),
-                )
-            else:
-                _bulk_kwargs = {}
-
-            _bulk_results = bulk_reoptimize_full_watchlist(
-                _bulk_tickers, progress_callback=_bulk_progress_cb,
-                skip_if_trusted=bool(_bulk_resume), **_bulk_kwargs,
-            )
-            _bulk_ok = {k: v for k, v in _bulk_results.items() if "error" not in v and not v.get("skipped")}
-            _bulk_skipped = {k: v for k, v in _bulk_results.items() if v.get("skipped")}
-            _bulk_errs = {k: v for k, v in _bulk_results.items() if "error" in v}
-            _bulk_missing = [t for t in _bulk_tickers if t not in _bulk_results]
-            st.success(
-                f"Newly optimized {len(_bulk_ok)}, skipped {len(_bulk_skipped)} (already trusted), "
-                f"failed {len(_bulk_errs)} — out of {len(_bulk_tickers)} total tickers."
-            )
-            if _bulk_errs:
-                st.warning(f"{len(_bulk_errs)} tickers failed (data/errors) — see table below.")
-                st.dataframe(pd.DataFrame(_bulk_errs).T, use_container_width=True)
-            if _bulk_missing:
-                st.error(f"{len(_bulk_missing)} tickers returned no result at all (unexpected): {', '.join(_bulk_missing[:30])}")
-            if _bulk_ok:
-                st.dataframe(pd.DataFrame(_bulk_ok).T, use_container_width=True)
-
-    with st.expander("📤 Export exact Main Kalman bundle for Render", expanded=False):
-        st.caption(
-            "This bundle now includes all Main Kalman controls, per-ticker optimized params, "
-            "signal lock, institutional ledger, and watchlist ledger. The in-app Render scanner "
-            "loads it automatically from `STREAMLIT_KALMAN_BUNDLE_FILE` after a fresh deploy."
-        )
-        if st.button("🧮 Build latest bundle", use_container_width=True):
-            _bundle_now = build_render_bundle_export()
-            st.session_state["_last_render_bundle_json"] = json.dumps(_bundle_now, indent=2, default=str)
-            st.session_state["_last_render_bundle_ct"] = _bundle_now["exported_ct"]
-            _ss = _bundle_now["sync_summary"]
-            st.success(
-                f"Bundle built at {_bundle_now['exported_ct']} — {_ss['total_params']} tickers total, "
-                f"✅ {_ss['trusted_saved_params']} trusted, ⚠️ {_ss['fallback_seed_params']} still fallback."
-            )
-
-        if st.session_state.get("_last_render_bundle_json"):
-            st.caption(f"Last built: {st.session_state.get('_last_render_bundle_ct', '')}")
-            st.download_button(
-                label="⬇️ Download streamlit_kalman_render_bundle.json",
-                data=st.session_state["_last_render_bundle_json"],
-                file_name="streamlit_kalman_render_bundle.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-    if _clicked_run:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, "Just ran (manual).")
-    elif auto_run_monitor:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, f"Auto-run on page load — {st.session_state.get('last_main_kalman_monitor_ct', '')}.")
-    elif st.session_state.get("last_main_kalman_monitor_rows"):
-        # Show the last result without re-running, so the table persists across reruns.
-        _render_open_closed_status(
-            st.session_state["last_main_kalman_monitor_rows"],
-            f"Showing last run from {st.session_state.get('last_main_kalman_monitor_ct', '')}. Click the button to refresh.",
-        )
-
-    with st.expander("📡 Render Telegram setup", expanded=False):
-        st.markdown(
-            "**This app is now the Telegram worker.** Keep the Render app running and use the same bot here."
-        )
-        st.markdown(
-            "1. In Render, set `BOT_TOKEN` and `CHAT_ID`.  "
-            "2. Keep `INAPP_TELEGRAM_ENABLED=true` (this is already the default).  "
-            "3. Stop any old separate `telegram_watchlist_scanner.py` or second Telegram worker using the same bot."
-        )
-        st.caption(
-            "Telegram commands: /status = full watchlist now, /status AAPL = one ticker with all params, /ping = bot health. "
-            "All times use America/Chicago (Central Time)."
-        )
+    st.caption(
+        f"Telegram commands: {_tg_cmd_state}. `/status` shows LONG first, then CASH/CLOSED separately. "
+        "Use `/status AAPL` for one ticker with all params."
+    )
 
     if False:
         st.caption("Auto monitor disabled for safe loading. Use Run Main Kalman Monitor Now.")
         _main_mon_rows = run_main_kalman_watchlist_monitor(
             main_kalman_monitor_watchlist,
-            send_telegram=bool(tg_alerts_on),
+            send_telegram=False,
             token=tg_bot_token,
             chat_id=tg_chat_id,
             show_table=True,
@@ -13907,7 +13563,7 @@ with tab4:
             if st.button("Reset institutional ledger for this ticker", key=f"reset_inst_ledger_{TICKER}"):
                 try:
                     _lg = _load_main_kalman_institutional_ledger()
-                    _lg.pop(f"{str(TICKER).upper()}|{str(locals().get('data_interval', locals().get('interval', '15m')))}", None)
+                    _lg.pop(str(TICKER).upper(), None)
                     _save_main_kalman_institutional_ledger(_lg)
                     st.success(f"Institutional ledger reset for {str(TICKER).upper()}.")
                 except Exception as _e:
@@ -23630,3 +23286,264 @@ except Exception as e:
 
 st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
+
+# ============================================================================
+# RENDER MIRROR SYNC EXPORT — ADDITIVE ONLY
+# ----------------------------------------------------------------------------
+# Purpose:
+#   Export the exact Main Kalman state that THIS running Streamlit session uses.
+#   Strategy math is untouched. Nothing is optimized, reset, deleted, or changed.
+# Priority for each ticker:
+#   1) active Streamlit Fast-mode session cache
+#   2) live Render-mirror capture written when the Main tab actually used params
+#   3) trusted persistent Main Kalman params (batch-tagged records excluded)
+#   4) optional uploaded 150-ticker JSON as fallback only
+# ============================================================================
+try:
+    import re as _render_sync_re
+
+    def _render_sync_normalize_param_store(_data):
+        if not isinstance(_data, dict):
+            return {}
+        _nested = _data.get("per_ticker_params")
+        if isinstance(_nested, dict):
+            _data = _nested
+        return {
+            str(_k).upper(): dict(_v)
+            for _k, _v in _data.items()
+            if isinstance(_v, dict)
+        }
+
+    def _render_sync_active_session_params():
+        _best = {}
+        _best_day = {}
+        try:
+            for _key, _val in list(st.session_state.items()):
+                _ks = str(_key)
+                if not _ks.startswith("kalman_opt::") or not isinstance(_val, dict):
+                    continue
+                if not all(_x in _val for _x in ("buffer", "confirm", "hold", "cool")):
+                    continue
+                _parts = _ks.split("::")
+                if len(_parts) < 4:
+                    continue
+                _sym = str(_parts[1]).upper().strip()
+                _day = str(_parts[3])
+                if not _sym:
+                    continue
+                _m_slope = _render_sync_re.search(r"::slope(True|False)::", _ks)
+                _m_atr = _render_sync_re.search(r"::atr(True|False)::", _ks)
+                _rec = {
+                    "buffer_pct": float(_val["buffer"]),
+                    "confirm_bars": int(_val["confirm"]),
+                    "min_hold_bars": int(_val["hold"]),
+                    "cooldown_bars": int(_val["cool"]),
+                    "slope_confirm": True if _m_slope is None else (_m_slope.group(1) == "True"),
+                    "atr_safety": True if _m_atr is None else (_m_atr.group(1) == "True"),
+                    "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                    "_sync_source": "ACTIVE_STREAMLIT_FAST_CACHE",
+                    "_cache_day": _day,
+                    "_cache_key": _ks,
+                }
+                if _sym not in _best or _day >= _best_day.get(_sym, ""):
+                    _best[_sym] = _rec
+                    _best_day[_sym] = _day
+        except Exception:
+            pass
+        return _best
+
+    def _render_sync_open_tickers(_institutional_ledger):
+        _opens = set()
+        try:
+            for _key, _val in list(st.session_state.items()):
+                _ks = str(_key)
+                if _ks.startswith("main_kalman_status_") and isinstance(_val, dict):
+                    if str(_val.get("Trade Position", "")).upper() == "LONG":
+                        _opens.add(_ks.replace("main_kalman_status_", "", 1).upper())
+        except Exception:
+            pass
+        try:
+            if isinstance(_institutional_ledger, dict):
+                for _sym, _book in _institutional_ledger.items():
+                    _rows = _book.get("trades", []) if isinstance(_book, dict) else []
+                    if isinstance(_rows, list) and any(str(_r.get("Status", "")).lower() == "open" for _r in _rows if isinstance(_r, dict)):
+                        _opens.add(str(_sym).upper())
+        except Exception:
+            pass
+        try:
+            _wl = _load_main_kalman_watchlist_ledger()
+            if isinstance(_wl, dict):
+                for _sym, _row in _wl.items():
+                    if isinstance(_row, dict) and str(_row.get("position", "")).upper() == "LONG":
+                        _opens.add(str(_sym).upper())
+        except Exception:
+            pass
+        return sorted(_opens)
+
+    with st.sidebar.expander("🔗 Render Mirror Sync", expanded=False):
+        st.caption("Read/export only. It does not optimize, reset, delete, or change Kalman strategy logic.")
+        _render_seed_upload = st.file_uploader(
+            "Optional 150-ticker fallback JSON",
+            type=["json"],
+            key="render_mirror_seed_json_upload",
+            help="Use your 150-ticker JSON only as fallback. Active Streamlit values override it.",
+        )
+
+        _seed_params = {}
+        if _render_seed_upload is not None:
+            try:
+                _seed_raw = json.loads(_render_seed_upload.getvalue().decode("utf-8"))
+                _seed_params = _render_sync_normalize_param_store(_seed_raw)
+            except Exception as _e:
+                st.error(f"Could not read fallback JSON: {_e}")
+
+        # Lowest priority: optional batch/seed JSON.
+        _merged_params = {}
+        for _sym, _rec in _seed_params.items():
+            _x = dict(_rec)
+            _x["_sync_source"] = "BATCH_SEED_FALLBACK"
+            _merged_params[_sym] = _x
+
+        # Trusted persistent live params. Explicit batch-tagged records are skipped.
+        _trusted_disk = {}
+        try:
+            _raw_disk = _load_main_kalman_opt_params()
+            if isinstance(_raw_disk, dict):
+                for _sym, _rec in _raw_disk.items():
+                    if not isinstance(_rec, dict):
+                        continue
+                    if str(_rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M":
+                        continue
+                    _x = dict(_rec)
+                    _x["_sync_source"] = "TRUSTED_STREAMLIT_SAVED_PARAMS"
+                    _trusted_disk[str(_sym).upper()] = _x
+        except Exception:
+            _trusted_disk = {}
+        _merged_params.update(_trusted_disk)
+
+        # Exact values captured when this Main Kalman app actually used them.
+        _live_mirror = _load_main_kalman_render_mirror_params()
+        if isinstance(_live_mirror, dict):
+            _merged_params.update(_render_sync_normalize_param_store(_live_mirror))
+
+        # Highest priority: exact in-memory Fast-mode cache from this running session.
+        _active_cache = _render_sync_active_session_params()
+        _merged_params.update(_active_cache)
+
+        try:
+            _signal_lock_export = _load_main_kalman_signal_lock()
+        except Exception:
+            _signal_lock_export = {}
+        try:
+            _institutional_export = _load_main_kalman_institutional_ledger()
+        except Exception:
+            _institutional_export = {}
+        try:
+            _watchlist_export = _load_main_kalman_watchlist_ledger()
+        except Exception:
+            _watchlist_export = {}
+
+        _open_export = _render_sync_open_tickers(_institutional_export)
+        _source_counts = {}
+        for _rec in _merged_params.values():
+            if isinstance(_rec, dict):
+                _src = str(_rec.get("_sync_source", "UNKNOWN"))
+                _source_counts[_src] = int(_source_counts.get(_src, 0)) + 1
+
+        _bundle = {
+            "bundle_version": 3,
+            "exported_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+            "main_kalman_controls": _get_current_main_kalman_params(),
+            "data_path": {
+                "lookback_days": 30,
+                "interval": str(locals().get("data_interval", "15m")),
+                "auto_adjust": False,
+                "prepost": False,
+                "source": "Visible Main Kalman tab",
+            },
+            "per_ticker_params": _merged_params,
+            "signal_lock": _signal_lock_export if isinstance(_signal_lock_export, dict) else {},
+            "institutional_ledger": _institutional_export if isinstance(_institutional_export, dict) else {},
+            "watchlist_ledger": _watchlist_export if isinstance(_watchlist_export, dict) else {},
+            "streamlit_open_tickers": _open_export,
+            "sync_summary": {
+                "total_params": len(_merged_params),
+                "active_session_overrides": len(_active_cache),
+                "live_mirror_captures": len(_live_mirror) if isinstance(_live_mirror, dict) else 0,
+                "trusted_saved_params": len(_trusted_disk),
+                "fallback_seed_params": len(_seed_params),
+                "source_counts": _source_counts,
+            },
+        }
+
+        st.write(f"Params ready: **{len(_merged_params)}**")
+        st.write(f"Active Fast-cache overrides: **{len(_active_cache)}**")
+        st.write(f"Live Streamlit captures: **{len(_live_mirror) if isinstance(_live_mirror, dict) else 0}**")
+        st.write(f"Signal-lock keys: **{len(_signal_lock_export) if isinstance(_signal_lock_export, dict) else 0}**")
+        st.write(f"Institutional ledger tickers: **{len(_institutional_export) if isinstance(_institutional_export, dict) else 0}**")
+        st.write(f"Open tickers exported: **{len(_open_export)}**")
+
+        _bundle_bytes = json.dumps(_bundle, indent=2, default=str).encode("utf-8")
+        st.download_button(
+            "⬇️ Download Exact Render Mirror Bundle",
+            data=_bundle_bytes,
+            file_name="streamlit_kalman_render_bundle.json",
+            mime="application/json",
+            use_container_width=True,
+            key="download_exact_render_mirror_bundle",
+        )
+
+        # FULL 150-TICKER COVERAGE TABLE — not just active-cache overrides.
+        _coverage_rows = []
+        for _sym, _rec in sorted(_merged_params.items()):
+            if not isinstance(_rec, dict):
+                continue
+            _coverage_rows.append({
+                "Ticker": _sym,
+                "Buffer %": round(float(_rec.get("buffer_pct", 0)) * 100, 2),
+                "Confirm": int(_rec.get("confirm_bars", 0)),
+                "Min Hold": int(_rec.get("min_hold_bars", 0)),
+                "Cooldown": int(_rec.get("cooldown_bars", 0)),
+                "Source": str(_rec.get("_sync_source", _rec.get("source", "UNKNOWN"))),
+            })
+
+        _expected_symbols = sorted(set(_seed_params.keys())) if _seed_params else sorted(set(_merged_params.keys()))
+        _missing_symbols = sorted(set(_expected_symbols) - set(_merged_params.keys()))
+        _extra_symbols = sorted(set(_merged_params.keys()) - set(_expected_symbols)) if _expected_symbols else []
+
+        if len(_merged_params) == 150:
+            st.success("✅ FULL COVERAGE: 150/150 ticker parameter sets are in the Render bundle.")
+        else:
+            st.warning(f"⚠️ Coverage is {len(_merged_params)}/150. Do not deploy until all 150 are present.")
+
+        st.caption(
+            f"All merged ticker parameters used by Render — Active Fast-cache overrides: {len(_active_cache)} | "
+            f"Live captures: {len(_live_mirror) if isinstance(_live_mirror, dict) else 0} | "
+            f"Trusted saved: {len(_trusted_disk)} | Fallback seed: {len(_seed_params)}"
+        )
+        st.dataframe(pd.DataFrame(_coverage_rows), use_container_width=True, hide_index=True, height=520)
+
+        if _missing_symbols:
+            st.error("Missing tickers: " + ", ".join(_missing_symbols))
+        if _extra_symbols:
+            st.info("Extra tickers not in uploaded 150 seed: " + ", ".join(_extra_symbols))
+
+        if _active_cache:
+            with st.expander(f"Show only {len(_active_cache)} active Streamlit Fast-cache overrides", expanded=False):
+                _active_rows = []
+                for _sym, _rec in sorted(_active_cache.items()):
+                    _active_rows.append({
+                        "Ticker": _sym,
+                        "Buffer %": round(float(_rec.get("buffer_pct", 0)) * 100, 2),
+                        "Confirm": int(_rec.get("confirm_bars", 0)),
+                        "Min Hold": int(_rec.get("min_hold_bars", 0)),
+                        "Cooldown": int(_rec.get("cooldown_bars", 0)),
+                        "Source": "ACTIVE_STREAMLIT_FAST_CACHE",
+                    })
+                st.dataframe(pd.DataFrame(_active_rows), use_container_width=True, hide_index=True)
+except Exception as _render_sync_error:
+    try:
+        st.sidebar.caption(f"Render Mirror Sync unavailable: {_render_sync_error}")
+    except Exception:
+        pass
+
