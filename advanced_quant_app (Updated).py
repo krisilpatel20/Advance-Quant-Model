@@ -890,12 +890,18 @@ def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_ch
     window — this is the same fix already applied to the Render bot's scanner.
     Cuts ~150 individual requests down to ~len(tickers)/chunk_size batched ones.
 
-    Returns {ticker: pd.Series} for every ticker that returned usable data.
+    Returns (out, debug):
+      out   = {ticker: pd.Series} for every ticker that returned usable data.
+      debug = {ticker: reason string} for every ticker that did NOT — so failures
+              are diagnosable instead of collapsing into one generic message.
     """
     out = {}
+    debug = {}
     tickers = [str(t).upper() for t in tickers]
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i:i + chunk_size]
+        raw = None
+        chunk_err = None
         try:
             raw = yf.download(
                 tickers=chunk,
@@ -908,32 +914,57 @@ def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_ch
                 threads=True,
             )
         except Exception as e:
+            chunk_err = f"yf.download raised: {e}"
             print(f"Batch fetch error for chunk {chunk}: {e}")
             raw = None
 
-        if raw is not None and not raw.empty:
+        if raw is None:
             for t in chunk:
-                try:
-                    if isinstance(raw.columns, pd.MultiIndex):
-                        top_level = raw.columns.get_level_values(0)
-                        if t not in top_level:
-                            continue
-                        df_t = raw[t]
-                    else:
-                        df_t = raw if len(chunk) == 1 else None
-                        if df_t is None:
-                            continue
-                    close_col = "Close" if "Close" in df_t.columns else df_t.columns[-1]
-                    px = _clean_15m_series(df_t[close_col])
-                    if px is not None:
-                        out[t] = px
-                except Exception:
+                debug[t] = chunk_err or "yf.download returned None"
+            if i + chunk_size < len(tickers):
+                time.sleep(pause_between_chunks)
+            continue
+
+        if raw.empty:
+            for t in chunk:
+                debug[t] = "yf.download returned an empty DataFrame for this whole chunk (likely rate-limited or market data unavailable)"
+            if i + chunk_size < len(tickers):
+                time.sleep(pause_between_chunks)
+            continue
+
+        for t in chunk:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    top_level = raw.columns.get_level_values(0)
+                    if t not in top_level:
+                        debug[t] = f"ticker not present in batch response columns (top-level keys seen: {sorted(set(top_level))[:5]}...)"
+                        continue
+                    df_t = raw[t]
+                else:
+                    if len(chunk) != 1:
+                        debug[t] = "unexpected non-MultiIndex columns for a multi-ticker chunk request"
+                        continue
+                    df_t = raw
+                if df_t is None or df_t.empty:
+                    debug[t] = "per-ticker frame is empty within the batch response"
                     continue
+                close_col = "Close" if "Close" in df_t.columns else (df_t.columns[-1] if len(df_t.columns) else None)
+                if close_col is None:
+                    debug[t] = f"no usable price column found (columns seen: {list(df_t.columns)})"
+                    continue
+                px = _clean_15m_series(df_t[close_col])
+                if px is None:
+                    debug[t] = "price series came back but was empty/too short (<80 bars) after cleaning"
+                    continue
+                out[t] = px
+            except Exception as e:
+                debug[t] = f"parse error: {e}"
+                continue
 
         if i + chunk_size < len(tickers):
             time.sleep(pause_between_chunks)
 
-    return out
+    return out, debug
 
 
 def _get_current_main_kalman_params():
@@ -1970,7 +2001,7 @@ def bulk_reoptimize_full_watchlist(
             progress_callback(0, total, "batch-fetching all tickers...")
         except Exception:
             pass
-    price_data = _bulk_fetch_15m_batch(symbols, period="60d", chunk_size=20, pause_between_chunks=2.0)
+    price_data, fetch_debug = _bulk_fetch_15m_batch(symbols, period="60d", chunk_size=20, pause_between_chunks=2.0)
 
     for i, sym in enumerate(symbols, start=1):
         sym = str(sym).upper()
@@ -1998,7 +2029,7 @@ def bulk_reoptimize_full_watchlist(
         try:
             px = price_data.get(sym)
             if px is None or len(px) < 80:
-                results[sym] = {"error": "insufficient/no data (batch fetch — likely rate-limited or no data for this ticker)"}
+                results[sym] = {"error": fetch_debug.get(sym, "insufficient/no data (unknown reason — not in fetch results at all)")}
                 continue
 
             rail, _center, _long_state = institutional_trend_rail(
