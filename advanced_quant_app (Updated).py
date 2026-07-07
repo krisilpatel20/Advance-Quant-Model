@@ -818,9 +818,22 @@ def _save_main_kalman_monitor_settings(data):
         return False, str(e)
 
 def _main_monitor_fetch_15m(ticker, period="60d"):
+    # FIX: switched from period="60d" to explicit start/end dates. The working
+    # single-ticker Main Kalman tab (load_data()) never uses period= at all —
+    # it passes explicit start/end datetimes, and that request style is proven
+    # reliable from this hosting environment while period="60d" was returning
+    # empty results. Keeping the same ~60-day span here since the optimizer and
+    # bundle schema are both built around a 60-day 15m lookback.
+    try:
+        _days = int(str(period).lower().replace("d", "").strip())
+    except Exception:
+        _days = 60
+    _end = datetime.now()
+    _start = _end - timedelta(days=_days)
     df = yf.download(
         str(ticker).upper(),
-        period=period,
+        start=_start,
+        end=_end,
         interval="15m",
         auto_adjust=True,
         progress=False,
