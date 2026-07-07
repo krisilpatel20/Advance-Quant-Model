@@ -2275,6 +2275,131 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
         return False, str(e)
 
 
+# ============================================================================
+# IN-APP BACKGROUND ALERT CHECKER
+# ----------------------------------------------------------------------------
+# Runs forever in its own background thread, independent of any browser tab
+# being open. Since this app now runs on a plan that never sleeps, this thread
+# just keeps going the whole time the server is up. It re-checks every ticker
+# in the saved watchlist every 15 minutes using the same proven-reliable
+# fetch/position logic as the rest of the app, and texts Telegram only when a
+# ticker's position actually changes (not on every check).
+#
+# Safety: guarded so only ONE copy of this loop can ever be running per server
+# process, no matter how many browser tabs/sessions connect.
+# ============================================================================
+import threading
+
+_INAPP_ALERT_THREAD_STARTED = False
+_INAPP_ALERT_LOCK = threading.Lock()
+
+
+def _inapp_alert_positions_path():
+    try:
+        return _Path.home() / ".pinehurst_inapp_alert_positions.json"
+    except Exception:
+        return _Path(".pinehurst_inapp_alert_positions.json")
+
+
+def _load_inapp_alert_positions():
+    try:
+        p = _inapp_alert_positions_path()
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_inapp_alert_positions(data):
+    try:
+        _inapp_alert_positions_path().write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _inapp_alert_check_once():
+    """One full pass over the saved watchlist: fetch each ticker one at a time
+    (same method proven reliable elsewhere in this app), work out LONG/CASH,
+    and text Telegram only if it changed since the last check."""
+    settings = _load_main_kalman_monitor_settings()
+    tickers = _normalize_watchlist(settings.get("watchlist", ""))
+    if not tickers:
+        return
+
+    tg = load_telegram_settings()
+    bot_token = tg.get("bot_token", "")
+    chat_id = tg.get("chat_id", "")
+    if not bot_token or not chat_id:
+        return  # nothing configured to send to yet
+
+    positions = _load_inapp_alert_positions()
+
+    for sym in tickers:
+        sym = str(sym).upper()
+        try:
+            px = _main_monitor_fetch_15m(sym, period="60d")
+            if px is None or len(px) < 80:
+                continue
+
+            trades_df, _raw = _build_main_kalman_trade_log_from_prices(sym, px)
+            new_pos = "CASH"
+            if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                last_row = trades_df.iloc[-1]
+                new_pos = "LONG" if _trade_row_is_open(last_row, columns=trades_df.columns) else "CASH"
+
+            old_pos = positions.get(sym, {}).get("position")
+            price_now = round(float(px.iloc[-1]), 2)
+
+            if old_pos is not None and old_pos != new_pos:
+                emoji = "🟢" if new_pos == "LONG" else "🔴"
+                action = "BUY" if new_pos == "LONG" else "SELL"
+                msg = (
+                    f"{emoji} <b>IN-APP MAIN KALMAN {action}</b>\n"
+                    f"Ticker: <b>{sym}</b>\n"
+                    f"Position: <b>{new_pos}</b>\n"
+                    f"Price: <b>{price_now}</b>\n"
+                    f"Time: <b>{datetime.now().strftime('%Y-%m-%d %I:%M %p')}</b>"
+                )
+                send_telegram_alert(bot_token, chat_id, msg)
+
+            positions[sym] = {
+                "position": new_pos,
+                "price": price_now,
+                "checked_at": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            print(f"In-app alert check error for {sym}: {e}")
+        time.sleep(1.0)  # pacing between tickers, same as the proven single-ticker path
+
+    _save_inapp_alert_positions(positions)
+
+
+def _inapp_alert_background_loop(interval_seconds=900):
+    while True:
+        try:
+            _inapp_alert_check_once()
+        except Exception as e:
+            print(f"In-app alert loop error: {e}")
+        time.sleep(interval_seconds)
+
+
+def _start_inapp_alert_thread_once():
+    global _INAPP_ALERT_THREAD_STARTED
+    with _INAPP_ALERT_LOCK:
+        if _INAPP_ALERT_THREAD_STARTED:
+            return
+        _INAPP_ALERT_THREAD_STARTED = True
+        t = threading.Thread(target=_inapp_alert_background_loop, daemon=True)
+        t.start()
+        print("✅ In-app background alert thread started.")
+
+
+# Start it once, right now, as soon as the server process boots — independent
+# of whether anyone has a browser tab open.
+_start_inapp_alert_thread_once()
+
+
 def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: str):
     """Prevent repeated alerts on Streamlit reruns."""
     try:
@@ -9323,6 +9448,18 @@ with st.sidebar:
         return _rows
 
     _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
+
+    st.info(
+        "📡 **Background alerts: ON.** This app checks your watchlist every 15 minutes on its own "
+        "and texts Telegram when a ticker's position changes — no browser tab needs to stay open."
+    )
+    _bg_positions = _load_inapp_alert_positions()
+    if _bg_positions:
+        _last_checks = [v.get("checked_at", "") for v in _bg_positions.values() if v.get("checked_at")]
+        if _last_checks:
+            st.caption(f"Last background check: {max(_last_checks)} — {len(_bg_positions)} tickers tracked.")
+    else:
+        st.caption("No background checks recorded yet — first check happens within 15 minutes of the app starting.")
 
     with st.expander("🔁 Bulk re-optimize ALL watchlist tickers (fix the 15-trusted / 135-fallback split)", expanded=False):
         st.caption(
