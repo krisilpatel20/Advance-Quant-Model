@@ -24,6 +24,8 @@ from pathlib import Path
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
+import html
 from pathlib import Path as _Path
 import smtplib
 import os
@@ -369,10 +371,8 @@ def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, late
 
 
 def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, token="", chat_id="", enabled=False):
-    """
-    Send Telegram only from the main Kalman trade log.
-    No separate scanner logic. No separate 15m helper logic.
-    """
+    """Legacy sender disabled. Background Main Kalman worker is the only signal sender."""
+    return False, "Disabled: in-app background Main Kalman worker is the single BUY/SELL sender."
     try:
         if not enabled:
             return False, "Telegram main-log alerts OFF."
@@ -866,6 +866,11 @@ def _clean_15m_series(px_raw):
             px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
         except Exception:
             pass
+        # load_data() adds Returns/Log_Returns and then dropna(), which removes
+        # the first historical row. Drop the same row here so the batch path
+        # starts the recursive Kalman calculation on the identical bar.
+        if len(px) > 1:
+            px = px.iloc[1:]
         try:
             now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
             latest_start = pd.Timestamp(px.index[-1])
@@ -906,7 +911,7 @@ def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_ch
                 period=period,
                 interval="15m",
                 group_by="ticker",
-                auto_adjust=True,
+                auto_adjust=False,
                 progress=False,
                 prepost=False,
                 threads=True,
@@ -965,48 +970,65 @@ def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_ch
     return out, debug
 
 
-def _get_current_main_kalman_params():
-    """Read current Main Kalman tab settings from Streamlit session_state."""
-    try:
-        rail_mult = float(st.session_state.get("kalman_trend_rail_distance", 1.35))
-    except Exception:
-        rail_mult = 1.35
-    try:
-        buffer_pct = float(st.session_state.get("kalman_strategy_cross_buffer_pct", 1.25)) / 100.0
-    except Exception:
-        buffer_pct = 0.0125
-    try:
-        confirm_bars = int(st.session_state.get("kalman_strategy_confirm_bars", 3))
-    except Exception:
-        confirm_bars = 3
-    try:
-        min_hold_bars = int(st.session_state.get("kalman_strategy_min_hold", 5))
-    except Exception:
-        min_hold_bars = 5
-    try:
-        cooldown_bars = int(st.session_state.get("kalman_strategy_cooldown", 3))
-    except Exception:
-        cooldown_bars = 3
-    try:
-        slope_confirm = bool(st.session_state.get("kalman_strategy_slope_confirm", True))
-    except Exception:
-        slope_confirm = True
-    try:
-        atr_safety = bool(st.session_state.get("kalman_strategy_atr_safety", True))
-    except Exception:
-        atr_safety = True
-    try:
-        fast_gain = float(st.session_state.get("kalman_fast_reaction", 0.34))
-    except Exception:
-        fast_gain = 0.34
-    try:
-        slow_gain = float(st.session_state.get("kalman_slow_smoothing", 0.055))
-    except Exception:
-        slow_gain = 0.055
-    try:
-        polish_span = int(st.session_state.get("kalman_polish_span", 3))
-    except Exception:
-        polish_span = 3
+def _get_current_main_kalman_params(runtime_settings=None):
+    """Read the exact Main Kalman controls.
+
+    In the visible Streamlit tab, session_state is authoritative. In the
+    background Render thread there is no safe browser session, so the same
+    values are read from the persisted Main Kalman monitor settings instead.
+    This changes only where parameters come from; the signal/trade logic below
+    is unchanged.
+    """
+    saved = runtime_settings if isinstance(runtime_settings, dict) else None
+
+    def _read(session_key, saved_key, default, cast, saved_transform=None):
+        if saved is not None and saved_key in saved:
+            try:
+                v = saved.get(saved_key)
+                if saved_transform is not None:
+                    v = saved_transform(v)
+                return cast(v)
+            except Exception:
+                return cast(default)
+        try:
+            return cast(st.session_state.get(session_key, default))
+        except Exception:
+            try:
+                fallback = _load_main_kalman_monitor_settings()
+                v = fallback.get(saved_key, default)
+                if saved_transform is not None:
+                    v = saved_transform(v)
+                return cast(v)
+            except Exception:
+                return cast(default)
+
+    rail_mult = _read("kalman_trend_rail_distance", "kalman_trend_rail_distance", 1.35, float)
+    buffer_pct = _read(
+        "kalman_strategy_cross_buffer_pct", "kalman_strategy_cross_buffer_pct", 1.25, float,
+        saved_transform=lambda v: float(v),
+    ) / 100.0
+    confirm_bars = _read("kalman_strategy_confirm_bars", "kalman_strategy_confirm_bars", 3, int)
+    min_hold_bars = _read("kalman_strategy_min_hold", "kalman_strategy_min_hold", 5, int)
+    cooldown_bars = _read("kalman_strategy_cooldown", "kalman_strategy_cooldown", 3, int)
+    slope_confirm = _read("kalman_strategy_slope_confirm", "kalman_strategy_slope_confirm", True, bool)
+    atr_safety = _read("kalman_strategy_atr_safety", "kalman_strategy_atr_safety", True, bool)
+    fast_gain = _read("kalman_fast_reaction", "kalman_fast_reaction", 0.34, float)
+    slow_gain = _read("kalman_slow_smoothing", "kalman_slow_smoothing", 0.055, float)
+    polish_span = _read("kalman_polish_span", "kalman_polish_span", 3, int)
+    risk_firewall = _read("kalman_use_risk_firewall", "kalman_use_risk_firewall", False, bool)
+    trade_stop_pct = _read("kalman_trade_stop_pct", "kalman_trade_stop_pct", 16.0, float)
+    trail_stop_pct = _read("kalman_trail_stop_pct", "kalman_trail_stop_pct", 22.0, float)
+    equity_dd_stop_pct = _read("kalman_equity_dd_stop_pct", "kalman_equity_dd_stop_pct", 28.0, float)
+    firewall_cooldown = _read("kalman_firewall_cooldown", "kalman_firewall_cooldown", 8, int)
+    institutional_ledger = _read(
+        "kalman_institutional_live_ledger", "kalman_institutional_live_ledger", True, bool
+    )
+    benchmark_optimizer = _read(
+        "kalman_benchmark_aware_optimizer", "kalman_benchmark_aware_optimizer", True, bool
+    )
+    non_repaint_lock = _read(
+        "kalman_non_repaint_lock", "kalman_non_repaint_lock", True, bool
+    )
 
     return {
         "rail_mult": rail_mult,
@@ -1019,12 +1041,33 @@ def _get_current_main_kalman_params():
         "fast_gain": fast_gain,
         "slow_gain": slow_gain,
         "polish_span": polish_span,
+        "risk_firewall": risk_firewall,
+        "trade_stop_pct": trade_stop_pct,
+        "trail_stop_pct": trail_stop_pct,
+        "equity_dd_stop_pct": equity_dd_stop_pct,
+        "firewall_cooldown": firewall_cooldown,
+        "institutional_ledger": institutional_ledger,
+        "benchmark_optimizer": benchmark_optimizer,
+        "non_repaint_lock": non_repaint_lock,
     }
+
 
 def _main_kalman_params_label(params=None):
     if params is None:
         params = _get_current_main_kalman_params()
+    firewall_txt = "OFF"
+    if bool(params.get("risk_firewall", False)):
+        firewall_txt = (
+            f"ON (stop {float(params.get('trade_stop_pct', 16.0)):.0f}%, "
+            f"trail {float(params.get('trail_stop_pct', 22.0)):.0f}%, "
+            f"equity {float(params.get('equity_dd_stop_pct', 28.0)):.0f}%, "
+            f"cooldown {int(params.get('firewall_cooldown', 8))})"
+        )
     return (
+        f"fast {params['fast_gain']:.3f}, "
+        f"slow {params['slow_gain']:.3f}, "
+        f"polish {params['polish_span']}, "
+        f"optimizer {'ON' if params.get('benchmark_optimizer', True) else 'OFF'}, "
         f"Trend Rail {params['rail_mult']:.2f}, "
         f"buffer {params['buffer_pct']*100:.2f}%, "
         f"confirm {params['confirm_bars']}, "
@@ -1032,11 +1075,11 @@ def _main_kalman_params_label(params=None):
         f"cooldown {params['cooldown_bars']}, "
         f"slope {'ON' if params['slope_confirm'] else 'OFF'}, "
         f"ATR safety {'ON' if params['atr_safety'] else 'OFF'}, "
-        "risk firewall OFF"
+        f"risk firewall {firewall_txt}"
     )
 
 
-def _build_main_kalman_trade_log_from_prices(ticker, px):
+def _build_main_kalman_trade_log_from_prices(ticker, px, runtime_settings=None):
     """
     Watchlist version using the SAME CURRENT main Kalman controls from session_state.
     This is the correct source for watchlist/telegram, not hardcoded buffer/hold values.
@@ -1046,7 +1089,7 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     if len(px) < 80:
         return pd.DataFrame(), None
 
-    params = _get_current_main_kalman_params()
+    params = _get_current_main_kalman_params(runtime_settings=runtime_settings)
 
     rail, center, long_state = institutional_trend_rail(
         px,
@@ -1061,7 +1104,7 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     # If the main tab saved optimizer-chosen params for THIS ticker, use them so
     # the watchlist reproduces the main-tab signal exactly. Otherwise fall back
     # to the current slider params.
-    _opt = _get_main_kalman_opt_params_for_ticker(ticker)
+    _opt = _get_main_kalman_opt_params_for_ticker(ticker) if bool(params.get("benchmark_optimizer", True)) else None
     if isinstance(_opt, dict):
         buffer_pct = float(_opt.get("buffer_pct", params["buffer_pct"]))
         confirm_bars = int(_opt.get("confirm_bars", params["confirm_bars"]))
@@ -1139,18 +1182,15 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     # Apply the Main Kalman risk firewall when the user has it enabled, using the
     # same session-state settings as the main chart, so a firewall-forced exit
     # closes the watchlist trade exactly as it closes the visible log trade.
-    try:
-        use_firewall = bool(st.session_state.get("kalman_use_risk_firewall", False))
-    except Exception:
-        use_firewall = False
+    use_firewall = bool(params.get("risk_firewall", False))
     if use_firewall and "apply_kalman_risk_firewall" in globals():
         try:
             sig = apply_kalman_risk_firewall(
                 px, sig, bt_trend,
-                max_trade_loss_pct=float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-                trail_stop_pct=float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-                equity_dd_stop_pct=float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-                cooldown_bars=int(st.session_state.get("kalman_firewall_cooldown", 8)),
+                max_trade_loss_pct=float(params.get("trade_stop_pct", 16.0)),
+                trail_stop_pct=float(params.get("trail_stop_pct", 22.0)),
+                equity_dd_stop_pct=float(params.get("equity_dd_stop_pct", 28.0)),
+                cooldown_bars=int(params.get("firewall_cooldown", 8)),
             )
         except Exception:
             pass
@@ -1160,15 +1200,21 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
     # history. Only new completed bars are appended. The firewall runs first so
     # its stop-outs are captured in the frozen value, then nothing downstream
     # can change a past bar. Controlled by session_state flag (default ON).
-    try:
-        _freeze = bool(st.session_state.get("kalman_non_repaint_lock", True))
-    except Exception:
-        _freeze = True
+    if isinstance(runtime_settings, dict):
+        _freeze = bool(params.get("non_repaint_lock", True))
+    else:
+        try:
+            _freeze = bool(st.session_state.get("kalman_non_repaint_lock", True))
+        except Exception:
+            _freeze = True
     sig = _apply_signal_lock(ticker, sig, freeze_enabled=_freeze)
 
     # Run the identical backtest engine the visible Main Kalman Trade Log uses.
     try:
-        initial_cap = float(st.session_state.get("initial_cap", 10000.0))
+        if isinstance(runtime_settings, dict) and "initial_cap" in runtime_settings:
+            initial_cap = float(runtime_settings.get("initial_cap", 10000.0))
+        else:
+            initial_cap = float(st.session_state.get("initial_cap", 10000.0))
     except Exception:
         initial_cap = 10000.0
 
@@ -1234,10 +1280,12 @@ def _build_main_kalman_trade_log_from_prices(ticker, px):
         "Ticker": ticker,
         "Alert Signal": "NO NEW ALERT",
         "Trade Position": status,
+        "Signal Position": "LONG" if (len(sig) and int(round(float(sig.iloc[-1]))) == 1) else "CASH",
         "Price": last_price,
         "Candle Close CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
         "Source": "Current Main Kalman Controls (same engine + firewall as visible log)",
         "Settings": _main_kalman_params_label(params),
+        "Params": dict(params),
     }
     return trades_df, latest
 
@@ -1761,16 +1809,18 @@ def _parse_watchlist_ct_time(x):
     except Exception:
         return None
 
-def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50, allow_sell_alerts=False):
+def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=150, allow_sell_alerts=False):
     """
-    Watchlist monitor using current Main Kalman controls.
-    First scan baselines. Future changes alert. This avoids separate hardcoded logic.
+    Status-only watchlist monitor using current Main Kalman controls.
+    IMPORTANT: it never sends BUY/SELL Telegram alerts. The in-app 15-minute
+    background Main Kalman worker is the single signal sender.
     """
+    send_telegram = False
     symbols = _normalize_watchlist(raw_watchlist)
     try:
         max_stocks = int(max_stocks)
     except Exception:
-        max_stocks = 50
+        max_stocks = 150
     if max_stocks > 0:
         symbols = symbols[:max_stocks]
 
@@ -2207,6 +2257,8 @@ def build_render_bundle_export():
         if isinstance(v, dict) and str(v.get("position", "")).upper() == "LONG"
     ])
 
+    main_kalman_controls = _get_current_main_kalman_params()
+
     sync_summary = {
         "total_params": len(per_ticker_params),
         "active_session_overrides": trusted_count,
@@ -2219,12 +2271,13 @@ def build_render_bundle_export():
     }
 
     bundle = {
-        "bundle_version": 2,
+        "bundle_version": 3,
         "exported_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+        "main_kalman_controls": main_kalman_controls,
         "data_path": {
             "lookback_days": 60,
             "interval": "15m",
-            "auto_adjust": True,
+            "auto_adjust": False,
             "prepost": False,
             "source": "Visible Main Kalman tab",
         },
@@ -2276,22 +2329,55 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str):
 
 
 # ============================================================================
-# IN-APP BACKGROUND ALERT CHECKER
+# IN-APP TELEGRAM + MAIN KALMAN BACKGROUND SYSTEM
 # ----------------------------------------------------------------------------
-# Runs forever in its own background thread, independent of any browser tab
-# being open. Since this app now runs on a plan that never sleeps, this thread
-# just keeps going the whole time the server is up. It re-checks every ticker
-# in the saved watchlist every 15 minutes using the same proven-reliable
-# fetch/position logic as the rest of the app, and texts Telegram only when a
-# ticker's position actually changes (not on every check).
-#
-# Safety: guarded so only ONE copy of this loop can ever be running per server
-# process, no matter how many browser tabs/sessions connect.
+# What this does:
+# 1) Render scans the FULL saved watchlist every 15 minutes.
+# 2) Each ticker uses the same Main Kalman engine, saved per-ticker optimizer
+#    parameters, non-repaint lock, risk firewall settings, and the existing
+#    institutional trade ledger. The trade engine itself is not changed here.
+# 3) /status is handled by a separate Telegram command thread, so it answers
+#    immediately from the latest cached snapshot and never waits for a scan.
+# 4) Every displayed/sent time uses America/Chicago (Central Time).
 # ============================================================================
 import threading
+import hashlib
 
 _INAPP_ALERT_THREAD_STARTED = False
+_INAPP_COMMAND_THREAD_STARTED = False
 _INAPP_ALERT_LOCK = threading.Lock()
+_INAPP_COMMAND_LOCK = threading.Lock()
+_INAPP_RUNTIME_LOCK = threading.Lock()
+_INAPP_SIGNAL_SEND_LOCK = threading.Lock()
+
+
+def _ct_now():
+    return pd.Timestamp.now(tz="America/Chicago")
+
+
+def _ct_now_text():
+    return _ct_now().strftime("%Y-%m-%d %I:%M %p CT")
+
+
+def _format_ct_display(value, default="N/A"):
+    """Normalize old Render ISO/UTC timestamps into Chicago Central Time."""
+    try:
+        s = str(value or "").strip()
+        if not s:
+            return default
+        if s.upper().endswith(" CT"):
+            return s
+        ts = pd.Timestamp(s)
+        if ts.tzinfo is None:
+            # Old Render worker used naive ISO datetime.now() on a UTC server.
+            if "T" in s:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_localize("America/Chicago")
+        ts = ts.tz_convert("America/Chicago")
+        return ts.strftime("%Y-%m-%d %I:%M %p CT")
+    except Exception:
+        return str(value) if value not in (None, "") else default
 
 
 def _inapp_alert_positions_path():
@@ -2305,7 +2391,8 @@ def _load_inapp_alert_positions():
     try:
         p = _inapp_alert_positions_path()
         if p.exists():
-            return json.loads(p.read_text())
+            data = json.loads(p.read_text())
+            return data if isinstance(data, dict) else {}
     except Exception:
         pass
     return {}
@@ -2313,9 +2400,199 @@ def _load_inapp_alert_positions():
 
 def _save_inapp_alert_positions(data):
     try:
-        _inapp_alert_positions_path().write_text(json.dumps(data, indent=2))
+        p = _inapp_alert_positions_path()
+        tmp = _Path(str(p) + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, default=str))
+        os.replace(str(tmp), str(p))
     except Exception:
         pass
+
+
+def _inapp_alert_runtime_path():
+    try:
+        return _Path.home() / ".pinehurst_inapp_alert_runtime.json"
+    except Exception:
+        return _Path(".pinehurst_inapp_alert_runtime.json")
+
+
+def _load_inapp_alert_runtime():
+    try:
+        p = _inapp_alert_runtime_path()
+        if p.exists():
+            data = json.loads(p.read_text())
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_inapp_alert_runtime(data):
+    try:
+        p = _inapp_alert_runtime_path()
+        tmp = _Path(str(p) + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, default=str))
+        os.replace(str(tmp), str(p))
+    except Exception:
+        pass
+
+
+def _update_inapp_alert_runtime(updates):
+    try:
+        with _INAPP_RUNTIME_LOCK:
+            data = _load_inapp_alert_runtime()
+            data.update(dict(updates or {}))
+            _save_inapp_alert_runtime(data)
+    except Exception:
+        pass
+
+
+def _telegram_command_offset_path():
+    try:
+        return _Path.home() / ".pinehurst_telegram_command_offset.json"
+    except Exception:
+        return _Path(".pinehurst_telegram_command_offset.json")
+
+
+def _load_telegram_command_offset():
+    try:
+        p = _telegram_command_offset_path()
+        if p.exists():
+            data = json.loads(p.read_text())
+            return int(data.get("offset", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _save_telegram_command_offset(offset):
+    try:
+        p = _telegram_command_offset_path()
+        tmp = _Path(str(p) + ".tmp")
+        tmp.write_text(json.dumps({"offset": int(offset)}))
+        os.replace(str(tmp), str(p))
+    except Exception:
+        pass
+
+
+def _telegram_runtime_credentials():
+    """Render environment values first, then locally saved in-app values."""
+    tg = load_telegram_settings()
+    bot_token = str(
+        os.environ.get("TELEGRAM_BOT_TOKEN")
+        or os.environ.get("BOT_TOKEN")
+        or tg.get("bot_token")
+        or ""
+    ).strip()
+    chat_id = str(
+        os.environ.get("TELEGRAM_CHAT_ID")
+        or os.environ.get("CHAT_ID")
+        or tg.get("chat_id")
+        or ""
+    ).strip()
+    return bot_token, chat_id
+
+
+def _hydrate_inapp_state_from_render_bundle_once():
+    """Seed an empty Render service from the exported Main Kalman bundle.
+
+    Existing live files always win. The bundle is only used to fill missing
+    state after a fresh deploy/restart, so it cannot overwrite a newer live
+    institutional ledger or signal lock.
+    """
+    candidates = []
+    env_path = str(os.environ.get("STREAMLIT_KALMAN_BUNDLE_FILE", "")).strip()
+    if env_path:
+        candidates.append(_Path(env_path))
+    try:
+        candidates.append(_Path(__file__).resolve().parent / "streamlit_kalman_render_bundle.json")
+    except Exception:
+        pass
+    candidates.append(_Path("streamlit_kalman_render_bundle.json"))
+
+    bundle_path = None
+    for c in candidates:
+        try:
+            if c and c.exists():
+                bundle_path = c
+                break
+        except Exception:
+            continue
+    if bundle_path is None:
+        return False
+
+    try:
+        bundle = json.loads(bundle_path.read_text())
+        if not isinstance(bundle, dict):
+            return False
+
+        per_params = bundle.get("per_ticker_params", {})
+        if isinstance(per_params, dict) and per_params and not _load_main_kalman_opt_params():
+            _main_kalman_opt_params_path().write_text(json.dumps(per_params, indent=2, default=str))
+
+        signal_lock = bundle.get("signal_lock", {})
+        if isinstance(signal_lock, dict) and signal_lock and not _load_main_kalman_signal_lock():
+            _save_main_kalman_signal_lock(signal_lock)
+
+        inst_ledger = bundle.get("institutional_ledger", {})
+        if isinstance(inst_ledger, dict) and inst_ledger and not _load_main_kalman_institutional_ledger():
+            _save_main_kalman_institutional_ledger(inst_ledger)
+
+        watch_ledger = bundle.get("watchlist_ledger", {})
+        if isinstance(watch_ledger, dict) and watch_ledger and not _load_main_kalman_watchlist_ledger():
+            _save_main_kalman_watchlist_ledger(watch_ledger)
+
+        monitor = _load_main_kalman_monitor_settings()
+        controls = bundle.get("main_kalman_controls", {})
+        if not isinstance(monitor, dict):
+            monitor = {}
+        if isinstance(controls, dict):
+            control_map = {
+                "rail_mult": "kalman_trend_rail_distance",
+                "confirm_bars": "kalman_strategy_confirm_bars",
+                "min_hold_bars": "kalman_strategy_min_hold",
+                "cooldown_bars": "kalman_strategy_cooldown",
+                "slope_confirm": "kalman_strategy_slope_confirm",
+                "atr_safety": "kalman_strategy_atr_safety",
+                "fast_gain": "kalman_fast_reaction",
+                "slow_gain": "kalman_slow_smoothing",
+                "polish_span": "kalman_polish_span",
+                "risk_firewall": "kalman_use_risk_firewall",
+                "trade_stop_pct": "kalman_trade_stop_pct",
+                "trail_stop_pct": "kalman_trail_stop_pct",
+                "equity_dd_stop_pct": "kalman_equity_dd_stop_pct",
+                "firewall_cooldown": "kalman_firewall_cooldown",
+                "institutional_ledger": "kalman_institutional_live_ledger",
+                "benchmark_optimizer": "kalman_benchmark_aware_optimizer",
+                "non_repaint_lock": "kalman_non_repaint_lock",
+            }
+            for src_key, dst_key in control_map.items():
+                if dst_key not in monitor and src_key in controls:
+                    monitor[dst_key] = controls.get(src_key)
+            if "kalman_strategy_cross_buffer_pct" not in monitor and "buffer_pct" in controls:
+                monitor["kalman_strategy_cross_buffer_pct"] = float(controls.get("buffer_pct", 0.0125)) * 100.0
+
+        # Fresh Render service: use every bundled ticker as the watchlist so
+        # /status can return the full universe before a browser is opened.
+        if not _normalize_watchlist(monitor.get("watchlist", "")) and isinstance(per_params, dict) and per_params:
+            monitor["watchlist"] = ", ".join([str(t).upper() for t in per_params.keys()])
+            monitor["max_stocks"] = len(per_params)
+            monitor.setdefault("enabled", True)
+            monitor.setdefault("sell_alerts", False)
+            monitor.setdefault("refresh", False)
+
+        _save_main_kalman_monitor_settings(monitor)
+        _update_inapp_alert_runtime({
+            "bundle_loaded": str(bundle_path),
+            "bundle_exported_ct": str(bundle.get("exported_ct", "")),
+            "bundle_loaded_ct": _ct_now_text(),
+        })
+        return True
+    except Exception as e:
+        _update_inapp_alert_runtime({
+            "bundle_error": str(e)[:240],
+            "updated_ct": _ct_now_text(),
+        })
+        return False
 
 
 def _inapp_alert_lock_path():
@@ -2325,15 +2602,8 @@ def _inapp_alert_lock_path():
         return _Path(".pinehurst_inapp_alert_lock.json")
 
 
-def _try_claim_inapp_alert_lock(stale_after_seconds=600):
-    """SAFETY FIX: only one running copy of this app should be doing the
-    background checks at a time. During a Render restart/redeploy, the old
-    and new copies can briefly both be alive — without this, both would start
-    their own independent 15-minute loop, and their checks landing a few
-    minutes apart is exactly what caused a ticker to alert BUY then SELL
-    minutes later at the same price. This makes every loop "claim" a shared
-    lock file each cycle; if another copy claimed it recently, this one backs
-    off instead of running its own check that cycle."""
+def _try_claim_inapp_alert_lock(stale_after_seconds=3600):
+    """Allow only one scanner per Render service process/redeploy overlap."""
     p = _inapp_alert_lock_path()
     my_id = f"{os.getpid()}-{id(threading.current_thread())}"
     try:
@@ -2349,87 +2619,643 @@ def _try_claim_inapp_alert_lock(stale_after_seconds=600):
         return True
 
 
+def _inapp_signal_claim_dir():
+    """Persistent per-event claims. One real BUY/SELL event can be sent only once."""
+    try:
+        p = _Path.home() / ".pinehurst_inapp_signal_claims"
+    except Exception:
+        p = _Path(".pinehurst_inapp_signal_claims")
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
+
+def _main_kalman_event_time(status_trades, new_pos, candle_ct):
+    """Use the trade event timestamp, not price/check time, so the key stays stable."""
+    try:
+        if isinstance(status_trades, pd.DataFrame) and not status_trades.empty:
+            last = status_trades.iloc[-1]
+            if str(new_pos).upper() == "LONG":
+                for c in ("Entry CT", "Entry Date", "Entry Time", "Entry"):
+                    if c in status_trades.columns:
+                        v = str(last.get(c, "")).strip()
+                        if v and v.lower() not in ("nan", "none", "nat"):
+                            return v
+            else:
+                for c in ("Exit CT", "Exit Date", "Exit Time", "Exit"):
+                    if c in status_trades.columns:
+                        v = str(last.get(c, "")).strip()
+                        if v and v.lower() not in ("", "open", "nan", "none", "nat"):
+                            return v
+    except Exception:
+        pass
+    return str(candle_ct or "")
+
+
+def _claim_main_kalman_event_once(event_key, stale_pending_seconds=180):
+    """Atomically claim one signal event across threads/processes sharing the filesystem."""
+    try:
+        digest = hashlib.sha256(str(event_key).encode("utf-8")).hexdigest()
+        base = _inapp_signal_claim_dir()
+        sent_path = base / f"{digest}.sent"
+        pending_path = base / f"{digest}.pending"
+
+        if sent_path.exists():
+            return None, "Already sent this exact Main Kalman event."
+
+        # Remove only an abandoned pending claim. A live claim blocks duplicates.
+        try:
+            if pending_path.exists() and (time.time() - pending_path.stat().st_mtime) > float(stale_pending_seconds):
+                pending_path.unlink()
+        except Exception:
+            pass
+
+        try:
+            fd = os.open(str(pending_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return None, "Another in-app sender already claimed this event."
+
+        try:
+            os.write(fd, str(event_key).encode("utf-8"))
+        finally:
+            os.close(fd)
+
+        return {"pending": pending_path, "sent": sent_path, "event_key": str(event_key)}, "CLAIMED"
+    except Exception as e:
+        return None, f"Could not claim alert event: {e}"
+
+
+def _finish_main_kalman_event_claim(claim, sent_ok):
+    try:
+        if not isinstance(claim, dict):
+            return
+        pending_path = claim.get("pending")
+        sent_path = claim.get("sent")
+        if sent_ok:
+            try:
+                _Path(pending_path).write_text(json.dumps({
+                    "event_key": claim.get("event_key", ""),
+                    "sent_ct": _ct_now_text(),
+                    "pid": os.getpid(),
+                }, indent=2))
+            except Exception:
+                pass
+            os.replace(str(pending_path), str(sent_path))
+        else:
+            try:
+                _Path(pending_path).unlink(missing_ok=True)
+            except TypeError:
+                if _Path(pending_path).exists():
+                    _Path(pending_path).unlink()
+    except Exception:
+        pass
+
+
+def _send_main_kalman_signal_event_once(bot_token, chat_id, event_key, message):
+    """The ONLY BUY/SELL Telegram sender in the app."""
+    with _INAPP_SIGNAL_SEND_LOCK:
+        claim, claim_note = _claim_main_kalman_event_once(event_key)
+        if claim is None:
+            return True, claim_note
+        ok, resp = send_telegram_alert(bot_token, chat_id, message)
+        _finish_main_kalman_event_claim(claim, bool(ok))
+        return ok, resp
+
+
+def _main_kalman_background_settings_record(sym, params, source="Saved Main Kalman settings"):
+    p = dict(params or {})
+    return {
+        "ticker": str(sym).upper(),
+        "buffer_pct": float(p.get("buffer_pct", 0.0125)),
+        "confirm_bars": int(p.get("confirm_bars", 3)),
+        "min_hold_bars": int(p.get("min_hold_bars", 5)),
+        "cooldown_bars": int(p.get("cooldown_bars", 3)),
+        "slope_confirm": bool(p.get("slope_confirm", True)),
+        "atr_safety": bool(p.get("atr_safety", True)),
+        "risk_firewall": bool(p.get("risk_firewall", False)),
+        "fast_gain": float(p.get("fast_gain", 0.34)),
+        "slow_gain": float(p.get("slow_gain", 0.055)),
+        "polish_span": int(p.get("polish_span", 3)),
+        "rail_mult": float(p.get("rail_mult", 1.35)),
+        "trend_name": "Institutional Trend Rail",
+        "interval": "15m",
+        "source": source,
+        "model_version": (
+            f"{str(sym).upper()}|15m|buf{float(p.get('buffer_pct', 0.0125))*100:.2f}|"
+            f"conf{int(p.get('confirm_bars', 3))}|hold{int(p.get('min_hold_bars', 5))}|"
+            f"cool{int(p.get('cooldown_bars', 3))}|fg{float(p.get('fast_gain', 0.34)):.3f}|"
+            f"sg{float(p.get('slow_gain', 0.055)):.3f}|rail{float(p.get('rail_mult', 1.35)):.2f}|"
+            f"slope{int(bool(p.get('slope_confirm', True)))}|atr{int(bool(p.get('atr_safety', True)))}|"
+            f"rf{int(bool(p.get('risk_firewall', False)))}"
+        ),
+        "saved_ct": _ct_now_text(),
+    }
+
+
+def _status_snapshot_for_watchlist(tickers, positions):
+    """Always return one row for every requested ticker, even with no data."""
+    rows = []
+    for sym in tickers:
+        sym = str(sym).upper()
+        rec = positions.get(sym, {}) if isinstance(positions.get(sym), dict) else {}
+        rows.append({
+            "Ticker": sym,
+            "Position": str(rec.get("position", "UNKNOWN")).upper(),
+            "Price": rec.get("price"),
+            "Candle Close CT": rec.get("candle_close_ct", ""),
+            "Checked CT": rec.get("checked_at", ""),
+            "Settings": rec.get("settings", ""),
+            "Error": rec.get("error", ""),
+        })
+    return rows
+
+
 def _inapp_alert_check_once():
-    """One full pass over the saved watchlist: fetch each ticker one at a time
-    (same method proven reliable elsewhere in this app), work out LONG/CASH,
-    and text Telegram only if it changed since the last check AND enough time
-    has passed since the last alert for that same ticker (second safety net
-    against rapid flip-flop alerts)."""
+    """Scan all saved tickers with the same Main Kalman state path used by the app."""
     settings = _load_main_kalman_monitor_settings()
     tickers = _normalize_watchlist(settings.get("watchlist", ""))
     if not tickers:
+        _update_inapp_alert_runtime({
+            "status": "NO WATCHLIST",
+            "last_error": "No saved Main Kalman watchlist.",
+            "updated_ct": _ct_now_text(),
+        })
         return
 
-    tg = load_telegram_settings()
-    bot_token = tg.get("bot_token", "")
-    chat_id = tg.get("chat_id", "")
-    if not bot_token or not chat_id:
-        return  # nothing configured to send to yet
+    bot_token, chat_id = _telegram_runtime_credentials()
+    telegram_enabled = bool(settings.get("enabled", True)) and bool(bot_token and chat_id)
+    sell_alerts = bool(settings.get("sell_alerts", False))
 
     positions = _load_inapp_alert_positions()
-    MIN_SECONDS_BETWEEN_ALERTS_PER_TICKER = 600  # 10 minutes
+    scan_started = _ct_now_text()
+    scan_id = f"{int(time.time())}-{os.getpid()}"
+
+    # Seed every requested ticker before fetching. /status therefore always
+    # returns the complete watchlist instead of silently showing only 149/150.
+    for sym in tickers:
+        sym = str(sym).upper()
+        prev = positions.get(sym, {}) if isinstance(positions.get(sym), dict) else {}
+        positions[sym] = {
+            **prev,
+            "ticker": sym,
+            "position": str(prev.get("position", "UNKNOWN")).upper(),
+            "scan_state": "PENDING",
+            "scan_id": scan_id,
+        }
+    _save_inapp_alert_positions(positions)
+    _update_inapp_alert_runtime({
+        "status": "SCANNING",
+        "scan_started_ct": scan_started,
+        "scan_completed_ct": "",
+        "requested_tickers": len(tickers),
+        "processed_tickers": 0,
+        "data_ok": 0,
+        "unknown": len(tickers),
+        "last_error": "",
+        "updated_ct": _ct_now_text(),
+    })
+
+    # Fast path: batch exact unadjusted 15m data (same Close basis as Main tab).
+    # Any missing ticker gets the original single-ticker load_data() fallback.
+    try:
+        batch_prices, batch_debug = _bulk_fetch_15m_batch(
+            tickers, period="60d", chunk_size=15, pause_between_chunks=0.35
+        )
+    except Exception as e:
+        batch_prices, batch_debug = {}, {str(t).upper(): str(e) for t in tickers}
+
+    MIN_SECONDS_BETWEEN_ALERTS_PER_TICKER = 600
+    processed = 0
+    data_ok = 0
+    unknown = 0
 
     for sym in tickers:
         sym = str(sym).upper()
+        now_ts = time.time()
+        prev = positions.get(sym, {}) if isinstance(positions.get(sym), dict) else {}
+        old_pos = str(prev.get("position", "UNKNOWN")).upper()
+        previous_model_version = str(prev.get("model_version", ""))
+        last_alert_ts = float(prev.get("last_alert_ts", 0) or 0)
+
         try:
-            px = _main_monitor_fetch_15m(sym, period="60d")
+            px = batch_prices.get(sym)
+            fetch_note = "batch"
             if px is None or len(px) < 80:
-                continue
+                fetch_note = "single-ticker fallback"
+                px = _main_monitor_fetch_15m(sym, period="60d")
 
-            trades_df, _raw = _build_main_kalman_trade_log_from_prices(sym, px)
-            new_pos = "CASH"
-            if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                last_row = trades_df.iloc[-1]
-                new_pos = "LONG" if _trade_row_is_open(last_row, columns=trades_df.columns) else "CASH"
-
-            prev = positions.get(sym, {})
-            old_pos = prev.get("position")
-            last_alert_ts = float(prev.get("last_alert_ts", 0))
-            price_now = round(float(px.iloc[-1]), 2)
-            now_ts = time.time()
-
-            should_alert = (
-                old_pos is not None
-                and old_pos != new_pos
-                and (now_ts - last_alert_ts) >= MIN_SECONDS_BETWEEN_ALERTS_PER_TICKER
-            )
-
-            if should_alert:
-                emoji = "🟢" if new_pos == "LONG" else "🔴"
-                action = "BUY" if new_pos == "LONG" else "SELL"
-                msg = (
-                    f"{emoji} <b>IN-APP MAIN KALMAN {action}</b>\n"
-                    f"Ticker: <b>{sym}</b>\n"
-                    f"Position: <b>{new_pos}</b>\n"
-                    f"Price: <b>{price_now}</b>\n"
-                    f"Time: <b>{pd.Timestamp.now(tz='America/Chicago').strftime('%Y-%m-%d %I:%M %p CT')}</b>"
+            if px is None or len(px) < 80:
+                unknown += 1
+                err = str(batch_debug.get(sym, "Not enough 15m data"))[:180]
+                positions[sym] = {
+                    **prev,
+                    "ticker": sym,
+                    "position": "UNKNOWN",
+                    "scan_state": "NO DATA",
+                    "scan_id": scan_id,
+                    "checked_at": _ct_now_text(),
+                    "error": err,
+                    "last_alert_ts": last_alert_ts,
+                }
+            else:
+                candidate_trades, raw = _build_main_kalman_trade_log_from_prices(
+                    sym, px, runtime_settings=settings
                 )
-                send_telegram_alert(bot_token, chat_id, msg)
-                last_alert_ts = now_ts
+                effective_params = dict(raw.get("Params", {})) if isinstance(raw, dict) else {}
+                inst_settings = _main_kalman_background_settings_record(
+                    sym, effective_params, source="Exact saved Main Kalman params"
+                )
 
+                # Apply the already-existing institutional ledger exactly like
+                # the visible Main Kalman tab. We do not change its logic.
+                status_trades = _main_kalman_apply_institutional_trade_ledger(
+                    sym,
+                    candidate_trades,
+                    px,
+                    inst_settings,
+                    enabled=bool(effective_params.get("institutional_ledger", True)),
+                )
+
+                new_pos = "CASH"
+                if isinstance(status_trades, pd.DataFrame) and not status_trades.empty:
+                    new_pos = "LONG" if _trade_row_is_open(
+                        status_trades.iloc[-1], columns=status_trades.columns
+                    ) else "CASH"
+                elif isinstance(raw, dict) and raw.get("Signal Position") in ("LONG", "CASH"):
+                    new_pos = str(raw.get("Signal Position"))
+
+                price_now = round(float(px.iloc[-1]), 2)
+                candle_ct = (
+                    pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)
+                ).strftime("%Y-%m-%d %I:%M %p CT")
+                settings_txt = raw.get("Settings", _main_kalman_params_label(effective_params)) if isinstance(raw, dict) else ""
+
+                current_model_version = str(inst_settings.get("model_version", ""))
+                should_alert = (
+                    previous_model_version
+                    and previous_model_version == current_model_version
+                    and old_pos in ("LONG", "CASH")
+                    and old_pos != new_pos
+                    and (now_ts - last_alert_ts) >= MIN_SECONDS_BETWEEN_ALERTS_PER_TICKER
+                )
+                action = "BUY" if new_pos == "LONG" else "SELL"
+                send_this_alert = should_alert and telegram_enabled and (action == "BUY" or sell_alerts)
+
+                if send_this_alert:
+                    # Stable event key: ticker + BUY/SELL + real trade event time.
+                    # Price/check time are intentionally excluded, so one event cannot
+                    # become 5-6 Telegram alerts as the app reruns or price changes.
+                    event_time = _main_kalman_event_time(status_trades, new_pos, candle_ct)
+                    event_key = f"MAIN_KALMAN|15m|{sym}|{action}|{event_time}"
+                    emoji = "🟢" if new_pos == "LONG" else "🔴"
+                    msg = (
+                        f"{emoji} <b>MAIN KALMAN {action}</b>\n"
+                        f"Ticker: <b>{html.escape(sym)}</b>\n"
+                        f"Status: <b>{new_pos}</b>\n"
+                        f"Price: <b>{price_now:.2f}</b>\n"
+                        f"Event: <b>{html.escape(str(event_time))}</b>\n"
+                        f"Candle: <b>{html.escape(candle_ct)}</b>\n"
+                        f"Checked: <b>{html.escape(_ct_now_text())}</b>\n"
+                        f"Params: {html.escape(settings_txt)}\n"
+                        "Source: in-app Main Kalman background worker — single sender."
+                    )
+                    ok, _resp = _send_main_kalman_signal_event_once(
+                        bot_token, chat_id, event_key, msg
+                    )
+                    if ok:
+                        last_alert_ts = now_ts
+
+                data_ok += 1
+                positions[sym] = {
+                    "ticker": sym,
+                    "position": new_pos,
+                    "price": price_now,
+                    "candle_close_ct": candle_ct,
+                    "checked_at": _ct_now_text(),
+                    "scan_state": "OK",
+                    "scan_id": scan_id,
+                    "settings": settings_txt,
+                    "params": effective_params,
+                    "source": "Same Main Kalman engine + institutional ledger",
+                    "model_version": current_model_version,
+                    "fetch": fetch_note,
+                    "error": "",
+                    "last_alert_ts": last_alert_ts,
+                }
+
+        except Exception as e:
+            unknown += 1
             positions[sym] = {
-                "position": new_pos,
-                "price": price_now,
-                "checked_at": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                **prev,
+                "ticker": sym,
+                "position": "UNKNOWN",
+                "scan_state": "ERROR",
+                "scan_id": scan_id,
+                "checked_at": _ct_now_text(),
+                "error": str(e)[:180],
                 "last_alert_ts": last_alert_ts,
             }
-        except Exception as e:
-            print(f"In-app alert check error for {sym}: {e}")
-        time.sleep(1.0)  # pacing between tickers, same as the proven single-ticker path
+            print(f"In-app Main Kalman check error for {sym}: {e}")
 
-    _save_inapp_alert_positions(positions)
+        processed += 1
+        # Save ticker-by-ticker so /status is always available during a long scan.
+        _save_inapp_alert_positions(positions)
+        _update_inapp_alert_runtime({
+            "status": "SCANNING",
+            "scan_started_ct": scan_started,
+            "scan_completed_ct": "",
+            "requested_tickers": len(tickers),
+            "processed_tickers": processed,
+            "data_ok": data_ok,
+            "unknown": unknown + max(0, len(tickers) - processed),
+            "last_error": "",
+            "updated_ct": _ct_now_text(),
+        })
+
+    completed = _ct_now_text()
+    _update_inapp_alert_runtime({
+        "status": "READY",
+        "scan_started_ct": scan_started,
+        "scan_completed_ct": completed,
+        "requested_tickers": len(tickers),
+        "processed_tickers": processed,
+        "data_ok": data_ok,
+        "unknown": unknown,
+        "last_error": "",
+        "updated_ct": completed,
+    })
+
+
+def _telegram_prepare_long_polling(bot_token):
+    """Make sure Telegram is not still configured for webhook delivery."""
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
+        payload = json.dumps({"drop_pending_updates": False}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return bool(data.get("ok"))
+    except Exception:
+        return False
+
+
+def _telegram_get_updates(bot_token, offset=0, timeout_seconds=20):
+    query = urllib.parse.urlencode({
+        "offset": int(offset),
+        "timeout": int(timeout_seconds),
+        "allowed_updates": json.dumps(["message"]),
+    })
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates?{query}"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_seconds + 10) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    if not payload.get("ok"):
+        raise RuntimeError(str(payload)[:240])
+    return payload.get("result", [])
+
+
+def _telegram_send_chunks(bot_token, chat_id, messages):
+    for msg in messages:
+        ok, resp = send_telegram_alert(bot_token, chat_id, msg)
+        if not ok:
+            return False, resp
+        time.sleep(0.15)
+    return True, "sent"
+
+
+def _format_status_price(value):
+    try:
+        if value is None or str(value).strip() == "":
+            return "N/A"
+        return f"{float(value):.2f}"
+    except Exception:
+        return "N/A"
+
+
+def _build_all_status_messages():
+    settings = _load_main_kalman_monitor_settings()
+    tickers = _normalize_watchlist(settings.get("watchlist", ""))
+    if not tickers:
+        _hydrate_inapp_state_from_render_bundle_once()
+        settings = _load_main_kalman_monitor_settings()
+        tickers = _normalize_watchlist(settings.get("watchlist", ""))
+    positions = _load_inapp_alert_positions()
+    runtime = _load_inapp_alert_runtime()
+
+    rows = _status_snapshot_for_watchlist(tickers, positions)
+    n_long = sum(1 for r in rows if r["Position"] == "LONG")
+    n_cash = sum(1 for r in rows if r["Position"] == "CASH")
+    n_unknown = len(rows) - n_long - n_cash
+
+    completed = _format_ct_display(
+        runtime.get("scan_completed_ct") or runtime.get("updated_ct"),
+        default="No completed scan yet",
+    )
+    scan_status = str(runtime.get("status", "STARTING"))
+    processed = int(runtime.get("processed_tickers", 0) or 0)
+
+    header = (
+        "<b>PINEHURST MAIN KALMAN STATUS</b>\n"
+        f"Chicago time: <b>{html.escape(_ct_now_text())}</b>\n"
+        f"Last full check: <b>{html.escape(str(completed))}</b>\n"
+        f"Scanner: <b>{html.escape(scan_status)}</b> ({processed}/{len(tickers)})\n"
+        f"Total: <b>{len(tickers)}</b> | LONG: <b>{n_long}</b> | CASH: <b>{n_cash}</b> | UNKNOWN: <b>{n_unknown}</b>\n"
+        "Source: same Main Kalman engine, saved ticker params, signal lock, firewall, and institutional ledger.\n\n"
+    )
+
+    lines = []
+    for r in rows:
+        pos = r["Position"]
+        icon = "🟢" if pos == "LONG" else ("⚪" if pos == "CASH" else "🟠")
+        px_txt = _format_status_price(r.get("Price"))
+        lines.append(f"{icon} <b>{html.escape(r['Ticker'])}</b> — {html.escape(pos)} — {px_txt}")
+
+    if not lines:
+        return [header + "No saved watchlist yet."]
+
+    messages = []
+    current = header
+    max_chars = 3600
+    for line in lines:
+        addition = line + "\n"
+        if len(current) + len(addition) > max_chars and current.strip():
+            messages.append(current.rstrip())
+            current = "<b>MAIN KALMAN STATUS — continued</b>\n" + addition
+        else:
+            current += addition
+    if current.strip():
+        messages.append(current.rstrip())
+    return messages
+
+
+def _build_one_ticker_status_message(ticker):
+    ticker = str(ticker).strip().upper()
+    settings = _load_main_kalman_monitor_settings()
+    tickers = _normalize_watchlist(settings.get("watchlist", ""))
+    if not tickers:
+        _hydrate_inapp_state_from_render_bundle_once()
+        settings = _load_main_kalman_monitor_settings()
+        tickers = _normalize_watchlist(settings.get("watchlist", ""))
+    if ticker not in tickers:
+        return f"Ticker <b>{html.escape(ticker)}</b> is not in the saved Main Kalman watchlist."
+
+    rec = _load_inapp_alert_positions().get(ticker, {})
+    if not isinstance(rec, dict):
+        rec = {}
+    pos = str(rec.get("position", "UNKNOWN")).upper()
+    px_txt = _format_status_price(rec.get("price"))
+    params_txt = str(rec.get("settings", "No completed parameter snapshot yet"))
+    return (
+        f"<b>{html.escape(ticker)} — MAIN KALMAN</b>\n"
+        f"Status: <b>{html.escape(pos)}</b>\n"
+        f"Price: <b>{px_txt}</b>\n"
+        f"Candle close: <b>{html.escape(_format_ct_display(rec.get('candle_close_ct'), 'N/A'))}</b>\n"
+        f"Last checked: <b>{html.escape(_format_ct_display(rec.get('checked_at'), 'N/A'))}</b>\n"
+        f"All params: {html.escape(params_txt)}\n"
+        "Source: same Main Kalman engine and existing institutional trade ledger."
+    )
+
+
+def _handle_telegram_command(bot_token, chat_id, text):
+    parts = str(text or "").strip().split()
+    if not parts:
+        return
+    command = parts[0].split("@")[0].lower()
+
+    if command == "/status":
+        if len(parts) >= 2:
+            _telegram_send_chunks(bot_token, chat_id, [_build_one_ticker_status_message(parts[1])])
+        else:
+            _telegram_send_chunks(bot_token, chat_id, _build_all_status_messages())
+        return
+
+    if command in ("/start", "/help"):
+        msg = (
+            "<b>Pinehurst Main Kalman Telegram</b>\n"
+            "/status — all saved tickers now\n"
+            "/status AAPL — one ticker with all Main Kalman params\n"
+            "/ping — check that the bot is alive\n"
+            "All times are Chicago Central Time."
+        )
+        _telegram_send_chunks(bot_token, chat_id, [msg])
+        return
+
+    if command == "/ping":
+        runtime = _load_inapp_alert_runtime()
+        msg = (
+            "✅ <b>Bot is alive.</b>\n"
+            f"Chicago time: <b>{html.escape(_ct_now_text())}</b>\n"
+            f"Scanner: <b>{html.escape(str(runtime.get('status', 'STARTING')))}</b>"
+        )
+        _telegram_send_chunks(bot_token, chat_id, [msg])
+        return
+
+
+def _inapp_telegram_command_loop():
+    offset = _load_telegram_command_offset()
+    prepared_token = ""
+    while True:
+        bot_token, allowed_chat_id = _telegram_runtime_credentials()
+        if not bot_token or not allowed_chat_id:
+            _update_inapp_alert_runtime({
+                "telegram_commands": "WAITING FOR BOT_TOKEN / CHAT_ID",
+                "updated_ct": _ct_now_text(),
+            })
+            time.sleep(5)
+            continue
+
+        try:
+            if bot_token != prepared_token:
+                _telegram_prepare_long_polling(bot_token)
+                prepared_token = bot_token
+            updates = _telegram_get_updates(bot_token, offset=offset, timeout_seconds=20)
+            for update in updates:
+                try:
+                    update_id = int(update.get("update_id", 0))
+                    offset = max(offset, update_id + 1)
+                    _save_telegram_command_offset(offset)
+
+                    message = update.get("message") or {}
+                    incoming_chat = str((message.get("chat") or {}).get("id", "")).strip()
+                    text = str(message.get("text", "")).strip()
+                    if incoming_chat != str(allowed_chat_id).strip():
+                        continue
+                    if text.startswith("/"):
+                        _handle_telegram_command(bot_token, allowed_chat_id, text)
+                except Exception as inner_e:
+                    print(f"Telegram command handling error: {inner_e}")
+
+            _update_inapp_alert_runtime({
+                "telegram_commands": "READY",
+                "telegram_last_poll_ct": _ct_now_text(),
+                "telegram_last_error": "",
+            })
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = str(e)
+            _update_inapp_alert_runtime({
+                "telegram_commands": f"ERROR {getattr(e, 'code', '')}",
+                "telegram_last_error": body[:240],
+                "updated_ct": _ct_now_text(),
+            })
+            time.sleep(5)
+        except Exception as e:
+            _update_inapp_alert_runtime({
+                "telegram_commands": "ERROR",
+                "telegram_last_error": str(e)[:240],
+                "updated_ct": _ct_now_text(),
+            })
+            time.sleep(5)
+
+
+def _wait_for_main_kalman_runtime_ready():
+    required = (
+        "institutional_trend_rail",
+        "BacktestEngine",
+        "load_data",
+        "_main_kalman_apply_institutional_trade_ledger",
+    )
+    while True:
+        if all(name in globals() for name in required):
+            return
+        time.sleep(0.5)
 
 
 def _inapp_alert_background_loop(interval_seconds=900):
+    _wait_for_main_kalman_runtime_ready()
+    _hydrate_inapp_state_from_render_bundle_once()
     while True:
+        # On a brand-new Render boot, the UI may need a few seconds to save the
+        # watchlist. Retry quickly instead of wasting the first 15-minute cycle.
+        _saved = _load_main_kalman_monitor_settings()
+        if not _normalize_watchlist(_saved.get("watchlist", "")):
+            time.sleep(10)
+            continue
+        cycle_start = time.time()
         try:
             if _try_claim_inapp_alert_lock():
                 _inapp_alert_check_once()
             else:
-                print("In-app alert loop: another copy of this app is already checking — skipping this cycle.")
+                print("In-app Main Kalman scanner: another copy owns the scan lock — skipping this cycle.")
         except Exception as e:
-            print(f"In-app alert loop error: {e}")
-        time.sleep(interval_seconds)
+            _update_inapp_alert_runtime({
+                "status": "ERROR",
+                "last_error": str(e)[:240],
+                "updated_ct": _ct_now_text(),
+            })
+            print(f"In-app Main Kalman loop error: {e}")
+
+        elapsed = time.time() - cycle_start
+        time.sleep(max(30, float(interval_seconds) - elapsed))
 
 
 def _start_inapp_alert_thread_once():
@@ -2438,22 +3264,41 @@ def _start_inapp_alert_thread_once():
         if _INAPP_ALERT_THREAD_STARTED:
             return
         _INAPP_ALERT_THREAD_STARTED = True
-        t = threading.Thread(target=_inapp_alert_background_loop, daemon=True)
+        t = threading.Thread(target=_inapp_alert_background_loop, daemon=True, name="MainKalmanScanner")
         t.start()
-        print("✅ In-app background alert thread started.")
+        print("✅ In-app Main Kalman background scanner started.")
 
 
-# Start it once, right now, as soon as the server process boots — independent
-# of whether anyone has a browser tab open.
-#
-# SIMPLE ON/OFF SWITCH: turned OFF by default because the separate Render bot
-# already sends these same alerts — running both at once means every signal
-# gets texted twice. Set this to True only if you stop using the Render bot
-# and want this app to be the one and only alert sender instead.
-INAPP_BACKGROUND_ALERTS_ENABLED = False
+def _start_inapp_command_thread_once():
+    global _INAPP_COMMAND_THREAD_STARTED
+    with _INAPP_COMMAND_LOCK:
+        if _INAPP_COMMAND_THREAD_STARTED:
+            return
+        _INAPP_COMMAND_THREAD_STARTED = True
+        t = threading.Thread(target=_inapp_telegram_command_loop, daemon=True, name="TelegramCommands")
+        t.start()
+        print("✅ In-app Telegram command listener started.")
 
-if INAPP_BACKGROUND_ALERTS_ENABLED:
-    _start_inapp_alert_thread_once()
+
+# Default ON for Render. Set INAPP_TELEGRAM_ENABLED=false only when another
+# service is intentionally using the same bot token with getUpdates.
+INAPP_TELEGRAM_ENABLED = str(os.environ.get("INAPP_TELEGRAM_ENABLED", "true")).strip().lower() not in (
+    "0", "false", "no", "off"
+)
+
+if INAPP_TELEGRAM_ENABLED:
+    try:
+        @st.cache_resource(show_spinner=False)
+        def _start_inapp_telegram_services_cached():
+            _start_inapp_alert_thread_once()
+            _start_inapp_command_thread_once()
+            return {"started": True, "started_ct": _ct_now_text(), "pid": os.getpid()}
+
+        _start_inapp_telegram_services_cached()
+    except Exception:
+        # Non-Streamlit fallback (for direct Python execution/testing).
+        _start_inapp_alert_thread_once()
+        _start_inapp_command_thread_once()
 
 
 def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: str):
@@ -2484,8 +3329,9 @@ def maybe_send_kalman_live_telegram_alert(
 ):
     """Send one Telegram alert when Kalman live BUY/SELL signal changes. Notification only."""
     try:
-        if not tg_alerts_on:
-            return
+        # Legacy live helper is intentionally disabled. BUY/SELL Telegram signals
+        # come only from the in-app Main Kalman 15-minute background worker.
+        return
 
         # Try to infer values from explicit hints first, then from globals.
         g = globals()
@@ -9306,7 +10152,7 @@ with st.sidebar:
         _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
         _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 150)),
             "enabled": True,
             "refresh": False,
         })
@@ -9319,9 +10165,9 @@ with st.sidebar:
         "Max stocks to monitor",
         min_value=1,
         max_value=200,
-        value=int(_mon_saved.get("max_stocks", 50) or 50),
+        value=int(_mon_saved.get("max_stocks", 150) or 150),
         step=1,
-        help="Higher number checks more tickers but can load slower. Default 50. Increase this if you want more symbols shown in open/closed status and trade-log monitor."
+        help="Set to 150 for your full watchlist. Telegram /status always reads the full saved watchlist."
     )
 
     # Auto-lock current watchlist on every rerun so refresh/reboot keeps your latest edits.
@@ -9329,7 +10175,7 @@ with st.sidebar:
         _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
         _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 150)),
             "enabled": True,
             "refresh": False,
         })
@@ -9358,7 +10204,7 @@ with st.sidebar:
     try:
         _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 150)),
             "sell_alerts": bool(main_kalman_monitor_sell_alerts),
             "enabled": bool(locals().get("main_kalman_monitor_on", True)),
             "refresh": bool(locals().get("main_kalman_monitor_refresh", False)),
@@ -9378,6 +10224,9 @@ with st.sidebar:
             "kalman_fast_reaction": float(st.session_state.get("kalman_fast_reaction", 0.34)),
             "kalman_slow_smoothing": float(st.session_state.get("kalman_slow_smoothing", 0.055)),
             "kalman_polish_span": int(st.session_state.get("kalman_polish_span", 3)),
+            "kalman_institutional_live_ledger": bool(st.session_state.get("kalman_institutional_live_ledger", True)),
+            "kalman_benchmark_aware_optimizer": bool(st.session_state.get("kalman_benchmark_aware_optimizer", True)),
+            "kalman_non_repaint_lock": bool(st.session_state.get("kalman_non_repaint_lock", True)),
         })
     except Exception:
         pass
@@ -9386,7 +10235,7 @@ with st.sidebar:
         _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
         _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
             "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 150)),
             "sell_alerts": bool(main_kalman_monitor_sell_alerts),
             "enabled": True,
             "refresh": False,
@@ -9485,14 +10334,14 @@ with st.sidebar:
         try:
             _max_stocks = int(main_kalman_monitor_max_stocks)
         except Exception:
-            _max_stocks = 50
+            _max_stocks = 150
         try:
             _sell_alerts = bool(main_kalman_monitor_sell_alerts)
         except Exception:
             _sell_alerts = False
         _rows = run_main_kalman_watchlist_monitor(
             main_kalman_monitor_watchlist,
-            send_telegram=bool(tg_alerts_on and main_kalman_monitor_on),
+            send_telegram=False,  # status-only; background worker is the one signal sender
             token=tg_bot_token,
             chat_id=tg_chat_id,
             show_table=True,
@@ -9506,16 +10355,25 @@ with st.sidebar:
     _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
 
     st.info(
-        "📡 **Background alerts: ON.** This app checks your watchlist every 15 minutes on its own "
-        "and texts Telegram when a ticker's position changes — no browser tab needs to stay open."
+        "📡 **In-app Telegram is ON — single sender mode.** Only the background Main Kalman worker can send BUY/SELL alerts. Render checks the full saved watchlist every 15 minutes. "
+        "Telegram `/status` answers immediately from the latest saved results; it does not wait for the next scan."
     )
     _bg_positions = _load_inapp_alert_positions()
-    if _bg_positions:
-        _last_checks = [v.get("checked_at", "") for v in _bg_positions.values() if v.get("checked_at")]
-        if _last_checks:
-            st.caption(f"Last background check: {max(_last_checks)} — {len(_bg_positions)} tickers tracked.")
-    else:
-        st.caption("No background checks recorded yet — first check happens within 15 minutes of the app starting.")
+    _bg_runtime = _load_inapp_alert_runtime()
+    _bg_tickers = _normalize_watchlist(main_kalman_monitor_watchlist)
+    _bg_done = int(_bg_runtime.get("processed_tickers", 0) or 0)
+    _bg_total = int(_bg_runtime.get("requested_tickers", len(_bg_tickers)) or len(_bg_tickers))
+    _bg_unknown = int(_bg_runtime.get("unknown", 0) or 0)
+    _bg_when = _format_ct_display(
+        _bg_runtime.get("scan_completed_ct") or _bg_runtime.get("updated_ct"),
+        default="Not checked yet",
+    )
+    st.caption(
+        f"Last background check: {_bg_when} — {_bg_done}/{_bg_total} tickers updated — "
+        f"{_bg_unknown} unknown/no-data. Time zone: America/Chicago (CT)."
+    )
+    _tg_cmd_state = str(_bg_runtime.get("telegram_commands", "STARTING"))
+    st.caption(f"Telegram commands: {_tg_cmd_state}. Use `/status` for all tickers or `/status AAPL` for one ticker with all params.")
 
     with st.expander("🔁 Bulk re-optimize ALL watchlist tickers (fix the 15-trusted / 135-fallback split)", expanded=False):
         st.caption(
@@ -9579,13 +10437,11 @@ with st.sidebar:
             if _bulk_ok:
                 st.dataframe(pd.DataFrame(_bulk_ok).T, use_container_width=True)
 
-    with st.expander("📤 Export bundle for Render / external Telegram bot", expanded=False):
+    with st.expander("📤 Export exact Main Kalman bundle for Render", expanded=False):
         st.caption(
-            "Build and download the exact JSON file your Render worker reads "
-            "(`streamlit_kalman_render_bundle.json`) — per-ticker params, watchlist ledger, "
-            "institutional trade ledger, signal lock, and a trust summary. Do this after any "
-            "bulk re-optimize or parameter change, then upload the downloaded file to Render "
-            "at the path set in `STREAMLIT_KALMAN_BUNDLE_FILE` and redeploy."
+            "This bundle now includes all Main Kalman controls, per-ticker optimized params, "
+            "signal lock, institutional ledger, and watchlist ledger. The in-app Render scanner "
+            "loads it automatically from `STREAMLIT_KALMAN_BUNDLE_FILE` after a fresh deploy."
         )
         if st.button("🧮 Build latest bundle", use_container_width=True):
             _bundle_now = build_render_bundle_export()
@@ -9620,46 +10476,19 @@ with st.sidebar:
             f"Showing last run from {st.session_state.get('last_main_kalman_monitor_ct', '')}. Click the button to refresh.",
         )
 
-    with st.expander("📡 Background Telegram alerts (works with app CLOSED)", expanded=False):
-        st.caption(
-            "The watchlist above only sends Telegram while this app is open. To receive BUY/SELL "
-            "alerts when the app is closed, run the standalone scanner on a schedule. It reuses the "
-            "exact settings you've saved here."
+    with st.expander("📡 Render Telegram setup", expanded=False):
+        st.markdown(
+            "**This app is now the Telegram worker.** Keep the Render app running and use the same bot here."
         )
-        st.markdown("**Step 1 — Save your settings** (so the scanner can read them):")
-        st.caption("Make sure you've clicked *Save Telegram Settings* and *Save Main Kalman Monitor Settings* above at least once.")
-
-        _home = str(_Path.home())
-        _script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else _home
-        _script_path = os.path.join(_script_dir, "telegram_watchlist_scanner.py")
-        _py = "python3"
-
-        st.markdown("**Step 2 — Test it** (sends one Telegram message now):")
-        st.code(f'{_py} "{_script_path}" --test', language="bash")
-
-        st.markdown("**Step 3 — Run continuously** (scan every 15 min while it stays open in a terminal):")
-        st.code(f'{_py} "{_script_path}" --loop --interval 900 --market-hours-only', language="bash")
-
-        st.markdown("**Step 4 (optional) — Auto-run via cron** (Mac/Linux; survives reboots, no terminal needed).")
-        st.caption("Runs every 15 min, 8:30am–3:00pm CT, Mon–Fri. Paste into your terminal:")
-        _cron_line = (
-            f"*/15 8-15 * * 1-5 {_py} \"{_script_path}\" --market-hours-only "
-            f">> \"{os.path.join(_script_dir, 'telegram_scanner.log')}\" 2>&1"
-        )
-        st.code(
-            "( crontab -l 2>/dev/null | grep -v telegram_watchlist_scanner.py ; "
-            f"echo '{_cron_line}' ) | crontab -",
-            language="bash",
+        st.markdown(
+            "1. In Render, set `BOT_TOKEN` and `CHAT_ID`.  "
+            "2. Keep `INAPP_TELEGRAM_ENABLED=true` (this is already the default).  "
+            "3. Stop any old separate `telegram_watchlist_scanner.py` or second Telegram worker using the same bot."
         )
         st.caption(
-            "To stop it later: run `crontab -e` and delete the telegram_watchlist_scanner.py line. "
-            "Windows users: use Task Scheduler to run the Step-3 command at login instead."
+            "Telegram commands: /status = full watchlist now, /status AAPL = one ticker with all params, /ping = bot health. "
+            "All times use America/Chicago (Central Time)."
         )
-        if not os.path.exists(_script_path):
-            st.warning(
-                f"Scanner file not found next to the app at:\n{_script_path}\n"
-                "Place telegram_watchlist_scanner.py in the same folder as this app."
-            )
 
     if False:
         st.caption("Auto monitor disabled for safe loading. Use Run Main Kalman Monitor Now.")
@@ -9669,7 +10498,7 @@ with st.sidebar:
             token=tg_bot_token,
             chat_id=tg_chat_id,
             show_table=True,
-            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
+            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 150)),
             allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
         )
 
