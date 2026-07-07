@@ -901,6 +901,7 @@ def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_ch
                 tickers=chunk,
                 period=period,
                 interval="15m",
+                group_by="ticker",
                 auto_adjust=True,
                 progress=False,
                 prepost=False,
