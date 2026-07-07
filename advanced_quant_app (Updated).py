@@ -2402,7 +2402,7 @@ def _inapp_alert_check_once():
                     f"Ticker: <b>{sym}</b>\n"
                     f"Position: <b>{new_pos}</b>\n"
                     f"Price: <b>{price_now}</b>\n"
-                    f"Time: <b>{datetime.now().strftime('%Y-%m-%d %I:%M %p')}</b>"
+                    f"Time: <b>{pd.Timestamp.now(tz='America/Chicago').strftime('%Y-%m-%d %I:%M %p CT')}</b>"
                 )
                 send_telegram_alert(bot_token, chat_id, msg)
                 last_alert_ts = now_ts
@@ -2410,7 +2410,7 @@ def _inapp_alert_check_once():
             positions[sym] = {
                 "position": new_pos,
                 "price": price_now,
-                "checked_at": datetime.now().isoformat(),
+                "checked_at": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
                 "last_alert_ts": last_alert_ts,
             }
         except Exception as e:
@@ -2445,7 +2445,15 @@ def _start_inapp_alert_thread_once():
 
 # Start it once, right now, as soon as the server process boots — independent
 # of whether anyone has a browser tab open.
-_start_inapp_alert_thread_once()
+#
+# SIMPLE ON/OFF SWITCH: turned OFF by default because the separate Render bot
+# already sends these same alerts — running both at once means every signal
+# gets texted twice. Set this to True only if you stop using the Render bot
+# and want this app to be the one and only alert sender instead.
+INAPP_BACKGROUND_ALERTS_ENABLED = False
+
+if INAPP_BACKGROUND_ALERTS_ENABLED:
+    _start_inapp_alert_thread_once()
 
 
 def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: str):
