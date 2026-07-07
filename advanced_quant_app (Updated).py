@@ -1826,6 +1826,184 @@ def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token=
 # --------------------------------------------------------
 
 
+# ============================================================================
+# BULK WATCHLIST RE-OPTIMIZER
+# ----------------------------------------------------------------------------
+# The single-ticker Main Kalman tab runs a full grid-search optimizer and saves
+# trusted per-ticker params (via _save_main_kalman_opt_params_for_ticker) only
+# for whichever ticker is currently open in the UI. Every other ticker in the
+# watchlist falls back to the old one-time BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M
+# seed, which _get_main_kalman_opt_params_for_ticker() deliberately treats as
+# untrusted/stale. This function runs that SAME optimizer for every ticker in
+# the watchlist (not just the one open in the UI) so all of them end up with
+# fresh, trusted, live-verified params — eliminating the "only 15 trusted"
+# split and the resulting mismatches against any external mirror (e.g. Render).
+# ============================================================================
+def bulk_reoptimize_full_watchlist(
+    raw_watchlist,
+    initial_cap=10000.0,
+    rf_rate=0.0,
+    buffer_grid=(0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070),
+    confirm_grid=(3, 4, 5, 7, 10),
+    hold_grid=(10, 15, 21, 34, 55),
+    cooldown_grid=(5, 8, 13, 21),
+    progress_callback=None,
+):
+    """
+    Re-run the exact same benchmark-aware Kalman optimizer used by the single-
+    ticker Main Kalman tab, but looped over every ticker in the watchlist.
+    Saves each ticker's winning params via _save_main_kalman_opt_params_for_ticker
+    (no "source" tag, so it is NOT filtered out as batch/fallback afterward) and
+    seeds st.session_state["main_kalman_status_{ticker}"] so the watchlist
+    monitor's authoritative-override path treats it identically to a ticker the
+    user actually opened and viewed this session.
+
+    Returns a dict: {ticker: {"buffer_pct":.., "confirm_bars":.., "min_hold_bars":..,
+                              "cooldown_bars":.., "position":.., "price":.., "score":..}}
+    """
+    symbols = _normalize_watchlist(raw_watchlist)
+    params = _get_current_main_kalman_params()
+    results = {}
+    total = len(symbols)
+
+    for i, sym in enumerate(symbols, start=1):
+        sym = str(sym).upper()
+        if progress_callback:
+            try:
+                progress_callback(i, total, sym)
+            except Exception:
+                pass
+        try:
+            px = _main_monitor_fetch_15m(sym, period="60d")
+            if px is None or len(px) < 80:
+                continue
+
+            rail, _center, _long_state = institutional_trend_rail(
+                px,
+                fast_gain=float(params["fast_gain"]),
+                slow_gain=float(params["slow_gain"]),
+                polish_span=int(params["polish_span"]),
+                atr_window=14,
+                atr_mult=float(params["rail_mult"]),
+            )
+            bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
+            trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
+            bt_px = px
+
+            def _build_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
+                               slope_confirm=True, atr_safety=True):
+                close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
+                close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
+                if bool(slope_confirm):
+                    entry_cond_i = close_above_i & (trend_slope >= 0)
+                    exit_cond_i = close_below_i & (trend_slope <= 0)
+                else:
+                    entry_cond_i = close_above_i
+                    exit_cond_i = close_below_i
+                if bool(atr_safety):
+                    atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+                    exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy_i)).fillna(False)
+                confirm_bars = int(confirm_bars)
+                entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+                exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+                sig_i = pd.Series(0.0, index=bt_px.index)
+                in_pos_i = False
+                bars_held_i = 0
+                cooldown_left_i = 0
+                for _dt in bt_px.index:
+                    if cooldown_left_i > 0:
+                        cooldown_left_i -= 1
+                    if not in_pos_i:
+                        if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
+                            in_pos_i = True
+                            bars_held_i = 0
+                            sig_i.loc[_dt] = 1.0
+                    else:
+                        bars_held_i += 1
+                        if bars_held_i >= int(min_hold_bars) and bool(exit_ready_i.loc[_dt]):
+                            in_pos_i = False
+                            cooldown_left_i = int(cooldown_bars)
+                            sig_i.loc[_dt] = 0.0
+                            bars_held_i = 0
+                        else:
+                            sig_i.loc[_dt] = 1.0
+                return sig_i.ffill().fillna(0).clip(0, 1)
+
+            bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
+            best_pack = None
+            for _buf in buffer_grid:
+                for _conf in confirm_grid:
+                    for _hold in hold_grid:
+                        for _cool in cooldown_grid:
+                            _sig = _build_signal(_buf, _conf, _hold, _cool,
+                                                  bool(params["slope_confirm"]), bool(params["atr_safety"]))
+                            _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
+                            _eq = _bt.get("equity_curve", pd.Series(dtype=float))
+                            _rets = _bt.get("returns", pd.Series(dtype=float))
+                            _tr = _bt.get("trades", pd.DataFrame())
+                            if _eq is None or len(_eq) < 2:
+                                continue
+                            _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
+                            _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
+                            _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
+                            _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
+                            _sh = float(_mets.get("Sharpe Ratio", 0.0))
+                            _dd_abs = abs(float(_dd))
+                            _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
+                            if _strat < bh_reference:
+                                _score -= (bh_reference - _strat) * 0.85
+                            if _dd_abs > 60:
+                                _score -= 5000.0
+                            if best_pack is None or _score > best_pack["score"]:
+                                best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
+
+            if best_pack is None:
+                continue
+
+            _save_main_kalman_opt_params_for_ticker(
+                sym, float(best_pack["buffer"]), int(best_pack["confirm"]),
+                int(best_pack["hold"]), int(best_pack["cool"]),
+                slope_confirm=bool(params["slope_confirm"]), atr_safety=bool(params["atr_safety"]),
+            )
+
+            trades_df, raw_row = _build_main_kalman_trade_log_from_prices(sym, px)
+            position = "CASH"
+            if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                last = trades_df.iloc[-1]
+                position = "LONG" if _trade_row_is_open(last, columns=trades_df.columns) else "CASH"
+            price_now = round(float(px.iloc[-1]), 2)
+            candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
+
+            # Seed the same session_state key the single-ticker tab sets, so the
+            # watchlist monitor's authoritative-override path treats this ticker
+            # exactly like one the user actually opened this session.
+            try:
+                st.session_state[f"main_kalman_status_{sym}"] = {
+                    "Trade Position": position,
+                    "Price": price_now,
+                    "Candle Close CT": candle_ct,
+                }
+            except Exception:
+                pass
+
+            results[sym] = {
+                "buffer_pct": float(best_pack["buffer"]),
+                "confirm_bars": int(best_pack["confirm"]),
+                "min_hold_bars": int(best_pack["hold"]),
+                "cooldown_bars": int(best_pack["cool"]),
+                "position": position,
+                "price": price_now,
+                "score": float(best_pack["score"]),
+            }
+        except Exception as e:
+            results[sym] = {"error": str(e)[:200]}
+
+    return results
+
+
+# --------------------------------------------------------
+
+
 # ---------- Telegram Alert Helpers ----------
 def send_telegram_alert(bot_token: str, chat_id: str, message: str):
     """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
@@ -8908,6 +9086,37 @@ with st.sidebar:
         return _rows
 
     _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
+
+    with st.expander("🔁 Bulk re-optimize ALL watchlist tickers (fix the 15-trusted / 135-fallback split)", expanded=False):
+        st.caption(
+            "Right now only tickers you've personally opened in the Main Kalman tab this session get "
+            "fresh, trusted optimizer params — every other ticker in the watchlist falls back to an old "
+            "one-time batch seed that this app itself treats as untrusted. Running this once loops the "
+            "SAME optimizer over every ticker in your full watchlist, so all of them end up trusted/live-synced "
+            "— eliminating mismatches between this app and any external mirror (e.g. a Render/Telegram bot). "
+            "This can take a while for a large watchlist (one grid-search per ticker)."
+        )
+        if st.button("🔁 Bulk Re-Optimize ALL Watchlist Tickers Now", use_container_width=True):
+            _bulk_tickers = _normalize_watchlist(main_kalman_monitor_watchlist)
+            _bulk_prog = st.progress(0.0)
+            _bulk_status = st.empty()
+
+            def _bulk_progress_cb(i, total, ticker):
+                _bulk_status.text(f"Optimizing {ticker}... ({i}/{total})")
+                _bulk_prog.progress(min(1.0, i / max(1, total)))
+
+            _bulk_results = bulk_reoptimize_full_watchlist(_bulk_tickers, progress_callback=_bulk_progress_cb)
+            _bulk_ok = {k: v for k, v in _bulk_results.items() if "error" not in v}
+            _bulk_errs = {k: v for k, v in _bulk_results.items() if "error" in v}
+            st.success(
+                f"Bulk re-optimized {len(_bulk_ok)}/{len(_bulk_tickers)} tickers. "
+                "All of these now use live-verified settings (not batch fallback) and will be treated "
+                "as trusted by the watchlist monitor and any bundle export."
+            )
+            if _bulk_errs:
+                st.warning(f"{len(_bulk_errs)} tickers failed (data/errors): {', '.join(sorted(_bulk_errs.keys())[:30])}")
+            if _bulk_ok:
+                st.dataframe(pd.DataFrame(_bulk_ok).T, use_container_width=True)
 
     if _clicked_run:
         _rows_now = _run_monitor_and_store()
