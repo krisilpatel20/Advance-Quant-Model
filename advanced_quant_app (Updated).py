@@ -1848,6 +1848,7 @@ def bulk_reoptimize_full_watchlist(
     hold_grid=(10, 15, 21, 34, 55),
     cooldown_grid=(5, 8, 13, 21),
     progress_callback=None,
+    skip_if_trusted=True,
 ):
     """
     Re-run the exact same benchmark-aware Kalman optimizer used by the single-
@@ -1857,6 +1858,18 @@ def bulk_reoptimize_full_watchlist(
     seeds st.session_state["main_kalman_status_{ticker}"] so the watchlist
     monitor's authoritative-override path treats it identically to a ticker the
     user actually opened and viewed this session.
+
+    PERFORMANCE NOTES:
+    - The per-bar state machine now runs on plain numpy arrays (positional index)
+      instead of pandas .loc-by-label lookups inside the loop, which is the single
+      biggest cost of each grid combination — this is a pure speed fix, identical
+      logic/output to the original label-based version.
+    - skip_if_trusted=True (default) skips any ticker that already has non-batch
+      (i.e. already-trusted) saved params, so re-running this after a partial/
+      interrupted run only processes what's actually left — safe to click again.
+    - Smaller grid tuples finish much faster at the cost of slightly less
+      exhaustive search; pass a reduced grid for a "quick pass", full grid for
+      an exact match to the single-ticker tab's optimizer.
 
     Returns a dict: {ticker: {"buffer_pct":.., "confirm_bars":.., "min_hold_bars":..,
                               "cooldown_bars":.., "position":.., "price":.., "score":..}}
@@ -1873,6 +1886,22 @@ def bulk_reoptimize_full_watchlist(
                 progress_callback(i, total, sym)
             except Exception:
                 pass
+
+        if skip_if_trusted:
+            _already = _get_main_kalman_opt_params_for_ticker(sym)
+            if isinstance(_already, dict):
+                results[sym] = {
+                    "buffer_pct": float(_already.get("buffer_pct", 0)),
+                    "confirm_bars": int(_already.get("confirm_bars", 0)),
+                    "min_hold_bars": int(_already.get("min_hold_bars", 0)),
+                    "cooldown_bars": int(_already.get("cooldown_bars", 0)),
+                    "position": "n/a",
+                    "price": None,
+                    "score": None,
+                    "skipped": "already trusted — resume mode",
+                }
+                continue
+
         try:
             px = None
             _fetch_err = None
@@ -1907,6 +1936,8 @@ def bulk_reoptimize_full_watchlist(
             bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
             trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
             bt_px = px
+            bt_px_idx = bt_px.index
+            atr_proxy = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
 
             def _build_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
                                slope_confirm=True, atr_safety=True):
@@ -1919,33 +1950,41 @@ def bulk_reoptimize_full_watchlist(
                     entry_cond_i = close_above_i
                     exit_cond_i = close_below_i
                 if bool(atr_safety):
-                    atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-                    exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy_i)).fillna(False)
+                    exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy)).fillna(False)
                 confirm_bars = int(confirm_bars)
-                entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                sig_i = pd.Series(0.0, index=bt_px.index)
+                # PERFORMANCE FIX: keep the rolling-confirm computation vectorized
+                # (pandas .rolling is C-level and fast), but pull the result out to
+                # a plain numpy array BEFORE the per-bar loop below, so the loop
+                # itself uses cheap positional indexing instead of slow .loc-by-
+                # label lookups — same exact logic, much faster.
+                entry_ready_arr = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False).to_numpy()
+                exit_ready_arr = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False).to_numpy()
+
+                n = len(bt_px_idx)
+                sig_arr = np.zeros(n, dtype=float)
                 in_pos_i = False
                 bars_held_i = 0
                 cooldown_left_i = 0
-                for _dt in bt_px.index:
+                min_hold_bars = int(min_hold_bars)
+                cooldown_bars = int(cooldown_bars)
+                for idx in range(n):
                     if cooldown_left_i > 0:
                         cooldown_left_i -= 1
                     if not in_pos_i:
-                        if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
+                        if cooldown_left_i <= 0 and entry_ready_arr[idx]:
                             in_pos_i = True
                             bars_held_i = 0
-                            sig_i.loc[_dt] = 1.0
+                            sig_arr[idx] = 1.0
                     else:
                         bars_held_i += 1
-                        if bars_held_i >= int(min_hold_bars) and bool(exit_ready_i.loc[_dt]):
+                        if bars_held_i >= min_hold_bars and exit_ready_arr[idx]:
                             in_pos_i = False
-                            cooldown_left_i = int(cooldown_bars)
-                            sig_i.loc[_dt] = 0.0
+                            cooldown_left_i = cooldown_bars
+                            sig_arr[idx] = 0.0
                             bars_held_i = 0
                         else:
-                            sig_i.loc[_dt] = 1.0
-                return sig_i.ffill().fillna(0).clip(0, 1)
+                            sig_arr[idx] = 1.0
+                return pd.Series(sig_arr, index=bt_px_idx)
 
             bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
             best_pack = None
@@ -9178,8 +9217,22 @@ with st.sidebar:
             "fresh, trusted optimizer params — every other ticker in the watchlist falls back to an old "
             "one-time batch seed that this app itself treats as untrusted. Running this once loops the "
             "SAME optimizer over every ticker in your full watchlist, so all of them end up trusted/live-synced "
-            "— eliminating mismatches between this app and any external mirror (e.g. a Render/Telegram bot). "
-            "This can take a while for a large watchlist (one grid-search per ticker)."
+            "— eliminating mismatches between this app and any external mirror (e.g. a Render/Telegram bot)."
+        )
+        st.caption(
+            "⚠️ Each ticker runs a full parameter grid search. **Quick** finishes far faster with a smaller "
+            "grid (good for getting all 150 tickers trusted quickly); **Thorough** uses the exact same grid "
+            "as the single-ticker tab (slower, most precise). Results are saved to disk per-ticker as it "
+            "goes, so it's always safe to stop and resume later — the next click continues where you left off."
+        )
+        _bulk_grid_choice = st.radio(
+            "Grid size", ["Quick (fast, ~10x fewer combos)", "Thorough (exact match to single-ticker tab)"],
+            index=0, horizontal=True, key="bulk_reopt_grid_choice",
+        )
+        _bulk_resume = st.checkbox(
+            "Skip tickers that already have trusted params (resume mode)",
+            value=True, key="bulk_reopt_resume",
+            help="Turn OFF only if you want to force-recompute every ticker from scratch, including ones already trusted.",
         )
         if st.button("🔁 Bulk Re-Optimize ALL Watchlist Tickers Now", use_container_width=True):
             _bulk_tickers = _normalize_watchlist(main_kalman_monitor_watchlist)
@@ -9190,14 +9243,27 @@ with st.sidebar:
                 _bulk_status.text(f"Optimizing {ticker}... ({i}/{total})")
                 _bulk_prog.progress(min(1.0, i / max(1, total)))
 
-            _bulk_results = bulk_reoptimize_full_watchlist(_bulk_tickers, progress_callback=_bulk_progress_cb)
-            _bulk_ok = {k: v for k, v in _bulk_results.items() if "error" not in v}
+            if _bulk_grid_choice.startswith("Quick"):
+                _bulk_kwargs = dict(
+                    buffer_grid=(0.010, 0.020, 0.040),
+                    confirm_grid=(3, 5),
+                    hold_grid=(10, 21, 55),
+                    cooldown_grid=(5, 13),
+                )
+            else:
+                _bulk_kwargs = {}
+
+            _bulk_results = bulk_reoptimize_full_watchlist(
+                _bulk_tickers, progress_callback=_bulk_progress_cb,
+                skip_if_trusted=bool(_bulk_resume), **_bulk_kwargs,
+            )
+            _bulk_ok = {k: v for k, v in _bulk_results.items() if "error" not in v and not v.get("skipped")}
+            _bulk_skipped = {k: v for k, v in _bulk_results.items() if v.get("skipped")}
             _bulk_errs = {k: v for k, v in _bulk_results.items() if "error" in v}
             _bulk_missing = [t for t in _bulk_tickers if t not in _bulk_results]
             st.success(
-                f"Bulk re-optimized {len(_bulk_ok)}/{len(_bulk_tickers)} tickers. "
-                "All of these now use live-verified settings (not batch fallback) and will be treated "
-                "as trusted by the watchlist monitor and any bundle export."
+                f"Newly optimized {len(_bulk_ok)}, skipped {len(_bulk_skipped)} (already trusted), "
+                f"failed {len(_bulk_errs)} — out of {len(_bulk_tickers)} total tickers."
             )
             if _bulk_errs:
                 st.warning(f"{len(_bulk_errs)} tickers failed (data/errors) — see table below.")
