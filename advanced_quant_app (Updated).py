@@ -18,2372 +18,16 @@ try:
 except Exception:
     ZoneInfo = None
 import io
+import csv
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import json
-import urllib.request
-import urllib.error
-from pathlib import Path as _Path
+import re
 import smtplib
 import os
 from email.message import EmailMessage
 import os
-
-# Streamlit runs scripts in a ScriptRunner thread. ib_insync/eventkit expects
-# an asyncio event loop to exist in the current thread at import time.
-# Create one safely before importing ib_insync.
-import asyncio
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-
-# ---------- Local Telegram Settings Persistence ----------
-def _telegram_settings_path():
-    try:
-        return _Path.home() / ".pinehurst_quant_telegram.json"
-    except Exception:
-        return _Path(".pinehurst_quant_telegram.json")
-
-def load_telegram_settings():
-    try:
-        p = _telegram_settings_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def save_telegram_settings(bot_token: str, chat_id: str, enabled: bool, auto_kalman: bool, **extra):
-    try:
-        p = _telegram_settings_path()
-        data = load_telegram_settings()
-        data.update({
-            "bot_token": str(bot_token).strip(),
-            "chat_id": str(chat_id).strip(),
-            "enabled": bool(enabled),
-            "auto_kalman": bool(auto_kalman),
-        })
-        for k, v in extra.items():
-            try:
-                if isinstance(v, (str, int, float, bool)) or v is None:
-                    data[k] = v
-                else:
-                    data[k] = str(v)
-            except Exception:
-                pass
-        p.write_text(json.dumps(data, indent=2))
-        return True, str(p)
-    except Exception as e:
-        return False, str(e)
-# --------------------------------------------------------
-
-
-
-def _clean_trade_log_numbers(df):
-    """Round numeric trade-log columns for clean display."""
-    try:
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            return df
-        out = df.copy()
-        for c in out.columns:
-            # Round all numeric columns to 2 decimals.
-            if pd.api.types.is_numeric_dtype(out[c]):
-                out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
-            else:
-                # Try converting object columns that are numeric-looking.
-                converted = pd.to_numeric(out[c], errors="coerce")
-                if converted.notna().sum() >= max(1, int(len(out) * 0.50)):
-                    out[c] = converted.round(2)
-        return out
-    except Exception:
-        return df
-
-
-def _trade_row_is_open(last_row, columns=None):
-    """
-    Canonical open/closed resolver for the last trade-log row.
-
-    Priority:
-      1. An explicit Status column ("Open"/"Closed") is authoritative.
-      2. Otherwise, an Exit field that is empty / NaN / literally "Open"
-         means the trade is still open.
-      3. Last fallback: substring scan of the row text.
-
-    This single helper is used by every status path (visible log, watchlist,
-    telegram, sidebar) so they can never disagree on open vs. closed.
-    """
-    try:
-        # 1) Explicit Status column wins.
-        try:
-            status_val = str(last_row.get("Status", "")).strip().upper()
-        except Exception:
-            status_val = ""
-        if status_val in ("OPEN", "LONG"):
-            return True
-        if status_val in ("CLOSED", "CLOSE", "STOP LOSS", "TRAILING STOP", "CASH"):
-            return False
-
-        # 2) Exit field check. Only true exit-time columns are reliable here:
-        #    Sell Price / Exit Price are populated even for OPEN trades (current
-        #    price), so they must NOT be treated as evidence of a close.
-        for c in ("Exit CT", "Exit Date", "Exit Time", "Exit"):
-            present = (columns is None) or (c in columns)
-            if not present:
-                continue
-            try:
-                v = last_row.get(c, "__MISSING__")
-            except Exception:
-                v = "__MISSING__"
-            if isinstance(v, str) and v == "__MISSING__":
-                # Column not actually retrievable on this row.
-                continue
-            # Column is present. Empty / NaN / None / "Open" => still open.
-            try:
-                if v is None or (pd.isna(v) if np.isscalar(v) or v is None else False):
-                    return True
-            except Exception:
-                pass
-            sv = str(v).strip()
-            if sv == "" or sv.lower() in ("nan", "none", "nat"):
-                return True
-            if sv.lower() == "open":
-                return True
-            # A real exit value present -> closed.
-            return False
-
-        # 3) Fallback: substring scan.
-        try:
-            row_txt = " ".join([str(x) for x in last_row.values]).upper()
-        except Exception:
-            row_txt = ""
-        return ("OPEN" in row_txt) and ("CLOSED" not in row_txt)
-    except Exception:
-        return False
-
-
-
-
-def _save_main_kalman_status_to_session(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
-    """
-    Save visible main Kalman status so the sidebar/scanner mirrors the MAIN TAB.
-
-    SOURCE OF TRUTH = the executed trade log (BacktestEngine output). Its last
-    row's Open/Closed reflects whether the strategy is actually holding the
-    position right now, after cooldown/min-hold/stop logic. The raw kalman_signal
-    series can differ from the executed position (e.g. signal drops to 0 during
-    min-hold while the trade is still open), so it must NOT override an explicit
-    Open/Closed trade-log row.
-
-    signal_state is used ONLY as a fallback when the trade log is empty/missing,
-    so a brand-new in-position bar with no recorded trade still shows LONG.
-    """
-    try:
-        row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
-
-        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
-        if not _have_trades and signal_state is not None:
-            try:
-                _is_long = int(round(float(signal_state))) == 1
-            except Exception:
-                _is_long = bool(signal_state)
-            row["Trade Position"] = "LONG" if _is_long else "CASH"
-            row["Alert"] = "No trade log row — position from main kalman_signal"
-
-        key = f"main_kalman_status_{str(ticker).upper()}"
-        st.session_state[key] = row
-        return row
-    except Exception:
-        return None
-
-
-
-
-
-def _sync_watchlist_ledger_from_visible_main_trade_log(ticker, trades_df, latest_price=None):
-    """
-    Sync watchlist ledger from the visible MAIN Kalman Trade Log.
-    This fixes cases where main trade log says Open/Long but Thesis Parameters shows CASH.
-    """
-    try:
-        sym = str(ticker).upper()
-        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-            return None
-
-        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
-        row_txt = " ".join([str(x) for x in last.values]).upper()
-
-        is_open = _trade_row_is_open(last, columns=t.columns)
-        position = "LONG" if is_open else "CASH"
-
-        entry_time = ""
-        exit_time = "Open" if is_open else ""
-        entry_price = None
-        current_price = latest_price
-        pnl_pct = None
-
-        for c in ["Entry CT", "Entry Time", "Entry"]:
-            if c in t.columns:
-                v = str(last.get(c, ""))
-                if v and v.lower() != "nan":
-                    entry_time = v
-                    break
-
-        for c in ["Exit CT", "Exit Time", "Exit"]:
-            if c in t.columns:
-                v = str(last.get(c, ""))
-                if v and v.lower() != "nan":
-                    exit_time = v
-                    break
-
-        for c in ["Entry Price", "Entry"]:
-            if c in t.columns:
-                try:
-                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
-                    if pd.notna(vv):
-                        entry_price = round(float(vv), 2)
-                        break
-                except Exception:
-                    pass
-
-        for c in ["Current Price", "Current", "Exit/Current Price", "Exit Price", "Exit", "Price", "Close"]:
-            if c in t.columns:
-                try:
-                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
-                    if pd.notna(vv):
-                        current_price = round(float(vv), 2)
-                        break
-                except Exception:
-                    pass
-
-        # Last fallback: pick last reasonable numeric value as current price.
-        if current_price is None:
-            try:
-                nums = []
-                for v in list(last.values):
-                    vv = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
-                    if pd.notna(vv) and 1 < float(vv) < 100000:
-                        nums.append(float(vv))
-                if nums:
-                    current_price = round(float(nums[-1]), 2)
-            except Exception:
-                pass
-
-        for c in ["PnL (%)", "Return (%)", "Return", "Trade Return", "Pnl", "PnL"]:
-            if c in t.columns:
-                try:
-                    vv = pd.to_numeric(pd.Series([last.get(c)]), errors="coerce").iloc[0]
-                    if pd.notna(vv):
-                        pnl_pct = round(float(vv), 2)
-                        break
-                except Exception:
-                    pass
-
-        if pnl_pct is None and entry_price and current_price:
-            try:
-                pnl_pct = round(((float(current_price) / float(entry_price)) - 1.0) * 100.0, 2)
-            except Exception:
-                pnl_pct = None
-
-        event_time = entry_time if is_open else (exit_time or entry_time)
-        state_key = f"{sym}|VISIBLE_MAIN|{'BUY' if is_open else 'SELL'}|{event_time}|{position}|{entry_price}|{current_price}"
-
-        ledger = _load_main_kalman_watchlist_ledger()
-        old = ledger.get(sym, {})
-        # Visible main trade log has priority. If it says OPEN, force ledger LONG.
-        ledger[sym] = {
-            "ticker": sym,
-            "position": position,
-            "entry_time": entry_time,
-            "exit_time": "Open" if is_open else exit_time,
-            "event_time": event_time,
-            "state_key": state_key,
-            "price": current_price,
-            "entry_price": entry_price,
-            "exit_current_price": current_price,
-            "pnl_pct": pnl_pct,
-            "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            "source": "Synced from visible Main Kalman Trade Log",
-        }
-        _save_main_kalman_watchlist_ledger(ledger)
-
-        row = {
-            "Ticker": sym,
-            "Alert Signal": "NO NEW ALERT",
-            "Trade Position": position,
-            "Price": current_price,
-            "Entry CT": entry_time,
-            "Exit CT": "Open" if is_open else exit_time,
-            "PnL (%)": pnl_pct,
-            "Source": "Visible Main Kalman Trade Log",
-        }
-
-        # Update sidebar verify placeholder if available.
-        try:
-            slot = globals().get("main_kalman_verify_slot", None)
-            if slot is not None:
-                with slot.container():
-                    st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
-        except Exception:
-            pass
-
-        return row
-    except Exception as e:
-        return None
-
-
-def _update_thesis_main_kalman_verify(ticker, trades_df, latest_price=None, latest_time=None, signal_state=None):
-    """Show the exact main Kalman status back in Thesis Parameters.
-
-    Source of truth is the executed trade log. signal_state is only a fallback
-    when there is no trade-log row, matching _save_main_kalman_status_to_session.
-    """
-    try:
-        row = _status_from_main_trade_log(ticker, trades_df, latest_price=latest_price, latest_time=latest_time)
-        _have_trades = isinstance(trades_df, pd.DataFrame) and not trades_df.empty
-        if not _have_trades and signal_state is not None:
-            try:
-                _is_long = int(round(float(signal_state))) == 1
-            except Exception:
-                _is_long = bool(signal_state)
-            row["Trade Position"] = "LONG" if _is_long else "CASH"
-        row["Source"] = "Main Institutional Trend Rail Graph + Main Kalman Trade Log"
-        st.session_state[f"main_kalman_verified_{str(ticker).upper()}"] = row
-
-        slot = globals().get("main_kalman_verify_slot", None)
-        if slot is not None:
-            with slot.container():
-                st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
-        return row
-    except Exception as e:
-        try:
-            slot = globals().get("main_kalman_verify_slot", None)
-            if slot is not None:
-                slot.warning(f"Main Kalman verify not available yet: {e}")
-        except Exception:
-            pass
-        return None
-
-
-def _telegram_from_main_kalman_trade_log(ticker, trades_df, latest_price=None, token="", chat_id="", enabled=False):
-    """
-    Send Telegram only from the main Kalman trade log.
-    No separate scanner logic. No separate 15m helper logic.
-    """
-    try:
-        if not enabled:
-            return False, "Telegram main-log alerts OFF."
-        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-            return False, "No main Kalman trade row."
-
-        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
-        row_txt = " ".join([str(x) for x in last.values]).upper()
-
-        is_open = _trade_row_is_open(last, columns=t.columns)
-        signal = "BUY" if is_open else "SELL"
-
-        # Pull event time from the visible main trade log row.
-        event_time = ""
-        for c in ["Entry CT", "Exit CT", "Entry Time", "Exit Time", "Entry", "Exit"]:
-            if c in t.columns:
-                val = str(last.get(c, ""))
-                if val and val.lower() != "nan":
-                    event_time = val
-                    # For closed trade, prefer exit time if available.
-                    if signal == "SELL" and "Exit" in c:
-                        break
-                    if signal == "BUY" and "Entry" in c:
-                        break
-
-        if not event_time:
-            event_time = str(pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"))
-
-        px = latest_price
-        for c in ["Current Price", "Current", "Exit Price", "Entry Price", "Price", "Close"]:
-            if c in t.columns:
-                try:
-                    v = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
-                    if pd.notna(v):
-                        px = float(v)
-                        break
-                except Exception:
-                    pass
-
-        px_txt = "N/A" if px is None else f"{float(px):.2f}"
-
-        ledger = _load_kalman_alert_ledger()
-        ledger_key = f"{ticker}|MAIN_KALMAN_TRADE_LOG|{signal}|{event_time}|{px_txt}"
-        if ledger.get(str(ticker).upper()) == ledger_key:
-            return True, "Already sent/synced."
-
-        msg = (
-            "PINEHURST MAIN KALMAN ALERT\n"
-            f"Ticker: {str(ticker).upper()}\n"
-            f"Signal: {signal}\n"
-            f"Price: {px_txt}\n"
-            f"Time: {event_time}\n"
-            "Source: Main Institutional Trend Rail Graph + Main Kalman Trade Log\n"
-            "Action: Notification only — no IBKR order sent."
-        )
-
-        ok, resp = send_telegram_alert(token, chat_id, msg)
-        if ok:
-            ledger[str(ticker).upper()] = ledger_key
-            _save_kalman_alert_ledger(ledger)
-            return True, "Sent."
-        return False, resp
-    except Exception as e:
-        return False, str(e)
-
-
-def _status_from_main_trade_log(ticker, trades_df, latest_price=None, latest_time=None):
-    """Copy main BUY/SELL trade-log state into scanner row. No separate signal math."""
-    try:
-        tkr = str(ticker).upper()
-        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-            return {
-                "Ticker": tkr,
-                "Alert Signal": "NO NEW ALERT",
-                "Trade Position": "CASH",
-                "Price": round(float(latest_price), 2) if latest_price is not None else None,
-                "Candle Close CT": str(latest_time) if latest_time is not None else "",
-                "Alert": "No trade log row",
-            }
-
-        t = _clean_trade_log_numbers(trades_df).copy() if "_clean_trade_log_numbers" in globals() else trades_df.copy()
-        last = t.iloc[-1]
-        is_open = _trade_row_is_open(last, columns=t.columns)
-        is_long = is_open
-
-        px = latest_price
-        for c in ["Current Price", "Exit Price", "Exit", "Last Price", "Price"]:
-            if c in t.columns:
-                try:
-                    v = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
-                    if pd.notna(v):
-                        px = float(v)
-                        break
-                except Exception:
-                    pass
-
-        tm = latest_time
-        for c in ["Entry CT", "Entry Time", "Entry", "Date", "Time"]:
-            if c in t.columns:
-                try:
-                    val = str(last[c])
-                    if val and val.lower() != "nan":
-                        tm = val
-                        break
-                except Exception:
-                    pass
-
-        return {
-            "Ticker": tkr,
-            "Alert Signal": "NO NEW ALERT",
-            "Trade Position": "LONG" if is_long else "CASH",
-            "Price": round(float(px), 2) if px is not None and str(px) != "" else None,
-            "Candle Close CT": str(tm) if tm is not None else "",
-            "Alert": "Copied from visible main Kalman trade log",
-        }
-    except Exception as e:
-        return {
-            "Ticker": str(ticker).upper(),
-            "Alert Signal": "ERROR",
-            "Trade Position": "UNKNOWN",
-            "Price": None,
-            "Candle Close CT": "",
-            "Alert": str(e)[:120],
-        }
-
-# ---------- Kalman 15m Watchlist Telegram Scanner ----------
-def _kalman_alert_ledger_path():
-    try:
-        return _Path.home() / ".pinehurst_kalman_15m_alert_ledger.json"
-    except Exception:
-        return _Path(".pinehurst_kalman_15m_alert_ledger.json")
-
-def _load_kalman_alert_ledger():
-    try:
-        p = _kalman_alert_ledger_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_kalman_alert_ledger(data):
-    try:
-        _kalman_alert_ledger_path().write_text(json.dumps(data, indent=2))
-    except Exception:
-        pass
-
-def _normalize_watchlist(raw):
-    try:
-        return [x.strip().upper() for x in str(raw).replace("\n", ",").split(",") if x.strip()]
-    except Exception:
-        return []
-
-def _fetch_15m_completed_bars(ticker, period="5d"):
-    """Fetch 15m bars and drop the currently-forming bar to avoid repaint-like alerts."""
-    df = yf.download(
-        ticker,
-        period=period,
-        interval="15m",
-        progress=False,
-        auto_adjust=True,
-        prepost=False,
-        threads=False,
-    )
-    if df is None or len(df) < 60:
-        return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
-    close_col = "Close" if "Close" in df.columns else df.columns[-1]
-    px = pd.Series(df[close_col]).dropna().astype(float)
-    if len(px) < 60:
-        return None
-
-    # yfinance intraday is normally US/Eastern. Convert to CT, then remove tz for display.
-    try:
-        if px.index.tz is None:
-            px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
-        px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
-    except Exception:
-        pass
-
-    # Drop latest bar ONLY if that 15m candle is still forming.
-    # yfinance labels intraday bars by candle START time.
-    # Example: 2:30 PM CT bar closes at 2:45 PM CT.
-    try:
-        now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
-        latest_start = pd.Timestamp(px.index[-1])
-        latest_close = latest_start + pd.Timedelta(minutes=15)
-        if latest_close > now_ct and len(px) > 2:
-            px = px.iloc[:-1]
-    except Exception:
-        # Safety fallback: if time comparison fails, stay conservative.
-        if len(px) > 2:
-            px = px.iloc[:-1]
-
-    return px.dropna()
-
-def _kalman_15m_signal_from_prices(px):
-    """
-    Scanner signal aligned to main Kalman 15m trade-log behavior.
-
-    Key fix:
-    - Alert Signal = only fresh BUY/SELL transition.
-    - Trade Position = current open trade state.
-    So if DELL has an open Long, scanner shows LONG even when there is NO NEW ALERT.
-    Risk Firewall stays OFF.
-    """
-    rail, center, long_state = institutional_trend_rail(
-        px,
-        fast_gain=0.34,
-        slow_gain=0.055,
-        polish_span=3,
-        atr_window=14,
-        atr_mult=1.35,
-    )
-    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
-    state_s = pd.Series(long_state, index=px.index).astype(bool)
-
-    # Main Kalman-style defaults; same family as the primary graph/trade-log logic.
-    buffer_pct = 0.0125
-    confirm_bars = 3
-    min_hold = 5
-    cooldown_bars = 3
-
-    above = ((px > rail_s * (1.0 + buffer_pct)) & state_s).astype(int)
-    below = ((px < rail_s * (1.0 - buffer_pct)) | (~state_s)).astype(int)
-
-    confirmed_buy = above.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
-    confirmed_sell = below.rolling(confirm_bars, min_periods=confirm_bars).sum().fillna(0) >= confirm_bars
-
-    sig = pd.Series(0, index=px.index, dtype=int)
-    in_pos = False
-    hold_count = 0
-    cooldown = 0
-
-    for dt in px.index:
-        if cooldown > 0:
-            cooldown -= 1
-
-        if not in_pos:
-            if cooldown == 0 and bool(confirmed_buy.loc[dt]):
-                in_pos = True
-                hold_count = 0
-                sig.loc[dt] = 1
-            else:
-                sig.loc[dt] = 0
-        else:
-            hold_count += 1
-            if hold_count >= min_hold and bool(confirmed_sell.loc[dt]):
-                in_pos = False
-                cooldown = cooldown_bars
-                sig.loc[dt] = 0
-            else:
-                sig.loc[dt] = 1
-
-    changes = sig.diff().fillna(sig.iloc[0])
-    latest = int(sig.iloc[-1])
-    prev = int(sig.iloc[-2]) if len(sig) >= 2 else latest
-    alert_signal = "BUY" if float(changes.iloc[-1]) > 0 else ("SELL" if float(changes.iloc[-1]) < 0 else "NO NEW ALERT")
-    trade_position = "LONG" if latest == 1 else "CASH"
-
-    return alert_signal, float(px.iloc[-1]), px.index[-1], prev, latest, trade_position
-
-
-
-def run_kalman_15m_watchlist_telegram_scan(watchlist, tg_on, token, chat_id, show_table=True):
-    """
-    Separate 15m scanner calculations are disabled.
-    Main Kalman Trade Log is the only source of truth.
-    """
-    symbols = _normalize_watchlist(watchlist)
-    rows = []
-    for sym in symbols:
-        rows.append({
-            "Ticker": sym,
-            "Status": "USE MAIN KALMAN TAB",
-            "Source": "Main Buy/Sell Graph + Main Trade Log only",
-            "Note": "Separate 15m scanner disabled to avoid mismatched signals."
-        })
-    if show_table:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    return rows
-
-
-
-def _kalman_15m_trend_rail_report(ticker):
-    """Create Institutional Trend Rail 15m chart + trade log using completed 15m candles only."""
-    px = _fetch_15m_completed_bars(ticker, period="5d")
-    if px is None or len(px) < 60:
-        return None, pd.DataFrame(), None
-
-    rail, center, long_state = institutional_trend_rail(
-        px,
-        fast_gain=0.34,
-        slow_gain=0.055,
-        polish_span=3,
-        atr_window=14,
-        atr_mult=1.35,
-    )
-    rail_s = pd.Series(rail, index=px.index).ffill().bfill()
-    state_s = pd.Series(long_state, index=px.index).astype(bool)
-    signal = ((px > rail_s) & state_s).astype(int)
-    changes = signal.diff().fillna(signal.iloc[0])
-
-    buys = changes[changes > 0].index
-    sells = changes[changes < 0].index
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=px.index, y=px.values, mode="lines", name="Price"))
-    fig.add_trace(go.Scatter(x=rail_s.index, y=rail_s.values, mode="lines", name="Institutional Trend Rail"))
-
-    if len(buys) > 0:
-        fig.add_trace(go.Scatter(
-            x=buys,
-            y=px.loc[buys],
-            mode="markers",
-            name="BUY",
-            marker=dict(symbol="triangle-up", size=12),
-        ))
-    if len(sells) > 0:
-        fig.add_trace(go.Scatter(
-            x=sells,
-            y=px.loc[sells],
-            mode="markers",
-            name="SELL",
-            marker=dict(symbol="triangle-down", size=12),
-        ))
-
-    fig.update_layout(
-        title=f"{ticker.upper()} — Kalman 15m Institutional Trend Rail",
-        xaxis_title="CT time",
-        yaxis_title="Price",
-        height=520,
-        hovermode="x unified",
-        margin=dict(l=20, r=20, t=55, b=35),
-    )
-
-    trades = []
-    in_trade = False
-    entry_time = None
-    entry_price = None
-
-    for dt in px.index:
-        ch = float(changes.loc[dt])
-        if ch > 0 and not in_trade:
-            in_trade = True
-            entry_time = dt
-            entry_price = float(px.loc[dt])
-        elif ch < 0 and in_trade:
-            exit_time = dt
-            exit_price = float(px.loc[dt])
-            ret = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
-            trades.append({
-                "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %I:%M %p CT"),
-                "Entry Price": round(entry_price, 2),
-                "Exit CT": pd.Timestamp(exit_time).strftime("%Y-%m-%d %I:%M %p CT"),
-                "Exit Price": round(exit_price, 2),
-                "Trade Return %": round(ret, 2),
-                "Status": "Closed",
-            })
-            in_trade = False
-            entry_time = None
-            entry_price = None
-
-    if in_trade and entry_time is not None:
-        last_time = px.index[-1]
-        last_price = float(px.iloc[-1])
-        ret = (last_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
-        trades.append({
-            "Entry CT": pd.Timestamp(entry_time).strftime("%Y-%m-%d %I:%M %p CT"),
-            "Entry Price": round(entry_price, 2),
-            "Exit CT": "",
-            "Exit Price": "",
-            "Trade Return %": round(ret, 2),
-            "Status": "Open",
-        })
-
-    trades_df = pd.DataFrame(trades)
-    latest_signal = "LONG" if int(signal.iloc[-1]) == 1 else "CASH"
-    latest_info = {
-        "Ticker": ticker.upper(),
-        "Latest Position": latest_signal,
-        "Latest Price": round(float(px.iloc[-1]), 2),
-        "Latest Completed Candle CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
-    }
-    return fig, trades_df, latest_info
-
-
-
-# ---------- Main Kalman Trade-Log Watchlist Monitor ----------
-
-def _get_query_param_value(name, default=""):
-    try:
-        qp = getattr(st, "query_params", {})
-        v = qp.get(name, default)
-        if isinstance(v, list):
-            return v[0] if v else default
-        return v if v is not None else default
-    except Exception:
-        try:
-            v = st.experimental_get_query_params().get(name, [default])
-            return v[0] if isinstance(v, list) and v else default
-        except Exception:
-            return default
-
-def _set_query_param_value(name, value):
-    try:
-        st.query_params[name] = str(value)
-        return True
-    except Exception:
-        try:
-            qp = st.experimental_get_query_params()
-            qp[name] = [str(value)]
-            st.experimental_set_query_params(**qp)
-            return True
-        except Exception:
-            return False
-
-def _main_kalman_monitor_settings_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_monitor.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_monitor.json")
-
-def _load_main_kalman_monitor_settings():
-    try:
-        p = _main_kalman_monitor_settings_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_monitor_settings(data):
-    try:
-        p = _main_kalman_monitor_settings_path()
-        p.write_text(json.dumps(data, indent=2))
-        return True, str(p)
-    except Exception as e:
-        return False, str(e)
-
-def _main_monitor_fetch_15m(ticker, period="60d"):
-    # FIX: stop maintaining a second, parallel fetch implementation that keeps
-    # drifting from what's actually proven reliable. Call load_data() directly
-    # — the exact function the working single-ticker Main Kalman tab uses —
-    # instead of a separate yf.download() with its own (subtly different)
-    # parameters. This removes any remaining guesswork about what's different.
-    try:
-        _days = int(str(period).lower().replace("d", "").strip())
-    except Exception:
-        _days = 60
-    _end = datetime.now()
-    _start = _end - timedelta(days=_days)
-
-    df = load_data(str(ticker).upper(), _start, _end, interval="15m")
-    if df is None or df.empty or "Close" not in df.columns:
-        return None
-
-    px = pd.Series(df["Close"]).dropna().astype(float)
-    if len(px) < 80:
-        return None
-
-    # load_data() already normalizes intraday timestamps to tz-naive Chicago
-    # time, so no further tz conversion is needed here — just the same
-    # forming-candle guard used everywhere else in this file.
-    try:
-        now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
-        latest_start = pd.Timestamp(px.index[-1])
-        latest_close = latest_start + pd.Timedelta(minutes=15)
-        if latest_close > now_ct and len(px) > 2:
-            px = px.iloc[:-1]
-    except Exception:
-        if len(px) > 2:
-            px = px.iloc[:-1]
-    return px.dropna()
-
-
-def _clean_15m_series(px_raw):
-    """Shared cleanup: dropna/cast, tz-convert to CT, drop forming candle. Used by
-    the batched fetch below so its per-ticker output matches _main_monitor_fetch_15m."""
-    try:
-        px = pd.Series(px_raw).dropna().astype(float)
-        if len(px) < 80:
-            return None
-        try:
-            if px.index.tz is None:
-                px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
-            px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
-        except Exception:
-            pass
-        try:
-            now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
-            latest_start = pd.Timestamp(px.index[-1])
-            latest_close = latest_start + pd.Timedelta(minutes=15)
-            if latest_close > now_ct and len(px) > 2:
-                px = px.iloc[:-1]
-        except Exception:
-            if len(px) > 2:
-                px = px.iloc[:-1]
-        return px.dropna()
-    except Exception:
-        return None
-
-
-def _bulk_fetch_15m_batch(tickers, period="60d", chunk_size=20, pause_between_chunks=2.0):
-    """
-    RATE-LIMIT FIX: fetch many tickers using a handful of batched, multi-ticker
-    yf.download() calls instead of one call per ticker. yfinance/Yahoo can block
-    the requesting IP after too many individual sequential requests in a short
-    window — this is the same fix already applied to the Render bot's scanner.
-    Cuts ~150 individual requests down to ~len(tickers)/chunk_size batched ones.
-
-    Returns (out, debug):
-      out   = {ticker: pd.Series} for every ticker that returned usable data.
-      debug = {ticker: reason string} for every ticker that did NOT — so failures
-              are diagnosable instead of collapsing into one generic message.
-    """
-    out = {}
-    debug = {}
-    tickers = [str(t).upper() for t in tickers]
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i + chunk_size]
-        raw = None
-        chunk_err = None
-        try:
-            raw = yf.download(
-                tickers=chunk,
-                period=period,
-                interval="15m",
-                group_by="ticker",
-                auto_adjust=True,
-                progress=False,
-                prepost=False,
-                threads=True,
-            )
-        except Exception as e:
-            chunk_err = f"yf.download raised: {e}"
-            print(f"Batch fetch error for chunk {chunk}: {e}")
-            raw = None
-
-        if raw is None:
-            for t in chunk:
-                debug[t] = chunk_err or "yf.download returned None"
-            if i + chunk_size < len(tickers):
-                time.sleep(pause_between_chunks)
-            continue
-
-        if raw.empty:
-            for t in chunk:
-                debug[t] = "yf.download returned an empty DataFrame for this whole chunk (likely rate-limited or market data unavailable)"
-            if i + chunk_size < len(tickers):
-                time.sleep(pause_between_chunks)
-            continue
-
-        for t in chunk:
-            try:
-                if isinstance(raw.columns, pd.MultiIndex):
-                    top_level = raw.columns.get_level_values(0)
-                    if t not in top_level:
-                        debug[t] = f"ticker not present in batch response columns (top-level keys seen: {sorted(set(top_level))[:5]}...)"
-                        continue
-                    df_t = raw[t]
-                else:
-                    if len(chunk) != 1:
-                        debug[t] = "unexpected non-MultiIndex columns for a multi-ticker chunk request"
-                        continue
-                    df_t = raw
-                if df_t is None or df_t.empty:
-                    debug[t] = "per-ticker frame is empty within the batch response"
-                    continue
-                close_col = "Close" if "Close" in df_t.columns else (df_t.columns[-1] if len(df_t.columns) else None)
-                if close_col is None:
-                    debug[t] = f"no usable price column found (columns seen: {list(df_t.columns)})"
-                    continue
-                px = _clean_15m_series(df_t[close_col])
-                if px is None:
-                    debug[t] = "price series came back but was empty/too short (<80 bars) after cleaning"
-                    continue
-                out[t] = px
-            except Exception as e:
-                debug[t] = f"parse error: {e}"
-                continue
-
-        if i + chunk_size < len(tickers):
-            time.sleep(pause_between_chunks)
-
-    return out, debug
-
-
-def _get_current_main_kalman_params():
-    """Read current Main Kalman tab settings from Streamlit session_state."""
-    try:
-        rail_mult = float(st.session_state.get("kalman_trend_rail_distance", 1.35))
-    except Exception:
-        rail_mult = 1.35
-    try:
-        buffer_pct = float(st.session_state.get("kalman_strategy_cross_buffer_pct", 1.25)) / 100.0
-    except Exception:
-        buffer_pct = 0.0125
-    try:
-        confirm_bars = int(st.session_state.get("kalman_strategy_confirm_bars", 3))
-    except Exception:
-        confirm_bars = 3
-    try:
-        min_hold_bars = int(st.session_state.get("kalman_strategy_min_hold", 5))
-    except Exception:
-        min_hold_bars = 5
-    try:
-        cooldown_bars = int(st.session_state.get("kalman_strategy_cooldown", 3))
-    except Exception:
-        cooldown_bars = 3
-    try:
-        slope_confirm = bool(st.session_state.get("kalman_strategy_slope_confirm", True))
-    except Exception:
-        slope_confirm = True
-    try:
-        atr_safety = bool(st.session_state.get("kalman_strategy_atr_safety", True))
-    except Exception:
-        atr_safety = True
-    try:
-        fast_gain = float(st.session_state.get("kalman_fast_reaction", 0.34))
-    except Exception:
-        fast_gain = 0.34
-    try:
-        slow_gain = float(st.session_state.get("kalman_slow_smoothing", 0.055))
-    except Exception:
-        slow_gain = 0.055
-    try:
-        polish_span = int(st.session_state.get("kalman_polish_span", 3))
-    except Exception:
-        polish_span = 3
-
-    return {
-        "rail_mult": rail_mult,
-        "buffer_pct": buffer_pct,
-        "confirm_bars": confirm_bars,
-        "min_hold_bars": min_hold_bars,
-        "cooldown_bars": cooldown_bars,
-        "slope_confirm": slope_confirm,
-        "atr_safety": atr_safety,
-        "fast_gain": fast_gain,
-        "slow_gain": slow_gain,
-        "polish_span": polish_span,
-    }
-
-def _main_kalman_params_label(params=None):
-    if params is None:
-        params = _get_current_main_kalman_params()
-    return (
-        f"Trend Rail {params['rail_mult']:.2f}, "
-        f"buffer {params['buffer_pct']*100:.2f}%, "
-        f"confirm {params['confirm_bars']}, "
-        f"min-hold {params['min_hold_bars']}, "
-        f"cooldown {params['cooldown_bars']}, "
-        f"slope {'ON' if params['slope_confirm'] else 'OFF'}, "
-        f"ATR safety {'ON' if params['atr_safety'] else 'OFF'}, "
-        "risk firewall OFF"
-    )
-
-
-def _build_main_kalman_trade_log_from_prices(ticker, px):
-    """
-    Watchlist version using the SAME CURRENT main Kalman controls from session_state.
-    This is the correct source for watchlist/telegram, not hardcoded buffer/hold values.
-    """
-    ticker = str(ticker).upper()
-    px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(px) < 80:
-        return pd.DataFrame(), None
-
-    params = _get_current_main_kalman_params()
-
-    rail, center, long_state = institutional_trend_rail(
-        px,
-        fast_gain=float(params["fast_gain"]),
-        slow_gain=float(params["slow_gain"]),
-        polish_span=int(params["polish_span"]),
-        atr_window=14,
-        atr_mult=float(params["rail_mult"]),
-    )
-    bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
-
-    # If the main tab saved optimizer-chosen params for THIS ticker, use them so
-    # the watchlist reproduces the main-tab signal exactly. Otherwise fall back
-    # to the current slider params.
-    _opt = _get_main_kalman_opt_params_for_ticker(ticker)
-    if isinstance(_opt, dict):
-        buffer_pct = float(_opt.get("buffer_pct", params["buffer_pct"]))
-        confirm_bars = int(_opt.get("confirm_bars", params["confirm_bars"]))
-        min_hold_bars = int(_opt.get("min_hold_bars", params["min_hold_bars"]))
-        cooldown_bars = int(_opt.get("cooldown_bars", params["cooldown_bars"]))
-        _slope_confirm = bool(_opt.get("slope_confirm", params["slope_confirm"]))
-        _atr_safety = bool(_opt.get("atr_safety", params["atr_safety"]))
-        params = dict(params)
-        params["buffer_pct"] = buffer_pct
-        params["confirm_bars"] = confirm_bars
-        params["min_hold_bars"] = min_hold_bars
-        params["cooldown_bars"] = cooldown_bars
-        params["slope_confirm"] = _slope_confirm
-        params["atr_safety"] = _atr_safety
-    else:
-        buffer_pct = float(params["buffer_pct"])
-        confirm_bars = int(params["confirm_bars"])
-        min_hold_bars = int(params["min_hold_bars"])
-        cooldown_bars = int(params["cooldown_bars"])
-
-    trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
-
-    close_above = px > bt_trend * (1.0 + buffer_pct)
-    close_below = px < bt_trend * (1.0 - buffer_pct)
-
-    if bool(params["slope_confirm"]):
-        entry_cond = close_above & (trend_slope >= 0)
-        exit_cond = close_below & (trend_slope <= 0)
-    else:
-        entry_cond = close_above
-        exit_cond = close_below
-
-    if bool(params["atr_safety"]):
-        atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-        safety_exit = px < (bt_trend - 1.25 * atr_proxy)
-        exit_cond = exit_cond | safety_exit.fillna(False)
-
-    entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-    exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-
-    # ---- Build the position signal EXACTLY like the visible main Kalman log ----
-    # The signal here uses the same entry/exit/confirm/min-hold/cooldown rules as
-    # _build_kalman_signal_for_params in the main tab. We then run that signal
-    # through the SAME BacktestEngine.run_strategy the visible log uses, and apply
-    # the SAME risk firewall when it is enabled. This guarantees the watchlist
-    # open/closed status matches the Main Kalman Trade Log for every stock.
-    sig = pd.Series(0.0, index=px.index)
-    in_pos = False
-    bars_held = 0
-    cooldown_left = 0
-
-    for dt in px.index:
-        if cooldown_left > 0:
-            cooldown_left -= 1
-
-        if not in_pos:
-            if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
-                in_pos = True
-                bars_held = 0
-                sig.loc[dt] = 1.0
-            else:
-                sig.loc[dt] = 0.0
-        else:
-            bars_held += 1
-            if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
-                in_pos = False
-                cooldown_left = cooldown_bars
-                bars_held = 0
-                sig.loc[dt] = 0.0
-            else:
-                sig.loc[dt] = 1.0
-
-    sig = sig.ffill().fillna(0).clip(0, 1)
-
-    # Apply the Main Kalman risk firewall when the user has it enabled, using the
-    # same session-state settings as the main chart, so a firewall-forced exit
-    # closes the watchlist trade exactly as it closes the visible log trade.
-    try:
-        use_firewall = bool(st.session_state.get("kalman_use_risk_firewall", False))
-    except Exception:
-        use_firewall = False
-    if use_firewall and "apply_kalman_risk_firewall" in globals():
-        try:
-            sig = apply_kalman_risk_firewall(
-                px, sig, bt_trend,
-                max_trade_loss_pct=float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-                trail_stop_pct=float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-                equity_dd_stop_pct=float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-                cooldown_bars=int(st.session_state.get("kalman_firewall_cooldown", 8)),
-            )
-        except Exception:
-            pass
-
-    # ---- NON-REPAINT LOCK (final, post-firewall) -----------------------
-    # Freeze the FINAL executed per-bar signal so re-running never rewrites
-    # history. Only new completed bars are appended. The firewall runs first so
-    # its stop-outs are captured in the frozen value, then nothing downstream
-    # can change a past bar. Controlled by session_state flag (default ON).
-    try:
-        _freeze = bool(st.session_state.get("kalman_non_repaint_lock", True))
-    except Exception:
-        _freeze = True
-    sig = _apply_signal_lock(ticker, sig, freeze_enabled=_freeze)
-
-    # Run the identical backtest engine the visible Main Kalman Trade Log uses.
-    try:
-        initial_cap = float(st.session_state.get("initial_cap", 10000.0))
-    except Exception:
-        initial_cap = 10000.0
-
-    try:
-        bt = BacktestEngine.run_strategy(px, sig, initial_cap)
-        engine_trades = bt.get("trades", pd.DataFrame())
-    except Exception:
-        engine_trades = pd.DataFrame()
-
-    last_price = round(float(px.iloc[-1]), 2)
-
-    # Convert the engine trade log (Entry Date/Exit Date/Buy Price/Sell Price/Status)
-    # into the watchlist schema, preserving the engine's authoritative Status.
-    trades = []
-    if isinstance(engine_trades, pd.DataFrame) and not engine_trades.empty:
-        for _, tr in engine_trades.iterrows():
-            status_txt = str(tr.get("Status", "")).strip()
-            is_open_row = status_txt.upper() == "OPEN"
-
-            entry_dt = tr.get("Entry Date", None)
-            exit_dt = tr.get("Exit Date", None)
-            try:
-                entry_ct = pd.Timestamp(entry_dt).strftime("%Y-%m-%d %H:%M:%S CT") if entry_dt is not None and pd.notna(entry_dt) else ""
-            except Exception:
-                entry_ct = str(entry_dt) if entry_dt is not None else ""
-
-            if is_open_row:
-                exit_ct = "Open"
-            else:
-                try:
-                    exit_ct = pd.Timestamp(exit_dt).strftime("%Y-%m-%d %H:%M:%S CT") if exit_dt is not None and pd.notna(exit_dt) else ""
-                except Exception:
-                    exit_ct = str(exit_dt) if exit_dt is not None else ""
-
-            try:
-                entry_px = round(float(tr.get("Buy Price")), 2)
-            except Exception:
-                entry_px = None
-            try:
-                exit_px = round(float(tr.get("Sell Price")), 2)
-            except Exception:
-                exit_px = last_price if is_open_row else None
-            try:
-                pnl = round(float(tr.get("PnL (%)")), 2)
-            except Exception:
-                pnl = None
-
-            trades.append({
-                "Ticker": ticker,
-                "Side": "Long",
-                "Entry CT": entry_ct,
-                "Exit CT": exit_ct,
-                "Entry Price": entry_px,
-                "Exit/Current Price": exit_px,
-                "PnL (%)": pnl,
-                "Status": "Open" if is_open_row else "Closed",
-            })
-
-    trades_df = pd.DataFrame(trades)
-    status = "LONG" if (not trades_df.empty and str(trades_df.iloc[-1].get("Status", "")).lower() == "open") else "CASH"
-
-    latest = {
-        "Ticker": ticker,
-        "Alert Signal": "NO NEW ALERT",
-        "Trade Position": status,
-        "Price": last_price,
-        "Candle Close CT": (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT"),
-        "Source": "Current Main Kalman Controls (same engine + firewall as visible log)",
-        "Settings": _main_kalman_params_label(params),
-    }
-    return trades_df, latest
-
-def _main_kalman_watchlist_ledger_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_watchlist_ledger.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_watchlist_ledger.json")
-
-def _load_main_kalman_watchlist_ledger():
-    try:
-        p = _main_kalman_watchlist_ledger_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_watchlist_ledger(data):
-    try:
-        _main_kalman_watchlist_ledger_path().write_text(json.dumps(data, indent=2))
-    except Exception:
-        pass
-
-
-# ---- Per-ticker optimized Kalman params store -----------------------------
-# When the Benchmark-aware optimizer is ON, the main tab chooses per-ticker
-# buffer/confirm/hold/cooldown that differ from the sliders. The watchlist must
-# use those SAME per-ticker params, or it will recompute with slider defaults
-# and disagree (e.g. ELF Long in main tab, CASH in watchlist). We persist the
-# chosen params per ticker so the watchlist can reproduce the main-tab signal.
-def _main_kalman_opt_params_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_opt_params_V2_CLEAN.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_opt_params_V2_CLEAN.json")
-
-def _load_main_kalman_opt_params():
-    try:
-        p = _main_kalman_opt_params_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_opt_params_for_ticker(ticker, buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
-                                            slope_confirm=True, atr_safety=True):
-    """Persist the exact params the main tab used for a ticker (optimizer or sliders)."""
-    try:
-        store = _load_main_kalman_opt_params()
-        store[str(ticker).upper()] = {
-            "buffer_pct": float(buffer_pct),
-            "confirm_bars": int(confirm_bars),
-            "min_hold_bars": int(min_hold_bars),
-            "cooldown_bars": int(cooldown_bars),
-            "slope_confirm": bool(slope_confirm),
-            "atr_safety": bool(atr_safety),
-            "saved_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-        }
-        _main_kalman_opt_params_path().write_text(json.dumps(store, indent=2))
-    except Exception:
-        pass
-
-def _get_main_kalman_opt_params_for_ticker(ticker):
-    """Return only trusted live/interactive params; ignore the old 150-ticker batch seed."""
-    try:
-        rec = _load_main_kalman_opt_params().get(str(ticker).upper())
-        if not isinstance(rec, dict):
-            return None
-        if str(rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M":
-            return None
-        return rec
-    except Exception:
-        return None
-
-
-# ---- Non-repaint signal lock --------------------------------------------
-# To guarantee the signal NEVER repaints, we freeze the per-bar signal value
-# once a completed bar has been seen. Each run may only APPEND signal values
-# for new completed-bar timestamps; it can never rewrite the signal of a bar
-# that was already locked. This removes repaint from the rolling data window
-# and from any later parameter changes.
-def _main_kalman_signal_lock_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_signal_lock_V2_CLEAN.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_signal_lock_V2_CLEAN.json")
-
-def _load_main_kalman_signal_lock():
-    try:
-        p = _main_kalman_signal_lock_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_signal_lock(store):
-    try:
-        _main_kalman_signal_lock_path().write_text(json.dumps(store, indent=2))
-    except Exception:
-        pass
-
-def _apply_signal_lock(ticker, sig, freeze_enabled=True, interval="15m"):
-    """
-    Merge a freshly computed causal signal with the locked history so the result
-    is append-only (non-repainting).
-
-    For every bar timestamp already in the lock, the LOCKED value is used (the
-    fresh recompute can never change history). New completed-bar timestamps are
-    added to the lock. Keyed by ticker+interval so 15m and daily signals never
-    mix.
-    """
-    try:
-        if sig is None or len(sig) == 0:
-            return sig
-        tkey = f"{str(ticker).upper()}|{str(interval)}"
-        store = _load_main_kalman_signal_lock()
-        locked = dict(store.get(tkey, {})) if isinstance(store.get(tkey), dict) else {}
-
-        out = sig.copy()
-        changed = False
-        for dt in out.index:
-            key = pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M:%S")
-            if freeze_enabled and key in locked:
-                # Use the frozen historical value; do not repaint.
-                try:
-                    out.loc[dt] = float(locked[key])
-                except Exception:
-                    pass
-            else:
-                # New bar -> record it (lock it going forward).
-                try:
-                    locked[key] = float(out.loc[dt])
-                    changed = True
-                except Exception:
-                    pass
-
-        if changed and freeze_enabled:
-            # Cap stored history so the file cannot grow without bound.
-            if len(locked) > 6000:
-                for k in sorted(locked.keys())[: len(locked) - 6000]:
-                    locked.pop(k, None)
-            store[tkey] = locked
-            _save_main_kalman_signal_lock(store)
-        return out
-    except Exception:
-        return sig
-
-
-
-# ============================================================================
-# INSTITUTIONAL MAIN KALMAN LIVE LEDGER
-# ----------------------------------------------------------------------------
-# Purpose:
-# - Research/backtest may re-optimize historical settings.
-# - Live/production trade log must be append-only.
-# - Once a trade opens, that trade keeps the exact settings/model version used
-#   at entry. Future optimizer changes cannot rewrite closed rows or erase an
-#   open row.
-# ============================================================================
-def _main_kalman_institutional_ledger_path():
-    try:
-        return _Path.home() / ".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER_V3_BY_INTERVAL.json"
-    except Exception:
-        return _Path(".pinehurst_main_kalman_INSTITUTIONAL_TRADE_LEDGER_V3_BY_INTERVAL.json")
-
-def _load_main_kalman_institutional_ledger():
-    try:
-        p = _main_kalman_institutional_ledger_path()
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-def _save_main_kalman_institutional_ledger(data):
-    try:
-        _main_kalman_institutional_ledger_path().write_text(json.dumps(data, indent=2, default=str))
-        return True
-    except Exception:
-        return False
-
-def _safe_float_or_none(v):
-    try:
-        if v is None:
-            return None
-        vv = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
-        if pd.isna(vv):
-            return None
-        return float(vv)
-    except Exception:
-        return None
-
-def _safe_str_dt(v):
-    try:
-        if v is None or (pd.isna(v) if np.isscalar(v) else False):
-            return ""
-    except Exception:
-        pass
-    try:
-        s = str(v).strip()
-        if not s or s.lower() in ("nan", "none", "nat"):
-            return ""
-        # Keep Open as Open.
-        if s.lower() == "open":
-            return "Open"
-        return pd.Timestamp(v).strftime("%Y-%m-%d %H:%M:%S CT")
-    except Exception:
-        return str(v).strip()
-
-def _institutional_settings_from_locals(ticker, locs):
-    """Capture the exact Main Kalman settings/model version used on this run."""
-    try:
-        ticker = str(ticker).upper()
-    except Exception:
-        ticker = str(ticker)
-
-    def _get_num(name, default):
-        try:
-            return float(locs.get(name, default))
-        except Exception:
-            return float(default)
-    def _get_int(name, default):
-        try:
-            return int(locs.get(name, default))
-        except Exception:
-            return int(default)
-    def _get_bool(name, default):
-        try:
-            return bool(locs.get(name, default))
-        except Exception:
-            return bool(default)
-
-    # Base slider defaults / currently visible controls.
-    settings = {
-        "ticker": ticker,
-        "buffer_pct": _get_num("kalman_buffer_pct", 0.0125),
-        "confirm_bars": _get_int("kalman_confirm_bars", 3),
-        "min_hold_bars": _get_int("kalman_min_hold", 5),
-        "cooldown_bars": _get_int("kalman_cooldown", 3),
-        "slope_confirm": _get_bool("use_slope_confirm", True),
-        "atr_safety": _get_bool("use_atr_safety", True),
-        "risk_firewall": _get_bool("use_kalman_risk_firewall", False),
-        "fast_gain": _get_num("fast_gain", 0.34),
-        "slow_gain": _get_num("slow_gain", 0.055),
-        "polish_span": _get_int("polish_span", 3),
-        "rail_mult": _get_num("rail_mult", 1.35),
-        "trend_name": str(locs.get("active_trend_name", "Institutional Trend Rail")),
-        "interval": str(locs.get("data_interval", locs.get("interval", "15m"))),
-        "source": "Visible sliders",
-    }
-
-    # If fast optimizer reused cached params, those are the active production params.
-    try:
-        cp = locs.get("_cached_params", None)
-        if isinstance(cp, dict) and all(k in cp for k in ("buffer", "confirm", "hold", "cool")):
-            settings.update({
-                "buffer_pct": float(cp.get("buffer")),
-                "confirm_bars": int(cp.get("confirm")),
-                "min_hold_bars": int(cp.get("hold")),
-                "cooldown_bars": int(cp.get("cool")),
-                "source": "Fast reused optimizer",
-            })
-    except Exception:
-        pass
-
-    # If full optimizer selected best_pack this run, capture it.
-    try:
-        bp = locs.get("best_pack", None)
-        if isinstance(bp, dict) and all(k in bp for k in ("buffer", "confirm", "hold", "cool")):
-            settings.update({
-                "buffer_pct": float(bp.get("buffer")),
-                "confirm_bars": int(bp.get("confirm")),
-                "min_hold_bars": int(bp.get("hold")),
-                "cooldown_bars": int(bp.get("cool")),
-                "source": "Fresh optimizer selection",
-            })
-    except Exception:
-        pass
-
-    # If chosen_kalman_settings exists in the full tab, it is authoritative for display.
-    try:
-        ck = locs.get("chosen_kalman_settings", None)
-        if isinstance(ck, dict) and ck.get("Optimizer", "") != "OFF":
-            if "Buffer %" in ck:
-                settings["buffer_pct"] = float(ck.get("Buffer %")) / 100.0
-            if "Confirm Bars" in ck:
-                settings["confirm_bars"] = int(ck.get("Confirm Bars"))
-            if "Min Hold" in ck:
-                settings["min_hold_bars"] = int(ck.get("Min Hold"))
-            if "Cooldown" in ck:
-                settings["cooldown_bars"] = int(ck.get("Cooldown"))
-            settings["source"] = "Benchmark-aware optimizer"
-    except Exception:
-        pass
-
-    settings["model_version"] = (
-        f"{ticker}|{settings.get('interval', '15m')}|{settings['trend_name']}|"
-        f"buf{settings['buffer_pct']*100:.2f}|conf{int(settings['confirm_bars'])}|"
-        f"hold{int(settings['min_hold_bars'])}|cool{int(settings['cooldown_bars'])}|"
-        f"fg{settings['fast_gain']:.3f}|sg{settings['slow_gain']:.3f}|rail{settings['rail_mult']:.2f}|"
-        f"slope{int(bool(settings['slope_confirm']))}|atr{int(bool(settings['atr_safety']))}|rf{int(bool(settings['risk_firewall']))}"
-    )
-    settings["saved_ct"] = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
-    return settings
-
-def _trade_row_to_institutional_record(ticker, tr, settings, latest_price=None, baseline=True):
-    ticker = str(ticker).upper()
-    status_txt = str(tr.get("Status", "")).strip()
-    is_open_row = status_txt.upper() == "OPEN"
-
-    entry_dt = tr.get("Entry Date", tr.get("Entry CT", tr.get("Entry", "")))
-    exit_dt = tr.get("Exit Date", tr.get("Exit CT", tr.get("Exit", "")))
-    entry_ct = _safe_str_dt(entry_dt)
-    exit_ct = "Open" if is_open_row else _safe_str_dt(exit_dt)
-
-    entry_px = _safe_float_or_none(tr.get("Buy Price", tr.get("Entry Price", None)))
-    exit_px = _safe_float_or_none(tr.get("Sell Price", tr.get("Exit/Current Price", tr.get("Exit Price", None))))
-    if is_open_row and latest_price is not None:
-        try:
-            exit_px = float(latest_price)
-        except Exception:
-            pass
-
-    pnl = _safe_float_or_none(tr.get("PnL (%)", tr.get("Return (%)", None)))
-    if pnl is None and entry_px and exit_px:
-        try:
-            pnl = (float(exit_px) / float(entry_px) - 1.0) * 100.0
-        except Exception:
-            pnl = None
-
-    record = {
-        "Ticker": ticker,
-        "Side": "Long",
-        "Entry CT": entry_ct,
-        "Exit CT": exit_ct,
-        "Entry Price": round(entry_px, 4) if entry_px is not None else None,
-        "Exit/Current Price": round(exit_px, 4) if exit_px is not None else None,
-        "PnL (%)": round(pnl, 4) if pnl is not None else None,
-        "Status": "Open" if is_open_row else "Closed",
-        "Locked Buffer %": round(float(settings.get("buffer_pct", 0.0)) * 100.0, 4),
-        "Locked Confirm": int(settings.get("confirm_bars", 0)),
-        "Locked Min Hold": int(settings.get("min_hold_bars", 0)),
-        "Locked Cooldown": int(settings.get("cooldown_bars", 0)),
-        "Model Version": settings.get("model_version", ""),
-        "Settings Source": settings.get("source", ""),
-        "Ledger Mode": "Baseline" if baseline else "Live Append",
-    }
-    return record
-
-def _main_kalman_apply_institutional_trade_ledger(ticker, candidate_trades, px, settings, enabled=True):
-    """
-    Append-only production ledger for Main Kalman.
-
-    If enabled:
-    - closed rows are never removed or rewritten by a later optimizer run.
-    - open row keeps the settings/model_version from entry.
-    - only an existing open row may update with latest price/PnL, or close when
-      candidate log shows that same entry as closed.
-    """
-    try:
-        if not enabled:
-            return candidate_trades
-        ticker = str(ticker).upper()
-        latest_price = None
-        latest_time = ""
-        try:
-            latest_price = float(pd.Series(px).dropna().iloc[-1])
-            latest_time = _safe_str_dt(pd.Series(px).dropna().index[-1])
-        except Exception:
-            pass
-
-        ledger = _load_main_kalman_institutional_ledger()
-        interval = str(settings.get("interval", "15m"))
-        ledger_key = f"{ticker}|{interval}"
-        book = ledger.get(ledger_key, {"trades": [], "last_update_ct": "", "interval": interval})
-        rows = book.get("trades", []) if isinstance(book, dict) else []
-        if not isinstance(rows, list):
-            rows = []
-
-        cand = candidate_trades.copy() if isinstance(candidate_trades, pd.DataFrame) else pd.DataFrame()
-
-        # First run: baseline current research/backtest log, then freeze it going forward.
-        if len(rows) == 0 and isinstance(cand, pd.DataFrame) and not cand.empty:
-            new_rows = []
-            for _, tr in cand.iterrows():
-                new_rows.append(_trade_row_to_institutional_record(ticker, tr, settings, latest_price=latest_price, baseline=True))
-            rows = new_rows
-        else:
-            # Update existing open trade with current price; close it if candidate has same Entry CT closed.
-            open_i = None
-            for i, r in enumerate(rows):
-                if str(r.get("Status", "")).lower() == "open":
-                    open_i = i
-                    break
-
-            if open_i is not None:
-                open_row = rows[open_i]
-                open_entry = str(open_row.get("Entry CT", ""))
-                matched_closed = None
-                if isinstance(cand, pd.DataFrame) and not cand.empty:
-                    for _, tr in cand.iterrows():
-                        rec = _trade_row_to_institutional_record(ticker, tr, settings, latest_price=latest_price, baseline=False)
-                        if str(rec.get("Entry CT", "")) == open_entry and str(rec.get("Status", "")).lower() == "closed":
-                            matched_closed = rec
-                            break
-                if matched_closed is not None:
-                    # Close the open row, but keep original locked settings/model version.
-                    for k in ["Exit CT", "Exit/Current Price", "PnL (%)", "Status"]:
-                        open_row[k] = matched_closed.get(k)
-                    open_row["Ledger Mode"] = "Live Closed"
-                    rows[open_i] = open_row
-                else:
-                    # Still open. Update current price/PnL only. Do not change settings.
-                    try:
-                        ep = _safe_float_or_none(open_row.get("Entry Price"))
-                        if latest_price is not None:
-                            open_row["Exit CT"] = "Open"
-                            open_row["Exit/Current Price"] = round(float(latest_price), 4)
-                            if ep:
-                                open_row["PnL (%)"] = round((float(latest_price) / float(ep) - 1.0) * 100.0, 4)
-                            open_row["Status"] = "Open"
-                            open_row["Ledger Mode"] = "Live Open"
-                            rows[open_i] = open_row
-                    except Exception:
-                        pass
-
-            # If no open trade exists, append only truly new candidate rows after the last known entry.
-            has_open = any(str(r.get("Status", "")).lower() == "open" for r in rows)
-            if not has_open and isinstance(cand, pd.DataFrame) and not cand.empty:
-                existing_entries = {str(r.get("Entry CT", "")) for r in rows}
-                for _, tr in cand.iterrows():
-                    rec = _trade_row_to_institutional_record(ticker, tr, settings, latest_price=latest_price, baseline=False)
-                    ent = str(rec.get("Entry CT", ""))
-                    if ent and ent not in existing_entries:
-                        rows.append(rec)
-                        existing_entries.add(ent)
-
-        book = {
-            "ticker": ticker,
-            "interval": interval,
-            "trades": rows,
-            "last_update_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            "latest_price": latest_price,
-            "latest_time": latest_time,
-            "current_settings_seen": settings,
-        }
-        ledger[ledger_key] = book
-        _save_main_kalman_institutional_ledger(ledger)
-        out = pd.DataFrame(rows)
-        return out
-    except Exception:
-        return candidate_trades
-
-def _parse_ct_time_safe(x):
-    try:
-        s = str(x).replace(" CT", "").strip()
-        if not s or s.lower() == "open" or s.lower() == "nan":
-            return None
-        return pd.to_datetime(s, errors="coerce")
-    except Exception:
-        return None
-
-def _candidate_from_main_watchlist_trades(sym, trades_df, row):
-    """Convert recalculated trade log into a candidate state. Candidate is NOT truth."""
-    sym = str(sym).upper()
-    if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
-        return {
-            "position": "CASH",
-            "signal": "NONE",
-            "entry_time": "",
-            "exit_time": "",
-            "event_time": "",
-            "price": row.get("Price") if isinstance(row, dict) else None,
-            "state_key": f"{sym}|CASH|NO_TRADES",
-            "raw_status": "NO_TRADES",
-        }
-
-    last = trades_df.iloc[-1]
-    _is_open_row = _trade_row_is_open(last, columns=trades_df.columns)
-    status = "OPEN" if _is_open_row else "CLOSED"
-    entry_time = str(last.get("Entry CT", ""))
-    exit_time = str(last.get("Exit CT", ""))
-    price = row.get("Price") if isinstance(row, dict) else None
-
-    if _is_open_row:
-        position = "LONG"
-        signal = "BUY"
-        event_time = entry_time
-    else:
-        position = "CASH"
-        signal = "SELL"
-        event_time = exit_time if exit_time and exit_time.upper() != "OPEN" else entry_time
-
-    state_key = f"{sym}|{signal}|{event_time}|{status}|{last.get('Entry Price')}|{last.get('Exit/Current Price')}"
-    return {
-        "position": position,
-        "signal": signal,
-        "entry_time": entry_time,
-        "exit_time": exit_time,
-        "event_time": event_time,
-        "price": price,
-        "state_key": state_key,
-        "raw_status": status,
-        "entry_price": last.get("Entry Price", None),
-        "exit_current_price": last.get("Exit/Current Price", None),
-        "pnl_pct": last.get("PnL (%)", None),
-    }
-
-def _parse_watchlist_ct_time(x):
-    try:
-        s = str(x).replace(" CT", "").strip()
-        if not s or s.lower() in ["open", "nan", "none"]:
-            return None
-        v = pd.to_datetime(s, errors="coerce")
-        if pd.isna(v):
-            return None
-        return v
-    except Exception:
-        return None
-
-def run_main_kalman_watchlist_monitor(raw_watchlist, send_telegram=False, token="", chat_id="", show_table=True, max_stocks=50, allow_sell_alerts=False):
-    """
-    Watchlist monitor using current Main Kalman controls.
-    First scan baselines. Future changes alert. This avoids separate hardcoded logic.
-    """
-    symbols = _normalize_watchlist(raw_watchlist)
-    try:
-        max_stocks = int(max_stocks)
-    except Exception:
-        max_stocks = 50
-    if max_stocks > 0:
-        symbols = symbols[:max_stocks]
-
-    params = _get_current_main_kalman_params()
-    model_version = "CURRENT_MAIN_CONTROLS|" + _main_kalman_params_label(params)
-
-    ledger = _load_main_kalman_watchlist_ledger()
-    rows = []
-
-    for sym in symbols:
-        sym = str(sym).upper()
-        try:
-            px = _main_monitor_fetch_15m(sym, period="60d")
-            if px is None or len(px) < 80:
-                rows.append({
-                    "Ticker": sym,
-                    "Alert Signal": "NO DATA",
-                    "Trade Position": "UNKNOWN",
-                    "Price": None,
-                    "Candle Close CT": "",
-                    "Ledger Note": "Not enough 15m data",
-                    "Settings": _main_kalman_params_label(params),
-                })
-                continue
-
-            trades_df, raw_row = _build_main_kalman_trade_log_from_prices(sym, px)
-            candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
-            price_now = round(float(px.iloc[-1]), 2)
-
-            # ---- Authoritative override -------------------------------------
-            # If the Main Kalman tab has already computed and saved a status for
-            # this exact ticker, that visible trade log is the source of truth.
-            # The watchlist must mirror it instead of its own 60d/15m recompute,
-            # otherwise the sidebar can disagree with the main tab (e.g. ELF
-            # showing CASH here while the main tab shows an Open position).
-            _visible_status = None
-            try:
-                _visible_status = st.session_state.get(f"main_kalman_status_{sym}")
-            except Exception:
-                _visible_status = None
-
-            _used_visible = False
-            if isinstance(_visible_status, dict) and _visible_status.get("Trade Position") in ("LONG", "CASH"):
-                position = str(_visible_status.get("Trade Position"))
-                is_open = position == "LONG"
-                signal_state = "BUY" if is_open else "SELL"
-                # Prefer prices/times from the recomputed log when present, else
-                # fall back to the saved visible row / current price.
-                if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                    last = trades_df.iloc[-1]
-                    entry_time = str(last.get("Entry CT", ""))
-                    exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
-                    entry_price = last.get("Entry Price", None)
-                    curr_exit_price = last.get("Exit/Current Price", price_now)
-                    pnl_pct = last.get("PnL (%)", None)
-                else:
-                    entry_time = str(_visible_status.get("Candle Close CT", ""))
-                    exit_time = "Open" if is_open else ""
-                    entry_price = None
-                    curr_exit_price = _visible_status.get("Price", price_now)
-                    pnl_pct = None
-                event_time = entry_time if is_open else (exit_time or candle_ct)
-                _used_visible = True
-            elif trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                last = trades_df.iloc[-1]
-                is_open = _trade_row_is_open(last, columns=trades_df.columns)
-                position = "LONG" if is_open else "CASH"
-                signal_state = "BUY" if is_open else "SELL"
-                entry_time = str(last.get("Entry CT", ""))
-                exit_time = "Open" if is_open else str(last.get("Exit CT", ""))
-                event_time = entry_time if is_open else exit_time
-                entry_price = last.get("Entry Price", None)
-                curr_exit_price = last.get("Exit/Current Price", price_now)
-                pnl_pct = last.get("PnL (%)", None)
-            else:
-                position = "CASH"
-                signal_state = "CASH"
-                entry_time = ""
-                exit_time = ""
-                event_time = candle_ct
-                entry_price = None
-                curr_exit_price = price_now
-                pnl_pct = None
-
-            state_key = f"{model_version}|{sym}|{position}|{signal_state}|{event_time}|{entry_price}|{curr_exit_price}"
-            saved = ledger.get(sym)
-            saved_key = saved.get("state_key") if isinstance(saved, dict) else saved
-            saved_model = saved.get("model_version") if isinstance(saved, dict) else None
-
-            alert_signal = "NO NEW ALERT"
-            note = "No change since last scan"
-
-            if not saved_key or saved_model != model_version:
-                note = "Baseline synced for current main controls — no alert sent"
-            elif saved_key != state_key:
-                alert_signal = "BUY" if position == "LONG" else "SELL"
-                note = "State changed"
-                if alert_signal == "SELL" and not bool(allow_sell_alerts):
-                    note = "SELL detected but Telegram SELL alerts are OFF"
-                elif send_telegram:
-                    msg = (
-                        "PINEHURST MAIN KALMAN WATCHLIST ALERT\n"
-                        f"Ticker: {sym}\n"
-                        f"Signal: {alert_signal}\n"
-                        f"Trade Position: {position}\n"
-                        f"Price: {price_now}\n"
-                        f"Event Time: {event_time}\n"
-                        f"Settings: {_main_kalman_params_label(params)}\n"
-                        "Source: Watchlist monitor using current Main Kalman controls\n"
-                        "Action: Notification only — no IBKR order sent."
-                    )
-                    ok, resp = send_telegram_alert(token, chat_id, msg)
-                    note = "Telegram sent" if ok else f"Telegram failed: {str(resp)[:80]}"
-
-            ledger[sym] = {
-                "ticker": sym,
-                "model_version": model_version,
-                "position": position,
-                "state_key": state_key,
-                "event_time": event_time,
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "price": price_now,
-                "entry_price": entry_price,
-                "exit_current_price": curr_exit_price,
-                "pnl_pct": pnl_pct,
-                "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-            }
-            _save_main_kalman_watchlist_ledger(ledger)
-
-            rows.append({
-                "Ticker": sym,
-                "Alert Signal": alert_signal,
-                "Trade Position": position,
-                "Price": price_now,
-                "Candle Close CT": candle_ct,
-                "Entry CT": entry_time,
-                "Exit CT": exit_time,
-                "Entry Price": entry_price,
-                "Current/Exit Price": curr_exit_price,
-                "PnL (%)": pnl_pct,
-                "Ledger Note": note,
-                "Status Source": "Visible Main Kalman tab" if _used_visible else "Watchlist recompute (60d/15m)",
-                "Settings": _main_kalman_params_label(params),
-            })
-
-        except Exception as e:
-            rows.append({
-                "Ticker": sym,
-                "Alert Signal": "ERROR",
-                "Trade Position": "UNKNOWN",
-                "Price": None,
-                "Candle Close CT": "",
-                "Ledger Note": str(e)[:120],
-                "Settings": _main_kalman_params_label(params),
-            })
-
-    df_rows = pd.DataFrame(rows)
-    if show_table:
-        st.dataframe(df_rows, use_container_width=True, hide_index=True)
-    return df_rows
-
-# --------------------------------------------------------
-
-
-# ============================================================================
-# BULK WATCHLIST RE-OPTIMIZER
-# ----------------------------------------------------------------------------
-# The single-ticker Main Kalman tab runs a full grid-search optimizer and saves
-# trusted per-ticker params (via _save_main_kalman_opt_params_for_ticker) only
-# for whichever ticker is currently open in the UI. Every other ticker in the
-# watchlist falls back to the old one-time BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M
-# seed, which _get_main_kalman_opt_params_for_ticker() deliberately treats as
-# untrusted/stale. This function runs that SAME optimizer for every ticker in
-# the watchlist (not just the one open in the UI) so all of them end up with
-# fresh, trusted, live-verified params — eliminating the "only 15 trusted"
-# split and the resulting mismatches against any external mirror (e.g. Render).
-# ============================================================================
-def bulk_reoptimize_full_watchlist(
-    raw_watchlist,
-    initial_cap=10000.0,
-    rf_rate=0.0,
-    buffer_grid=(0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070),
-    confirm_grid=(3, 4, 5, 7, 10),
-    hold_grid=(10, 15, 21, 34, 55),
-    cooldown_grid=(5, 8, 13, 21),
-    progress_callback=None,
-    skip_if_trusted=True,
-):
-    """
-    Re-run the exact same benchmark-aware Kalman optimizer used by the single-
-    ticker Main Kalman tab, but looped over every ticker in the watchlist.
-    Saves each ticker's winning params via _save_main_kalman_opt_params_for_ticker
-    (no "source" tag, so it is NOT filtered out as batch/fallback afterward) and
-    seeds st.session_state["main_kalman_status_{ticker}"] so the watchlist
-    monitor's authoritative-override path treats it identically to a ticker the
-    user actually opened and viewed this session.
-
-    PERFORMANCE NOTES:
-    - The per-bar state machine now runs on plain numpy arrays (positional index)
-      instead of pandas .loc-by-label lookups inside the loop, which is the single
-      biggest cost of each grid combination — this is a pure speed fix, identical
-      logic/output to the original label-based version.
-    - skip_if_trusted=True (default) skips any ticker that already has non-batch
-      (i.e. already-trusted) saved params, so re-running this after a partial/
-      interrupted run only processes what's actually left — safe to click again.
-    - Smaller grid tuples finish much faster at the cost of slightly less
-      exhaustive search; pass a reduced grid for a "quick pass", full grid for
-      an exact match to the single-ticker tab's optimizer.
-
-    Returns a dict: {ticker: {"buffer_pct":.., "confirm_bars":.., "min_hold_bars":..,
-                              "cooldown_bars":.., "position":.., "price":.., "score":..}}
-    """
-    symbols = _normalize_watchlist(raw_watchlist)
-    params = _get_current_main_kalman_params()
-    results = {}
-    total = len(symbols)
-
-    for i, sym in enumerate(symbols, start=1):
-        sym = str(sym).upper()
-        if progress_callback:
-            try:
-                progress_callback(i, total, sym)
-            except Exception:
-                pass
-
-        if skip_if_trusted:
-            _already = _get_main_kalman_opt_params_for_ticker(sym)
-            if isinstance(_already, dict):
-                results[sym] = {
-                    "buffer_pct": float(_already.get("buffer_pct", 0)),
-                    "confirm_bars": int(_already.get("confirm_bars", 0)),
-                    "min_hold_bars": int(_already.get("min_hold_bars", 0)),
-                    "cooldown_bars": int(_already.get("cooldown_bars", 0)),
-                    "position": "n/a",
-                    "price": None,
-                    "score": None,
-                    "skipped": "already trusted — resume mode",
-                }
-                continue
-
-        try:
-            # REVERTED: the multi-ticker batched yf.download() (group_by="ticker",
-            # threads=True) turned out to be unreliable specifically from Streamlit
-            # Community Cloud's shared IPs — it returned empty even on the very
-            # first request, while the plain single-ticker fetch (same one the
-            # working single-ticker tab uses) is fine. So: back to single-ticker
-            # calls here too, just paced so 150 sequential calls don't trip a
-            # volume-based limit on their own, with a light retry for genuine
-            # one-off transient hiccups (not for a systemic block).
-            px = None
-            _fetch_err = None
-            for _attempt in range(2):
-                try:
-                    px = _main_monitor_fetch_15m(sym, period="60d")
-                except Exception as _fe:
-                    _fetch_err = str(_fe)
-                    px = None
-                if px is not None and len(px) >= 80:
-                    break
-                time.sleep(1.0)
-            time.sleep(1.0)  # pacing between tickers regardless of outcome
-
-            if px is None or len(px) < 80:
-                results[sym] = {"error": "insufficient/no data" + (f" ({_fetch_err})" if _fetch_err else "")}
-                continue
-
-            rail, _center, _long_state = institutional_trend_rail(
-                px,
-                fast_gain=float(params["fast_gain"]),
-                slow_gain=float(params["slow_gain"]),
-                polish_span=int(params["polish_span"]),
-                atr_window=14,
-                atr_mult=float(params["rail_mult"]),
-            )
-            bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
-            trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
-            bt_px = px
-            bt_px_idx = bt_px.index
-            atr_proxy = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-
-            def _build_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars,
-                               slope_confirm=True, atr_safety=True):
-                close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
-                close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
-                if bool(slope_confirm):
-                    entry_cond_i = close_above_i & (trend_slope >= 0)
-                    exit_cond_i = close_below_i & (trend_slope <= 0)
-                else:
-                    entry_cond_i = close_above_i
-                    exit_cond_i = close_below_i
-                if bool(atr_safety):
-                    exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy)).fillna(False)
-                confirm_bars = int(confirm_bars)
-                # PERFORMANCE FIX: keep the rolling-confirm computation vectorized
-                # (pandas .rolling is C-level and fast), but pull the result out to
-                # a plain numpy array BEFORE the per-bar loop below, so the loop
-                # itself uses cheap positional indexing instead of slow .loc-by-
-                # label lookups — same exact logic, much faster.
-                entry_ready_arr = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False).to_numpy()
-                exit_ready_arr = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False).to_numpy()
-
-                n = len(bt_px_idx)
-                sig_arr = np.zeros(n, dtype=float)
-                in_pos_i = False
-                bars_held_i = 0
-                cooldown_left_i = 0
-                min_hold_bars = int(min_hold_bars)
-                cooldown_bars = int(cooldown_bars)
-                for idx in range(n):
-                    if cooldown_left_i > 0:
-                        cooldown_left_i -= 1
-                    if not in_pos_i:
-                        if cooldown_left_i <= 0 and entry_ready_arr[idx]:
-                            in_pos_i = True
-                            bars_held_i = 0
-                            sig_arr[idx] = 1.0
-                    else:
-                        bars_held_i += 1
-                        if bars_held_i >= min_hold_bars and exit_ready_arr[idx]:
-                            in_pos_i = False
-                            cooldown_left_i = cooldown_bars
-                            sig_arr[idx] = 0.0
-                            bars_held_i = 0
-                        else:
-                            sig_arr[idx] = 1.0
-                return pd.Series(sig_arr, index=bt_px_idx)
-
-            bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-            best_pack = None
-            for _buf in buffer_grid:
-                for _conf in confirm_grid:
-                    for _hold in hold_grid:
-                        for _cool in cooldown_grid:
-                            _sig = _build_signal(_buf, _conf, _hold, _cool,
-                                                  bool(params["slope_confirm"]), bool(params["atr_safety"]))
-                            _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
-                            _eq = _bt.get("equity_curve", pd.Series(dtype=float))
-                            _rets = _bt.get("returns", pd.Series(dtype=float))
-                            _tr = _bt.get("trades", pd.DataFrame())
-                            if _eq is None or len(_eq) < 2:
-                                continue
-                            _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
-                            _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
-                            _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
-                            _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
-                            _sh = float(_mets.get("Sharpe Ratio", 0.0))
-                            _dd_abs = abs(float(_dd))
-                            _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
-                            if _strat < bh_reference:
-                                _score -= (bh_reference - _strat) * 0.85
-                            if _dd_abs > 60:
-                                _score -= 5000.0
-                            if best_pack is None or _score > best_pack["score"]:
-                                best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
-
-            if best_pack is None:
-                results[sym] = {"error": "no valid backtest result across grid (data too short/flat)"}
-                continue
-
-            _save_main_kalman_opt_params_for_ticker(
-                sym, float(best_pack["buffer"]), int(best_pack["confirm"]),
-                int(best_pack["hold"]), int(best_pack["cool"]),
-                slope_confirm=bool(params["slope_confirm"]), atr_safety=bool(params["atr_safety"]),
-            )
-
-            trades_df, raw_row = _build_main_kalman_trade_log_from_prices(sym, px)
-            position = "CASH"
-            if trades_df is not None and isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
-                last = trades_df.iloc[-1]
-                position = "LONG" if _trade_row_is_open(last, columns=trades_df.columns) else "CASH"
-            price_now = round(float(px.iloc[-1]), 2)
-            candle_ct = (pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %I:%M %p CT")
-
-            # Seed the same session_state key the single-ticker tab sets, so the
-            # watchlist monitor's authoritative-override path treats this ticker
-            # exactly like one the user actually opened this session.
-            try:
-                st.session_state[f"main_kalman_status_{sym}"] = {
-                    "Trade Position": position,
-                    "Price": price_now,
-                    "Candle Close CT": candle_ct,
-                }
-            except Exception:
-                pass
-
-            results[sym] = {
-                "buffer_pct": float(best_pack["buffer"]),
-                "confirm_bars": int(best_pack["confirm"]),
-                "min_hold_bars": int(best_pack["hold"]),
-                "cooldown_bars": int(best_pack["cool"]),
-                "position": position,
-                "price": price_now,
-                "score": float(best_pack["score"]),
-            }
-        except Exception as e:
-            results[sym] = {"error": str(e)[:200]}
-
-    return results
-
-
-# ============================================================================
-# RENDER BUNDLE EXPORT
-# ----------------------------------------------------------------------------
-# Packages this app's own local state (per-ticker optimizer params, watchlist
-# ledger, institutional trade ledger, signal lock) into the exact JSON schema
-# the external Render/Telegram worker reads (STREAMLIT_KALMAN_BUNDLE_FILE).
-# Each ticker's params get tagged _sync_source so Render can tell trusted
-# (live-optimized) tickers apart from any still-stale batch-seeded ones.
-# ============================================================================
-def build_render_bundle_export():
-    opt_store = _load_main_kalman_opt_params()
-    watchlist_ledger = _load_main_kalman_watchlist_ledger()
-    institutional_ledger = _load_main_kalman_institutional_ledger()
-    signal_lock = _load_main_kalman_signal_lock()
-
-    per_ticker_params = {}
-    trusted_count = 0
-    fallback_count = 0
-    for ticker, rec in opt_store.items():
-        if not isinstance(rec, dict):
-            continue
-        rec = dict(rec)
-        is_batch = str(rec.get("source", "")) == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M"
-        rec["_sync_source"] = "BATCH_SEED_FALLBACK" if is_batch else "ACTIVE_STREAMLIT_FAST_CACHE"
-        if is_batch:
-            fallback_count += 1
-        else:
-            trusted_count += 1
-        per_ticker_params[str(ticker).upper()] = rec
-
-    open_tickers = sorted([
-        str(t).upper() for t, v in watchlist_ledger.items()
-        if isinstance(v, dict) and str(v.get("position", "")).upper() == "LONG"
-    ])
-
-    sync_summary = {
-        "total_params": len(per_ticker_params),
-        "active_session_overrides": trusted_count,
-        "trusted_saved_params": trusted_count,
-        "fallback_seed_params": fallback_count,
-        "source_counts": {
-            "ACTIVE_STREAMLIT_FAST_CACHE": trusted_count,
-            "BATCH_SEED_FALLBACK": fallback_count,
-        },
-    }
-
-    bundle = {
-        "bundle_version": 2,
-        "exported_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-        "data_path": {
-            "lookback_days": 60,
-            "interval": "15m",
-            "auto_adjust": True,
-            "prepost": False,
-            "source": "Visible Main Kalman tab",
-        },
-        "per_ticker_params": per_ticker_params,
-        "signal_lock": signal_lock,
-        "institutional_ledger": institutional_ledger,
-        "watchlist_ledger": watchlist_ledger,
-        "streamlit_open_tickers": open_tickers,
-        "sync_summary": sync_summary,
-    }
-    return bundle
-
-
-# --------------------------------------------------------
-
-
-# ---------- Telegram Alert Helpers ----------
-def send_telegram_alert(bot_token: str, chat_id: str, message: str):
-    """Send a Telegram message using only Python standard library. Returns (ok, response_text)."""
-    try:
-        bot_token = str(bot_token).strip()
-        chat_id = str(chat_id).strip()
-        if not bot_token or not chat_id:
-            return False, "Missing bot token or chat ID."
-
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return True, body
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        return False, body
-    except Exception as e:
-        return False, str(e)
-
-
-def telegram_alert_once(alert_key: str, bot_token: str, chat_id: str, message: str):
-    """Prevent repeated alerts on Streamlit reruns."""
-    try:
-        sent = st.session_state.setdefault("_telegram_alerts_sent", set())
-        if alert_key in sent:
-            return True, "Already sent this alert."
-        ok, resp = send_telegram_alert(bot_token, chat_id, message)
-        if ok:
-            sent.add(alert_key)
-        return ok, resp
-    except Exception as e:
-        return False, str(e)
-# -------------------------------------------
-
-
-# ---------- Auto Kalman Telegram Alert Helper ----------
-def maybe_send_kalman_live_telegram_alert(
-    tg_alerts_on: bool,
-    tg_bot_token: str,
-    tg_chat_id: str,
-    symbol_hint=None,
-    signal_hint=None,
-    price_hint=None,
-    strategy_hint="Kalman Live Decision",
-    reason_hint="Kalman live signal changed.",
-):
-    """Send one Telegram alert when Kalman live BUY/SELL signal changes. Notification only."""
-    try:
-        if not tg_alerts_on:
-            return
-
-        # Try to infer values from explicit hints first, then from globals.
-        g = globals()
-
-        ticker = symbol_hint
-        if ticker is None:
-            for k in ["ticker", "symbol", "selected_ticker", "kalman_ticker", "live_ticker", "asset"]:
-                v = g.get(k)
-                if isinstance(v, str) and v.strip():
-                    ticker = v.strip().upper()
-                    break
-        if ticker is None:
-            ticker = "UNKNOWN"
-
-        signal = signal_hint
-        if signal is None:
-            for k in [
-                "kalman_live_signal",
-                "live_signal",
-                "latest_signal",
-                "current_signal",
-                "signal",
-                "decision",
-                "trade_signal",
-            ]:
-                v = g.get(k)
-                if isinstance(v, str) and v.strip():
-                    signal = v.strip().upper()
-                    break
-
-        if signal is None:
-            return
-
-        signal_upper = str(signal).strip().upper()
-        if "BUY" in signal_upper:
-            clean_signal = "BUY"
-        elif "SELL" in signal_upper or "EXIT" in signal_upper:
-            clean_signal = "SELL"
-        else:
-            return
-
-        price = price_hint
-        if price is None:
-            for k in ["latest_price", "current_price", "live_price", "last_price", "price", "close"]:
-                v = g.get(k)
-                try:
-                    if v is not None:
-                        price = float(v)
-                        break
-                except Exception:
-                    pass
-
-        price_txt = "N/A" if price is None else f"{float(price):.2f}"
-
-        now_ct = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
-        key = f"KALMAN_LIVE::{ticker}::{clean_signal}::{price_txt}"
-
-        msg = (
-            "PINEHURST KALMAN LIVE ALERT\n"
-            f"Ticker: {ticker}\n"
-            f"Signal: {clean_signal}\n"
-            f"Price: {price_txt}\n"
-            f"Time: {now_ct}\n"
-            f"Strategy: {strategy_hint}\n"
-            f"Reason: {reason_hint}\n"
-            "Action: Notification only — no IBKR order sent."
-        )
-
-        ok, resp = telegram_alert_once(key, tg_bot_token, tg_chat_id, msg)
-        if ok:
-            st.toast(f"Telegram Kalman alert sent: {ticker} {clean_signal}", icon="📲")
-        else:
-            st.warning(f"Telegram Kalman alert failed: {resp}")
-
-    except Exception as e:
-        st.warning(f"Telegram Kalman alert skipped: {e}")
-# ------------------------------------------------------
-
-
 
 
 # Databento is optional and lazy-loaded only when the user clicks the pull button.
@@ -2392,6 +36,68 @@ DATABENTO_AVAILABLE = None
 
 # Default historical/non-live anchor date
 DEFAULT_NONLIVE_START = datetime(2024, 1, 1)
+
+# TradingView-style max history anchor.
+# For daily/weekly/monthly Yahoo can usually return the full listed history when
+# start is very old. Intraday intervals have provider limits, so we request the
+# maximum useful range Yahoo generally supports for that bar size.
+MAX_HISTORY_START = datetime(1900, 1, 1)
+
+def _tv_interval_from_label(label):
+    m = {
+        "1 Min": "1m", "1m": "1m",
+        "5 Min": "5m", "5m": "5m",
+        "15 Min": "15m", "15m": "15m",
+        "30 Min": "30m", "30m": "30m",
+        "1 Hour": "60m", "60m": "60m",
+        "1 Day": "1d", "1D": "1d", "1d": "1d",
+        "1 Week": "1wk", "1W": "1wk", "1wk": "1wk",
+        "1 Month": "1mo", "1M": "1mo", "1mo": "1mo",
+    }
+    return m.get(str(label), "1d")
+
+def _tv_max_start_for_interval(interval, end=None):
+    end_ts = pd.Timestamp(end if end is not None else datetime.now()).to_pydatetime()
+    interval = str(interval)
+    if interval == "1m":
+        return end_ts - timedelta(days=6)       # Yahoo 1m limit is very short.
+    if interval in {"2m", "5m", "15m", "30m", "90m"}:
+        return end_ts - timedelta(days=59)      # Yahoo intraday limit.
+    if interval in {"60m", "1h"}:
+        return end_ts - timedelta(days=729)     # Yahoo hourly limit.
+    return MAX_HISTORY_START
+
+def _tv_fast_start_for_interval(interval, end=None):
+    """
+    Fast TradingView-style start date.
+
+    Full listed history on daily/weekly can be decades long, and this app has
+    heavy models that run on every Streamlit rerun. This keeps the TV-style
+    behavior but caps the default load to a practical window. Users can still
+    select Full max history or a custom anchor when they need it.
+    """
+    end_ts = pd.Timestamp(end if end is not None else datetime.now()).to_pydatetime()
+    interval = str(interval)
+    if interval == "1m":
+        return end_ts - timedelta(days=6)
+    if interval in {"2m", "5m", "15m", "30m", "90m"}:
+        return end_ts - timedelta(days=59)
+    if interval in {"60m", "1h"}:
+        return end_ts - timedelta(days=365)
+    if interval == "1wk":
+        return end_ts - timedelta(days=365 * 12)
+    if interval == "1mo":
+        return end_ts - timedelta(days=365 * 25)
+    return end_ts - timedelta(days=365 * 7)
+
+def _tv_history_caption(interval, custom_anchor_on, start_value, history_mode=None):
+    if custom_anchor_on or str(history_mode) == "Custom anchor start date":
+        return f"Custom anchor ON: data starts from {pd.Timestamp(start_value).date()} for interval {interval}."
+    if str(history_mode) == "Full max history":
+        if str(interval) in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+            return f"Full max history ON: using the maximum intraday history Yahoo provides for {interval}."
+        return f"Full max history ON: using full available listed history for {interval}. This can be slow on heavy models."
+    return f"Fast TradingView-style history ON: loaded from {pd.Timestamp(start_value).date()} for {interval}. Select Full max history only when you need every listed bar."
 # Try importing export libraries
 try:
     from fpdf import FPDF
@@ -2414,18 +120,6 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-# Try importing IBKR connection library
-try:
-    from ib_insync import IB, Stock, MarketOrder, LimitOrder
-    IBKR_AVAILABLE = True
-except ImportError:
-    IB = None
-    Stock = None
-    MarketOrder = None
-    LimitOrder = None
-    IBKR_AVAILABLE = False
-
-
 
 # Statsmodels Diagnostic Imports
 
@@ -2435,234 +129,6 @@ from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 # 1. CONFIGURATION & STYLING
 # ==========================================
 st.set_page_config(page_title="Quant Thesis: Advanced Models (Filtered)", layout="wide")
-
-# ==========================================
-# PINEHURST CLEAN WHITE/GREEN UI BRANDING
-# ==========================================
-PINEHURST_LOGO_BASE64 = """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"""
-
-def render_pinehurst_clean_white_green_branding():
-    """
-    Visual-only Pinehurst branding for the Advanced Quant App.
-    White + deep green style using the original logo feel.
-    No model, signal, ledger, trade-log, WFO, scanner, or pricing logic is changed.
-    """
-    try:
-        logo_uri = "data:image/jpeg;base64," + PINEHURST_LOGO_BASE64
-        st.markdown(f"""
-        <style>
-        :root {
-            --pine-green: #06351f;
-            --pine-green-2: #0b4a2e;
-            --pine-soft-green: #edf6f1;
-            --pine-border: rgba(6, 53, 31, 0.14);
-            --pine-gold-soft: rgba(176, 149, 82, 0.22);
-            --pine-text: #10251b;
-        }
-
-        [data-testid="stAppViewContainer"] {
-            background:
-                radial-gradient(circle at 50% 0%, rgba(6,53,31,0.055) 0%, rgba(6,53,31,0.018) 38%, rgba(255,255,255,0) 68%),
-                linear-gradient(180deg, #ffffff 0%, #f7faf8 46%, #eef5f1 100%) !important;
-            color: var(--pine-text);
-        }
-
-        [data-testid="stHeader"] {
-            background: rgba(255,255,255,0.86) !important;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(6,53,31,0.10);
-        }
-
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #ffffff 0%, #f2f8f4 100%) !important;
-            border-right: 1px solid rgba(6,53,31,0.13);
-        }
-
-        [data-testid="stSidebar"] > div:first-child {
-            background: transparent !important;
-        }
-
-        .pinehurst-hero {
-            margin: 0.25rem 0 1.20rem 0;
-            padding: 1.35rem 1.30rem;
-            border: 1px solid rgba(6,53,31,0.13);
-            border-radius: 22px;
-            background:
-                linear-gradient(135deg, rgba(255,255,255,0.98), rgba(240,248,244,0.94)),
-                radial-gradient(circle at 78% 10%, rgba(6,53,31,0.08), rgba(255,255,255,0) 34%);
-            box-shadow: 0 18px 46px rgba(6,53,31,0.10);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .pinehurst-hero:before {
-            content: "";
-            position: absolute;
-            inset: 0;
-            background:
-                linear-gradient(115deg, rgba(6,53,31,0.07), rgba(255,255,255,0) 24%),
-                repeating-linear-gradient(155deg, rgba(6,53,31,0.045) 0px, rgba(6,53,31,0.045) 1px, transparent 1px, transparent 15px);
-            opacity: 0.42;
-            pointer-events: none;
-        }
-
-        .pinehurst-hero-inner {
-            position: relative;
-            display: flex;
-            align-items: center;
-            gap: 1.15rem;
-            z-index: 2;
-        }
-
-        .pinehurst-logo-box {
-            width: 116px;
-            min-width: 116px;
-            height: 116px;
-            border-radius: 20px;
-            padding: 7px;
-            background: #ffffff;
-            box-shadow: 0 12px 28px rgba(6,53,31,0.13);
-            border: 1px solid rgba(6,53,31,0.12);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .pinehurst-logo-box img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            border-radius: 14px;
-        }
-
-        .pinehurst-title {
-            font-size: 2.08rem;
-            font-weight: 780;
-            letter-spacing: 0.075em;
-            color: var(--pine-green);
-            line-height: 1.05;
-            margin-bottom: 0.33rem;
-        }
-
-        .pinehurst-subtitle {
-            font-size: 0.90rem;
-            letter-spacing: 0.18em;
-            text-transform: uppercase;
-            color: rgba(6,53,31,0.72);
-            margin-bottom: 0.48rem;
-            font-weight: 650;
-        }
-
-        .pinehurst-small {
-            font-size: 0.91rem;
-            color: rgba(16,37,27,0.66);
-        }
-
-        .pinehurst-sidebar-logo {
-            text-align: center;
-            padding: 0.85rem 0.55rem 1rem 0.55rem;
-            margin-bottom: 0.75rem;
-            border: 1px solid rgba(6,53,31,0.12);
-            border-radius: 18px;
-            background: #ffffff;
-            box-shadow: 0 10px 26px rgba(6,53,31,0.08);
-        }
-
-        .pinehurst-sidebar-logo img {
-            max-width: 165px;
-            width: 86%;
-            border-radius: 14px;
-            background: #ffffff;
-            padding: 5px;
-        }
-
-        .stMetric, [data-testid="stMetric"] {
-            background: rgba(255,255,255,0.92);
-            border: 1px solid rgba(6,53,31,0.12);
-            border-radius: 16px;
-            padding: 0.72rem 0.82rem;
-            box-shadow: 0 10px 28px rgba(6,53,31,0.07);
-        }
-
-        div[data-testid="stExpander"] {
-            border: 1px solid rgba(6,53,31,0.12) !important;
-            border-radius: 14px !important;
-            background: rgba(255,255,255,0.82) !important;
-            box-shadow: 0 8px 22px rgba(6,53,31,0.045);
-        }
-
-        .stButton > button, .stDownloadButton > button {
-            border-radius: 12px !important;
-            border: 1px solid rgba(6,53,31,0.25) !important;
-            background: linear-gradient(135deg, #0b4a2e, #06351f) !important;
-            color: #ffffff !important;
-            box-shadow: 0 9px 20px rgba(6,53,31,0.18);
-        }
-
-        .stButton > button:hover, .stDownloadButton > button:hover {
-            border-color: rgba(6,53,31,0.65) !important;
-            box-shadow: 0 12px 28px rgba(6,53,31,0.25);
-            transform: translateY(-1px);
-        }
-
-        div[data-testid="stDataFrame"] {
-            border: 1px solid rgba(6,53,31,0.12);
-            border-radius: 14px;
-            overflow: hidden;
-            box-shadow: 0 12px 34px rgba(6,53,31,0.07);
-        }
-
-        h1, h2, h3, h4 {
-            color: var(--pine-green) !important;
-        }
-
-        hr {
-            border-color: rgba(6,53,31,0.14) !important;
-        }
-
-        p, label, span, div {
-            color: inherit;
-        }
-        </style>
-
-        <div class="pinehurst-hero">
-            <div class="pinehurst-hero-inner">
-                <div class="pinehurst-logo-box">
-                    <img src="{logo_uri}" alt="Pinehurst Capital logo" />
-                </div>
-                <div>
-                    <div class="pinehurst-subtitle">Advanced Quant Dashboard</div>
-                    <div class="pinehurst-title">PINEHURST CAPITAL</div>
-                    <div class="pinehurst-small">Clean regime research • capital rotation • risk-first signal dashboard</div>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        with st.sidebar:
-
-            # Kalman Risk Firewall default OFF everywhere.
-
-            try:
-
-                if "kalman_use_risk_firewall" not in st.session_state:
-
-                    st.session_state["kalman_use_risk_firewall"] = False
-
-            except Exception:
-
-                pass
-
-            st.markdown(f"""
-            <div class="pinehurst-sidebar-logo">
-                <img src="{logo_uri}" alt="Pinehurst Capital logo" />
-            </div>
-            """, unsafe_allow_html=True)
-    except Exception:
-        pass
-
-render_pinehurst_clean_white_green_branding()
-
 plt.style.use('ggplot')
 
 st.title("Results of Advanced Quantitative Thesis (Filtered Probabilities)")
@@ -2677,6 +143,75 @@ if not ARCH_AVAILABLE:
 # ==========================================
 # 2. HELPER CLASSES & FUNCTIONS
 # ==========================================
+
+def _safe_filename_piece(x):
+    """Return a compact filename-safe text piece."""
+    try:
+        s = str(x).strip().replace(" ", "_")
+        s = re.sub(r"[^A-Za-z0-9_\-\.]+", "", s)
+        return s[:80] if s else "NA"
+    except Exception:
+        return "NA"
+
+
+def add_regime_trade_log_export_metadata(trades_df, metadata=None):
+    """
+    Legacy helper kept for safety.
+    Prefer build_regime_trade_log_export_csv(), which writes the export in
+    separated sections like:
+      Section,Field,Value
+      INFO,Ticker,ADI
+      ...
+      TRADE_LOG,Data starts below,
+      Side,Entry Date,Exit Date,...
+      Long,...
+    """
+    try:
+        return build_regime_trade_log_export_csv(trades_df, metadata)
+    except Exception:
+        return trades_df.to_csv(index=False) if isinstance(trades_df, pd.DataFrame) else ""
+
+
+def build_regime_trade_log_export_csv(trades_df, metadata=None):
+    """
+    Build a clean sectioned CSV like the user's preferred sample:
+      1) INFO section with vertical Field/Value metadata
+      2) blank separator row
+      3) TRADE_LOG marker row
+      4) original trade-log header
+      5) original trade-log rows
+
+    This avoids the wide horizontal metadata table and keeps the trade log as its
+    own readable section inside the same CSV file.
+    """
+    try:
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        metadata = metadata or {}
+        writer.writerow(["Section", "Field", "Value"])
+        for key, value in metadata.items():
+            writer.writerow(["INFO", str(key), "" if value is None else value])
+
+        writer.writerow(["", "", ""])
+        writer.writerow(["TRADE_LOG", "Data starts below", ""])
+
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            writer.writerow(["No trades generated"])
+            return output.getvalue()
+
+        trades = trades_df.copy()
+        writer.writerow(list(trades.columns))
+        for _, row in trades.iterrows():
+            writer.writerow(["" if pd.isna(v) else v for v in row.tolist()])
+
+        return output.getvalue()
+    except Exception:
+        try:
+            return trades_df.to_csv(index=False)
+        except Exception:
+            return ""
+
 
 def format_plot_dates(ax, dates):
     """
@@ -2899,213 +434,6 @@ class KalmanFilterTrend:
             smoothed_covs[t] = filtered_covs[t] + J**2 * (smoothed_covs[t+1] - P_pred)
         
         return smoothed_means, smoothed_covs
-
-
-def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055, vol_window=20, polish_span=3):
-    """
-    Causal adaptive Kalman-style trend line for the Single Asset Trend tab.
-    It turns faster in strong moves while still smoothing chop. Uses current/past bars only.
-    """
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        if px.empty:
-            return np.array([])
-        ret = px.pct_change().abs()
-        vol = ret.rolling(int(vol_window), min_periods=max(3, int(vol_window)//3)).median().replace(0, np.nan)
-        shock = (ret / (vol + 1e-12)).replace([np.inf, -np.inf], np.nan).fillna(0).clip(0, 3) / 3.0
-        fast_gain = float(fast_gain)
-        slow_gain = float(slow_gain)
-        gains = (slow_gain + (fast_gain - slow_gain) * shock).clip(min(slow_gain, fast_gain), max(slow_gain, fast_gain))
-        out = np.zeros(len(px), dtype=float)
-        out[0] = float(px.iloc[0])
-        for i in range(1, len(px)):
-            out[i] = out[i-1] + float(gains.iloc[i]) * (float(px.iloc[i]) - out[i-1])
-        if int(polish_span) > 1:
-            out = pd.Series(out, index=px.index).ewm(span=int(polish_span), adjust=False).mean().values
-        return out
-    except Exception:
-        try:
-            return pd.Series(prices).ewm(span=8, adjust=False).mean().values
-        except Exception:
-            return np.array(prices, dtype=float)
-
-
-def zero_lag_ema_trend(prices, span=10):
-    """Causal zero-lag EMA style trend."""
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        lag = max(1, int((int(span) - 1) / 2))
-        adj = px + (px - px.shift(lag))
-        return adj.ewm(span=int(span), adjust=False).mean().ffill().bfill().values
-    except Exception:
-        return pd.Series(prices).ewm(span=max(2, int(span)), adjust=False).mean().values
-
-
-def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_span=3, atr_window=14, atr_mult=1.35):
-    """
-    Directional trend rail for the Kalman tab.
-
-    This is what the user wants visually:
-    - In an uptrend, the line behaves like a smooth support rail below price.
-    - In a downtrend, the line behaves like a smooth resistance rail above price.
-    - It avoids constantly cutting through the middle of price like a centerline filter.
-
-    Causal only: uses current/past bars, no backward smoothing.
-    """
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        if px.empty:
-            return np.array([]), np.array([]), pd.Series(dtype=float)
-
-        center = pd.Series(
-            institutional_adaptive_kalman_trend(
-                px.values,
-                fast_gain=float(fast_gain),
-                slow_gain=float(slow_gain),
-                vol_window=20,
-                polish_span=int(polish_span)
-            ),
-            index=px.index
-        )
-
-        # Close-only ATR proxy, robust when only close data is available in this tab.
-        atr = px.diff().abs().ewm(span=int(atr_window), adjust=False).mean()
-        atr = atr.replace(0, np.nan).ffill().bfill()
-        if atr.isna().all():
-            atr = pd.Series(px.std() * 0.02 if len(px) > 2 else 1.0, index=px.index)
-        atr = atr.fillna(float(px.iloc[-1]) * 0.015)
-
-        slope = center.diff().ewm(span=5, adjust=False).mean().fillna(0)
-        long_state = pd.Series(False, index=px.index)
-        rail = pd.Series(index=px.index, dtype=float)
-
-        state = True
-        rail.iloc[0] = float(center.iloc[0] - float(atr.iloc[0]) * float(atr_mult))
-        long_state.iloc[0] = state
-
-        for i in range(1, len(px)):
-            p = float(px.iloc[i])
-            c = float(center.iloc[i])
-            a = float(atr.iloc[i]) * float(atr_mult)
-            sl = float(slope.iloc[i])
-
-            # Switch logic with a small buffer so it does not flip every tiny cross.
-            if state:
-                candidate = c - a
-                # Trailing support should generally rise/hold in an uptrend.
-                if sl >= 0:
-                    candidate = max(candidate, float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate)
-                # Flip bearish only when price loses the prior support rail.
-                if p < (float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate):
-                    state = False
-                    candidate = c + a
-            else:
-                candidate = c + a
-                # Trailing resistance should generally fall/hold in a downtrend.
-                if sl <= 0:
-                    candidate = min(candidate, float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate)
-                # Flip bullish only when price clears the prior resistance rail.
-                if p > (float(rail.iloc[i-1]) if np.isfinite(rail.iloc[i-1]) else candidate):
-                    state = True
-                    candidate = c - a
-
-            rail.iloc[i] = candidate
-            long_state.iloc[i] = state
-
-        # Light causal polish to make it visually smooth without turning it into a centerline.
-        rail = rail.ewm(span=2, adjust=False).mean()
-        return rail.values, center.values, long_state
-    except Exception:
-        base = institutional_adaptive_kalman_trend(prices, fast_gain=fast_gain, slow_gain=slow_gain, polish_span=polish_span)
-        return base, base, pd.Series([True] * len(base))
-
-
-def apply_kalman_risk_firewall(prices, signal, trend, max_trade_loss_pct=18.0, trail_stop_pct=22.0, equity_dd_stop_pct=30.0, cooldown_bars=8):
-    """
-    Risk overlay for Kalman strategy.
-
-    It does not change the trend/entry model. It only applies capital protection:
-    - hard trade stop from entry
-    - trailing stop from highest close since entry
-    - equity drawdown circuit breaker
-    - cooldown after forced exit
-
-    Causal only: current/past bars.
-    """
-    try:
-        px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-        sig = pd.Series(signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0, 1)
-        tr = pd.Series(trend).reindex(px.index).ffill().bfill().astype(float)
-
-        out = pd.Series(0.0, index=px.index)
-        in_pos = False
-        entry = 0.0
-        peak_price = 0.0
-        eq = 1.0
-        peak_eq = 1.0
-        cooldown = 0
-        prev_price = None
-
-        max_trade_loss = float(max_trade_loss_pct) / 100.0
-        trail_stop = float(trail_stop_pct) / 100.0
-        equity_dd_stop = float(equity_dd_stop_pct) / 100.0
-        cooldown_bars = int(cooldown_bars)
-
-        for i, dt in enumerate(px.index):
-            p = float(px.loc[dt])
-            desired = float(sig.loc[dt])
-
-            if prev_price is not None and in_pos:
-                eq *= (p / float(prev_price))
-                peak_eq = max(peak_eq, eq)
-
-            if cooldown > 0:
-                cooldown -= 1
-
-            forced_exit = False
-            if in_pos:
-                peak_price = max(peak_price, p)
-
-                if max_trade_loss > 0 and p <= entry * (1.0 - max_trade_loss):
-                    forced_exit = True
-
-                if (not forced_exit) and trail_stop > 0 and p <= peak_price * (1.0 - trail_stop):
-                    forced_exit = True
-
-                if (not forced_exit) and equity_dd_stop > 0 and eq <= peak_eq * (1.0 - equity_dd_stop):
-                    forced_exit = True
-
-                # Secondary structural fail-safe: if price loses trend after being in position.
-                if (not forced_exit) and p < float(tr.loc[dt]) * 0.985:
-                    forced_exit = True
-
-                if forced_exit:
-                    in_pos = False
-                    cooldown = cooldown_bars
-                    out.loc[dt] = 0.0
-                elif desired >= 0.5:
-                    out.loc[dt] = 1.0
-                else:
-                    in_pos = False
-                    out.loc[dt] = 0.0
-            else:
-                if cooldown <= 0 and desired >= 0.5:
-                    in_pos = True
-                    entry = p
-                    peak_price = p
-                    out.loc[dt] = 1.0
-                else:
-                    out.loc[dt] = 0.0
-
-            prev_price = p
-
-        return out.ffill().fillna(0).clip(0, 1)
-    except Exception:
-        return pd.Series(signal).ffill().fillna(0).clip(0, 1)
-
-
-
-
 
 def simulate_heston(S0, T, r, kappa, theta, sigma, rho, v0, steps, paths):
     """
@@ -4131,87 +1459,131 @@ def clean_overlapping_duplicate_trades(trades_df):
             return trades_df
 
 
-def _to_ct_naive_timestamp(x, default_bar_time="16:00", assume_naive_intraday_is_ct=True):
+def recalc_trade_log_cumulative_from_pnl(trades_df):
     """
-    Convert timestamps to Central Time, then remove tz for consistent Plotly/table display.
+    Display/log fix only.
 
-    Critical rule for this app:
-    - Intraday/live data is already converted to CT earlier in the pipeline.
-    - If an intraday timestamp is naive, treat it as CT, not New York.
-    - Date-only daily/weekly bars are treated as Eastern close and converted to CT.
+    Left column PnL (%) = single trade return.
+    Cumulative Return (%) = compounded from those visible PnL values,
+    calculated oldest-to-newest, while preserving the current display row order.
+
+    This does not change signals, dates, buy/sell prices, equity curve, or graph logic.
     """
     try:
-        if x is None:
-            return pd.NaT
-        ts = pd.Timestamp(x)
-        if pd.isna(ts):
-            return pd.NaT
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return trades_df
+        if "PnL (%)" not in trades_df.columns or "Cumulative Return (%)" not in trades_df.columns:
+            return trades_df
 
-        eastern_tz = "America/New_York"
-        central_tz = "America/Chicago"
+        out = trades_df.copy()
+        entry_col = "Entry Date" if "Entry Date" in out.columns else ("Entry CT" if "Entry CT" in out.columns else None)
 
-        # Date-only rows: assume regular market close in Eastern then convert to CT.
-        if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
+        def _parse_entry_for_cum(v):
             try:
-                hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
-            except Exception:
-                hh, mm = 16, 0
-            ts = ts.replace(hour=hh, minute=mm, second=0)
-            if getattr(ts, "tzinfo", None) is None:
-                ts = ts.tz_localize(eastern_tz)
-            else:
-                ts = ts.tz_convert(eastern_tz)
-            return ts.tz_convert(central_tz).tz_localize(None)
-
-        # Intraday rows.
-        if getattr(ts, "tzinfo", None) is None:
-            # Already CT inside this app after live-data conversion; do NOT subtract an hour again.
-            if bool(assume_naive_intraday_is_ct):
+                if v is None:
+                    return pd.NaT
+                s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                if s.lower() in {"", "open", "nan", "nat", "none", "intraday unavailable"}:
+                    return pd.NaT
+                ts = pd.Timestamp(s)
+                if pd.isna(ts):
+                    return pd.NaT
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert(None)
                 return ts
-            return ts.tz_localize(eastern_tz).tz_convert(central_tz).tz_localize(None)
+            except Exception:
+                return pd.NaT
 
-        return ts.tz_convert(central_tz).tz_localize(None)
+        if entry_col is not None:
+            out["__cum_entry_sort__"] = out[entry_col].apply(_parse_entry_for_cum)
+        else:
+            out["__cum_entry_sort__"] = np.arange(len(out))
+
+        calc = out.sort_values("__cum_entry_sort__", ascending=True, na_position="last", kind="mergesort")
+
+        cumulative_multiplier = 1.0
+        for idx, row in calc.iterrows():
+            pnl = pd.to_numeric(pd.Series([row.get("PnL (%)")]), errors="coerce").iloc[0]
+            if pd.isna(pnl) or not np.isfinite(float(pnl)):
+                continue
+            cumulative_multiplier *= (1.0 + float(pnl) / 100.0)
+            out.at[idx, "Cumulative Return (%)"] = (cumulative_multiplier - 1.0) * 100.0
+
+        out = out.drop(columns=["__cum_entry_sort__"], errors="ignore")
+        return out
     except Exception:
         try:
-            return pd.Timestamp(x)
+            return trades_df.drop(columns=["__cum_entry_sort__"], errors="ignore")
         except Exception:
-            return pd.NaT
+            return trades_df
 
 
-def _ct_naive_index(idx, default_bar_time="16:00"):
+
+def clean_trade_log_for_display(trades_df):
+    """
+    Final visible/export trade-log cleanup only.
+
+    Does not change signals/backtest logic. It only makes the table human-readable:
+    - remove accidental index-like columns
+    - round prices and percent columns to 2 decimals
+    - keep newest-first row order already prepared by the caller
+    """
     try:
-        return pd.DatetimeIndex([_to_ct_naive_timestamp(v, default_bar_time=default_bar_time) for v in idx])
+        if trades_df is None or not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return trades_df
+        out = trades_df.copy()
+        out = out.drop(columns=[c for c in ["index", "level_0", "Unnamed: 0"] if c in out.columns], errors="ignore")
+
+        for col in ["Buy Price", "Sell Price", "Entry Price", "Exit Price"]:
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+
+        for col in ["PnL (%)", "Cumulative Return (%)", "Trade Return (%)", "Account Return (%)"]:
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+
+        return out.reset_index(drop=True)
     except Exception:
-        try:
-            return pd.to_datetime(idx)
-        except Exception:
-            return idx
-
-
-def _ct_display_str(x, default_bar_time="16:00"):
-    try:
-        ts = _to_ct_naive_timestamp(x, default_bar_time=default_bar_time)
-        if pd.isna(ts):
-            return x
-        return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
-    except Exception:
-        return x
-
+        return trades_df
 
 def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
     """
     Display-only timestamp formatter for trade logs.
 
-    Everything displays in Central Time (CT). Intraday naive timestamps are treated
-    as already-CT because live data is converted to CT earlier. This prevents the
-    table from showing 11:30 CT while the chart hover shows 12:30/13:30.
+    Shows all trade timestamps in Central Time (CT).
+    Intraday/live bars keep seconds. Daily/weekly/date-only rows use the
+    assumed market close time, converted from Eastern market time to Central Time.
+    Open trades show Exit Date as "Open" instead of NaT.
+
+    This does not change strategy logic, prices, equity curves, or metrics.
     """
     try:
         if trades_df is None or trades_df.empty:
             return trades_df
         out = trades_df.copy()
 
+        eastern_tz = "America/New_York"
+        central_tz = "America/Chicago"
+
+        def _to_central_display(ts):
+            # Naive timestamps from Yahoo/pandas are treated as exchange/New York time.
+            # Timezone-aware Databento/UTC timestamps are converted directly to Central.
+            try:
+                if getattr(ts, "tzinfo", None) is None:
+                    ts = ts.tz_localize(eastern_tz)
+                else:
+                    ts = ts.tz_convert(central_tz)
+                    return ts.strftime("%Y-%m-%d %H:%M:%S CT")
+                ts = ts.tz_convert(central_tz)
+                return ts.strftime("%Y-%m-%d %H:%M:%S CT")
+            except Exception:
+                try:
+                    return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+                except Exception:
+                    return ts
+
         def _format_one(x, is_exit=False, status=None):
+            # Open positions should not display NaT in the exit column.
             try:
                 if is_exit and str(status).strip().lower() == "open":
                     return "Open"
@@ -4224,12 +1596,17 @@ def apply_trade_log_timestamp_display(trades_df, default_bar_time="16:00"):
                 xl = x.strip().lower()
                 if xl in {"open", "", "nan", "none", "nat"}:
                     return "Open" if is_exit else x
-
             try:
-                ts = _to_ct_naive_timestamp(x, default_bar_time=default_bar_time, assume_naive_intraday_is_ct=True)
+                ts = pd.Timestamp(x)
                 if pd.isna(ts):
                     return "Open" if is_exit else x
-                return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S CT")
+
+                # If data is daily/weekly/date-only, assume regular market close in Eastern time.
+                if ts.hour == 0 and ts.minute == 0 and ts.second == 0:
+                    hh, mm = [int(v) for v in str(default_bar_time).split(":")[:2]]
+                    ts = ts.replace(hour=hh, minute=mm, second=0)
+
+                return _to_central_display(ts)
             except Exception:
                 return x
 
@@ -4511,6 +1888,252 @@ def get_price_trend_override(prices_index, model_index, strat_prices):
 
 
 
+
+
+def apply_regime_surgical_rescue(prices, base_signal, max_trade_loss_pct=0.08):
+    """
+    REGIME-SWITCHING ONLY: surgical loss rescue.
+
+    Keeps the original Regime LONG/CASH series intact except for one narrow rule:
+    - while long, exit when the trade closes at or below the max-loss threshold;
+    - after that exit, do not re-enter the SAME stale LONG regime while price is
+      still below the failed trade's entry price;
+    - re-arm immediately when the original Regime goes CASH and later LONG again,
+      or when price fully reclaims the failed trade's entry price.
+
+    No EMA filters, no account drawdown breaker, no cooldown, no trailing stop,
+    and no winner exit. Strong winning Regime trades are left completely alone.
+    All decisions are causal.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna().astype(float).sort_index()
+    if px.empty:
+        return pd.Series(dtype=float)
+
+    sig = (
+        pd.Series(base_signal)
+        .reindex(px.index)
+        .ffill()
+        .fillna(0.0)
+        .astype(float)
+        .clip(0.0, 1.0)
+    )
+
+    max_loss = min(max(abs(float(max_trade_loss_pct)), 0.02), 0.25)
+    out = pd.Series(0.0, index=px.index, dtype=float)
+
+    in_trade = False
+    entry_price = np.nan
+    quarantined = False
+    failed_entry_price = np.nan
+    prev_desired = 0.0
+
+    stats = {
+        "protective_exits": 0,
+        "quarantine_bars": 0,
+        "regime_reset_reentries": 0,
+        "price_reclaim_reentries": 0,
+    }
+
+    for dt in px.index:
+        price = float(px.loc[dt])
+        desired = float(sig.loc[dt])
+
+        # Original Regime CASH always wins and fully resets a failed-regime quarantine.
+        if desired <= 0.0:
+            in_trade = False
+            entry_price = np.nan
+            quarantined = False
+            failed_entry_price = np.nan
+            out.loc[dt] = 0.0
+            prev_desired = desired
+            continue
+
+        # A genuine new Regime LONG after a CASH phase is allowed immediately.
+        fresh_regime_long = prev_desired <= 0.0 and desired > 0.0
+        if fresh_regime_long and quarantined:
+            quarantined = False
+            failed_entry_price = np.nan
+            stats["regime_reset_reentries"] += 1
+
+        # After a stop inside a still-stale LONG regime, stay out until price fully
+        # reclaims the failed entry. This blocks repeated stop/re-enter/stop damage
+        # without imposing any broad trend filter on normal Regime entries.
+        if quarantined and not in_trade:
+            if np.isfinite(failed_entry_price) and price >= float(failed_entry_price):
+                quarantined = False
+                stats["price_reclaim_reentries"] += 1
+            else:
+                out.loc[dt] = 0.0
+                stats["quarantine_bars"] += 1
+                prev_desired = desired
+                continue
+
+        if not in_trade:
+            in_trade = True
+            entry_price = price
+
+        trade_return = (price / entry_price) - 1.0 if entry_price > 0 else 0.0
+
+        if trade_return <= -max_loss:
+            out.loc[dt] = 0.0
+            stats["protective_exits"] += 1
+            quarantined = True
+            failed_entry_price = entry_price
+            in_trade = False
+            entry_price = np.nan
+        else:
+            out.loc[dt] = desired
+
+        prev_desired = desired
+
+    result = out.fillna(0.0).clip(0.0, 1.0)
+    result.attrs["rescue_stats"] = stats
+    return result
+
+
+
+def apply_regime_major_winner_rollover_exit(
+    daily_prices,
+    base_signal,
+    original_prices=None,
+    arm_profit_pct=1.00,
+    peak_drawdown_pct=0.20,
+    ema_len=20,
+    ema_confirm_bars=2,
+):
+    """
+    REGIME-SWITCHING ONLY: clean major-winner rollover exit.
+
+    The original Weekly Regime remains the entry/hold brain. This overlay acts only
+    after an open Regime trade has already gained at least `arm_profit_pct`. Once
+    armed, it exits on the FIRST closed daily bar that is `peak_drawdown_pct` below
+    the highest close since entry.
+
+    Important behavior:
+    - normal Regime trades are untouched;
+    - no EMA gate is required, so the exit cannot drift far below the requested
+      peak-giveback level while waiting for another slow confirmation;
+    - after the rollover exit, the same stale Weekly LONG is quarantined;
+    - re-entry is allowed only after the ORIGINAL Regime goes CASH and later
+      produces a fresh LONG transition;
+    - no stop-loss, cooldown, entry filter, or repeated same-regime re-entry is
+      introduced here.
+
+    `ema_len` and `ema_confirm_bars` remain in the signature only for backward
+    compatibility with older calls; they are intentionally not used.
+    """
+    meta = {
+        "applied": False,
+        "exit_count": 0,
+        "arm_profit_pct": float(arm_profit_pct) * 100.0,
+        "peak_drawdown_pct": float(peak_drawdown_pct) * 100.0,
+        "exit_dates": [],
+        "exit_prices": [],
+    }
+
+    try:
+        px = (
+            pd.Series(daily_prices)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+            .astype(float)
+            .sort_index()
+        )
+        if px.empty:
+            return base_signal, original_prices, meta
+
+        sig_in = pd.Series(base_signal).copy()
+        if sig_in.empty:
+            return base_signal, original_prices, meta
+
+        # Map the ORIGINAL slow Regime decision to daily closes for execution only.
+        union_idx = pd.Index(sig_in.index).union(px.index)
+        base = (
+            sig_in.reindex(union_idx)
+            .sort_index()
+            .ffill()
+            .reindex(px.index)
+            .ffill()
+            .fillna(0.0)
+            .astype(float)
+            .clip(0.0, 1.0)
+        )
+
+        out = pd.Series(0.0, index=px.index, dtype=float)
+        arm = max(0.25, float(arm_profit_pct))
+        peak_dd = min(max(float(peak_drawdown_pct), 0.05), 0.60)
+
+        in_trade = False
+        quarantined = False
+        entry_price = np.nan
+        high_since_entry = np.nan
+        prev_desired = 0.0
+
+        for dt in px.index:
+            price = float(px.loc[dt])
+            desired = float(base.loc[dt])
+
+            # The original Regime CASH closes/resets everything. After a protected
+            # exit we still stay in cash here; only the next genuine CASH->LONG
+            # transition can open a new position.
+            if desired <= 0.0:
+                out.loc[dt] = 0.0
+                in_trade = False
+                entry_price = np.nan
+                high_since_entry = np.nan
+                quarantined = False
+                prev_desired = 0.0
+                continue
+
+            fresh_long = prev_desired <= 0.0 and desired > 0.0
+
+            # A protected exit must not be followed by re-entry while the same old
+            # Weekly LONG remains active.
+            if quarantined:
+                out.loc[dt] = 0.0
+                prev_desired = desired
+                continue
+
+            # Enter only on a genuine original Regime LONG transition (or at the
+            # first available bar if the backtest begins while already LONG).
+            if not in_trade:
+                if fresh_long or prev_desired <= 0.0:
+                    in_trade = True
+                    entry_price = price
+                    high_since_entry = price
+                else:
+                    out.loc[dt] = 0.0
+                    prev_desired = desired
+                    continue
+
+            high_since_entry = max(float(high_since_entry), price)
+            peak_profit = (high_since_entry / entry_price) - 1.0 if entry_price > 0 else 0.0
+            drawdown_from_peak = (price / high_since_entry) - 1.0 if high_since_entry > 0 else 0.0
+
+            # Only major winners are affected. Once armed, exit exactly on the first
+            # closed daily bar that reaches the requested peak giveback.
+            if peak_profit >= arm and drawdown_from_peak <= -peak_dd:
+                out.loc[dt] = 0.0
+                in_trade = False
+                quarantined = True
+                meta["exit_count"] += 1
+                meta["exit_dates"].append(pd.Timestamp(dt))
+                meta["exit_prices"].append(float(price))
+            else:
+                out.loc[dt] = desired
+
+            prev_desired = desired
+
+        if int(meta["exit_count"]) <= 0:
+            return base_signal, original_prices, meta
+
+        meta["applied"] = True
+        return out.clip(0.0, 1.0), px, meta
+
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return base_signal, original_prices, meta
+
 def build_live_regime_hybrid_signal(anchor_signal, anchor_prices, live_prices, enable_overlay=True, mode="Balanced"):
     """
     Live Regime Hybrid:
@@ -4754,49 +2377,6 @@ def _save_regime_locked_ledger(df):
         return True
     except Exception:
         return False
-
-
-
-def _safe_filename_part(x):
-    try:
-        s = str(x).strip().replace(" ", "_")
-        keep = []
-        for ch in s:
-            if ch.isalnum() or ch in ["_", "-", "."]:
-                keep.append(ch)
-            else:
-                keep.append("_")
-        s = "".join(keep).strip("_")
-        return s or "NA"
-    except Exception:
-        return "NA"
-
-
-def build_trade_log_csv_with_info(trades_df, info_dict):
-    """
-    Builds a CSV with a simple INFO section first, then the trade log below.
-    This stays Excel-compatible while preserving context for future verification.
-    """
-    try:
-        info_rows = []
-        for k, v in (info_dict or {}).items():
-            info_rows.append({"Section": "INFO", "Field": str(k), "Value": "" if v is None else str(v)})
-        info_df = pd.DataFrame(info_rows, columns=["Section", "Field", "Value"])
-        blank_df = pd.DataFrame([{"Section": "", "Field": "", "Value": ""}])
-        header_df = pd.DataFrame([{"Section": "TRADE_LOG", "Field": "Data starts below", "Value": ""}])
-        trade = trades_df.copy() if isinstance(trades_df, pd.DataFrame) else pd.DataFrame()
-        # Put trade log under the same CSV by writing manually; easier for Excel/users.
-        buf = io.StringIO()
-        info_df.to_csv(buf, index=False)
-        blank_df.to_csv(buf, index=False, header=False)
-        header_df.to_csv(buf, index=False, header=False)
-        trade.to_csv(buf, index=False)
-        return buf.getvalue().encode("utf-8")
-    except Exception:
-        try:
-            return trades_df.to_csv(index=False).encode("utf-8")
-        except Exception:
-            return b""
 
 
 def reset_regime_locked_ledger_for_key(lock_key: str):
@@ -5150,8 +2730,14 @@ def _tradable_display_price(row, target_price=None):
             tp = np.nan
         if np.isfinite(tp) and tp > 0 and lo <= tp <= hi:
             return float(tp)
-        # Neutral fallback: inside the real candle range, but not the perfect low/high or always close.
+        # Smoothed/model trigger prices drift from real market prices. When the
+        # target is outside the real candle range, display the actual market close
+        # of that raw trading date (the true tradable price), not an OHLC midpoint.
+        if np.isfinite(close) and close > 0:
+            return float(close)
         midpoint_vals = [v for v in [open_px, hi, lo, close] if np.isfinite(v)]
+        if not midpoint_vals:
+            return float(tp) if np.isfinite(tp) else np.nan
         fill = float(np.mean(midpoint_vals))
         return float(np.clip(fill, lo, hi))
     except Exception:
@@ -5159,6 +2745,97 @@ def _tradable_display_price(row, target_price=None):
             return float(target_price)
         except Exception:
             return np.nan
+
+
+def _raw_close_display_price_for_trade_date(raw_prices, dt, fallback_price=np.nan, lookback_days=6):
+    """
+    DISPLAY ONLY.
+    Return the actual raw-market Close for the displayed trade date.
+
+    This is intentionally separate from strategy/backtest execution. It fixes trade-log
+    display rows that were showing model stop/trailing-stop prices on dates where the
+    user expects the visible Buy/Sell Price to match the public OHLC close.
+    """
+    try:
+        if pd.isna(dt) or str(dt).strip().lower() == "open":
+            return fallback_price
+        raw = _normalize_market_frame(raw_prices)
+        if raw.empty or "Close" not in raw.columns:
+            return fallback_price
+        d = pd.Timestamp(str(dt).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip())
+        if getattr(d, "tzinfo", None) is not None:
+            d = d.tz_convert(None)
+        # Direct daily-date match first.
+        same_day = raw.loc[raw.index.normalize() == d.normalize()]
+        if not same_day.empty:
+            close_px = pd.to_numeric(same_day["Close"], errors="coerce").dropna()
+            if not close_px.empty and float(close_px.iloc[-1]) > 0:
+                return float(close_px.iloc[-1])
+        # Weekly/model bars can carry the period end; use the last real raw close in
+        # that signal bucket. This keeps the date mapping logic intact but prevents
+        # synthetic stop prices from appearing as if they were public OHLC closes.
+        start = d - pd.Timedelta(days=int(max(0, lookback_days)))
+        bucket = raw.loc[(raw.index >= start) & (raw.index <= min(d, raw.index.max()))]
+        if bucket.empty and d > raw.index.max():
+            bucket = raw.loc[(raw.index >= start) & (raw.index <= raw.index.max())]
+        if bucket.empty:
+            bucket = raw.loc[raw.index <= min(d, raw.index.max())].tail(1)
+        if not bucket.empty:
+            close_px = pd.to_numeric(bucket["Close"], errors="coerce").dropna()
+            if not close_px.empty and float(close_px.iloc[-1]) > 0:
+                return float(close_px.iloc[-1])
+    except Exception:
+        pass
+    return fallback_price
+
+
+def apply_regime_trade_log_raw_close_prices_display(trades_df, raw_prices):
+    """
+    DISPLAY ONLY for Regime Switching trade logs.
+
+    Do not touch model signals, trade dates, stop logic, equity curve, or backtest metrics.
+    Only replace visible Buy/Sell Price with the real raw-market Close on the displayed
+    Entry/Exit Date, then recalc displayed PnL from those displayed prices.
+    """
+    try:
+        if trades_df is None or trades_df.empty:
+            return trades_df
+        raw = _normalize_market_frame(raw_prices)
+        if raw.empty:
+            return trades_df
+        out = trades_df.copy()
+
+        if "Entry Date" in out.columns:
+            buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+            if buy_col is not None:
+                new_buy = []
+                for dt, old_px in zip(out["Entry Date"], out[buy_col]):
+                    new_buy.append(_raw_close_display_price_for_trade_date(raw, dt, old_px, lookback_days=6))
+                out[buy_col] = new_buy
+
+        if "Exit Date" in out.columns:
+            sell_col = "Sell Price" if "Sell Price" in out.columns else ("Exit Price" if "Exit Price" in out.columns else None)
+            if sell_col is not None:
+                status_series = out.get("Status", pd.Series([""] * len(out), index=out.index))
+                new_sell = []
+                for dt, old_px, status in zip(out["Exit Date"], out[sell_col], status_series):
+                    if str(status).strip().lower() == "open" or str(dt).strip().lower() == "open":
+                        new_sell.append(old_px)
+                    else:
+                        new_sell.append(_raw_close_display_price_for_trade_date(raw, dt, old_px, lookback_days=6))
+                out[sell_col] = new_sell
+
+        buy_col = "Buy Price" if "Buy Price" in out.columns else ("Entry Price" if "Entry Price" in out.columns else None)
+        sell_col = "Sell Price" if "Sell Price" in out.columns else ("Exit Price" if "Exit Price" in out.columns else None)
+        if buy_col is not None and sell_col is not None and "PnL (%)" in out.columns:
+            bp = pd.to_numeric(out[buy_col], errors="coerce")
+            sp = pd.to_numeric(out[sell_col], errors="coerce")
+            status_series = out.get("Status", pd.Series([""] * len(out), index=out.index)).astype(str).str.lower()
+            valid = bp.notna() & sp.notna() & (bp > 0) & ~status_series.eq("open")
+            out.loc[valid, "PnL (%)"] = ((sp[valid] - bp[valid]) / bp[valid]) * 100.0
+        return out
+    except Exception:
+        return trades_df
 
 
 def map_weekly_trade_log_dates_only(trades_df, raw_prices):
@@ -5237,7 +2914,14 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
                 mapped_dt = _map_by_price(dt, bp)
                 row = _row_at(mapped_dt)
                 new_dates.append(mapped_dt)
-                new_prices.append(_tradable_display_price(row, bp) if row is not None else bp)
+                if row is not None:
+                    try:
+                        _rc = float(pd.to_numeric(row.get('Close'), errors='coerce'))
+                    except Exception:
+                        _rc = np.nan
+                    new_prices.append(_rc if np.isfinite(_rc) and _rc > 0 else bp)
+                else:
+                    new_prices.append(bp)
             out['Entry Date'] = new_dates
             if 'Buy Price' in out.columns:
                 out['Buy Price'] = new_prices
@@ -5254,7 +2938,9 @@ def map_weekly_trade_log_dates_only(trades_df, raw_prices):
                     mapped_dt = _map_by_price(dt, sp)
                     row = _row_at(mapped_dt)
                     new_dates.append(mapped_dt)
-                    new_prices.append(_tradable_display_price(row, sp) if row is not None else sp)
+                    # DISPLAY ONLY: show the public raw Close for the displayed exit date,
+                    # not a synthetic trailing-stop/model price.
+                    new_prices.append(_raw_close_display_price_for_trade_date(raw, mapped_dt, sp, lookback_days=0) if row is not None else sp)
             out['Exit Date'] = new_dates
             if 'Sell Price' in out.columns:
                 out['Sell Price'] = new_prices
@@ -6695,6 +4381,344 @@ def apply_iv_sharpe_dd_guard(prices, base_signal, mode="Balanced", max_price_dd=
     return out.ffill().fillna(0.0).clip(0.0, 1.0)
 
 
+def apply_iv_trade_loss_guard(prices, base_signal, max_trade_loss_pct=0.06, cooldown_bars=5):
+    """
+    IV-PROXY ONLY: causal per-trade loss limiter.
+
+    This leaves the selected IV rule intact while preventing a weak trade from being
+    held through a slow -10% to -15% decline. It exits when either:
+      1) the trade reaches the selected maximum loss, or
+      2) the trade is already down 65% of that limit AND short/medium trend is weak.
+
+    After a protective exit it waits a few bars and requires price recovery before
+    re-entering while the underlying IV rule is still long. No future bars are used.
+    """
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna()
+    sig = pd.Series(base_signal).reindex(px.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
+    if len(px) < 5:
+        return sig
+
+    max_loss = abs(float(max_trade_loss_pct))
+    max_loss = min(max(max_loss, 0.01), 0.50)
+    early_loss = max_loss * 0.65
+    cooldown_len = max(0, int(cooldown_bars))
+
+    ema20 = px.ewm(span=20, adjust=False).mean()
+    ema50 = px.ewm(span=50, adjust=False).mean()
+    ret5 = px.pct_change(5).fillna(0.0)
+
+    out = pd.Series(0.0, index=px.index, dtype=float)
+    in_trade = False
+    entry_price = np.nan
+    cooldown_left = 0
+    stopped_by_guard = False
+
+    for dt in px.index:
+        desired = float(sig.loc[dt])
+        price = float(px.loc[dt])
+
+        # The underlying IV rule has gone to cash. Reset the loss-guard state.
+        if desired <= 0.0:
+            in_trade = False
+            entry_price = np.nan
+            cooldown_left = 0
+            stopped_by_guard = False
+            out.loc[dt] = 0.0
+            continue
+
+        # Do not immediately re-enter the same failing setup.
+        if cooldown_left > 0:
+            cooldown_left -= 1
+            out.loc[dt] = 0.0
+            continue
+
+        if not in_trade:
+            recovered = bool(price > float(ema20.loc[dt])) or bool(float(ret5.loc[dt]) > 0.0)
+            if stopped_by_guard and not recovered:
+                out.loc[dt] = 0.0
+                continue
+            in_trade = True
+            entry_price = price
+            stopped_by_guard = False
+
+        trade_return = (price / entry_price) - 1.0 if entry_price > 0 else 0.0
+        weak_trend = bool(price < float(ema20.loc[dt])) and (
+            bool(float(ema20.loc[dt]) < float(ema50.loc[dt])) or bool(float(ret5.loc[dt]) < 0.0)
+        )
+
+        hard_loss_hit = trade_return <= -max_loss
+        early_weakness_hit = (trade_return <= -early_loss) and weak_trend
+
+        if hard_loss_hit or early_weakness_hit:
+            out.loc[dt] = 0.0
+            in_trade = False
+            entry_price = np.nan
+            cooldown_left = cooldown_len
+            stopped_by_guard = True
+        else:
+            # Preserve the exact exposure requested by the selected IV rule/overlay.
+            out.loc[dt] = desired
+
+    return out.ffill().fillna(0.0).clip(0.0, 1.0)
+
+
+def render_iv_price_trade_chart_like_regime(ticker, prices, trades_df, bt_results, benchmark_label):
+    """IV-only chart presentation matching the Regime Switching price graph style."""
+    st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
+    st.write("#### 📈 Implied Volatility Proxy Price Graph")
+    st.caption("Asset price with buy/sell markers built from the SAME backtest trade log shown below.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        graph_mode = st.selectbox(
+            "Price graph display range",
+            ["Recent only (fast)", "Full anchor history (slow)"],
+            index=0,
+            key=f"iv_price_graph_display_range_{ticker}"
+        )
+    with c2:
+        recent_bars = st.number_input(
+            "Recent graph bars",
+            min_value=100, max_value=5000, value=900, step=100,
+            key=f"iv_price_graph_recent_bars_{ticker}"
+        )
+
+    px = pd.Series(prices).replace([np.inf, -np.inf], np.nan).dropna().sort_index()
+    if graph_mode == "Recent only (fast)":
+        price_for_plot = px.tail(int(recent_bars))
+    else:
+        price_for_plot = px
+
+    plot_trades = trades_df.copy() if isinstance(trades_df, pd.DataFrame) else pd.DataFrame()
+    try:
+        if not plot_trades.empty and "Entry Date" in plot_trades.columns:
+            def _entry_sort_key(v):
+                try:
+                    s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                    if s.lower() in {"", "nan", "nat", "none", "open"}:
+                        return pd.NaT
+                    ts = pd.Timestamp(s)
+                    if getattr(ts, "tzinfo", None) is not None:
+                        ts = ts.tz_convert(None)
+                    return ts
+                except Exception:
+                    return pd.NaT
+            plot_trades["__entry_sort_key__"] = plot_trades["Entry Date"].apply(_entry_sort_key)
+            plot_trades = plot_trades.sort_values("__entry_sort_key__", ascending=False, na_position="last").drop(columns=["__entry_sort_key__"], errors="ignore")
+        plot_trades = clean_overlapping_duplicate_trades(plot_trades)
+        plot_trades = apply_trade_log_timestamp_display(plot_trades)
+        plot_trades = recalc_trade_log_cumulative_from_pnl(plot_trades)
+        plot_trades = clean_trade_log_for_display(plot_trades)
+    except Exception:
+        pass
+
+    def _parse_trade_dt(v):
+        try:
+            s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+            if s.lower() in {"", "nan", "nat", "none", "open"}:
+                return pd.NaT
+            ts = pd.Timestamp(s)
+            if getattr(ts, "tzinfo", None) is not None:
+                ts = ts.tz_convert(None)
+            return ts
+        except Exception:
+            return pd.NaT
+
+    latest_price_text = "N/A"
+    latest_date_text = "N/A"
+    try:
+        latest_price_text = f"${float(price_for_plot.iloc[-1]):,.2f}"
+        latest_date_text = pd.Timestamp(price_for_plot.index[-1]).strftime("%b %d, %Y")
+    except Exception:
+        pass
+
+    fig_price = go.Figure()
+    fig_price.add_trace(go.Scatter(
+        x=price_for_plot.index, y=price_for_plot.values, mode="lines",
+        line=dict(color="#5b7cfa", width=2), name=f"{ticker} Price",
+        hovertemplate="<b>%{x}</b><br>Price: $%{y:,.2f}<extra></extra>"
+    ))
+
+    buy_points_js = []
+    sell_points_js = []
+    plot_start = None
+    try:
+        if len(price_for_plot):
+            plot_start = pd.Timestamp(price_for_plot.index[0])
+            if getattr(plot_start, "tzinfo", None) is not None:
+                plot_start = plot_start.tz_convert(None)
+    except Exception:
+        plot_start = None
+
+    if not plot_trades.empty and "Entry Date" in plot_trades.columns:
+        for _, row in plot_trades.iterrows():
+            dt = _parse_trade_dt(row.get("Entry Date"))
+            price = pd.to_numeric(pd.Series([row.get("Buy Price", row.get("Entry Price", np.nan))]), errors="coerce").iloc[0]
+            if pd.isna(dt) or pd.isna(price):
+                continue
+            if plot_start is not None and dt < plot_start:
+                continue
+            fig_price.add_trace(go.Scatter(
+                x=[dt], y=[float(price)], mode="markers", name="Buy",
+                marker=dict(symbol="triangle-up", size=9, color="lime"),
+                hovertemplate="<b>BUY</b><br>%{x}<br>Trade log price: $%{y:,.2f}<extra></extra>",
+                showlegend=not any(t.name == "Buy" for t in fig_price.data)
+            ))
+            buy_points_js.append({
+                "t": dt.isoformat(), "p": float(price),
+                "date": dt.strftime("%b %d, %Y"), "time": dt.strftime("%I:%M:%S %p CT")
+            })
+
+    if not plot_trades.empty and "Exit Date" in plot_trades.columns:
+        for _, row in plot_trades.iterrows():
+            if str(row.get("Status", "")).strip().lower() == "open":
+                continue
+            dt = _parse_trade_dt(row.get("Exit Date"))
+            price = pd.to_numeric(pd.Series([row.get("Sell Price", row.get("Exit Price", np.nan))]), errors="coerce").iloc[0]
+            if pd.isna(dt) or pd.isna(price):
+                continue
+            if plot_start is not None and dt < plot_start:
+                continue
+            fig_price.add_trace(go.Scatter(
+                x=[dt], y=[float(price)], mode="markers", name="Sell / Exit",
+                marker=dict(symbol="triangle-down", size=9, color="red"),
+                hovertemplate="<b>SELL / EXIT</b><br>%{x}<br>Trade log price: $%{y:,.2f}<extra></extra>",
+                showlegend=not any(t.name == "Sell / Exit" for t in fig_price.data)
+            ))
+            sell_points_js.append({
+                "t": dt.isoformat(), "p": float(price),
+                "date": dt.strftime("%b %d, %Y"), "time": dt.strftime("%I:%M:%S %p CT")
+            })
+
+    fig_price.update_layout(
+        title=f"{ticker} Implied Volatility Proxy Price + Entry/Exit Markers",
+        template="plotly_dark", height=560, hovermode="closest", dragmode="pan",
+        margin=dict(l=70, r=30, t=60, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hoverlabel=dict(bgcolor="rgba(0,0,0,0.86)", font_size=12, font_color="white")
+    )
+    fig_price.update_xaxes(
+        rangeslider=dict(visible=True), showgrid=False, showspikes=True,
+        spikemode="across", spikesnap="cursor", spikecolor="white", spikethickness=1, spikedash="solid", showline=True
+    )
+    fig_price.update_yaxes(
+        showgrid=True, showspikes=True, spikemode="across", spikesnap="cursor",
+        spikecolor="white", spikethickness=1, spikedash="solid", showline=True
+    )
+
+    try:
+        chart_div_id = f"iv_price_chart_{ticker}".replace(" ", "_").replace(".", "_").replace("-", "_")
+        hover_panel_id = f"iv_hover_panel_{ticker}".replace(" ", "_").replace(".", "_").replace("-", "_")
+        price_points = []
+        for dt, p in price_for_plot.items():
+            ts = pd.Timestamp(dt)
+            if getattr(ts, "tzinfo", None) is not None:
+                ts = ts.tz_convert(None)
+            if pd.notna(p):
+                price_points.append({"t": ts.isoformat(), "p": float(p)})
+
+        chart_html = fig_price.to_html(
+            full_html=False, include_plotlyjs="cdn", div_id=chart_div_id,
+            config={
+                "scrollZoom": True, "displaylogo": False, "displayModeBar": True,
+                "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                "toImageButtonOptions": {"format": "png", "filename": f"{ticker}_iv_proxy_price_chart"}
+            }
+        )
+
+        html = f"""
+        <style>#{chart_div_id} .hoverlayer .hovertext {{ display:none !important; }}</style>
+        <div style="position:relative; width:100%;">
+            <div id="{hover_panel_id}" style="position:absolute;top:62px;left:82px;z-index:9999;background:rgba(0,0,0,0.74);color:white;border:1px solid rgba(255,255,255,0.32);border-radius:6px;padding:7px 9px;font-family:Arial,sans-serif;font-size:12px;line-height:1.28;min-width:165px;max-width:230px;pointer-events:none;">
+                <b>{ticker}</b><br>Move crosshair on chart<br>Latest date: <b>{latest_date_text}</b><br>Latest price: <b>{latest_price_text}</b>
+            </div>
+            {chart_html}
+        </div>
+        <script>
+        (function() {{
+            const plot = document.getElementById("{chart_div_id}");
+            const panel = document.getElementById("{hover_panel_id}");
+            const pricePoints = {json.dumps(price_points)};
+            const buyPoints = {json.dumps(buy_points_js)};
+            const sellPoints = {json.dumps(sell_points_js)};
+
+            function fmtDate(x) {{
+                const d = new Date(x);
+                return isNaN(d.getTime()) ? String(x) : d.toLocaleDateString("en-US", {{year:"numeric", month:"short", day:"numeric"}});
+            }}
+            function fmtPrice(y) {{
+                const n = Number(y);
+                return Number.isFinite(n) ? "$" + n.toLocaleString("en-US", {{minimumFractionDigits:2, maximumFractionDigits:2}}) : "N/A";
+            }}
+            function nearest(xVal, arr) {{
+                if (!arr || !arr.length) return null;
+                const target = new Date(xVal).getTime();
+                let best = null, bestD = Infinity;
+                for (const p of arr) {{
+                    const t = new Date(p.t).getTime();
+                    if (!Number.isFinite(t)) continue;
+                    const d = Math.abs(t - target);
+                    if (d < bestD) {{ best = p; bestD = d; }}
+                }}
+                return best;
+            }}
+            function nearestSignal(xVal, arr) {{
+                const p = nearest(xVal, arr);
+                if (!p) return null;
+                const d = Math.abs(new Date(p.t).getTime() - new Date(xVal).getTime());
+                return d <= 36 * 60 * 60 * 1000 ? p : null;
+            }}
+            function update(xVal) {{
+                const p = nearest(xVal, pricePoints);
+                if (!p || !panel) return;
+                let dateTxt = fmtDate(p.t), priceTxt = fmtPrice(p.p), timeTxt = "", signalTxt = "";
+                const b = nearestSignal(xVal, buyPoints);
+                const s = nearestSignal(xVal, sellPoints);
+                const sig = b || s;
+                if (sig) {{
+                    dateTxt = sig.date || fmtDate(sig.t);
+                    priceTxt = fmtPrice(sig.p);
+                    timeTxt = sig.time ? "<br>Time: <b>" + sig.time + "</b>" : "";
+                }}
+                if (b) signalTxt += "<br>🟢 Buy: <b>" + fmtPrice(b.p) + "</b>";
+                if (s) signalTxt += "<br>🔴 Sell/Exit: <b>" + fmtPrice(s.p) + "</b>";
+                panel.innerHTML = "<b>{ticker}</b><br>Date: <b>" + dateTxt + "</b>" + timeTxt + "<br>Price: <b>" + priceTxt + "</b>" + signalTxt;
+            }}
+            function attach() {{
+                if (!plot || typeof plot.on !== "function") {{ setTimeout(attach, 250); return; }}
+                plot.on("plotly_hover", e => {{ if (e && e.points && e.points.length) update(e.points[0].x); }});
+                plot.on("plotly_click", e => {{ if (e && e.points && e.points.length) update(e.points[0].x); }});
+            }}
+            attach();
+        }})();
+        </script>
+        """
+        components.html(html, height=640, scrolling=False)
+    except Exception:
+        st.plotly_chart(
+            fig_price, use_container_width=True,
+            config={"scrollZoom": True, "displaylogo": False, "displayModeBar": True, "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"]}
+        )
+
+    safe_report_add("IV Proxy Price Entry Exit Chart", fig_price)
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    show_equity = st.checkbox(
+        "Show strategy performance / equity curve", value=False,
+        key=f"show_iv_equity_curve_secondary_{ticker}"
+    )
+    if show_equity:
+        st.write("#### 📉 Strategy Performance / Equity Curve")
+        fig_bt = go.Figure()
+        fig_bt.add_trace(go.Scatter(x=bt_results['equity_curve'].index, y=bt_results['equity_curve'], mode='lines', line=dict(color='#00f2ff', width=2), name='IV Proxy Strategy'))
+        fig_bt.add_trace(go.Scatter(x=bt_results['benchmark_curve'].index, y=bt_results['benchmark_curve'], mode='lines', line=dict(color='gray', dash='dash'), opacity=0.7, name=benchmark_label))
+        fig_bt.update_layout(title=f"Strategy Performance: {ticker}", hovermode="x unified", template="plotly_dark", height=500)
+        fig_bt.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", rangeslider=dict(visible=True))
+        fig_bt.update_yaxes(showspikes=True, spikemode="across", spikesnap="cursor")
+        st.plotly_chart(fig_bt, use_container_width=True, config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"]})
+        safe_report_add("Backtest Performance", fig_bt)
+
+
 def strong_runner_trend_hold_signal(prices, fast=20, slow=50, long=100):
     """
     Benchmark-aware trend-hold candidate.
@@ -7911,94 +5935,11 @@ def _market_close_realtime_daily_patch(ticker: str, daily_df: pd.DataFrame) -> p
 
 
 @st.cache_data(ttl=60) # Cache live data for 1 minute
-
-# ==========================================
-# IBKR READ-ONLY BRIDGE HELPERS
-# ==========================================
-def ibkr_readonly_status(host="127.0.0.1", port=7497, client_id=101):
-    """
-    Safe IBKR read-only connection test.
-    No orders. No execution. Only connects, reads accounts/positions/account summary,
-    then disconnects.
-    """
-    if not IBKR_AVAILABLE:
-        return {
-            "ok": False,
-            "error": "ib_insync is not installed in this Python environment. Run: python3 -m pip install ib_insync",
-            "accounts": [],
-            "positions": pd.DataFrame(),
-            "summary": pd.DataFrame()
-        }
-
-    ib = IB()
-    try:
-        ib.connect(str(host), int(port), clientId=int(client_id), readonly=True, timeout=8)
-        accounts = ib.managedAccounts()
-
-        summary_rows = []
-        try:
-            summary = ib.accountSummary()
-            for row in summary:
-                try:
-                    summary_rows.append({
-                        "Account": row.account,
-                        "Tag": row.tag,
-                        "Value": row.value,
-                        "Currency": row.currency
-                    })
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        summary_df = pd.DataFrame(summary_rows)
-
-        pos_rows = []
-        try:
-            positions = ib.positions()
-            for p in positions:
-                try:
-                    con = p.contract
-                    pos_rows.append({
-                        "Account": p.account,
-                        "Symbol": getattr(con, "symbol", ""),
-                        "SecType": getattr(con, "secType", ""),
-                        "Exchange": getattr(con, "exchange", ""),
-                        "Currency": getattr(con, "currency", ""),
-                        "Position": float(p.position),
-                        "Avg Cost": float(p.avgCost)
-                    })
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        pos_df = pd.DataFrame(pos_rows)
-
-        ib.disconnect()
-        return {
-            "ok": True,
-            "error": "",
-            "accounts": accounts,
-            "positions": pos_df,
-            "summary": summary_df
-        }
-    except Exception as e:
-        try:
-            if ib.isConnected():
-                ib.disconnect()
-        except Exception:
-            pass
-        return {
-            "ok": False,
-            "error": str(e),
-            "accounts": [],
-            "positions": pd.DataFrame(),
-            "summary": pd.DataFrame()
-        }
-
-
-
 def load_data(ticker, start, end, interval='1d'):
     try:
+        if start is None or str(start).upper() in {"MAX", "MAX_AVAILABLE", "TRADINGVIEW"}:
+            start = _tv_max_start_for_interval(interval, end)
+
         # yfinance's `end` date is EXCLUSIVE for daily bars. If the user selects
         # Friday as the end date, `end=Friday` often returns Thursday as the last
         # row. Add one calendar day for daily/weekly/monthly historical requests.
@@ -8015,30 +5956,9 @@ def load_data(ticker, start, end, interval='1d'):
 
         df = _flatten_yfinance_columns(df, ticker)
             
-        # NORMALIZE TIMEZONE
-        # Critical for live intraday Kalman:
-        # yfinance intraday bars are normally timestamped in the exchange timezone
-        # (US equities = New York / Eastern). The app displays and trade logs in CT.
-        # Previously we stripped timezone without converting, so a 10:00 ET bar could
-        # appear as 10:00 CT, creating impossible price/time mismatches.
-        try:
-            idx = pd.DatetimeIndex(df.index)
-            is_intraday_interval = str(interval).lower() not in ["1d", "1wk", "1mo"]
-            if is_intraday_interval:
-                if idx.tz is not None:
-                    df.index = idx.tz_convert("America/Chicago").tz_localize(None)
-                else:
-                    # If yfinance returns naive intraday timestamps, treat them as
-                    # exchange/New York time first, then convert to CT.
-                    df.index = idx.tz_localize("America/New_York").tz_convert("America/Chicago").tz_localize(None)
-            else:
-                if idx.tz is not None:
-                    df.index = idx.tz_localize(None)
-                else:
-                    df.index = idx
-        except Exception:
-            if getattr(df.index, "tz", None) is not None:
-                df.index = df.index.tz_localize(None)
+        # NORMALIZE TIMEZONE: Ensure all data is timezone-naive to avoid join errors
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
 
         # Standard cleaning
         if 'Close' not in df.columns and 'Adj Close' in df.columns:
@@ -8843,6 +6763,3115 @@ def walk_forward_strategy_selection_institutional(prices, candidates, train_wind
         'mode': 'Institutional Ensemble'
     }
 
+
+# ==========================================
+# INSTITUTIONAL GAMMA EXPOSURE (GEX) ENGINE
+# ==========================================
+# OI-based dealer-proxy gamma analytics using the app's existing yfinance stack.
+# No paid options feed is required. The sign convention is transparent:
+# calls = positive gamma, puts = negative gamma. This is a conventional proxy,
+# not a direct observation of dealer inventory.
+
+
+def _gex_now_ct():
+    """Current timestamp in US Central Time."""
+    try:
+        return pd.Timestamp.now(tz='America/Chicago')
+    except Exception:
+        return pd.Timestamp.now()
+
+
+def _gex_expiry_t_years(expiry_value, now_ct=None):
+    """Time to standard US equity option close (3:00 PM CT) in years."""
+    try:
+        now_ct = _gex_now_ct() if now_ct is None else pd.Timestamp(now_ct)
+        if getattr(now_ct, 'tzinfo', None) is None:
+            now_ct = now_ct.tz_localize('America/Chicago')
+        else:
+            now_ct = now_ct.tz_convert('America/Chicago')
+        exp_date = pd.Timestamp(expiry_value).strftime('%Y-%m-%d')
+        expiry_ct = pd.Timestamp(f'{exp_date} 15:00:00', tz='America/Chicago')
+        seconds = float((expiry_ct - now_ct).total_seconds())
+        # Keep live 0DTE gamma finite during the session; expired contracts are removed upstream.
+        return max(seconds / (365.0 * 24.0 * 3600.0), 1.0 / (365.0 * 24.0 * 60.0))
+    except Exception:
+        return 1.0 / 365.0
+
+
+def _gex_bs_gamma(spot, strike, iv, t_years, r=0.04, q=0.0):
+    """Vectorized Black-Scholes gamma for calls/puts (same gamma for both)."""
+    s = np.asarray(spot, dtype=float)
+    k = np.asarray(strike, dtype=float)
+    sigma = np.asarray(iv, dtype=float)
+    t = np.asarray(t_years, dtype=float)
+    r = float(r)
+    q = float(q)
+
+    valid = (s > 0) & (k > 0) & (sigma > 1e-6) & (t > 1e-10)
+    s_safe = np.where(valid, s, np.nan)
+    k_safe = np.where(valid, k, np.nan)
+    sig_safe = np.where(valid, sigma, np.nan)
+    t_safe = np.where(valid, t, np.nan)
+    sqrt_t = np.sqrt(t_safe)
+    d1 = (np.log(s_safe / k_safe) + (r - q + 0.5 * sig_safe ** 2) * t_safe) / (sig_safe * sqrt_t)
+    pdf = np.exp(-0.5 * d1 ** 2) / np.sqrt(2.0 * np.pi)
+    gamma = np.exp(-q * t_safe) * pdf / (s_safe * sig_safe * sqrt_t)
+    return np.where(np.isfinite(gamma), gamma, 0.0)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _gex_fetch_option_snapshot(ticker, max_dte=90, max_expiries=10, strike_window_pct=25.0,
+                               min_open_interest=1, include_0dte=True):
+    """
+    Fetch an options-chain snapshot from Yahoo Finance.
+    Returns raw filtered contract rows; pricing Greek calculations happen separately.
+    """
+    tkr = str(ticker).strip().upper()
+    if not tkr:
+        return {'error': 'No ticker selected.', 'rows': pd.DataFrame()}
+
+    try:
+        tk = yf.Ticker(tkr)
+        spot = np.nan
+        try:
+            hist = tk.history(period='5d', interval='1d', auto_adjust=False)
+            if hist is not None and not hist.empty and 'Close' in hist.columns:
+                spot = float(pd.to_numeric(hist['Close'], errors='coerce').dropna().iloc[-1])
+        except Exception:
+            pass
+        if not np.isfinite(spot) or spot <= 0:
+            try:
+                spot = float(tk.fast_info['lastPrice'])
+            except Exception:
+                spot = np.nan
+        if not np.isfinite(spot) or spot <= 0:
+            return {'error': f'Could not determine a valid current price for {tkr}.', 'rows': pd.DataFrame()}
+
+        expirations = list(tk.options or [])
+        if not expirations:
+            return {'error': f'No listed options expirations were returned for {tkr}.', 'rows': pd.DataFrame(), 'spot': spot}
+
+        now_ct = _gex_now_ct()
+        expiry_candidates = []
+        for exp in expirations:
+            try:
+                exp_date = pd.Timestamp(exp).date()
+                dte = int((exp_date - now_ct.date()).days)
+                expiry_close_ct = pd.Timestamp(f'{exp} 15:00:00', tz='America/Chicago')
+                if now_ct >= expiry_close_ct:
+                    continue
+                t_years = _gex_expiry_t_years(exp, now_ct)
+                if t_years <= 0:
+                    continue
+                if dte < 0:
+                    continue
+                if dte == 0 and not bool(include_0dte):
+                    continue
+                if dte <= int(max_dte):
+                    expiry_candidates.append((str(exp), dte, t_years))
+            except Exception:
+                continue
+
+        expiry_candidates = expiry_candidates[:max(1, int(max_expiries))]
+        if not expiry_candidates:
+            return {
+                'error': f'No expirations matched the selected 0-{int(max_dte)} DTE window.',
+                'rows': pd.DataFrame(), 'spot': spot
+            }
+
+        low_strike = spot * (1.0 - float(strike_window_pct) / 100.0)
+        high_strike = spot * (1.0 + float(strike_window_pct) / 100.0)
+        frames = []
+        fetch_errors = []
+
+        for exp, dte, t_years in expiry_candidates:
+            try:
+                chain = tk.option_chain(exp)
+            except Exception as e:
+                fetch_errors.append(f'{exp}: {e}')
+                continue
+
+            for side_name, side_df, sign in [('Call', chain.calls, 1.0), ('Put', chain.puts, -1.0)]:
+                try:
+                    d = side_df.copy()
+                    if d is None or d.empty:
+                        continue
+                    for col in ['strike', 'impliedVolatility', 'openInterest', 'volume', 'lastPrice', 'bid', 'ask']:
+                        if col not in d.columns:
+                            d[col] = np.nan
+                    d['strike'] = pd.to_numeric(d['strike'], errors='coerce')
+                    d['impliedVolatility'] = pd.to_numeric(d['impliedVolatility'], errors='coerce')
+                    d['openInterest'] = pd.to_numeric(d['openInterest'], errors='coerce').fillna(0.0)
+                    d['volume'] = pd.to_numeric(d['volume'], errors='coerce').fillna(0.0)
+                    d['lastPrice'] = pd.to_numeric(d['lastPrice'], errors='coerce')
+                    d['bid'] = pd.to_numeric(d['bid'], errors='coerce')
+                    d['ask'] = pd.to_numeric(d['ask'], errors='coerce')
+
+                    d = d[
+                        d['strike'].between(low_strike, high_strike, inclusive='both') &
+                        d['impliedVolatility'].between(0.005, 5.0, inclusive='both') &
+                        (d['openInterest'] >= float(min_open_interest))
+                    ].copy()
+                    if d.empty:
+                        continue
+
+                    d['Ticker'] = tkr
+                    d['Type'] = side_name
+                    d['Sign'] = float(sign)
+                    d['Expiry'] = str(exp)
+                    d['DTE'] = int(dte)
+                    d['T Years'] = float(t_years)
+                    d['Spot'] = float(spot)
+                    d['Mid'] = np.where(
+                        (d['bid'].fillna(0) > 0) & (d['ask'].fillna(0) > 0),
+                        (d['bid'] + d['ask']) / 2.0,
+                        d['lastPrice']
+                    )
+                    keep = [
+                        'Ticker', 'Type', 'Sign', 'Expiry', 'DTE', 'T Years', 'Spot',
+                        'strike', 'impliedVolatility', 'openInterest', 'volume',
+                        'lastPrice', 'bid', 'ask', 'Mid'
+                    ]
+                    frames.append(d[keep])
+                except Exception as e:
+                    fetch_errors.append(f'{exp} {side_name}: {e}')
+
+        if not frames:
+            return {
+                'error': 'Options expirations were found, but no contracts passed the selected IV/OI/strike filters.',
+                'rows': pd.DataFrame(), 'spot': spot, 'fetch_errors': fetch_errors
+            }
+
+        rows = pd.concat(frames, ignore_index=True)
+        return {
+            'error': '',
+            'ticker': tkr,
+            'spot': float(spot),
+            'rows': rows,
+            'available_expiries': int(len(expirations)),
+            'used_expiries': [x[0] for x in expiry_candidates],
+            'snapshot_ct': now_ct.strftime('%Y-%m-%d %H:%M:%S CT'),
+            'fetch_errors': fetch_errors,
+            'settings': {
+                'max_dte': int(max_dte),
+                'max_expiries': int(max_expiries),
+                'strike_window_pct': float(strike_window_pct),
+                'min_open_interest': int(min_open_interest),
+                'include_0dte': bool(include_0dte),
+            }
+        }
+    except Exception as e:
+        return {'error': f'GEX options fetch failed: {e}', 'rows': pd.DataFrame()}
+
+
+def _gex_build_profile(rows, spot, r, q, scenario_range_pct=20.0, points=181):
+    """Reprice gamma across a spot grid while holding OI and IV constant."""
+    if rows is None or rows.empty:
+        return pd.DataFrame(), np.nan, []
+
+    pct = max(5.0, float(scenario_range_pct)) / 100.0
+    grid = np.linspace(float(spot) * (1.0 - pct), float(spot) * (1.0 + pct), int(points))
+    strikes = rows['strike'].to_numpy(dtype=float)
+    ivs = rows['impliedVolatility'].to_numpy(dtype=float)
+    t_years = rows['T Years'].to_numpy(dtype=float)
+    oi = rows['openInterest'].to_numpy(dtype=float)
+    signs = rows['Sign'].to_numpy(dtype=float)
+
+    net = np.zeros(len(grid), dtype=float)
+    gross = np.zeros(len(grid), dtype=float)
+    # Chunk contracts so large option chains do not create a huge temporary matrix.
+    chunk = 2000
+    for start in range(0, len(rows), chunk):
+        sl = slice(start, min(start + chunk, len(rows)))
+        s_mat = grid[:, None]
+        gamma = _gex_bs_gamma(
+            s_mat,
+            strikes[sl][None, :],
+            ivs[sl][None, :],
+            t_years[sl][None, :],
+            r=float(r), q=float(q)
+        )
+        dollar_1pct = gamma * oi[sl][None, :] * 100.0 * (s_mat ** 2) * 0.01 / 1_000_000.0
+        signed = dollar_1pct * signs[sl][None, :]
+        net += np.nansum(signed, axis=1)
+        gross += np.nansum(np.abs(signed), axis=1)
+
+    profile = pd.DataFrame({'Spot Scenario': grid, 'Net GEX $M / 1%': net, 'Gross GEX $M / 1%': gross})
+
+    flips = []
+    y = net
+    for i in range(len(grid) - 1):
+        y1, y2 = float(y[i]), float(y[i + 1])
+        x1, x2 = float(grid[i]), float(grid[i + 1])
+        if y1 == 0:
+            flips.append(x1)
+        elif y1 * y2 < 0:
+            # Linear interpolation between grid points.
+            root = x1 + (0.0 - y1) * (x2 - x1) / (y2 - y1)
+            flips.append(float(root))
+    flips = sorted(set(round(float(x), 6) for x in flips if np.isfinite(x)))
+    nearest_flip = min(flips, key=lambda x: abs(x - float(spot))) if flips else np.nan
+    return profile, nearest_flip, flips
+
+
+def _gex_build_analytics(snapshot, risk_free_rate=0.04, dividend_yield=0.0, scenario_range_pct=20.0):
+    """Calculate current GEX, walls, flip profile, concentration and regime diagnostics."""
+    if not isinstance(snapshot, dict) or snapshot.get('rows') is None or snapshot.get('rows').empty:
+        return {'error': 'No valid options rows are available for GEX analytics.'}
+
+    rows = snapshot['rows'].copy()
+    spot = float(snapshot['spot'])
+    r = float(risk_free_rate)
+    q = float(dividend_yield)
+
+    rows['Gamma'] = _gex_bs_gamma(
+        spot,
+        rows['strike'].to_numpy(dtype=float),
+        rows['impliedVolatility'].to_numpy(dtype=float),
+        rows['T Years'].to_numpy(dtype=float),
+        r=r, q=q
+    )
+    rows['GEX $M / 1%'] = (
+        rows['Gamma'] * rows['openInterest'] * 100.0 * (spot ** 2) * 0.01 / 1_000_000.0
+    )
+    rows['Signed GEX $M / 1%'] = rows['GEX $M / 1%'] * rows['Sign']
+    rows['Call GEX $M / 1%'] = np.where(rows['Type'].eq('Call'), rows['GEX $M / 1%'], 0.0)
+    rows['Put GEX $M / 1%'] = np.where(rows['Type'].eq('Put'), -rows['GEX $M / 1%'], 0.0)
+    rows['Gross GEX $M / 1%'] = rows['GEX $M / 1%'].abs()
+    rows['Distance %'] = (rows['strike'] / spot - 1.0) * 100.0
+
+    by_strike = rows.groupby('strike', as_index=False).agg({
+        'Call GEX $M / 1%': 'sum',
+        'Put GEX $M / 1%': 'sum',
+        'Signed GEX $M / 1%': 'sum',
+        'Gross GEX $M / 1%': 'sum',
+        'openInterest': 'sum',
+        'volume': 'sum'
+    }).rename(columns={
+        'strike': 'Strike',
+        'Signed GEX $M / 1%': 'Net GEX $M / 1%',
+        'openInterest': 'Open Interest',
+        'volume': 'Volume'
+    }).sort_values('Strike')
+    by_strike['Distance %'] = (by_strike['Strike'] / spot - 1.0) * 100.0
+
+    by_expiry = rows.groupby(['Expiry', 'DTE'], as_index=False).agg({
+        'Call GEX $M / 1%': 'sum',
+        'Put GEX $M / 1%': 'sum',
+        'Signed GEX $M / 1%': 'sum',
+        'Gross GEX $M / 1%': 'sum',
+        'openInterest': 'sum',
+        'volume': 'sum'
+    }).rename(columns={
+        'Signed GEX $M / 1%': 'Net GEX $M / 1%',
+        'openInterest': 'Open Interest',
+        'volume': 'Volume'
+    }).sort_values(['DTE', 'Expiry'])
+
+    net_gex = float(rows['Signed GEX $M / 1%'].sum())
+    call_gex = float(rows['Call GEX $M / 1%'].sum())
+    put_gex = float(rows['Put GEX $M / 1%'].sum())
+    gross_gex = float(rows['Gross GEX $M / 1%'].sum())
+    net_to_gross = net_gex / gross_gex if gross_gex > 0 else 0.0
+
+    call_wall = float(by_strike.loc[by_strike['Call GEX $M / 1%'].idxmax(), 'Strike']) if not by_strike.empty else np.nan
+    put_wall = float(by_strike.loc[by_strike['Put GEX $M / 1%'].idxmin(), 'Strike']) if not by_strike.empty else np.nan
+    gamma_magnet = float(by_strike.loc[by_strike['Gross GEX $M / 1%'].idxmax(), 'Strike']) if not by_strike.empty else np.nan
+
+    gross_weights = by_strike['Gross GEX $M / 1%'] / gross_gex if gross_gex > 0 else pd.Series(0.0, index=by_strike.index)
+    concentration_hhi = float((gross_weights ** 2).sum() * 100.0) if len(gross_weights) else 0.0
+    zero_dte_share = float(rows.loc[rows['DTE'].eq(0), 'Gross GEX $M / 1%'].sum() / gross_gex) if gross_gex > 0 else 0.0
+    near_7d_share = float(rows.loc[rows['DTE'].le(7), 'Gross GEX $M / 1%'].sum() / gross_gex) if gross_gex > 0 else 0.0
+
+    profile, nearest_flip, all_flips = _gex_build_profile(
+        rows, spot=spot, r=r, q=q, scenario_range_pct=float(scenario_range_pct), points=181
+    )
+    flip_distance_pct = abs(nearest_flip / spot - 1.0) * 100.0 if np.isfinite(nearest_flip) else np.nan
+    magnet_distance_pct = abs(gamma_magnet / spot - 1.0) * 100.0 if np.isfinite(gamma_magnet) else np.nan
+
+    # The regime is based on net/gross balance; a near flip overrides because small spot moves can change the hedge regime.
+    if np.isfinite(flip_distance_pct) and flip_distance_pct <= 0.75:
+        regime = 'GAMMA FLIP ZONE — UNSTABLE'
+        regime_key = 'flip'
+        explanation = 'Spot is very close to estimated zero gamma. Small price moves can change the hedge regime, so whipsaw and sudden acceleration risk are both elevated.'
+        kalman_overlay = 'REDUCE CONVICTION / WAIT FOR CONFIRMED BREAK'
+    elif net_to_gross >= 0.15:
+        regime = 'POSITIVE GAMMA — VOLATILITY SUPPRESSION'
+        regime_key = 'positive'
+        explanation = 'The conventional dealer-proxy is net positive gamma. Estimated hedge rebalancing tends to oppose price moves, favoring mean reversion, pinning and failed breakouts.'
+        kalman_overlay = 'STRICT ENTRY CONFIRMATION / EXPECT CHOP'
+    elif net_to_gross <= -0.15:
+        regime = 'NEGATIVE GAMMA — VOLATILITY AMPLIFICATION'
+        regime_key = 'negative'
+        explanation = 'The conventional dealer-proxy is net negative gamma. Estimated hedge rebalancing can reinforce price moves, increasing breakout, squeeze and trend-extension risk in either direction.'
+        kalman_overlay = 'LET CONFIRMED TREND RUN / DO NOT EXIT TOO EARLY'
+    else:
+        regime = 'MIXED GAMMA — TWO-WAY / LEVEL-DRIVEN'
+        regime_key = 'mixed'
+        explanation = 'Positive and negative gamma concentrations are relatively balanced. Price behavior is more dependent on nearby walls, expiry concentration and any approach to the gamma flip.'
+        kalman_overlay = 'NORMAL MODE / USE WALLS AS CONTEXT'
+
+    negative_component = max(0.0, -net_to_gross)
+    positive_component = max(0.0, net_to_gross)
+    flip_closeness = 0.0 if not np.isfinite(flip_distance_pct) else max(0.0, 1.0 - flip_distance_pct / 3.0)
+    magnet_closeness = 0.0 if not np.isfinite(magnet_distance_pct) else max(0.0, 1.0 - magnet_distance_pct / 3.0)
+    concentration_norm = min(1.0, concentration_hhi / 12.0)
+    acceleration_score = float(np.clip(100.0 * (0.55 * negative_component + 0.25 * near_7d_share + 0.20 * flip_closeness), 0, 100))
+    pin_score = float(np.clip(100.0 * (0.50 * positive_component + 0.25 * concentration_norm + 0.25 * magnet_closeness), 0, 100))
+
+    top_levels = by_strike.sort_values('Gross GEX $M / 1%', ascending=False).head(25).copy()
+    upside_candidates = top_levels[top_levels['Strike'] > spot].sort_values('Strike')
+    downside_candidates = top_levels[top_levels['Strike'] < spot].sort_values('Strike', ascending=False)
+    nearest_upside_level = float(upside_candidates.iloc[0]['Strike']) if not upside_candidates.empty else np.nan
+    nearest_downside_level = float(downside_candidates.iloc[0]['Strike']) if not downside_candidates.empty else np.nan
+
+    # Heatmap: retain the highest-concentration strikes to keep the chart readable.
+    heat_strikes = by_strike.nlargest(50, 'Gross GEX $M / 1%')['Strike'].sort_values().tolist()
+    heat_rows = rows[rows['strike'].isin(heat_strikes)].copy()
+    heatmap = heat_rows.pivot_table(index=['Expiry', 'DTE'], columns='strike', values='Signed GEX $M / 1%', aggfunc='sum', fill_value=0.0)
+    if not heatmap.empty:
+        heatmap = heatmap.sort_index(level='DTE')
+
+    return {
+        'error': '',
+        'ticker': snapshot.get('ticker', ''),
+        'spot': spot,
+        'snapshot_ct': snapshot.get('snapshot_ct', ''),
+        'available_expiries': snapshot.get('available_expiries', 0),
+        'used_expiries': snapshot.get('used_expiries', []),
+        'fetch_errors': snapshot.get('fetch_errors', []),
+        'settings': snapshot.get('settings', {}),
+        'risk_free_rate': r,
+        'dividend_yield': q,
+        'rows': rows,
+        'by_strike': by_strike,
+        'by_expiry': by_expiry,
+        'profile': profile,
+        'heatmap': heatmap,
+        'net_gex': net_gex,
+        'call_gex': call_gex,
+        'put_gex': put_gex,
+        'gross_gex': gross_gex,
+        'net_to_gross': net_to_gross,
+        'call_wall': call_wall,
+        'put_wall': put_wall,
+        'gamma_magnet': gamma_magnet,
+        'nearest_flip': nearest_flip,
+        'all_flips': all_flips,
+        'flip_distance_pct': flip_distance_pct,
+        'zero_dte_share': zero_dte_share,
+        'near_7d_share': near_7d_share,
+        'concentration_hhi': concentration_hhi,
+        'acceleration_score': acceleration_score,
+        'pin_score': pin_score,
+        'regime': regime,
+        'regime_key': regime_key,
+        'explanation': explanation,
+        'kalman_overlay': kalman_overlay,
+        'nearest_upside_level': nearest_upside_level,
+        'nearest_downside_level': nearest_downside_level,
+    }
+
+
+def _gex_money_m(value):
+    try:
+        return f'{float(value):+,.2f}M'
+    except Exception:
+        return 'N/A'
+
+
+def _gex_price(value):
+    try:
+        return f'${float(value):,.2f}' if np.isfinite(float(value)) else 'N/A'
+    except Exception:
+        return 'N/A'
+
+
+def render_institutional_gamma_exposure_tab(active_ticker, default_rf_rate=0.04):
+    """Render the complete lazy-loaded institutional GEX dashboard."""
+    ticker = str(active_ticker).strip().upper()
+    st.header('🧲 Institutional Gamma Exposure')
+    st.caption(
+        f'Active ticker: {ticker} | OI-based options positioning, gamma walls, zero-gamma flip, expiry concentration and a Kalman regime overlay. '
+        'The tab uses yfinance and loads only when you click the calculation button.'
+    )
+
+    st.info(
+        'Important: this is a conventional dealer-proxy GEX model, not a direct view of market-maker books. '
+        'Calls are signed positive and puts negative; public open interest does not reveal the actual holder or dealer side.'
+    )
+
+    with st.expander('Institutional GEX controls', expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            max_dte = st.selectbox('Maximum DTE', [30, 60, 90, 180, 365], index=2, key='inst_gex_max_dte')
+            include_0dte = st.checkbox('Include 0DTE', value=True, key='inst_gex_include_0dte')
+        with c2:
+            max_expiries = st.number_input('Max expirations to fetch', min_value=1, max_value=30, value=10, step=1, key='inst_gex_max_exp')
+            min_oi = st.number_input('Minimum OI per contract', min_value=0, max_value=10000, value=1, step=1, key='inst_gex_min_oi')
+        with c3:
+            strike_window = st.slider('Strike window around spot (%)', min_value=5, max_value=75, value=25, step=5, key='inst_gex_strike_window')
+            scenario_range = st.slider('Gamma-flip scenario range (%)', min_value=5, max_value=50, value=20, step=5, key='inst_gex_scenario_range')
+        with c4:
+            rf_pct = st.number_input('Risk-free rate (%)', min_value=0.0, max_value=20.0, value=float(default_rf_rate) * 100.0, step=0.10, key='inst_gex_rf')
+            dividend_pct = st.number_input('Dividend yield (%)', min_value=0.0, max_value=20.0, value=0.0, step=0.10, key='inst_gex_div_yield')
+
+        run_gex = st.button('Fetch Latest Options + Calculate Institutional GEX', type='primary', use_container_width=True, key='inst_gex_run')
+
+    if run_gex:
+        with st.spinner(f'Fetching {ticker} options chains and calculating gamma exposure...'):
+            snapshot = _gex_fetch_option_snapshot(
+                ticker=ticker,
+                max_dte=int(max_dte),
+                max_expiries=int(max_expiries),
+                strike_window_pct=float(strike_window),
+                min_open_interest=int(min_oi),
+                include_0dte=bool(include_0dte),
+            )
+            if snapshot.get('error'):
+                st.session_state['institutional_gex_pack'] = None
+                st.error(snapshot.get('error'))
+            else:
+                pack = _gex_build_analytics(
+                    snapshot,
+                    risk_free_rate=float(rf_pct) / 100.0,
+                    dividend_yield=float(dividend_pct) / 100.0,
+                    scenario_range_pct=float(scenario_range),
+                )
+                if pack.get('error'):
+                    st.session_state['institutional_gex_pack'] = None
+                    st.error(pack.get('error'))
+                else:
+                    st.session_state['institutional_gex_pack'] = pack
+
+    pack = st.session_state.get('institutional_gex_pack')
+    if not isinstance(pack, dict):
+        st.info('Click the button above to build the current GEX snapshot. Nothing is fetched in the background.')
+        return
+
+    if str(pack.get('ticker', '')).upper() != ticker:
+        st.warning(f"The displayed snapshot is for {pack.get('ticker', 'another ticker')}. The sidebar ticker is now {ticker}; click the GEX button to refresh.")
+        return
+
+    spot = float(pack['spot'])
+    net = float(pack['net_gex'])
+    gross = float(pack['gross_gex'])
+    ratio = float(pack['net_to_gross'])
+    regime_key = pack.get('regime_key', 'mixed')
+
+    st.caption(
+        f"Snapshot: {pack.get('snapshot_ct', 'N/A')} | Expirations loaded: {len(pack.get('used_expiries', []))} "
+        f"of {pack.get('available_expiries', 0)} available | Contracts analyzed: {len(pack.get('rows', [])):,}"
+    )
+
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+    m1.metric('Spot', _gex_price(spot))
+    m2.metric('Net GEX / 1% move', f'${_gex_money_m(net)}')
+    m3.metric('Gross GEX / 1% move', f'${abs(gross):,.2f}M')
+    m4.metric('Call GEX', f'${_gex_money_m(pack.get("call_gex", np.nan))}')
+    m5.metric('Put GEX', f'${_gex_money_m(pack.get("put_gex", np.nan))}')
+    m6.metric('Net / Gross', f'{ratio:+.1%}')
+    m7.metric('Gamma Flip', _gex_price(pack.get('nearest_flip', np.nan)))
+
+    if regime_key == 'positive':
+        st.success(f"### {pack['regime']}\n{pack['explanation']}")
+    elif regime_key == 'negative':
+        st.error(f"### {pack['regime']}\n{pack['explanation']}\n\nNegative gamma does **not** mean bearish; it means moves can be amplified in either direction.")
+    elif regime_key == 'flip':
+        st.warning(f"### {pack['regime']}\n{pack['explanation']}")
+    else:
+        st.info(f"### {pack['regime']}\n{pack['explanation']}")
+
+    st.write('#### Institutional Levels & Risk Map')
+    l1, l2, l3, l4, l5, l6, l7, l8 = st.columns(8)
+    l1.metric('Call Wall', _gex_price(pack.get('call_wall', np.nan)))
+    l2.metric('Put Wall', _gex_price(pack.get('put_wall', np.nan)))
+    l3.metric('Gamma Magnet', _gex_price(pack.get('gamma_magnet', np.nan)))
+    l4.metric('Nearest Upside Level', _gex_price(pack.get('nearest_upside_level', np.nan)))
+    l5.metric('Nearest Downside Level', _gex_price(pack.get('nearest_downside_level', np.nan)))
+    l6.metric('0DTE Gross Share', f"{pack.get('zero_dte_share', 0.0):.1%}")
+    l7.metric('≤7D Gross Share', f"{pack.get('near_7d_share', 0.0):.1%}")
+    l8.metric('Strike Concentration', f"{pack.get('concentration_hhi', 0.0):.1f} HHI")
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric('Acceleration Risk Score', f"{pack.get('acceleration_score', 0.0):.0f}/100")
+    s2.metric('Pin / Mean-Reversion Score', f"{pack.get('pin_score', 0.0):.0f}/100")
+    s3.metric('Kalman Regime Overlay', pack.get('kalman_overlay', 'N/A'))
+
+    by_strike = pack['by_strike'].copy()
+    fig_strike = go.Figure()
+    fig_strike.add_trace(go.Bar(x=by_strike['Strike'], y=by_strike['Call GEX $M / 1%'], name='Call GEX (+)'))
+    fig_strike.add_trace(go.Bar(x=by_strike['Strike'], y=by_strike['Put GEX $M / 1%'], name='Put GEX (-)'))
+    fig_strike.add_trace(go.Scatter(x=by_strike['Strike'], y=by_strike['Net GEX $M / 1%'], mode='lines+markers', name='Net GEX'))
+    fig_strike.add_hline(y=0, line_width=1)
+    fig_strike.add_vline(x=spot, line_dash='solid', annotation_text='Spot')
+    for level, label, dash in [
+        (pack.get('nearest_flip', np.nan), 'Gamma Flip', 'dash'),
+        (pack.get('call_wall', np.nan), 'Call Wall', 'dot'),
+        (pack.get('put_wall', np.nan), 'Put Wall', 'dot'),
+    ]:
+        try:
+            if np.isfinite(float(level)):
+                fig_strike.add_vline(x=float(level), line_dash=dash, annotation_text=label)
+        except Exception:
+            pass
+    fig_strike.update_layout(
+        title=f'{ticker} Gamma Exposure by Strike',
+        xaxis_title='Strike', yaxis_title='GEX ($M of delta change per 1% underlying move)',
+        barmode='relative', hovermode='x unified', template='plotly_dark', height=620
+    )
+    st.plotly_chart(fig_strike, use_container_width=True)
+
+    cprof1, cprof2 = st.columns(2)
+    with cprof1:
+        profile = pack['profile'].copy()
+        fig_profile = go.Figure()
+        pos = profile['Net GEX $M / 1%'].where(profile['Net GEX $M / 1%'] >= 0)
+        neg = profile['Net GEX $M / 1%'].where(profile['Net GEX $M / 1%'] < 0)
+        fig_profile.add_trace(go.Scatter(x=profile['Spot Scenario'], y=pos, mode='lines', name='Positive Gamma'))
+        fig_profile.add_trace(go.Scatter(x=profile['Spot Scenario'], y=neg, mode='lines', name='Negative Gamma'))
+        fig_profile.add_hline(y=0, line_dash='dash')
+        fig_profile.add_vline(x=spot, annotation_text='Current Spot')
+        try:
+            if np.isfinite(float(pack.get('nearest_flip', np.nan))):
+                fig_profile.add_vline(x=float(pack['nearest_flip']), line_dash='dash', annotation_text='Nearest Flip')
+        except Exception:
+            pass
+        fig_profile.update_layout(
+            title='Zero-Gamma / Flip Scenario Profile', xaxis_title='Hypothetical Underlying Price',
+            yaxis_title='Net GEX ($M / 1%)', template='plotly_dark', height=470, hovermode='x unified'
+        )
+        st.plotly_chart(fig_profile, use_container_width=True)
+
+    with cprof2:
+        by_expiry = pack['by_expiry'].copy()
+        expiry_labels = by_expiry.apply(lambda r: f"{r['Expiry']} ({int(r['DTE'])}D)", axis=1)
+        fig_exp = go.Figure()
+        fig_exp.add_trace(go.Bar(x=expiry_labels, y=by_expiry['Call GEX $M / 1%'], name='Call GEX'))
+        fig_exp.add_trace(go.Bar(x=expiry_labels, y=by_expiry['Put GEX $M / 1%'], name='Put GEX'))
+        fig_exp.add_trace(go.Scatter(x=expiry_labels, y=by_expiry['Net GEX $M / 1%'], mode='lines+markers', name='Net GEX'))
+        fig_exp.add_hline(y=0, line_width=1)
+        fig_exp.update_layout(
+            title='Gamma Exposure by Expiration', xaxis_title='Expiration (DTE)', yaxis_title='GEX ($M / 1%)',
+            barmode='relative', template='plotly_dark', height=470, hovermode='x unified'
+        )
+        st.plotly_chart(fig_exp, use_container_width=True)
+
+    heatmap = pack.get('heatmap')
+    if isinstance(heatmap, pd.DataFrame) and not heatmap.empty:
+        st.write('#### Expiry × Strike Gamma Concentration Map')
+        heat_y = [f'{idx[0]} ({int(idx[1])}D)' if isinstance(idx, tuple) else str(idx) for idx in heatmap.index]
+        fig_heat = go.Figure(data=go.Heatmap(
+            z=heatmap.values,
+            x=[float(x) for x in heatmap.columns],
+            y=heat_y,
+            colorscale='RdYlGn', zmid=0,
+            colorbar=dict(title='$M / 1%')
+        ))
+        fig_heat.add_vline(x=spot, line_dash='dash')
+        fig_heat.update_layout(
+            title='Signed GEX Concentration: Green = Positive Proxy, Red = Negative Proxy',
+            xaxis_title='Strike', yaxis_title='Expiration', template='plotly_dark', height=max(380, 42 * len(heatmap.index))
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    st.write('#### Highest-Impact Gamma Levels')
+    level_table = by_strike.sort_values('Gross GEX $M / 1%', ascending=False).head(25).copy()
+    level_table = level_table[[
+        'Strike', 'Distance %', 'Net GEX $M / 1%', 'Call GEX $M / 1%', 'Put GEX $M / 1%',
+        'Gross GEX $M / 1%', 'Open Interest', 'Volume'
+    ]]
+    st.dataframe(
+        level_table.style.format({
+            'Strike': '${:,.2f}', 'Distance %': '{:+.2f}%', 'Net GEX $M / 1%': '{:+,.3f}',
+            'Call GEX $M / 1%': '{:+,.3f}', 'Put GEX $M / 1%': '{:+,.3f}',
+            'Gross GEX $M / 1%': '{:,.3f}', 'Open Interest': '{:,.0f}', 'Volume': '{:,.0f}'
+        }),
+        use_container_width=True, height=620
+    )
+
+    st.write('#### Expiration Risk Table')
+    expiry_table = pack['by_expiry'].copy()
+    st.dataframe(
+        expiry_table.style.format({
+            'Call GEX $M / 1%': '{:+,.3f}', 'Put GEX $M / 1%': '{:+,.3f}',
+            'Net GEX $M / 1%': '{:+,.3f}', 'Gross GEX $M / 1%': '{:,.3f}',
+            'Open Interest': '{:,.0f}', 'Volume': '{:,.0f}'
+        }),
+        use_container_width=True, hide_index=True
+    )
+
+    with st.expander('Raw contract diagnostics & exports', expanded=False):
+        raw = pack['rows'].copy().sort_values('Gross GEX $M / 1%', ascending=False)
+        raw_show = raw[[
+            'Type', 'Expiry', 'DTE', 'strike', 'impliedVolatility', 'openInterest', 'volume',
+            'Gamma', 'Signed GEX $M / 1%', 'Distance %', 'bid', 'ask', 'Mid'
+        ]].rename(columns={
+            'strike': 'Strike', 'impliedVolatility': 'IV', 'openInterest': 'Open Interest',
+            'volume': 'Volume'
+        })
+        st.dataframe(raw_show.head(1000), use_container_width=True, height=500, hide_index=True)
+        d1, d2, d3 = st.columns(3)
+        d1.download_button(
+            'Download GEX by Strike CSV', by_strike.to_csv(index=False).encode('utf-8'),
+            file_name=f'{ticker}_gex_by_strike.csv', mime='text/csv', key='inst_gex_dl_strike'
+        )
+        d2.download_button(
+            'Download GEX by Expiry CSV', pack['by_expiry'].to_csv(index=False).encode('utf-8'),
+            file_name=f'{ticker}_gex_by_expiry.csv', mime='text/csv', key='inst_gex_dl_expiry'
+        )
+        d3.download_button(
+            'Download Raw GEX Contracts CSV', raw_show.to_csv(index=False).encode('utf-8'),
+            file_name=f'{ticker}_gex_contracts.csv', mime='text/csv', key='inst_gex_dl_raw'
+        )
+
+    fetch_errors = pack.get('fetch_errors', [])
+    if fetch_errors:
+        with st.expander(f'Partial chain fetch warnings ({len(fetch_errors)})', expanded=False):
+            for msg in fetch_errors[:50]:
+                st.caption(str(msg))
+
+    with st.expander('How this institutional GEX model is calculated', expanded=False):
+        st.markdown(r"""
+**Current-contract gamma** uses Black-Scholes gamma with each contract's Yahoo implied volatility and time to the 3:00 PM CT expiration close.
+
+**Dollar GEX per 1% move** is calculated as:
+
+`Gamma × Open Interest × 100-share multiplier × Spot² × 1%`
+
+**Signed net GEX convention:** calls are positive and puts are negative. This is a widely used *proxy convention* for public-data dashboards, but it is not proof of the actual dealer position.
+
+**Gamma flip:** every contract is repriced across the selected hypothetical spot range while open interest and implied volatility are held constant. The nearest zero crossing of aggregate signed GEX is reported as the flip.
+
+**What the tab does not know:** Yahoo open interest does not identify customer vs dealer ownership, trade initiation side, OTC positions, intraday position changes, or every multi-leg hedge. Therefore this is a positioning/regime model—not a guaranteed support/resistance map and not a standalone buy/sell signal.
+        """)
+
+
+
+
+# ==========================================
+# INSTITUTIONAL LIQUIDITY / FLOW PROXY TAB
+# ==========================================
+@st.cache_data(ttl=20, show_spinner=False)
+def _inst_liq_fetch_intraday(ticker: str, period: str, interval: str, prepost: bool = False) -> pd.DataFrame:
+    """Fetch intraday OHLCV from Yahoo and flatten any MultiIndex columns."""
+    try:
+        df = yf.download(
+            tickers=ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            prepost=prepost,
+            threads=False,
+        )
+        if df is None or len(df) == 0:
+            tk = yf.Ticker(ticker)
+            df = tk.history(period=period, interval=interval, auto_adjust=False, prepost=prepost)
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        need = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+        df = df[need].copy()
+        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['Open', 'High', 'Low', 'Close'])
+        if 'Volume' not in df.columns:
+            df['Volume'] = 0.0
+        df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0.0)
+        try:
+            if getattr(df.index, 'tz', None) is not None:
+                df.index = df.index.tz_convert('America/Chicago')
+        except Exception:
+            pass
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _inst_liq_find_swings(series: pd.Series, left_right: int = 3):
+    """Simple local swing detector for annotated liquidity events."""
+    vals = pd.Series(series).astype(float).values
+    n = len(vals)
+    highs = np.zeros(n, dtype=bool)
+    lows = np.zeros(n, dtype=bool)
+    w = max(1, int(left_right))
+    for i in range(w, n - w):
+        window = vals[i-w:i+w+1]
+        center = vals[i]
+        if np.isfinite(center) and center == np.nanmax(window) and np.sum(window == center) == 1:
+            highs[i] = True
+        if np.isfinite(center) and center == np.nanmin(window) and np.sum(window == center) == 1:
+            lows[i] = True
+    return highs, lows
+
+
+def _build_institutional_liquidity_proxy(df: pd.DataFrame, price_bins: int = 48, decay: float = 0.965, near_atr_mult: float = 1.0, swing_window: int = 3):
+    """
+    Institutional-style liquidity map built from intraday OHLCV only.
+    This is NOT true order-book/L2 data. It is a proxy using transacted volume,
+    candle location value, VWAP, persistent price-volume memory, and signed-volume approximations.
+    """
+    if df is None or df.empty or len(df) < 20:
+        return {'error': 'Not enough intraday data to build liquidity map.'}
+
+    work = df.copy()
+    work = work.replace([np.inf, -np.inf], np.nan).dropna(subset=['Open', 'High', 'Low', 'Close'])
+    if work.empty:
+        return {'error': 'No valid OHLCV rows available.'}
+
+    # Basic microstructure-style proxies
+    rng = (work['High'] - work['Low']).replace(0, np.nan)
+    clv = (((work['Close'] - work['Low']) - (work['High'] - work['Close'])) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1.0, 1.0)
+    work['CLV'] = clv
+    work['BuyVol'] = work['Volume'] * ((clv + 1.0) / 2.0)
+    work['SellVol'] = work['Volume'] - work['BuyVol']
+    work['SignedDelta'] = work['BuyVol'] - work['SellVol']
+    work['DeltaEMA'] = work['SignedDelta'].ewm(span=8, adjust=False).mean()
+    work['BuyFlowLine'] = work['BuyVol'].ewm(span=8, adjust=False).mean()
+    work['SellFlowLine'] = work['SellVol'].ewm(span=8, adjust=False).mean()
+    work['FlowImbalance'] = (work['SignedDelta'] / (work['Volume'].replace(0, np.nan))).fillna(0.0)
+    work['VWAP'] = (work['Close'] * work['Volume']).cumsum() / work['Volume'].replace(0, np.nan).cumsum()
+    work['VWAP'] = work['VWAP'].fillna(work['Close'].expanding().mean())
+    work['ATRProxy'] = (work['High'] - work['Low']).rolling(14, min_periods=1).mean().bfill().fillna((work['Close'].iloc[-1] or 1) * 0.005)
+
+    # Price bins for a persistent price-volume liquidity memory map
+    pmin = float(work['Low'].min())
+    pmax = float(work['High'].max())
+    span = max(pmax - pmin, float(work['Close'].iloc[-1]) * 0.02)
+    pad = span * 0.06
+    edges = np.linspace(pmin - pad, pmax + pad, max(20, int(price_bins)) + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    nbins = len(centers)
+    n = len(work)
+
+    heat = np.zeros((nbins, n), dtype=float)
+    state = np.zeros(nbins, dtype=float)
+    buy_side_near = np.zeros(n, dtype=float)
+    sell_side_near = np.zeros(n, dtype=float)
+    total_near = np.zeros(n, dtype=float)
+    nearest_above = np.full(n, np.nan)
+    nearest_below = np.full(n, np.nan)
+    liq_signal = []
+
+    lows = work['Low'].values.astype(float)
+    highs = work['High'].values.astype(float)
+    opens = work['Open'].values.astype(float)
+    closes = work['Close'].values.astype(float)
+    vols = work['Volume'].values.astype(float)
+    atrs = work['ATRProxy'].values.astype(float)
+
+    for i in range(n):
+        state *= float(decay)
+        low = lows[i]
+        high = highs[i]
+        close = closes[i]
+        open_ = opens[i]
+        vol = max(vols[i], 1.0)
+        atr_here = max(atrs[i], max(close * 0.0025, 1e-9))
+
+        # Persistent liquidity deposition across the traded candle range.
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            idx = int(np.argmin(np.abs(centers - close)))
+            state[idx] += vol
+        else:
+            mask = (centers >= low) & (centers <= high)
+            if not np.any(mask):
+                idx = int(np.argmin(np.abs(centers - close)))
+                state[idx] += vol
+            else:
+                region = centers[mask]
+                width = max(high - low, 1e-9)
+                dist_close = np.abs(region - close) / width
+                dist_mid = np.abs(region - ((high + low) / 2.0)) / width
+                shape_close = np.exp(-(dist_close ** 2) / 0.08)
+                shape_mid = np.exp(-(dist_mid ** 2) / 0.25)
+                body_bias = 1.15 if close >= open_ else 0.95
+                weights = 0.65 * shape_close + 0.35 * shape_mid
+                # Add wick emphasis as stop/absorption areas
+                upper_wick = max(high - max(open_, close), 0.0)
+                lower_wick = max(min(open_, close) - low, 0.0)
+                if upper_wick / width > 0.22:
+                    wick_zone = np.exp(-((region - high) / width) ** 2 / 0.01)
+                    weights += 0.25 * wick_zone
+                if lower_wick / width > 0.22:
+                    wick_zone = np.exp(-((region - low) / width) ** 2 / 0.01)
+                    weights += 0.25 * wick_zone
+                weights = np.maximum(weights, 1e-9)
+                weights = weights / weights.sum()
+                state[mask] += vol * body_bias * weights
+
+        # Latest persistent state becomes the heatmap column.
+        heat[:, i] = state
+
+        # Near-price liquidity reservoirs around current spot.
+        near = atr_here * float(near_atr_mult)
+        above_mask = (centers > close) & (centers <= close + near)
+        below_mask = (centers < close) & (centers >= close - near)
+        sell_side_near[i] = float(state[above_mask].sum()) if np.any(above_mask) else 0.0
+        buy_side_near[i] = float(state[below_mask].sum()) if np.any(below_mask) else 0.0
+        total_near[i] = buy_side_near[i] + sell_side_near[i]
+
+        above_all = centers[centers > close]
+        below_all = centers[centers < close]
+        above_strength = state[centers > close]
+        below_strength = state[centers < close]
+        if len(above_all):
+            strong_idx = int(np.argmax(above_strength))
+            nearest_above[i] = float(above_all[strong_idx])
+        if len(below_all):
+            strong_idx = int(np.argmax(below_strength))
+            nearest_below[i] = float(below_all[strong_idx])
+
+        # Institutional-style message layer
+        if i < 5:
+            liq_signal.append('Warming Up')
+        else:
+            sell_chg = (sell_side_near[i] - sell_side_near[i-5]) / (abs(sell_side_near[i-5]) + 1e-9)
+            buy_chg = (buy_side_near[i] - buy_side_near[i-5]) / (abs(buy_side_near[i-5]) + 1e-9)
+            delta_now = work['DeltaEMA'].iloc[i]
+            px_ret = (closes[i] / closes[max(0, i-5)] - 1.0) if closes[max(0, i-5)] != 0 else 0.0
+            if sell_chg > 0.20 and delta_now < 0 and px_ret <= 0.004:
+                liq_signal.append('Sell-Side Liquidity Increase')
+            elif buy_chg < -0.20 and delta_now < 0:
+                liq_signal.append('Buy-Side Liquidity Collapse')
+            elif buy_chg > 0.20 and delta_now > 0:
+                liq_signal.append('Buy-Side Replenishment')
+            elif sell_chg < -0.20 and delta_now > 0:
+                liq_signal.append('Offer Absorption / Sell Liquidity Removed')
+            else:
+                liq_signal.append('Balanced / Two-Way')
+
+    work['BuySideLiquidity'] = buy_side_near
+    work['SellSideLiquidity'] = sell_side_near
+    work['NearLiquidityTotal'] = total_near
+    work['NearestLiquidityAbove'] = nearest_above
+    work['NearestLiquidityBelow'] = nearest_below
+    work['LiquiditySignal'] = liq_signal
+
+    # Normalized tracker lines
+    def _robust_z(x: pd.Series, win: int = 40):
+        mu = x.rolling(win, min_periods=max(5, win // 4)).mean()
+        sd = x.rolling(win, min_periods=max(5, win // 4)).std().replace(0, np.nan)
+        return ((x - mu) / sd).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    work['BuyLiqZ'] = _robust_z(work['BuySideLiquidity'])
+    work['SellLiqZ'] = _robust_z(work['SellSideLiquidity'])
+    work['DeltaZ'] = _robust_z(work['SignedDelta'])
+    work['VolumeZ'] = _robust_z(work['Volume'])
+    work['DivergenceScore'] = (work['DeltaZ'] - _robust_z(work['Close'].pct_change().fillna(0).ewm(span=5, adjust=False).mean())).fillna(0.0)
+
+    # Swing points for bubble overlay
+    swing_highs, swing_lows = _inst_liq_find_swings(work['Close'], left_right=max(2, int(swing_window)))
+    event_strength = (work['VolumeZ'].abs() + work['DeltaZ'].abs()).clip(lower=0.0)
+    work['SwingHigh'] = swing_highs
+    work['SwingLow'] = swing_lows
+    work['EventStrength'] = event_strength
+    work['BubbleSize'] = (8 + 10 * event_strength.clip(0, 3.0)).round(1)
+
+    latest = work.iloc[-1]
+    latest_state = heat[:, -1]
+    ranked_idx = np.argsort(latest_state)[::-1][:15]
+    liq_levels = pd.DataFrame({
+        'Liquidity Level': centers[ranked_idx],
+        'Liquidity Score': latest_state[ranked_idx],
+        'Distance %': (centers[ranked_idx] / latest['Close'] - 1.0) * 100.0
+    }).sort_values('Liquidity Score', ascending=False)
+
+    nearest_up = latest['NearestLiquidityAbove']
+    nearest_down = latest['NearestLiquidityBelow']
+    if np.isfinite(nearest_up) and np.isfinite(nearest_down):
+        up_dist = abs(nearest_up / latest['Close'] - 1.0)
+        down_dist = abs(nearest_down / latest['Close'] - 1.0)
+        seek_direction = 'UPWARD LIQUIDITY SEEK' if up_dist < down_dist else 'DOWNWARD LIQUIDITY SEEK'
+    else:
+        seek_direction = 'BALANCED / NO CLEAR MAGNET'
+
+    imbalance = float((latest['BuySideLiquidity'] - latest['SellSideLiquidity']) / (latest['NearLiquidityTotal'] + 1e-9))
+    buy_collapse = bool((work['BuySideLiquidity'].iloc[-1] < work['BuySideLiquidity'].rolling(8, min_periods=3).mean().iloc[-1] * 0.82) and (latest['DeltaEMA'] < 0))
+    sell_increase = bool((work['SellSideLiquidity'].iloc[-1] > work['SellSideLiquidity'].rolling(8, min_periods=3).mean().iloc[-1] * 1.18))
+    divergence = float(latest['DivergenceScore'])
+
+    if sell_increase and buy_collapse:
+        regime = 'SUPPLY BUILDING / RISK-OFF'
+        verdict = 'Expect heavy offers / downside pressure unless absorbed.'
+    elif imbalance > 0.15 and latest['DeltaEMA'] > 0:
+        regime = 'DEMAND DOMINANT / SUPPORTIVE'
+        verdict = 'Buy-side liquidity is stronger than nearby offers. Dips may find support.'
+    elif imbalance < -0.15 and latest['DeltaEMA'] < 0:
+        regime = 'OFFER DOMINANT / DISTRIBUTION'
+        verdict = 'Sell-side liquidity is heavier than nearby bids. Rallies may struggle.'
+    else:
+        regime = 'BALANCED / ROTATIONAL'
+        verdict = 'Two-way liquidity. Use the nearest stacked levels as context rather than trend conviction.'
+
+    # Convert to a more chart-friendly heatmap scale
+    heat_vis = np.log1p(heat)
+
+    return {
+        'error': '',
+        'df': work,
+        'heat': heat_vis,
+        'raw_heat': heat,
+        'price_centers': centers,
+        'liq_levels': liq_levels,
+        'latest_signal': str(latest['LiquiditySignal']),
+        'seek_direction': seek_direction,
+        'regime': regime,
+        'verdict': verdict,
+        'imbalance': imbalance,
+        'buy_side_latest': float(latest['BuySideLiquidity']),
+        'sell_side_latest': float(latest['SellSideLiquidity']),
+        'buy_collapse': buy_collapse,
+        'sell_increase': sell_increase,
+        'divergence': divergence,
+        'spot': float(latest['Close']),
+        'vwap': float(latest['VWAP']),
+        'nearest_up': float(nearest_up) if np.isfinite(nearest_up) else np.nan,
+        'nearest_down': float(nearest_down) if np.isfinite(nearest_down) else np.nan,
+    }
+
+
+
+def _inst_liq_build_trade_log(work: pd.DataFrame, entry_confirm_bars: int = 1, hard_stop_pct: float = 1.5, cooldown_bars: int = 1):
+    """
+    Causal, long-only trade engine for the Institutional Liquidity Flow tab.
+
+    IMPORTANT:
+    - Uses only current/past bar data.
+    - Does NOT use SwingHigh/SwingLow bubbles because those require future bars to confirm.
+    - Executes at the signal bar close, matching the information available at that bar close.
+    """
+    if work is None or work.empty or len(work) < 10:
+        return {
+            'trades': pd.DataFrame(),
+            'entry_mask': pd.Series(False, index=getattr(work, 'index', []), dtype=bool),
+            'exit_mask': pd.Series(False, index=getattr(work, 'index', []), dtype=bool),
+            'position': pd.Series(0, index=getattr(work, 'index', []), dtype=int),
+            'metrics': {}
+        }
+
+    df = work.copy()
+    idx = df.index
+
+    # Institutional-style long setup. A valid entry requires positive flow alignment,
+    # price acceptance above VWAP, and either replenishing bids or disappearing offers.
+    positive_event = df['LiquiditySignal'].isin([
+        'Buy-Side Replenishment',
+        'Offer Absorption / Sell Liquidity Removed'
+    ])
+    structural_support = (
+        (df['BuyLiqZ'] > df['SellLiqZ']) &
+        (df['BuyLiqZ'] > -0.25) &
+        (df['FlowImbalance'] > 0.0)
+    )
+    momentum_confirm = (
+        (df['DeltaEMA'] > 0.0) &
+        (df['Close'] >= df['VWAP'])
+    )
+
+    raw_entry = (momentum_confirm & structural_support & (positive_event | (df['DivergenceScore'] > 0.35))).fillna(False)
+    confirm_n = max(1, int(entry_confirm_bars))
+    if confirm_n > 1:
+        entry_ready = raw_entry.astype(int).rolling(confirm_n, min_periods=confirm_n).sum().eq(confirm_n)
+    else:
+        entry_ready = raw_entry
+
+    # Exit regime: collapsing bid support, expanding overhead supply, or broad flow reversal.
+    negative_event = df['LiquiditySignal'].isin([
+        'Sell-Side Liquidity Increase',
+        'Buy-Side Liquidity Collapse'
+    ])
+    broad_reversal = (
+        (df['DeltaEMA'] < 0.0) &
+        (df['BuyLiqZ'] < df['SellLiqZ'])
+    )
+    vwap_failure = (
+        (df['Close'] < df['VWAP']) &
+        (df['FlowImbalance'] < -0.05)
+    )
+    raw_exit = (negative_event | broad_reversal | vwap_failure).fillna(False)
+
+    entry_mask = pd.Series(False, index=idx, dtype=bool)
+    exit_mask = pd.Series(False, index=idx, dtype=bool)
+    position_series = pd.Series(0, index=idx, dtype=int)
+    entry_reason_series = pd.Series('', index=idx, dtype=object)
+    exit_reason_series = pd.Series('', index=idx, dtype=object)
+
+    in_position = False
+    entry_i = None
+    entry_price = np.nan
+    entry_time = None
+    entry_reason = ''
+    last_exit_i = -10_000
+    trades = []
+
+    def _fmt_ct(ts):
+        try:
+            t = pd.Timestamp(ts)
+            if t.tzinfo is None:
+                t = t.tz_localize('America/Chicago')
+            else:
+                t = t.tz_convert('America/Chicago')
+            return t.strftime('%Y-%m-%d %H:%M:%S CT')
+        except Exception:
+            return str(ts)
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        close = float(row['Close'])
+
+        if not in_position:
+            can_reenter = (i - last_exit_i) > max(0, int(cooldown_bars))
+            if can_reenter and bool(entry_ready.iloc[i]):
+                in_position = True
+                entry_i = i
+                entry_price = close
+                entry_time = idx[i]
+
+                reason_parts = []
+                if str(row['LiquiditySignal']) == 'Buy-Side Replenishment':
+                    reason_parts.append('Buy-Side Replenishment')
+                elif str(row['LiquiditySignal']) == 'Offer Absorption / Sell Liquidity Removed':
+                    reason_parts.append('Offer Absorption')
+                if float(row['BuyLiqZ']) > float(row['SellLiqZ']):
+                    reason_parts.append('Buy Liquidity > Sell Liquidity')
+                if float(row['DeltaEMA']) > 0:
+                    reason_parts.append('Positive Delta Flow')
+                if close >= float(row['VWAP']):
+                    reason_parts.append('Above VWAP')
+                if float(row['DivergenceScore']) > 0.35:
+                    reason_parts.append('Positive Flow Divergence')
+                entry_reason = ' + '.join(reason_parts) if reason_parts else 'Institutional Liquidity Long Setup'
+                entry_mask.iloc[i] = True
+                entry_reason_series.iloc[i] = entry_reason
+        else:
+            position_series.iloc[i] = 1
+            stop_hit = bool(float(hard_stop_pct) > 0 and close <= entry_price * (1.0 - float(hard_stop_pct) / 100.0))
+            signal_exit = bool(raw_exit.iloc[i])
+
+            if stop_hit or signal_exit:
+                if stop_hit:
+                    exit_reason = f'Hard Stop {float(hard_stop_pct):.2f}%'
+                else:
+                    reasons = []
+                    sig = str(row['LiquiditySignal'])
+                    if sig == 'Sell-Side Liquidity Increase':
+                        reasons.append('Sell-Side Liquidity Increase')
+                    if sig == 'Buy-Side Liquidity Collapse':
+                        reasons.append('Buy-Side Liquidity Collapse')
+                    if bool(broad_reversal.iloc[i]):
+                        reasons.append('Flow Reversal')
+                    if bool(vwap_failure.iloc[i]):
+                        reasons.append('VWAP Failure')
+                    exit_reason = ' + '.join(reasons) if reasons else 'Liquidity Exit'
+
+                pnl_pct = (close / entry_price - 1.0) * 100.0
+                trades.append({
+                    'Side': 'Long',
+                    'Entry CT': _fmt_ct(entry_time),
+                    'Exit CT': _fmt_ct(idx[i]),
+                    'Buy Price': entry_price,
+                    'Sell Price': close,
+                    'PnL (%)': pnl_pct,
+                    'Bars Held': int(i - entry_i + 1),
+                    'Entry Reason': entry_reason,
+                    'Exit Reason': exit_reason,
+                    'Status': 'Closed',
+                })
+                exit_mask.iloc[i] = True
+                exit_reason_series.iloc[i] = exit_reason
+                in_position = False
+                last_exit_i = i
+                entry_i = None
+                entry_price = np.nan
+                entry_time = None
+                entry_reason = ''
+            else:
+                position_series.iloc[i] = 1
+
+    # Current open position is included in the log with live/unrealized PnL.
+    if in_position and entry_i is not None:
+        last_close = float(df['Close'].iloc[-1])
+        open_pnl = (last_close / entry_price - 1.0) * 100.0
+        trades.append({
+            'Side': 'Long',
+            'Entry CT': _fmt_ct(entry_time),
+            'Exit CT': 'Open',
+            'Buy Price': entry_price,
+            'Sell Price': last_close,
+            'PnL (%)': open_pnl,
+            'Bars Held': int(len(df) - entry_i),
+            'Entry Reason': entry_reason,
+            'Exit Reason': 'Open Position',
+            'Status': 'Open',
+        })
+        position_series.iloc[entry_i:] = 1
+
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        # Compounded cumulative return is calculated oldest -> newest, then table is displayed newest first.
+        cumulative = []
+        mult = 1.0
+        for pnl in pd.to_numeric(trades_df['PnL (%)'], errors='coerce').fillna(0.0):
+            mult *= (1.0 + float(pnl) / 100.0)
+            cumulative.append((mult - 1.0) * 100.0)
+        trades_df['Cumulative Return (%)'] = cumulative
+        trades_df = trades_df[[
+            'Side', 'Entry CT', 'Exit CT', 'Buy Price', 'Sell Price', 'PnL (%)',
+            'Cumulative Return (%)', 'Bars Held', 'Entry Reason', 'Exit Reason', 'Status'
+        ]]
+        trades_df = trades_df.iloc[::-1].reset_index(drop=True)
+
+    closed = trades_df[trades_df['Status'].eq('Closed')].copy() if not trades_df.empty else pd.DataFrame()
+    all_rows = trades_df.copy()
+    total_return = 0.0
+    if not all_rows.empty:
+        # Newest-first table: row 0 is the latest cumulative result.
+        total_return = float(all_rows['Cumulative Return (%)'].iloc[0])
+    metrics = {
+        'closed_trades': int(len(closed)),
+        'win_rate': float((closed['PnL (%)'] > 0).mean() * 100.0) if len(closed) else 0.0,
+        'total_return': total_return,
+        'avg_trade': float(closed['PnL (%)'].mean()) if len(closed) else 0.0,
+        'open_position': bool(in_position),
+    }
+
+    return {
+        'trades': trades_df,
+        'entry_mask': entry_mask,
+        'exit_mask': exit_mask,
+        'position': position_series,
+        'entry_reason_series': entry_reason_series,
+        'exit_reason_series': exit_reason_series,
+        'metrics': metrics,
+        'raw_entry': raw_entry,
+        'raw_exit': raw_exit,
+    }
+
+def render_institutional_liquidity_flow_tab(active_ticker):
+    ticker = str(active_ticker).strip().upper()
+    st.header('🌊 Institutional Liquidity Flow')
+    st.caption(
+        f'Active ticker: {ticker} | Institutional-style liquidity map, flow tracker, stacked price-volume memory and real-time seek-direction proxy.'
+    )
+    st.info(
+        'Important: this is an institutional-style OHLCV proxy — not a true Level II / DOM / order-book feed. '
+        'It uses intraday price, volume, VWAP, candle-location value and persistent price-volume memory to approximate liquidity behavior.'
+    )
+
+    with st.expander('Liquidity flow controls', expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            interval = st.selectbox('Interval', ['1m', '2m', '5m', '15m', '30m'], index=2, key='inst_liq_interval')
+            latest_session_only = st.checkbox('Keep only latest session', value=True, key='inst_liq_latest_session')
+        with c2:
+            period_options = {
+                '1m': ['1d', '2d', '5d', '7d'],
+                '2m': ['1d', '5d', '10d', '30d'],
+                '5m': ['1d', '5d', '10d', '30d', '60d'],
+                '15m': ['5d', '10d', '30d', '60d'],
+                '30m': ['10d', '30d', '60d']
+            }
+            period = st.selectbox('Lookback period', period_options.get(interval, ['5d', '30d']), index=min(1, len(period_options.get(interval, ['5d'])) - 1), key='inst_liq_period')
+            include_prepost = st.checkbox('Include pre/post market', value=False, key='inst_liq_prepost')
+        with c3:
+            price_bins = st.slider('Price bins', min_value=24, max_value=80, value=48, step=4, key='inst_liq_bins')
+            decay = st.slider('Liquidity memory decay', min_value=0.90, max_value=0.995, value=0.965, step=0.005, key='inst_liq_decay')
+        with c4:
+            near_atr = st.slider('Near-price liquidity window (ATR x)', min_value=0.5, max_value=2.0, value=1.0, step=0.1, key='inst_liq_near_atr')
+            swing_window = st.slider('Swing sensitivity', min_value=2, max_value=8, value=3, step=1, key='inst_liq_swing')
+
+        st.markdown('##### Trade Log Engine')
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            trade_confirm_bars = st.number_input('Entry confirmation bars', min_value=1, max_value=5, value=1, step=1, key='inst_liq_trade_confirm')
+        with t2:
+            trade_stop_pct = st.number_input('Hard stop loss (%)', min_value=0.0, max_value=10.0, value=1.5, step=0.1, key='inst_liq_trade_stop')
+        with t3:
+            trade_cooldown = st.number_input('Cooldown bars after exit', min_value=0, max_value=20, value=1, step=1, key='inst_liq_trade_cooldown')
+
+        run = st.button('Build Institutional Liquidity Map', type='primary', use_container_width=True, key='inst_liq_run')
+
+    if run:
+        with st.spinner(f'Building {ticker} liquidity / flow proxy...'):
+            raw = _inst_liq_fetch_intraday(ticker, period=period, interval=interval, prepost=include_prepost)
+            if latest_session_only and raw is not None and not raw.empty:
+                try:
+                    session_dates = pd.Series(raw.index.date, index=raw.index)
+                    raw = raw.loc[session_dates == session_dates.iloc[-1]].copy()
+                except Exception:
+                    pass
+            pack = _build_institutional_liquidity_proxy(
+                raw,
+                price_bins=int(price_bins),
+                decay=float(decay),
+                near_atr_mult=float(near_atr),
+                swing_window=int(swing_window)
+            )
+            if not pack.get('error'):
+                pack['trade_pack'] = _inst_liq_build_trade_log(
+                    pack['df'],
+                    entry_confirm_bars=int(trade_confirm_bars),
+                    hard_stop_pct=float(trade_stop_pct),
+                    cooldown_bars=int(trade_cooldown),
+                )
+                pack['trade_settings'] = {
+                    'entry_confirm_bars': int(trade_confirm_bars),
+                    'hard_stop_pct': float(trade_stop_pct),
+                    'cooldown_bars': int(trade_cooldown),
+                }
+            st.session_state['institutional_liquidity_pack'] = pack
+
+    pack = st.session_state.get('institutional_liquidity_pack')
+    if not pack:
+        st.warning('Click **Build Institutional Liquidity Map** to load the tab.')
+        return
+    if pack.get('error'):
+        st.error(pack['error'])
+        return
+
+    dfp = pack['df']
+    spot = pack['spot']
+    cta, ctb, ctc, ctd = st.columns(4)
+    with cta:
+        st.metric('Liquidity Seek Direction', pack['seek_direction'])
+        st.metric('Latest Flow State', pack['latest_signal'])
+    with ctb:
+        st.metric('Spot', f"{spot:,.2f}")
+        st.metric('VWAP', f"{pack['vwap']:,.2f}", delta=f"{(spot / pack['vwap'] - 1.0) * 100:+.2f}%")
+    with ctc:
+        st.metric('Nearest Sell-Side Stack', 'N/A' if not np.isfinite(pack['nearest_up']) else f"{pack['nearest_up']:,.2f}")
+        st.metric('Nearest Buy-Side Stack', 'N/A' if not np.isfinite(pack['nearest_down']) else f"{pack['nearest_down']:,.2f}")
+    with ctd:
+        st.metric('Liquidity Imbalance', f"{pack['imbalance']:+.2f}")
+        st.metric('Flow Divergence', f"{pack['divergence']:+.2f}")
+
+    regime_color = '#8ef77b' if 'DEMAND' in pack['regime'] else ('#ff5dbd' if ('OFFER' in pack['regime'] or 'SUPPLY' in pack['regime']) else '#b9c0c9')
+    st.markdown(
+        f"""
+        <div style="padding:0.8rem 1rem; border-radius:14px; border:1px solid #2c3154; background:linear-gradient(90deg, rgba(18,22,45,0.95), rgba(11,13,26,0.95)); margin-bottom:0.9rem;">
+            <div style="font-size:1.05rem; font-weight:700; color:{regime_color};">{pack['regime']}</div>
+            <div style="font-size:0.95rem; color:#d7dbff; margin-top:0.25rem;">{pack['verdict']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    if pack['sell_increase']:
+        st.warning('⚠️ Sell-Side Liquidity Increase detected: nearby offers are building faster than usual.')
+    if pack['buy_collapse']:
+        st.error('⚠️ Buy-Side Liquidity Collapse detected: nearby bid-side support has weakened materially.')
+
+    trade_pack = pack.get('trade_pack') or _inst_liq_build_trade_log(dfp, int(trade_confirm_bars), float(trade_stop_pct), int(trade_cooldown))
+    trade_metrics = trade_pack.get('metrics', {})
+    tm1, tm2, tm3, tm4, tm5 = st.columns(5)
+    tm1.metric('Current Position', 'LONG' if trade_metrics.get('open_position') else 'CASH')
+    tm2.metric('Closed Trades', int(trade_metrics.get('closed_trades', 0)))
+    tm3.metric('Win Rate', f"{float(trade_metrics.get('win_rate', 0.0)):.1f}%")
+    tm4.metric('Cumulative Return', f"{float(trade_metrics.get('total_return', 0.0)):+.2f}%")
+    tm5.metric('Avg Closed Trade', f"{float(trade_metrics.get('avg_trade', 0.0)):+.2f}%")
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+        row_heights=[0.72, 0.28],
+        specs=[[{'secondary_y': False}], [{'secondary_y': False}]]
+    )
+
+    heat = pack['heat']
+    price_centers = pack['price_centers']
+    xvals = dfp.index
+
+    fig.add_trace(
+        go.Heatmap(
+            z=heat,
+            x=xvals,
+            y=price_centers,
+            colorscale=[
+                [0.00, 'rgba(5,8,20,0.0)'],
+                [0.15, 'rgba(20,60,35,0.20)'],
+                [0.45, 'rgba(40,120,55,0.45)'],
+                [0.75, 'rgba(105,220,70,0.75)'],
+                [1.00, 'rgba(170,255,110,0.95)']
+            ],
+            showscale=True,
+            colorbar=dict(title='Liquidity'),
+            hovertemplate='Time: %{x}<br>Price: %{y:.2f}<br>Liquidity: %{z:.2f}<extra></extra>'
+        ),
+        row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(x=xvals, y=dfp['Close'], mode='lines', line=dict(color='#67ff54', width=2.0), name='Price'),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=xvals, y=dfp['VWAP'], mode='lines', line=dict(color='#8d4dff', width=1.6), name='VWAP'),
+        row=1, col=1
+    )
+
+    swing_high_df = dfp[dfp['SwingHigh']].copy()
+    swing_low_df = dfp[dfp['SwingLow']].copy()
+    if not swing_high_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=swing_high_df.index, y=swing_high_df['Close'], mode='markers', name='Distribution Event',
+                marker=dict(size=swing_high_df['BubbleSize'], color='rgba(237,76,242,0.78)', line=dict(color='rgba(255,170,255,0.95)', width=1)),
+                hovertemplate='Distribution / sell-side event<br>%{x}<br>Price: %{y:.2f}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+    if not swing_low_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=swing_low_df.index, y=swing_low_df['Close'], mode='markers', name='Accumulation Event',
+                marker=dict(size=swing_low_df['BubbleSize'], color='rgba(100,240,255,0.74)', line=dict(color='rgba(200,255,255,0.95)', width=1)),
+                hovertemplate='Accumulation / buy-side event<br>%{x}<br>Price: %{y:.2f}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+
+    # Causal trade markers. These are the exact bars used in the trade log.
+    entry_pts = dfp.loc[trade_pack['entry_mask']].copy()
+    exit_pts = dfp.loc[trade_pack['exit_mask']].copy()
+    if not entry_pts.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=entry_pts.index, y=entry_pts['Close'], mode='markers+text', name='Trade Entry',
+                marker=dict(symbol='triangle-up', size=16, color='#00ff88', line=dict(color='white', width=1)),
+                text=['BUY'] * len(entry_pts), textposition='bottom center',
+                hovertemplate='BUY<br>%{x}<br>Price: %{y:.2f}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+    if not exit_pts.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=exit_pts.index, y=exit_pts['Close'], mode='markers+text', name='Trade Exit',
+                marker=dict(symbol='triangle-down', size=16, color='#ff4d6d', line=dict(color='white', width=1)),
+                text=['SELL'] * len(exit_pts), textposition='top center',
+                hovertemplate='SELL<br>%{x}<br>Price: %{y:.2f}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+
+    # Lower tracker: grey histogram + green/purple liquidity lines
+    fig.add_trace(
+        go.Bar(x=xvals, y=dfp['DeltaZ'], name='Flow Histogram', marker_color='rgba(185,185,185,0.65)'),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=xvals, y=dfp['BuyLiqZ'], mode='lines', line=dict(color='#67ff54', width=2), name='Buy-Side Liquidity'),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=xvals, y=dfp['SellLiqZ'], mode='lines', line=dict(color='#8d4dff', width=2), name='Sell-Side Liquidity'),
+        row=2, col=1
+    )
+    fig.add_hline(y=0, line_width=1, line_color='rgba(220,220,220,0.45)', row=2, col=1)
+
+    # Show current stacked levels and magnets
+    if np.isfinite(pack['nearest_up']):
+        fig.add_hline(y=pack['nearest_up'], line_dash='dot', line_color='rgba(205,90,255,0.75)', row=1, col=1)
+    if np.isfinite(pack['nearest_down']):
+        fig.add_hline(y=pack['nearest_down'], line_dash='dot', line_color='rgba(110,255,140,0.75)', row=1, col=1)
+
+    fig.update_layout(
+        template='plotly_dark',
+        height=860,
+        hovermode='x unified',
+        title=f'{ticker} — Institutional Liquidity Flow Map',
+        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0)
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(title_text='Price', row=1, col=1)
+    fig.update_yaxes(title_text='Tracker Z-Score', row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write('#### Institutional Liquidity Trade Log')
+    st.caption(
+        'Long-only and causal. Entry/exit decisions use only information available at each bar close. '
+        'The swing bubbles are visual context only and are not used by the trade engine.'
+    )
+    trades_df = trade_pack.get('trades', pd.DataFrame()).copy()
+    if trades_df.empty:
+        st.info('No completed or open trades were generated for the selected ticker, interval, lookback and trade settings.')
+    else:
+        st.dataframe(
+            trades_df.style.format({
+                'Buy Price': '{:,.2f}',
+                'Sell Price': '{:,.2f}',
+                'PnL (%)': '{:+.2f}%',
+                'Cumulative Return (%)': '{:+.2f}%',
+            }),
+            use_container_width=True,
+            hide_index=True,
+            height=min(650, 72 + 36 * len(trades_df))
+        )
+        st.download_button(
+            'Download Liquidity Trade Log CSV',
+            trades_df.to_csv(index=False).encode('utf-8'),
+            file_name=f'{ticker}_institutional_liquidity_trade_log.csv',
+            mime='text/csv',
+            key='inst_liq_dl_trade_log'
+        )
+
+    c1, c2 = st.columns([1.15, 0.85])
+    with c1:
+        st.write('#### Top Stacked Liquidity Levels')
+        levels = pack['liq_levels'].copy().head(15)
+        st.dataframe(
+            levels.style.format({'Liquidity Level': '{:,.2f}', 'Liquidity Score': '{:,.2f}', 'Distance %': '{:+.2f}%'}),
+            use_container_width=True, hide_index=True, height=460
+        )
+    with c2:
+        st.write('#### Real-Time Flow Diagnostics')
+        diag = pd.DataFrame([
+            ('Latest Signal', pack['latest_signal']),
+            ('Seek Direction', pack['seek_direction']),
+            ('Buy-Side Liquidity', f"{pack['buy_side_latest']:,.2f}"),
+            ('Sell-Side Liquidity', f"{pack['sell_side_latest']:,.2f}"),
+            ('Nearest Sell-Side Stack', 'N/A' if not np.isfinite(pack['nearest_up']) else f"{pack['nearest_up']:,.2f}"),
+            ('Nearest Buy-Side Stack', 'N/A' if not np.isfinite(pack['nearest_down']) else f"{pack['nearest_down']:,.2f}"),
+            ('Imbalance', f"{pack['imbalance']:+.3f}"),
+            ('Flow Divergence', f"{pack['divergence']:+.3f}"),
+            ('Supply Expansion Flag', 'Yes' if pack['sell_increase'] else 'No'),
+            ('Bid Collapse Flag', 'Yes' if pack['buy_collapse'] else 'No'),
+        ], columns=['Metric', 'Value'])
+        st.dataframe(diag, use_container_width=True, hide_index=True, height=460)
+
+    with st.expander('Raw proxy data & exports', expanded=False):
+        raw_show = dfp[[
+            'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP', 'BuyVol', 'SellVol', 'SignedDelta', 'DeltaEMA',
+            'BuySideLiquidity', 'SellSideLiquidity', 'BuyLiqZ', 'SellLiqZ', 'FlowImbalance', 'DivergenceScore',
+            'NearestLiquidityAbove', 'NearestLiquidityBelow', 'LiquiditySignal'
+        ]].copy()
+        st.dataframe(raw_show, use_container_width=True, height=420)
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            'Download Liquidity Tracker CSV', raw_show.to_csv().encode('utf-8'),
+            file_name=f'{ticker}_institutional_liquidity_tracker.csv', mime='text/csv', key='inst_liq_dl_tracker'
+        )
+        d2.download_button(
+            'Download Liquidity Levels CSV', pack['liq_levels'].to_csv(index=False).encode('utf-8'),
+            file_name=f'{ticker}_stacked_liquidity_levels.csv', mime='text/csv', key='inst_liq_dl_levels'
+        )
+
+    with st.expander('How this tab works', expanded=False):
+        st.markdown("""
+**What you are seeing**
+- The upper panel is a persistent **price-volume liquidity memory map** built from intraday candles.
+- The green line is **price** and the purple line is **VWAP**.
+- Cyan bubbles highlight **accumulation-style swing lows** and magenta bubbles highlight **distribution-style swing highs**.
+- The lower panel combines a **flow histogram** with normalized **buy-side** and **sell-side liquidity tracker** lines.
+
+**What the terms mean here**
+- **Sell-Side Liquidity Increase** = nearby offers above price have built faster than normal while flow is softening.
+- **Buy-Side Liquidity Collapse** = nearby bids/support below price have thinned while sell pressure is rising.
+- **Liquidity Seek Direction** = the nearest major stacked liquidity area that price is statistically more likely to test.
+
+**Trade log logic**
+- **Entry:** positive delta flow + price above VWAP + buy-side liquidity stronger than sell-side liquidity + replenishment/offer-absorption or strong positive flow divergence.
+- **Exit:** sell-side liquidity increase, buy-side liquidity collapse, broad flow reversal, VWAP failure, or the selected hard stop.
+- **Execution:** signal-bar close. The log is **long-only** and uses no future bars.
+- **Swing bubbles are not used for trades** because they need future bars to confirm a local swing.
+
+**Limitations**
+This is not real DOM/heatmap data. Yahoo does not provide book depth. So this module is an **institutional-style proxy**, not a true Level II feed.
+        """)
+
+
+
+
+# ==========================================
+# INSTITUTIONAL MULTI-FUTURES SCALPER TAB
+# ==========================================
+def _fut_contract_presets():
+    """Exchange-style defaults. Every field remains editable in the UI."""
+    return {
+        '/SI — Silver Futures': {
+            'root': '/SI', 'name': 'Silver Futures', 'yahoo': 'SI=F',
+            'multiplier': 5000.0, 'tick_size': 0.005, 'tick_value': 25.0,
+        },
+        '/GC — Gold Futures': {
+            'root': '/GC', 'name': 'Gold Futures', 'yahoo': 'GC=F',
+            'multiplier': 100.0, 'tick_size': 0.10, 'tick_value': 10.0,
+        },
+        '/HG — Copper Futures': {
+            'root': '/HG', 'name': 'Copper Futures', 'yahoo': 'HG=F',
+            'multiplier': 25000.0, 'tick_size': 0.0005, 'tick_value': 12.50,
+        },
+        '/ES — E-mini S&P 500': {
+            'root': '/ES', 'name': 'E-mini S&P 500', 'yahoo': 'ES=F',
+            'multiplier': 50.0, 'tick_size': 0.25, 'tick_value': 12.50,
+        },
+        '/NQ — E-mini Nasdaq-100': {
+            'root': '/NQ', 'name': 'E-mini Nasdaq-100', 'yahoo': 'NQ=F',
+            'multiplier': 20.0, 'tick_size': 0.25, 'tick_value': 5.00,
+        },
+        '/BTC — Bitcoin Futures': {
+            'root': '/BTC', 'name': 'Bitcoin Futures', 'yahoo': 'BTC=F',
+            'multiplier': 5.0, 'tick_size': 5.0, 'tick_value': 25.0,
+        },
+        '/ETH — Ether Futures': {
+            'root': '/ETH', 'name': 'Ether Futures', 'yahoo': 'ETH=F',
+            'multiplier': 50.0, 'tick_size': 0.50, 'tick_value': 25.0,
+        },
+        'Custom Futures Contract': {
+            'root': 'CUSTOM', 'name': 'Custom Futures Contract', 'yahoo': '',
+            'multiplier': 1.0, 'tick_size': 0.01, 'tick_value': 0.01,
+        },
+    }
+
+
+def _fut_detect_preset_index(active_ticker: str, preset_keys: list) -> int:
+    t = str(active_ticker).strip().upper()
+    aliases = {
+        'SI=F': '/SI', '/SI': '/SI', 'SI': '/SI',
+        'GC=F': '/GC', '/GC': '/GC', 'GC': '/GC',
+        'HG=F': '/HG', '/HG': '/HG', 'HG': '/HG',
+        'ES=F': '/ES', '/ES': '/ES', 'ES': '/ES',
+        'NQ=F': '/NQ', '/NQ': '/NQ', 'NQ': '/NQ',
+        'BTC=F': '/BTC', '/BTC': '/BTC', 'BTC': '/BTC',
+        'ETH=F': '/ETH', '/ETH': '/ETH', 'ETH': '/ETH',
+    }
+    root = aliases.get(t, '/SI')
+    for i, key in enumerate(preset_keys):
+        if key.startswith(root + ' '):
+            return i
+    return 0
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _fut_fetch_intraday_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """Fetch continuous-futures intraday bars from Yahoo and normalize them to CT."""
+    try:
+        attempts = []
+        period_chain = [period]
+        fallback = {
+            '1d': ['2d', '5d'], '2d': ['5d', '7d'], '5d': ['7d', '10d'],
+            '7d': ['10d'], '10d': ['30d'], '30d': ['60d'], '60d': []
+        }
+        for p in fallback.get(period, []):
+            if p not in period_chain:
+                period_chain.append(p)
+
+        for p in period_chain:
+            try:
+                df = yf.download(
+                    tickers=ticker, period=p, interval=interval, auto_adjust=False,
+                    progress=False, prepost=True, threads=False
+                )
+                if df is None or df.empty:
+                    df = yf.Ticker(ticker).history(period=p, interval=interval, auto_adjust=False, prepost=True)
+                if df is not None and not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+                    keep = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+                    df = df[keep].copy()
+                    if all(c in df.columns for c in ['Open', 'High', 'Low', 'Close']):
+                        if 'Volume' not in df.columns:
+                            df['Volume'] = 0.0
+                        df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0.0)
+                        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['Open', 'High', 'Low', 'Close'])
+                        try:
+                            if getattr(df.index, 'tz', None) is None:
+                                df.index = pd.DatetimeIndex(df.index).tz_localize('UTC').tz_convert('America/Chicago')
+                            else:
+                                df.index = pd.DatetimeIndex(df.index).tz_convert('America/Chicago')
+                        except Exception:
+                            pass
+                        return df[~df.index.duplicated(keep='last')].sort_index()
+                attempts.append(p)
+            except Exception:
+                attempts.append(p)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fut_rma(series: pd.Series, length: int) -> pd.Series:
+    return pd.Series(series).ewm(alpha=1.0 / max(1, int(length)), adjust=False, min_periods=max(2, int(length))).mean()
+
+
+def _fut_session_key(index) -> pd.Series:
+    """CME-style trading-day bucket with a 5:00 PM CT reset."""
+    idx = pd.DatetimeIndex(index)
+    try:
+        if idx.tz is None:
+            idx = idx.tz_localize('America/Chicago')
+        else:
+            idx = idx.tz_convert('America/Chicago')
+    except Exception:
+        pass
+    # 17:00 CT + 7 hours = next calendar day midnight.
+    return pd.Series((idx + pd.Timedelta(hours=7)).date, index=index)
+
+
+
+def _fut_calculate_avwap(df: pd.DataFrame, anchor_date) -> pd.Series:
+    """Causal anchored VWAP mapped to the full index."""
+    out = pd.Series(np.nan, index=df.index, dtype=float)
+    if df is None or df.empty or anchor_date is None:
+        return out
+    try:
+        anchor = pd.Timestamp(anchor_date)
+        idx = pd.DatetimeIndex(df.index)
+        if getattr(idx, 'tz', None) is not None:
+            if anchor.tzinfo is None:
+                anchor = anchor.tz_localize(idx.tz)
+            else:
+                anchor = anchor.tz_convert(idx.tz)
+        elif anchor.tzinfo is not None:
+            anchor = anchor.tz_localize(None)
+
+        mask = idx >= anchor
+        if not np.any(mask):
+            return out
+        post = df.loc[mask].copy()
+        vol = pd.to_numeric(post['Volume'], errors='coerce').fillna(0.0).clip(lower=0.0)
+        # Typical price is more robust for intraday futures than close-only AVWAP.
+        typical = (post['High'] + post['Low'] + post['Close']) / 3.0
+        cum_vol = vol.cumsum().replace(0.0, np.nan)
+        avwap = (typical * vol).cumsum() / cum_vol
+        out.loc[post.index] = avwap.values
+        return out
+    except Exception:
+        return out
+
+
+def _fut_calculate_rolling_poc(df: pd.DataFrame, lookback_periods: int = 78, bins: int = 50) -> pd.Series:
+    """
+    Causal rolling volume-profile POC.
+    Each bar uses only the PRIOR lookback bars, never the current/future bar.
+    """
+    n = len(df)
+    poc = np.full(n, np.nan, dtype=float)
+    lookback = max(10, int(lookback_periods))
+    bins = max(10, int(bins))
+    closes = pd.to_numeric(df['Close'], errors='coerce').to_numpy(dtype=float)
+    lows = pd.to_numeric(df['Low'], errors='coerce').to_numpy(dtype=float)
+    highs = pd.to_numeric(df['High'], errors='coerce').to_numpy(dtype=float)
+    volumes = pd.to_numeric(df['Volume'], errors='coerce').fillna(0.0).to_numpy(dtype=float)
+
+    for i in range(lookback, n):
+        lo = float(np.nanmin(lows[i-lookback:i]))
+        hi = float(np.nanmax(highs[i-lookback:i]))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            continue
+        if hi <= lo:
+            poc[i] = lo
+            continue
+        edges = np.linspace(lo, hi, bins + 1)
+        hist, edges = np.histogram(
+            closes[i-lookback:i], bins=edges, weights=volumes[i-lookback:i]
+        )
+        if len(hist) == 0 or not np.any(np.isfinite(hist)):
+            continue
+        k = int(np.nanargmax(hist))
+        # Use the center of the highest-volume node, not the lower bin edge.
+        poc[i] = (edges[k] + edges[k + 1]) / 2.0
+    return pd.Series(poc, index=df.index, dtype=float)
+
+
+def _fut_prepare_features(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """Causal futures feature stack with multi-speed trend, VWAP, ADX, efficiency and flow."""
+    work = df.copy()
+    fast_len = max(2, int(params.get('fast_len', 8)))
+    trend_len = max(fast_len + 1, int(params.get('trend_len', 21)))
+    slow_len = max(trend_len + 5, int(params.get('slow_len', trend_len * 3)))
+    atr_len = max(5, int(params.get('atr_len', 14)))
+    er_len = max(5, int(params.get('er_len', 10)))
+    breakout_len = max(3, int(params.get('breakout_len', 10)))
+
+    prev_close = work['Close'].shift(1)
+    tr = pd.concat([
+        (work['High'] - work['Low']).abs(),
+        (work['High'] - prev_close).abs(),
+        (work['Low'] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    work['ATR'] = _fut_rma(tr, atr_len).bfill()
+
+    work['EMA_Fast'] = work['Close'].ewm(span=fast_len, adjust=False).mean()
+    work['EMA_Trend'] = work['Close'].ewm(span=trend_len, adjust=False).mean()
+    work['EMA_Slow'] = work['Close'].ewm(span=slow_len, adjust=False).mean()
+    regime_len = max(slow_len + 20, int(params.get('regime_len', max(126, slow_len * 2))))
+    work['EMA_Regime'] = work['Close'].ewm(span=regime_len, adjust=False).mean()
+
+    session_key = _fut_session_key(work.index)
+    typical = (work['High'] + work['Low'] + work['Close']) / 3.0
+    pv = typical * work['Volume']
+    cum_pv = pv.groupby(session_key).cumsum()
+    cum_vol = work['Volume'].groupby(session_key).cumsum().replace(0, np.nan)
+    work['VWAP'] = (cum_pv / cum_vol).fillna(work['Close'].expanding().mean())
+    work['SessionKey'] = session_key.astype(str)
+
+    atr_safe = work['ATR'].replace(0, np.nan)
+    work['VWAP_Slope_ATR'] = ((work['VWAP'] - work['VWAP'].shift(3)) / atr_safe).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    work['Trend_Slope_ATR'] = ((work['EMA_Trend'] - work['EMA_Trend'].shift(5)) / atr_safe).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    work['Slow_Slope_ATR'] = ((work['EMA_Slow'] - work['EMA_Slow'].shift(8)) / atr_safe).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # V7 long-term regime slope normalized by ATR. This column is required by
+    # the structural regime filter below; without it the tab raises KeyError.
+    regime_slope_bars = max(8, min(24, regime_len // 8))
+    work['Regime_Slope_ATR'] = (
+        (work['EMA_Regime'] - work['EMA_Regime'].shift(regime_slope_bars)) / atr_safe
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    work['EMA_VWAP_ATR'] = ((work['EMA_Fast'] - work['VWAP']) / atr_safe).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    er_noise = work['Close'].diff().abs().rolling(er_len).sum().replace(0, np.nan)
+    work['Efficiency'] = (work['Close'].diff(er_len).abs() / er_noise).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(0.0, 1.0)
+
+    vol_mu = work['Volume'].rolling(40, min_periods=10).mean()
+    vol_sd = work['Volume'].rolling(40, min_periods=10).std().replace(0, np.nan)
+    work['VolumeZ'] = ((work['Volume'] - vol_mu) / vol_sd).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    atr_med = work['ATR'].rolling(100, min_periods=20).median().replace(0, np.nan)
+    work['ATR_Ratio'] = (work['ATR'] / atr_med).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    work['PriorHigh'] = work['High'].shift(1).rolling(breakout_len, min_periods=breakout_len).max()
+    work['PriorLow'] = work['Low'].shift(1).rolling(breakout_len, min_periods=breakout_len).min()
+    pullback_lookback = max(2, int(params.get('pullback_lookback', 3)))
+    work['PriorPullbackLow'] = work['Low'].shift(1).rolling(pullback_lookback, min_periods=1).min()
+    work['PriorPullbackHigh'] = work['High'].shift(1).rolling(pullback_lookback, min_periods=1).max()
+
+    # Causal signed-flow proxy.
+    rng = (work['High'] - work['Low']).replace(0, np.nan)
+    clv = (((work['Close'] - work['Low']) - (work['High'] - work['Close'])) / rng).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1.0, 1.0)
+    work['FlowDelta'] = (clv * work['Volume']).ewm(span=8, adjust=False).mean()
+    flow_scale = work['Volume'].ewm(span=20, adjust=False).mean().replace(0, np.nan)
+    work['FlowNorm'] = (work['FlowDelta'] / flow_scale).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-2.0, 2.0)
+
+    # ADX / directional movement for trend-strength filtering.
+    up_move = work['High'].diff()
+    down_move = -work['Low'].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=work.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=work.index)
+    plus_di = 100.0 * _fut_rma(plus_dm, atr_len) / atr_safe
+    minus_di = 100.0 * _fut_rma(minus_dm, atr_len) / atr_safe
+    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    work['ADX'] = _fut_rma(dx, atr_len).fillna(0.0)
+    work['PlusDI'] = plus_di.fillna(0.0)
+    work['MinusDI'] = minus_di.fillna(0.0)
+
+    # V8 institutional context: anchored VWAP + causal rolling volume-profile POC.
+    avwap_anchor = params.get('avwap_anchor_date')
+    work['AVWAP'] = _fut_calculate_avwap(work, avwap_anchor)
+    work['POC'] = _fut_calculate_rolling_poc(
+        work,
+        lookback_periods=int(params.get('poc_lookback', 78)),
+        bins=int(params.get('poc_bins', 50)),
+    )
+    poc_safe = work['POC'].replace(0, np.nan)
+    work['POC_Distance_Pct'] = ((work['Close'] - work['POC']).abs() / poc_safe).replace([np.inf, -np.inf], np.nan)
+    work['Above_AVWAP'] = work['AVWAP'].notna() & (work['Close'] >= work['AVWAP'])
+
+    return work
+
+def _fut_time_gate(index, trading_window: str) -> pd.Series:
+    idx = pd.DatetimeIndex(index)
+    try:
+        if idx.tz is None:
+            idx = idx.tz_localize('America/Chicago')
+        else:
+            idx = idx.tz_convert('America/Chicago')
+    except Exception:
+        pass
+    mins = idx.hour * 60 + idx.minute
+    if trading_window == 'US Liquid Window 07:30–15:00 CT':
+        mask = (mins >= 7 * 60 + 30) & (mins <= 15 * 60)
+    elif trading_window == 'Index RTH 08:30–15:00 CT':
+        mask = (mins >= 8 * 60 + 30) & (mins <= 15 * 60)
+    else:
+        # Exclude the usual maintenance hour from the full-Globex option.
+        mask = ~((mins >= 16 * 60) & (mins < 17 * 60))
+    return pd.Series(mask, index=index)
+
+
+def _fut_generate_signals(df: pd.DataFrame, params: dict, allow_short: bool, trading_window: str):
+    """High-selectivity score-based futures entries. No loose OR-based crossover entries."""
+    work = _fut_prepare_features(df, params)
+    atr = work['ATR']
+    slope_min = float(params.get('slope_min', 0.04))
+    er_min = float(params.get('er_min', 0.30))
+    adx_min = float(params.get('adx_min', 18.0))
+    min_score = int(params.get('min_entry_score', 7))
+    max_chase_atr = float(params.get('max_chase_atr', 1.50))
+
+    time_ok = _fut_time_gate(work.index, trading_window)
+    healthy_vol = work['ATR_Ratio'].between(0.70, 2.20)
+    trend_quality = work['Efficiency'] >= er_min
+    adx_ok = work['ADX'] >= adx_min
+
+    # Multiple causal entry archetypes so a strong trend can produce more than one
+    # independent scalp opportunity. No future bars are used.
+    prior_touch_long = (
+        (work['PriorPullbackLow'] <= work['EMA_Trend'].shift(1) + 0.30 * atr.shift(1)) |
+        (work['Low'].shift(1) <= work['EMA_Fast'].shift(1) + 0.15 * atr.shift(1)) |
+        (work['Low'].shift(1) <= work['VWAP'].shift(1) + 0.15 * atr.shift(1))
+    )
+    prior_touch_short = (
+        (work['PriorPullbackHigh'] >= work['EMA_Trend'].shift(1) - 0.30 * atr.shift(1)) |
+        (work['High'].shift(1) >= work['EMA_Fast'].shift(1) - 0.15 * atr.shift(1)) |
+        (work['High'].shift(1) >= work['VWAP'].shift(1) - 0.15 * atr.shift(1))
+    )
+    long_pullback = (
+        prior_touch_long &
+        (work['Close'] > work['EMA_Fast']) &
+        (work['Close'] > work['Open']) &
+        ((work['Close'].shift(1) <= work['EMA_Fast'].shift(1)) | (work['FlowNorm'].diff() > 0.08))
+    )
+    short_pullback = (
+        prior_touch_short &
+        (work['Close'] < work['EMA_Fast']) &
+        (work['Close'] < work['Open']) &
+        ((work['Close'].shift(1) >= work['EMA_Fast'].shift(1)) | (work['FlowNorm'].diff() < -0.08))
+    )
+    long_breakout = (
+        (work['Close'] > work['PriorHigh']) &
+        (work['VolumeZ'] > 0.00) &
+        (work['FlowNorm'] > 0.06)
+    )
+    short_breakout = (
+        (work['Close'] < work['PriorLow']) &
+        (work['VolumeZ'] > 0.00) &
+        (work['FlowNorm'] < -0.06)
+    )
+
+    # Continuation pulse after a shallow reset in a mature trend. This permits
+    # re-entry opportunities after a prior scalp exits without requiring a full
+    # deep pullback to the slow trend EMA.
+    long_continuation = (
+        (work['Close'] > work['EMA_Fast']) &
+        (work['Close'].shift(1) <= work['Close'].shift(2)) &
+        (work['Close'] > work['High'].shift(1)) &
+        (work['FlowNorm'] > 0.08) &
+        (work['VolumeZ'] > -0.25)
+    )
+    short_continuation = (
+        (work['Close'] < work['EMA_Fast']) &
+        (work['Close'].shift(1) >= work['Close'].shift(2)) &
+        (work['Close'] < work['Low'].shift(1)) &
+        (work['FlowNorm'] < -0.08) &
+        (work['VolumeZ'] > -0.25)
+    )
+
+    long_components = pd.DataFrame({
+        'above_vwap': work['Close'] > work['VWAP'],
+        'ema_stack': (work['EMA_Fast'] > work['EMA_Trend']) & (work['EMA_Trend'] > work['EMA_Slow']),
+        'slow_trend': work['Slow_Slope_ATR'] > 0,
+        'vwap_slope': work['VWAP_Slope_ATR'] >= slope_min,
+        'trend_slope': work['Trend_Slope_ATR'] > 0,
+        'flow': work['FlowNorm'] > 0.05,
+        'directional': work['PlusDI'] > work['MinusDI'],
+        'volume': work['VolumeZ'] > -0.10,
+        'quality': trend_quality & adx_ok,
+    }, index=work.index)
+    short_components = pd.DataFrame({
+        'below_vwap': work['Close'] < work['VWAP'],
+        'ema_stack': (work['EMA_Fast'] < work['EMA_Trend']) & (work['EMA_Trend'] < work['EMA_Slow']),
+        'slow_trend': work['Slow_Slope_ATR'] < 0,
+        'vwap_slope': work['VWAP_Slope_ATR'] <= -slope_min,
+        'trend_slope': work['Trend_Slope_ATR'] < 0,
+        'flow': work['FlowNorm'] < -0.05,
+        'directional': work['MinusDI'] > work['PlusDI'],
+        'volume': work['VolumeZ'] > -0.10,
+        'quality': trend_quality & adx_ok,
+    }, index=work.index)
+
+    work['LongScore'] = long_components.astype(int).sum(axis=1)
+    work['ShortScore'] = short_components.astype(int).sum(axis=1)
+    long_not_chasing = (((work['Close'] - work['VWAP']) / atr.replace(0, np.nan)) <= max_chase_atr).fillna(False)
+    short_not_chasing = (((work['VWAP'] - work['Close']) / atr.replace(0, np.nan)) <= max_chase_atr).fillna(False)
+
+    long_trigger = long_pullback | long_breakout | long_continuation
+    short_trigger = short_pullback | short_breakout | short_continuation
+
+    # V7 structural regime filter: long-only systems should not keep buying a falling /SI tape.
+    # This uses only current and past bars. It is intentionally slower than the entry EMAs.
+    long_regime_ok = (work['Close'] > work['EMA_Regime']) & (work['Regime_Slope_ATR'] > -0.01)
+    short_regime_ok = (work['Close'] < work['EMA_Regime']) & (work['Regime_Slope_ATR'] < 0.01)
+
+    # Raw setup is preserved for diagnostics; AVWAP/POC are conversion gates.
+    raw_long_setup = (time_ok & healthy_vol & long_regime_ok & (work['LongScore'] >= min_score) & long_trigger & long_not_chasing).fillna(False)
+    raw_short_setup = (time_ok & healthy_vol & short_regime_ok & (work['ShortScore'] >= min_score) & short_trigger & short_not_chasing).fillna(False)
+
+    use_avwap_gate = bool(params.get('use_avwap_gate', True))
+    use_poc_gate = bool(params.get('use_poc_gate', True))
+    poc_tolerance_pct = max(0.0001, float(params.get('poc_tolerance_pct', 0.003)))
+
+    avwap_long_ok = pd.Series(True, index=work.index) if not use_avwap_gate else work['Above_AVWAP'].fillna(False)
+    avwap_short_ok = pd.Series(True, index=work.index) if not use_avwap_gate else (work['AVWAP'].notna() & (work['Close'] <= work['AVWAP']))
+    poc_ok = pd.Series(True, index=work.index) if not use_poc_gate else (work['POC'].notna() & (work['POC_Distance_Pct'] <= poc_tolerance_pct))
+
+    long_entry = (raw_long_setup & avwap_long_ok & poc_ok).fillna(False)
+    short_entry = (raw_short_setup & avwap_short_ok & poc_ok).fillna(False)
+    if not allow_short:
+        short_entry[:] = False
+
+    # Exit faster on structural failure; stops remain the primary risk control.
+    long_exit = (
+        ((work['Close'] < work['VWAP']) & (work['EMA_Fast'] < work['EMA_Trend'])) |
+        ((work['LongScore'] <= 3) & (work['FlowNorm'] < -0.15))
+    ).fillna(False)
+    short_exit = (
+        ((work['Close'] > work['VWAP']) & (work['EMA_Fast'] > work['EMA_Trend'])) |
+        ((work['ShortScore'] <= 3) & (work['FlowNorm'] > 0.15))
+    ).fillna(False)
+
+    confirm_bars = max(1, int(params.get('confirm_bars', 1)))
+    if confirm_bars > 1:
+        long_entry = long_entry.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+        short_entry = short_entry.astype(int).rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+
+    work['RawLongSetup'] = raw_long_setup
+    work['RawShortSetup'] = raw_short_setup
+    work['AVWAPGateLong'] = avwap_long_ok
+    work['POCGate'] = poc_ok
+    work['LongEntrySignal'] = long_entry
+    work['ShortEntrySignal'] = short_entry
+    work['LongExitSignal'] = long_exit
+    work['ShortExitSignal'] = short_exit
+    return work
+
+def _fut_fmt_ct(ts):
+    try:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize('America/Chicago')
+        else:
+            t = t.tz_convert('America/Chicago')
+        return t.strftime('%Y-%m-%d %H:%M:%S CT')
+    except Exception:
+        return str(ts)
+
+
+def _fut_calc_metrics(trades: pd.DataFrame, equity: pd.Series, initial_capital: float) -> dict:
+    if trades is None or trades.empty:
+        closed = pd.DataFrame()
+    else:
+        closed = trades[trades['Status'].eq('Closed')].copy()
+
+    pnl = pd.to_numeric(closed.get('Net PnL ($)', pd.Series(dtype=float)), errors='coerce').dropna()
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl < 0]
+    gross_profit = float(wins.sum()) if len(wins) else 0.0
+    gross_loss = float(abs(losses.sum())) if len(losses) else 0.0
+    pf = gross_profit / gross_loss if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
+    if equity is not None and len(equity):
+        eq = pd.Series(equity).astype(float)
+        peak = eq.cummax()
+        dd = eq - peak
+        dd_pct = (eq / peak.replace(0, np.nan) - 1.0) * 100.0
+        max_dd = float(dd.min()) if len(dd) else 0.0
+        max_dd_pct = float(dd_pct.min()) if len(dd_pct.dropna()) else 0.0
+        ending_equity = float(eq.iloc[-1])
+    else:
+        max_dd = 0.0
+        max_dd_pct = 0.0
+        ending_equity = float(initial_capital)
+
+    max_consec_losses = 0
+    run = 0
+    for v in pnl.tolist():
+        if v < 0:
+            run += 1
+            max_consec_losses = max(max_consec_losses, run)
+        else:
+            run = 0
+
+    return {
+        'closed_trades': int(len(closed)),
+        'win_rate': float((pnl > 0).mean() * 100.0) if len(pnl) else 0.0,
+        'net_pnl': float(pnl.sum()) if len(pnl) else 0.0,
+        'avg_trade': float(pnl.mean()) if len(pnl) else 0.0,
+        'profit_factor': float(pf),
+        'max_drawdown': float(max_dd),
+        'max_drawdown_pct': float(max_dd_pct),
+        'ending_equity': ending_equity,
+        'return_pct': (ending_equity / float(initial_capital) - 1.0) * 100.0 if initial_capital else 0.0,
+        'max_consecutive_losses': int(max_consec_losses),
+        'avg_win': float(wins.mean()) if len(wins) else 0.0,
+        'avg_loss': float(losses.mean()) if len(losses) else 0.0,
+    }
+
+
+def _fut_backtest(signals: pd.DataFrame, spec: dict, params: dict, contracts: int, initial_capital: float,
+                  commission_per_side: float, slippage_ticks: float, daily_loss_cap: float,
+                  max_consecutive_losses: int, day_trade_flat: bool, trade_start_time=None):
+    """Single-position, next-bar-open futures backtest with multiplier-aware PnL."""
+    df = signals.copy()
+    if df.empty or len(df) < 5:
+        return {'trades': pd.DataFrame(), 'equity': pd.Series(dtype=float), 'metrics': {}}
+
+    multiplier = float(spec['multiplier'])
+    tick_size = float(spec['tick_size'])
+    tick_value = float(spec['tick_value'])
+    contracts = max(1, int(contracts))
+    slip = float(slippage_ticks) * tick_size
+    commission = float(commission_per_side) * contracts
+
+    stop_atr = float(params.get('stop_atr', 1.25))
+    trail_atr = float(params.get('trail_atr', 1.10))
+    target_r = float(params.get('target_r', 2.0))
+    breakeven_r = float(params.get('breakeven_r', 0.85))
+    trail_activate_r = float(params.get('trail_activate_r', 1.10))
+    min_stop_ticks = max(1, int(params.get('min_stop_ticks', 6)))
+    max_bars = max(2, int(params.get('max_bars', 24)))
+    cooldown_bars = max(0, int(params.get('cooldown_bars', 2)))
+    max_risk_pct = max(0.05, float(params.get('max_risk_pct', 0.75)))
+    # Fixed-contract research must still execute trades even when one contract exceeds
+    # the account risk budget. Deployment approval remains separate.
+    enforce_risk_gate = bool(params.get('enforce_risk_gate', False))
+    max_account_dd_pct = max(0.5, float(params.get('max_account_dd_pct', 6.0)))
+    cap_stop_to_risk_budget = bool(params.get('cap_stop_to_risk_budget', True))
+    early_failure_bars = max(1, int(params.get('early_failure_bars', 3)))
+    early_failure_mfe_r = max(0.05, float(params.get('early_failure_mfe_r', 0.30)))
+    post_loss_cooldown_bars = max(0, int(params.get('post_loss_cooldown_bars', 3)))
+    # Research backtests must continue to show the full strategy sample even after a
+    # deployment risk limit is breached. Live deployment can enforce the kill switch;
+    # research mode records the breach without deleting all later trades.
+    enforce_drawdown_kill_switch = bool(params.get('enforce_drawdown_kill_switch', False))
+    # V8 temporary drawdown lockout: pause new entries after a realized drawdown breach,
+    # then automatically resume. This is separate from the permanent deployment kill switch.
+    drawdown_lockout_dollars = max(0.0, float(params.get('drawdown_lockout_dollars', 1500.0)))
+    drawdown_lockout_bars = max(0, int(params.get('drawdown_lockout_bars', 39)))
+
+    idx = df.index
+    trade_start_ts = pd.Timestamp(trade_start_time) if trade_start_time is not None else None
+    if trade_start_ts is not None:
+        try:
+            if trade_start_ts.tzinfo is None and getattr(idx, 'tz', None) is not None:
+                trade_start_ts = trade_start_ts.tz_localize(idx.tz)
+            elif trade_start_ts.tzinfo is not None and getattr(idx, 'tz', None) is not None:
+                trade_start_ts = trade_start_ts.tz_convert(idx.tz)
+        except Exception:
+            pass
+
+    position = 0
+    entry_price = np.nan
+    entry_time = None
+    entry_i = None
+    stop_price = np.nan
+    initial_stop = np.nan
+    target_price = np.nan
+    risk_points = np.nan
+    high_since = -np.inf
+    low_since = np.inf
+    entry_reason = ''
+    pending_entry = 0
+    pending_entry_reason = ''
+    pending_exit_reason = ''
+    last_exit_i = -100000
+    session_realized = 0.0
+    session_key_prev = None
+    consecutive_losses_session = 0
+    account_peak_realized = 0.0
+    account_dd_locked = False
+    # Execution funnel diagnostics
+    pending_entries_created = 0
+    entry_attempts = 0
+    fills = 0
+    blocked_risk = 0
+    blocked_clock = 0
+    blocked_cooldown = 0
+    blocked_daily = 0
+    blocked_loss_streak = 0
+    blocked_drawdown = 0
+    blocked_temp_lockout = 0
+    temp_lockout_triggers = 0
+    temp_lockout_until_i = -1
+    drawdown_limit_breaches = 0
+    drawdown_breach_active = False
+    risk_budget_violations = 0
+    risk_capped_fills = 0
+    last_trade_was_loss = False
+    entry_risk_budget = np.nan
+    entry_risk_status = ''
+
+    realized_pnl = 0.0
+    equity_vals = []
+    equity_idx = []
+    trades = []
+    entry_points = pd.Series(np.nan, index=idx)
+    exit_points = pd.Series(np.nan, index=idx)
+    stop_series = pd.Series(np.nan, index=idx)
+    position_series = pd.Series(0, index=idx, dtype=int)
+
+    def _signal_reason(row, direction):
+        parts = []
+        if direction == 1:
+            if row['Close'] > row['PriorHigh']:
+                parts.append('Momentum Breakout')
+            else:
+                parts.append('VWAP/EMA Pullback Reclaim')
+            if row['FlowNorm'] > 0.05:
+                parts.append('Positive Flow')
+            parts.append('Above Session VWAP')
+        else:
+            if row['Close'] < row['PriorLow']:
+                parts.append('Momentum Breakdown')
+            else:
+                parts.append('VWAP/EMA Pullback Reject')
+            if row['FlowNorm'] < -0.05:
+                parts.append('Negative Flow')
+            parts.append('Below Session VWAP')
+        return ' + '.join(parts)
+
+    def _close_trade(i, fill_price, reason):
+        nonlocal position, entry_price, entry_time, entry_i, stop_price, initial_stop, target_price
+        nonlocal risk_points, high_since, low_since, entry_reason, realized_pnl, session_realized
+        nonlocal consecutive_losses_session, last_exit_i, account_peak_realized, account_dd_locked
+        nonlocal drawdown_limit_breaches, drawdown_breach_active
+        nonlocal temp_lockout_triggers, temp_lockout_until_i
+        nonlocal entry_risk_budget, entry_risk_status, last_trade_was_loss
+
+        direction = position
+        exit_cost_adj = -slip if direction == 1 else slip
+        exit_fill = float(fill_price) + exit_cost_adj
+        gross_points = direction * (exit_fill - entry_price)
+        gross_pnl = gross_points * multiplier * contracts
+        costs = 2.0 * commission
+        net_pnl = gross_pnl - costs
+        ticks = gross_points / tick_size if tick_size else np.nan
+        cumulative_before = realized_pnl
+        # Entry-side commission was already deducted when the trade opened.
+        # On close, add gross PnL minus only the exit-side commission so the
+        # equity path and session loss lock are charged exactly two sides total.
+        close_cash_flow = gross_pnl - commission
+        realized_pnl += close_cash_flow
+        session_realized += close_cash_flow
+        account_peak_realized = max(account_peak_realized, realized_pnl)
+        dd_from_peak = realized_pnl - account_peak_realized
+        dd_limit_dollars = abs(float(initial_capital) * max_account_dd_pct / 100.0)
+        breached_now = dd_from_peak <= -dd_limit_dollars
+        if breached_now and not drawdown_breach_active:
+            drawdown_limit_breaches += 1
+        drawdown_breach_active = breached_now
+        # Only live/deployment mode should permanently suppress later research trades.
+        if breached_now and enforce_drawdown_kill_switch:
+            account_dd_locked = True
+
+        # Temporary lockout uses REAL realized drawdown from peak. The user's original
+        # placeholder current_trade_dd never changed, so it could never trigger.
+        if drawdown_lockout_dollars > 0 and drawdown_lockout_bars > 0:
+            if dd_from_peak <= -abs(drawdown_lockout_dollars) and i >= temp_lockout_until_i:
+                temp_lockout_until_i = i + drawdown_lockout_bars
+                temp_lockout_triggers += 1
+
+        last_trade_was_loss = bool(net_pnl < 0)
+        if net_pnl < 0:
+            consecutive_losses_session += 1
+        else:
+            consecutive_losses_session = 0
+
+        segment = df.iloc[entry_i:i+1]
+        if direction == 1:
+            mfe_points = float(segment['High'].max() - entry_price)
+            mae_points = float(segment['Low'].min() - entry_price)
+        else:
+            mfe_points = float(entry_price - segment['Low'].min())
+            mae_points = float(entry_price - segment['High'].max())
+        mfe_dollars = mfe_points * multiplier * contracts
+        mae_dollars = mae_points * multiplier * contracts
+
+        trades.append({
+            'Side': 'Long' if direction == 1 else 'Short',
+            'Contracts': contracts,
+            'Entry CT': _fut_fmt_ct(entry_time),
+            'Exit CT': _fut_fmt_ct(idx[i]),
+            'Entry Price': entry_price,
+            'Initial Stop': initial_stop,
+            'Initial Risk ($)': risk_points * multiplier * contracts,
+            'Risk Budget ($)': entry_risk_budget,
+            'Risk Budget Status': entry_risk_status,
+            'Exit Price': exit_fill,
+            'Points': gross_points,
+            'Ticks': ticks,
+            'Gross PnL ($)': gross_pnl,
+            'Costs ($)': costs,
+            'Net PnL ($)': net_pnl,
+            'R Multiple': net_pnl / max(risk_points * multiplier * contracts, 1e-12),
+            'Cumulative PnL ($)': realized_pnl,
+            'Account Return (%)': realized_pnl / float(initial_capital) * 100.0 if initial_capital else 0.0,
+            'MFE ($)': mfe_dollars,
+            'MAE ($)': mae_dollars,
+            'Bars Held': int(i - entry_i + 1),
+            'Entry Reason': entry_reason,
+            'Exit Reason': reason,
+            'Status': 'Closed',
+        })
+        exit_points.iloc[i] = exit_fill
+        last_exit_i = i
+        position = 0
+        entry_price = np.nan
+        entry_time = None
+        entry_i = None
+        stop_price = np.nan
+        initial_stop = np.nan
+        target_price = np.nan
+        risk_points = np.nan
+        high_since = -np.inf
+        low_since = np.inf
+        entry_reason = ''
+        entry_risk_budget = np.nan
+        entry_risk_status = ''
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        current_session = str(row.get('SessionKey', ''))
+        if session_key_prev is None or current_session != session_key_prev:
+            session_realized = 0.0
+            consecutive_losses_session = 0
+            session_key_prev = current_session
+
+        allowed_by_start = True
+        if trade_start_ts is not None:
+            try:
+                allowed_by_start = idx[i] >= trade_start_ts
+            except Exception:
+                allowed_by_start = True
+
+        # Execute a close-generated signal at the next bar open.
+        if position != 0 and pending_exit_reason:
+            _close_trade(i, float(row['Open']), pending_exit_reason)
+            pending_exit_reason = ''
+
+        # Execute a close-generated entry at the next bar open.
+        if position == 0 and pending_entry != 0 and allowed_by_start:
+            entry_attempts += 1
+            day_locked = (float(daily_loss_cap) > 0 and session_realized <= -abs(float(daily_loss_cap)))
+            loss_locked = (int(max_consecutive_losses) > 0 and consecutive_losses_session >= int(max_consecutive_losses))
+            entry_clock_ok = True
+            if day_trade_flat:
+                try:
+                    tt = pd.Timestamp(idx[i]).tz_convert('America/Chicago') if pd.Timestamp(idx[i]).tzinfo else pd.Timestamp(idx[i])
+                    entry_clock_ok = (tt.hour < 15)
+                except Exception:
+                    entry_clock_ok = True
+
+            active_cooldown = max(cooldown_bars, post_loss_cooldown_bars if last_trade_was_loss else cooldown_bars)
+            cooldown_locked = (i - last_exit_i) <= active_cooldown
+            if day_locked: blocked_daily += 1
+            if loss_locked: blocked_loss_streak += 1
+            if account_dd_locked: blocked_drawdown += 1
+            if not entry_clock_ok: blocked_clock += 1
+            temp_lockout_active = i < temp_lockout_until_i
+            if cooldown_locked: blocked_cooldown += 1
+            if temp_lockout_active: blocked_temp_lockout += 1
+
+            can_enter = not cooldown_locked and not day_locked and not loss_locked and not account_dd_locked and not temp_lockout_active and entry_clock_ok
+            if can_enter:
+                direction = int(pending_entry)
+                raw_fill = float(row['Open'])
+                candidate_entry = raw_fill + slip if direction == 1 else raw_fill - slip
+                atr_ref = float(df['ATR'].iloc[max(0, i-1)])
+                raw_stop_dist = max(stop_atr * atr_ref, min_stop_ticks * tick_size)
+                current_equity_for_risk = max(float(initial_capital) + realized_pnl, 1.0)
+                max_risk_dollars = current_equity_for_risk * max_risk_pct / 100.0
+                max_stop_from_budget = max((max_risk_dollars - 2.0 * commission) / max(multiplier * contracts, 1e-12), 0.0)
+                min_stop_dist = min_stop_ticks * tick_size
+
+                stop_dist = raw_stop_dist
+                was_risk_capped = False
+                if cap_stop_to_risk_budget and max_stop_from_budget >= min_stop_dist and raw_stop_dist > max_stop_from_budget:
+                    stop_dist = max_stop_from_budget
+                    was_risk_capped = True
+                    risk_capped_fills += 1
+
+                candidate_risk_dollars = stop_dist * multiplier * contracts + 2.0 * commission
+                risk_ok = candidate_risk_dollars <= max_risk_dollars + 1e-9
+                if not risk_ok:
+                    risk_budget_violations += 1
+                if risk_ok or not enforce_risk_gate:
+                    entry_price = candidate_entry
+                    risk_points = stop_dist
+                    position = direction
+                    entry_i = i
+                    entry_time = idx[i]
+                    entry_reason = pending_entry_reason
+                    entry_risk_budget = max_risk_dollars
+                    entry_risk_status = ('Capped to Risk Budget' if was_risk_capped else ('Within Budget' if risk_ok else 'Exceeded — Research Fill'))
+                    if direction == 1:
+                        initial_stop = entry_price - stop_dist
+                        stop_price = initial_stop
+                        target_price = entry_price + target_r * stop_dist
+                    else:
+                        initial_stop = entry_price + stop_dist
+                        stop_price = initial_stop
+                        target_price = entry_price - target_r * stop_dist
+                    high_since = float(row['High'])
+                    low_since = float(row['Low'])
+                    realized_pnl -= commission
+                    session_realized -= commission
+                    entry_points.iloc[i] = entry_price
+                    fills += 1
+                else:
+                    blocked_risk += 1
+            pending_entry = 0
+            pending_entry_reason = ''
+
+        if position != 0:
+            position_series.iloc[i] = position
+            stop_series.iloc[i] = stop_price
+
+            # Day-trade flat rule: exit near the end of the US liquid window.
+            force_flat = False
+            if day_trade_flat:
+                try:
+                    t = pd.Timestamp(idx[i]).tz_convert('America/Chicago') if pd.Timestamp(idx[i]).tzinfo else pd.Timestamp(idx[i])
+                    force_flat = (t.hour == 15 and t.minute >= 0) or (t.hour >= 16)
+                except Exception:
+                    force_flat = False
+
+            # Conservative intrabar ordering: when stop and target are both touched,
+            # assume the stop happened first.
+            if position == 1:
+                if float(row['Open']) <= stop_price:
+                    _close_trade(i, float(row['Open']), 'Gap Through Protective Stop')
+                elif float(row['Low']) <= stop_price and float(row['High']) >= target_price:
+                    _close_trade(i, stop_price, 'Protective Stop (Conservative Same-Bar Order)')
+                elif float(row['Low']) <= stop_price:
+                    _close_trade(i, stop_price, 'Protective / Trailing Stop')
+                elif float(row['High']) >= target_price:
+                    _close_trade(i, target_price, f'{target_r:.2f}R Profit Target')
+                elif force_flat:
+                    _close_trade(i, float(row['Close']), 'Day-Trade Flat Rule')
+            else:
+                if float(row['Open']) >= stop_price:
+                    _close_trade(i, float(row['Open']), 'Gap Through Protective Stop')
+                elif float(row['High']) >= stop_price and float(row['Low']) <= target_price:
+                    _close_trade(i, stop_price, 'Protective Stop (Conservative Same-Bar Order)')
+                elif float(row['High']) >= stop_price:
+                    _close_trade(i, stop_price, 'Protective / Trailing Stop')
+                elif float(row['Low']) <= target_price:
+                    _close_trade(i, target_price, f'{target_r:.2f}R Profit Target')
+                elif force_flat:
+                    _close_trade(i, float(row['Close']), 'Day-Trade Flat Rule')
+
+            if position != 0:
+                # Update break-even and trailing levels only after the current bar is complete,
+                # so the updated stop becomes active on the next bar.
+                high_since = max(high_since, float(row['High']))
+                low_since = min(low_since, float(row['Low']))
+                atr_now = float(row['ATR'])
+                if position == 1:
+                    favorable_r = (high_since - entry_price) / max(risk_points, 1e-12)
+                    if favorable_r >= breakeven_r:
+                        stop_price = max(stop_price, entry_price + tick_size)
+                    if favorable_r >= trail_activate_r:
+                        stop_price = max(stop_price, high_since - trail_atr * atr_now)
+                    bars_held = i - entry_i + 1
+                    mfe_r_now = (high_since - entry_price) / max(risk_points, 1e-12)
+                    failed_to_launch = (bars_held >= early_failure_bars and mfe_r_now < early_failure_mfe_r and float(row['Close']) < entry_price and float(row['FlowNorm']) < 0)
+                    if failed_to_launch:
+                        pending_exit_reason = 'Early Failure / No Follow-Through'
+                    elif bars_held >= max_bars:
+                        pending_exit_reason = 'Time Stop'
+                    elif bool(row['LongExitSignal']):
+                        pending_exit_reason = 'VWAP / Momentum Failure'
+                else:
+                    favorable_r = (entry_price - low_since) / max(risk_points, 1e-12)
+                    if favorable_r >= breakeven_r:
+                        stop_price = min(stop_price, entry_price - tick_size)
+                    if favorable_r >= trail_activate_r:
+                        stop_price = min(stop_price, low_since + trail_atr * atr_now)
+                    bars_held = i - entry_i + 1
+                    mfe_r_now = (entry_price - low_since) / max(risk_points, 1e-12)
+                    failed_to_launch = (bars_held >= early_failure_bars and mfe_r_now < early_failure_mfe_r and float(row['Close']) > entry_price and float(row['FlowNorm']) > 0)
+                    if failed_to_launch:
+                        pending_exit_reason = 'Early Failure / No Follow-Through'
+                    elif bars_held >= max_bars:
+                        pending_exit_reason = 'Time Stop'
+                    elif bool(row['ShortExitSignal']):
+                        pending_exit_reason = 'VWAP / Momentum Failure'
+
+        # Generate next-bar entries only after the current bar closes.
+        if position == 0 and allowed_by_start:
+            day_locked = (float(daily_loss_cap) > 0 and session_realized <= -abs(float(daily_loss_cap)))
+            loss_locked = (int(max_consecutive_losses) > 0 and consecutive_losses_session >= int(max_consecutive_losses))
+            active_cooldown = max(cooldown_bars, post_loss_cooldown_bars if last_trade_was_loss else cooldown_bars)
+            if not day_locked and not loss_locked and not account_dd_locked and (i - last_exit_i) > active_cooldown:
+                if bool(row['LongEntrySignal']):
+                    pending_entries_created += 1
+                    pending_entry = 1
+                    pending_entry_reason = _signal_reason(row, 1)
+                elif bool(row['ShortEntrySignal']):
+                    pending_entries_created += 1
+                    pending_entry = -1
+                    pending_entry_reason = _signal_reason(row, -1)
+
+        # Mark-to-market account equity.
+        unrealized = 0.0
+        if position == 1:
+            unrealized = (float(row['Close']) - entry_price) * multiplier * contracts
+        elif position == -1:
+            unrealized = (entry_price - float(row['Close'])) * multiplier * contracts
+        equity_vals.append(float(initial_capital) + realized_pnl + unrealized)
+        equity_idx.append(idx[i])
+
+    # Open trade row for the live/current state.
+    if position != 0 and entry_i is not None:
+        mark = float(df['Close'].iloc[-1])
+        direction = position
+        points = direction * (mark - entry_price)
+        gross_pnl = points * multiplier * contracts
+        costs = commission  # entry side already incurred; exit side not yet paid
+        net_pnl = gross_pnl - costs
+        segment = df.iloc[entry_i:]
+        if direction == 1:
+            mfe_points = float(segment['High'].max() - entry_price)
+            mae_points = float(segment['Low'].min() - entry_price)
+        else:
+            mfe_points = float(entry_price - segment['Low'].min())
+            mae_points = float(entry_price - segment['High'].max())
+        trades.append({
+            'Side': 'Long' if direction == 1 else 'Short',
+            'Contracts': contracts,
+            'Entry CT': _fut_fmt_ct(entry_time),
+            'Exit CT': 'Open',
+            'Entry Price': entry_price,
+            'Initial Stop': initial_stop,
+            'Initial Risk ($)': risk_points * multiplier * contracts,
+            'Risk Budget ($)': entry_risk_budget,
+            'Risk Budget Status': entry_risk_status,
+            'Exit Price': mark,
+            'Points': points,
+            'Ticks': points / tick_size if tick_size else np.nan,
+            'Gross PnL ($)': gross_pnl,
+            'Costs ($)': costs,
+            'Net PnL ($)': net_pnl,
+            'R Multiple': net_pnl / max(risk_points * multiplier * contracts, 1e-12),
+            # realized_pnl already includes the open trade's entry-side commission.
+            'Cumulative PnL ($)': realized_pnl + gross_pnl,
+            'Account Return (%)': (realized_pnl + net_pnl) / float(initial_capital) * 100.0 if initial_capital else 0.0,
+            'MFE ($)': mfe_points * multiplier * contracts,
+            'MAE ($)': mae_points * multiplier * contracts,
+            'Bars Held': int(len(df) - entry_i),
+            'Entry Reason': entry_reason,
+            'Exit Reason': 'Open Position',
+            'Status': 'Open',
+        })
+
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        display_cols = [
+            'Side', 'Contracts', 'Entry CT', 'Exit CT', 'Entry Price', 'Initial Stop', 'Initial Risk ($)',
+            'Risk Budget ($)', 'Risk Budget Status', 'Exit Price', 'Points', 'Ticks', 'Gross PnL ($)', 'Costs ($)', 'Net PnL ($)', 'R Multiple',
+            'Cumulative PnL ($)', 'Account Return (%)',
+            'MFE ($)', 'MAE ($)', 'Bars Held', 'Entry Reason', 'Exit Reason', 'Status'
+        ]
+        trades_df = trades_df[display_cols]
+        trades_df = trades_df.iloc[::-1].reset_index(drop=True)
+
+    equity = pd.Series(equity_vals, index=equity_idx, dtype=float)
+    metrics = _fut_calc_metrics(trades_df, equity, initial_capital)
+
+    # Fair benchmark: one continuously long position using the same contract count,
+    # entry/exit slippage and round-turn commission assumptions.
+    bench_start_i = 0
+    if trade_start_ts is not None:
+        try:
+            locs = np.where(pd.DatetimeIndex(df.index) >= trade_start_ts)[0]
+            if len(locs):
+                bench_start_i = int(locs[0])
+        except Exception:
+            bench_start_i = 0
+    bench_entry = float(df['Open'].iloc[bench_start_i]) + slip
+    bench_exit = float(df['Close'].iloc[-1]) - slip
+    benchmark_gross = (bench_exit - bench_entry) * multiplier * contracts
+    benchmark_net = benchmark_gross - 2.0 * commission
+    benchmark_return = benchmark_net / float(initial_capital) * 100.0 if initial_capital else 0.0
+
+    metrics['benchmark_pnl'] = float(benchmark_net)
+    metrics['benchmark_return_pct'] = float(benchmark_return)
+    metrics['benchmark_gap_pnl'] = float(metrics['net_pnl'] - benchmark_net)
+    metrics['benchmark_gap_return_pct'] = float(metrics['return_pct'] - benchmark_return)
+    metrics['current_position'] = 'LONG' if position == 1 else ('SHORT' if position == -1 else 'CASH')
+    metrics['account_dd_locked'] = bool(account_dd_locked)
+    metrics['active_stop'] = float(stop_price) if position != 0 and np.isfinite(stop_price) else np.nan
+    metrics['active_target'] = float(target_price) if position != 0 and np.isfinite(target_price) else np.nan
+    metrics['pending_entries_created'] = int(pending_entries_created)
+    metrics['entry_attempts'] = int(entry_attempts)
+    metrics['fills'] = int(fills)
+    metrics['blocked_risk'] = int(blocked_risk)
+    metrics['blocked_clock'] = int(blocked_clock)
+    metrics['blocked_cooldown'] = int(blocked_cooldown)
+    metrics['blocked_daily'] = int(blocked_daily)
+    metrics['blocked_loss_streak'] = int(blocked_loss_streak)
+    metrics['blocked_drawdown'] = int(blocked_drawdown)
+    metrics['blocked_temp_lockout'] = int(blocked_temp_lockout)
+    metrics['temp_lockout_triggers'] = int(temp_lockout_triggers)
+    metrics['drawdown_limit_breaches'] = int(drawdown_limit_breaches)
+    metrics['drawdown_kill_switch_enforced'] = bool(enforce_drawdown_kill_switch)
+    metrics['risk_budget_violations'] = int(risk_budget_violations)
+    metrics['risk_capped_fills'] = int(risk_capped_fills)
+    metrics['risk_gate_enforced'] = bool(enforce_risk_gate)
+
+    return {
+        'trades': trades_df,
+        'equity': equity,
+        'metrics': metrics,
+        'entry_points': entry_points,
+        'exit_points': exit_points,
+        'stop_series': stop_series,
+        'position_series': position_series,
+        'signals': df,
+    }
+
+
+def _fut_candidate_params(base: dict, max_candidates: int = 30):
+    """Deterministic, frequency-aware parameter search for the futures scalper."""
+    fast_opts = sorted(set([max(4, int(base['fast_len']) - 2), int(base['fast_len']), int(base['fast_len']) + 2]))
+    trend_opts = sorted(set([max(12, int(base['trend_len']) - 4), int(base['trend_len']), int(base['trend_len']) + 5]))
+    stop_opts = sorted(set([max(0.70, float(base['stop_atr']) - 0.30), float(base['stop_atr']), float(base['stop_atr']) + 0.25]))
+    target_opts = sorted(set([max(1.10, float(base['target_r']) - 0.50), float(base['target_r']), float(base['target_r']) + 0.50]))
+    er_opts = sorted(set([max(0.12, float(base['er_min']) - 0.08), float(base['er_min']), min(0.50, float(base['er_min']) + 0.05)]))
+    score_opts = sorted(set([max(4, int(base.get('min_entry_score', 6)) - 1), int(base.get('min_entry_score', 6)), min(8, int(base.get('min_entry_score', 6)) + 1)]))
+    adx_opts = sorted(set([max(10.0, float(base.get('adx_min', 15.0)) - 3.0), float(base.get('adx_min', 15.0)), float(base.get('adx_min', 15.0)) + 3.0]))
+    bars_opts = sorted(set([max(6, int(base.get('max_bars', 12)) // 2), int(base.get('max_bars', 12)), min(36, int(base.get('max_bars', 12)) + 6)]))
+    cooldown_opts = sorted(set([0, max(0, int(base.get('cooldown_bars', 1)) - 1), int(base.get('cooldown_bars', 1))]))
+
+    # Build a large logical grid, then sample it deterministically so runtime stays bounded.
+    combos = []
+    for fast in fast_opts:
+        for trend in trend_opts:
+            if trend <= fast + 3:
+                continue
+            for stop in stop_opts:
+                for target in target_opts:
+                    for er in er_opts:
+                        for score in score_opts:
+                            for adx in adx_opts:
+                                for bars in bars_opts:
+                                    for cooldown in cooldown_opts:
+                                        p = dict(base)
+                                        p.update({
+                                            'fast_len': int(fast), 'trend_len': int(trend),
+                                            'stop_atr': round(float(stop), 3), 'target_r': round(float(target), 3),
+                                            'trail_atr': round(max(0.75, float(base.get('trail_atr', 1.10))), 3),
+                                            'er_min': round(float(er), 3), 'min_entry_score': int(score),
+                                            'adx_min': round(float(adx), 2), 'max_bars': int(bars),
+                                            'cooldown_bars': int(cooldown),
+                                        })
+                                        combos.append(p)
+    if len(combos) <= max_candidates:
+        return combos
+    picks = np.linspace(0, len(combos) - 1, int(max_candidates), dtype=int)
+    return [combos[i] for i in sorted(set(picks.tolist()))]
+
+
+def _fut_optimize(train_df: pd.DataFrame, spec: dict, base_params: dict, allow_short: bool, trading_window: str,
+                  contracts: int, initial_capital: float, commission_per_side: float, slippage_ticks: float,
+                  daily_loss_cap: float, max_consecutive_losses: int, day_trade_flat: bool,
+                  max_candidates: int, min_trades: int, objective: str):
+    """
+    Sequential internal validation.
+
+    Returns both:
+      1) deploy_params: only when the hard stability gate passes;
+      2) research_params: best trade-producing candidate even when deployment is rejected.
+
+    This keeps research/backtest visibility separate from live-deployment approval.
+    """
+    candidates = _fut_candidate_params(base_params, max_candidates=max_candidates)
+    rows = []
+    best_score = -np.inf
+    best_params = None
+    best_research_score = -np.inf
+    best_research_params = None
+    n = len(train_df)
+    fold_edges = np.linspace(0, n, 4, dtype=int)
+
+    for params in candidates:
+        fold_metrics = []
+        total_trades = 0
+        valid = True
+        for k in range(3):
+            fold = train_df.iloc[fold_edges[k]:fold_edges[k+1]].copy()
+            if len(fold) < 40:
+                valid = False
+                break
+            sig = _fut_generate_signals(fold, params, allow_short, trading_window)
+            bt = _fut_backtest(sig, spec, params, contracts, initial_capital, commission_per_side,
+                               slippage_ticks, daily_loss_cap, max_consecutive_losses, day_trade_flat)
+            m = bt['metrics']
+            total_trades += int(m.get('closed_trades', 0))
+            fold_metrics.append(m)
+        if not valid or not fold_metrics:
+            continue
+
+        nets = np.array([float(m.get('net_pnl', 0.0)) for m in fold_metrics], dtype=float)
+        pfs = np.array([min(float(m.get('profit_factor', 0.0)), 5.0) for m in fold_metrics], dtype=float)
+        dds = np.array([abs(float(m.get('max_drawdown', 0.0))) for m in fold_metrics], dtype=float)
+        positive_folds = int((nets > 0).sum())
+        total_net = float(nets.sum())
+        worst_fold = float(nets.min())
+        median_pf = float(np.median(pfs))
+        max_dd = float(dds.max())
+
+        passed = (
+            total_trades >= int(min_trades) and
+            total_net > 0 and
+            positive_folds >= 2 and
+            median_pf >= 1.05 and
+            max_dd <= float(initial_capital) * 0.08
+        )
+
+        # Deployment score: strict and absolute-profit-first.
+        if passed:
+            stability_bonus = positive_folds * 250.0
+            if objective == 'Loss Reduction':
+                deploy_score = 1.00 * total_net + 0.75 * worst_fold - 2.50 * max_dd + 125.0 * median_pf + stability_bonus
+            elif objective == 'Profit Factor':
+                deploy_score = 0.80 * total_net + 0.50 * worst_fold - 1.50 * max_dd + 250.0 * median_pf + stability_bonus
+            else:
+                deploy_score = 1.20 * total_net + 0.75 * worst_fold - 1.75 * max_dd + 150.0 * median_pf + stability_bonus
+        else:
+            deploy_score = -1e9 + total_net
+
+        # Research score: never grants deployment. It only chooses the most informative
+        # trade-producing candidate so rejected systems still show actual trades.
+        trade_bonus = min(total_trades, 40) * 18.0
+        pf_bonus = min(median_pf, 3.0) * 100.0
+        positive_bonus = positive_folds * 140.0
+        # A scalper with only 1-2 trades over the training history is not informative.
+        activity_floor = max(4, int(min_trades))
+        inactivity_penalty = max(0, activity_floor - total_trades) * 450.0
+        research_score = total_net - 1.35 * max_dd + pf_bonus + trade_bonus + positive_bonus - inactivity_penalty
+        if total_trades == 0:
+            research_score -= 1e8
+
+        rows.append({
+            'Passed Stability Gate': passed,
+            'Deploy Score': deploy_score,
+            'Research Score': research_score,
+            '3-Fold Net PnL ($)': total_net,
+            'Worst Fold PnL ($)': worst_fold,
+            'Positive Folds': positive_folds,
+            'Median Profit Factor': median_pf,
+            'Max Fold DD ($)': max_dd,
+            'Trades': total_trades,
+            'Fast EMA': params['fast_len'], 'Trend EMA': params['trend_len'],
+            'Stop ATR': params['stop_atr'], 'Target R': params['target_r'],
+            'Trail ATR': params['trail_atr'], 'ER Min': params['er_min'],
+            'Entry Score': params.get('min_entry_score'), 'ADX Min': params.get('adx_min'),
+            'Max Bars': params.get('max_bars'), 'Cooldown': params.get('cooldown_bars'),
+        })
+
+        if passed and deploy_score > best_score:
+            best_score = deploy_score
+            best_params = dict(params)
+        if total_trades > 0 and research_score > best_research_score:
+            best_research_score = research_score
+            best_research_params = dict(params)
+
+    leaderboard = pd.DataFrame(rows)
+    if not leaderboard.empty:
+        leaderboard = leaderboard.sort_values(
+            ['Passed Stability Gate', 'Deploy Score', 'Research Score'],
+            ascending=[False, False, False]
+        ).reset_index(drop=True)
+    return best_params, best_research_params, leaderboard
+
+def render_institutional_futures_scalper_tab(active_ticker):
+    st.header('⚔️ Institutional Multi-Futures Scalper')
+    st.caption(
+        'Long-only default | No forced 3:00 PM flattening | Anchored VWAP + rolling POC context | One-contract multiplier-aware PnL | Real drawdown lockout, risk-budget-capped stop, early-failure exit, break-even, ATR trail and full trade log.'
+    )
+    st.warning(
+        'Research / paper-trading engine only. Yahoo continuous-futures data is delayed and is not execution-grade. '
+        'Absolute profitability comes first. Benchmark gap is secondary and never rescues a losing strategy. A failed stability gate now rejects deployment but DOES NOT erase backtest trades or the trade log.'
+    )
+
+    presets = _fut_contract_presets()
+    preset_keys = list(presets.keys())
+    default_idx = _fut_detect_preset_index(active_ticker, preset_keys)
+
+    with st.expander('1) Contract, Data & Dollar PnL', expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            preset_name = st.selectbox('Futures contract', preset_keys, index=default_idx, key='fut_scalp_preset')
+            preset = presets[preset_name]
+            yahoo_symbol = st.text_input('Yahoo data symbol', value=preset['yahoo'] or str(active_ticker), key=f"fut_scalp_symbol_{preset['root']}").strip().upper()
+        with c2:
+            multiplier = st.number_input('Contract multiplier', min_value=0.0001, value=float(preset['multiplier']), step=float(max(preset['multiplier'] * 0.01, 0.0001)), format='%.6f', key=f"fut_scalp_multiplier_{preset['root']}")
+            tick_size = st.number_input('Minimum tick size', min_value=0.000001, value=float(preset['tick_size']), step=float(preset['tick_size']), format='%.6f', key=f"fut_scalp_tick_size_{preset['root']}")
+        with c3:
+            contracts = st.number_input('Contracts', min_value=1, max_value=100, value=1, step=1, key='fut_scalp_contracts')
+            initial_capital = st.number_input('Starting account capital ($)', min_value=1000.0, max_value=10000000.0, value=25000.0, step=1000.0, key='fut_scalp_capital')
+        with c4:
+            tick_value_calc = float(multiplier) * float(tick_size)
+            st.metric('Calculated Tick Value', f'${tick_value_calc:,.2f}')
+            st.caption(f"Preset reference: {preset['root']} | {preset['name']} | 1 contract default")
+            st.caption('Multiplier × tick size drives every PnL row. You can override both fields.')
+
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            interval = st.selectbox('Chart interval', ['1m', '2m', '5m', '15m', '30m'], index=2, key='fut_scalp_interval')
+        with d2:
+            period_map = {
+                '1m': ['1d', '2d', '5d', '7d'],
+                '2m': ['5d', '10d', '30d', '60d'],
+                '5m': ['5d', '10d', '30d', '60d'],
+                '15m': ['10d', '30d', '60d'],
+                '30m': ['30d', '60d']
+            }
+            opts = period_map[interval]
+            period = st.selectbox('Backtest lookback', opts, index=min(2, len(opts)-1), key='fut_scalp_period')
+        with d3:
+            trading_window = st.selectbox(
+                'Trading window',
+                ['US Liquid Window 07:30–15:00 CT', 'Index RTH 08:30–15:00 CT', 'Full Globex (except maintenance hour)'],
+                index=0, key='fut_scalp_window'
+            )
+        with d4:
+            allow_short = st.checkbox('Allow short trades', value=False, key='fut_scalp_allow_short', help='Futures are two-sided. Keep ON for serious scalping unless your mandate is long-only.')
+            day_trade_flat = st.checkbox('Force flat after 15:00 CT', value=False, key='fut_scalp_day_flat')
+
+    with st.expander('2) Strategy & Loss-Control Engine', expanded=True):
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            fast_len = st.number_input('Fast EMA', min_value=3, max_value=50, value=8, step=1, key='fut_scalp_fast')
+            trend_len = st.number_input('Trend EMA', min_value=8, max_value=100, value=21, step=1, key='fut_scalp_trend')
+        with a2:
+            stop_atr = st.number_input('Initial stop (ATR x)', min_value=0.50, max_value=5.0, value=1.25, step=0.05, key='fut_scalp_stop_atr')
+            min_stop_ticks = st.number_input('Minimum stop (ticks)', min_value=1, max_value=200, value=6, step=1, key='fut_scalp_min_stop_ticks')
+        with a3:
+            target_r = st.number_input('Profit target (R)', min_value=0.75, max_value=10.0, value=1.75, step=0.25, key='fut_scalp_target_r')
+            breakeven_r = st.number_input('Move stop to BE at (R)', min_value=0.25, max_value=5.0, value=0.65, step=0.05, key='fut_scalp_be_r')
+        with a4:
+            trail_activate_r = st.number_input('Activate trail at (R)', min_value=0.50, max_value=8.0, value=0.90, step=0.05, key='fut_scalp_trail_activate')
+            trail_atr = st.number_input('Trailing stop (ATR x)', min_value=0.50, max_value=5.0, value=1.10, step=0.05, key='fut_scalp_trail_atr')
+
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            er_min = st.number_input('Minimum efficiency ratio', min_value=0.05, max_value=0.80, value=0.30, step=0.05, key='fut_scalp_er')
+            slope_min = st.number_input('Minimum VWAP slope / ATR', min_value=0.00, max_value=1.00, value=0.04, step=0.01, key='fut_scalp_slope')
+        with b2:
+            breakout_len = st.number_input('Breakout lookback bars', min_value=3, max_value=50, value=10, step=1, key='fut_scalp_breakout')
+            confirm_bars = st.number_input('Entry confirmation bars', min_value=1, max_value=5, value=1, step=1, key='fut_scalp_confirm')
+        with b3:
+            max_bars = st.number_input('Maximum bars in trade', min_value=2, max_value=200, value=12, step=1, key='fut_scalp_max_bars')
+            cooldown_bars = st.number_input('Cooldown bars after exit', min_value=0, max_value=100, value=1, step=1, key='fut_scalp_cooldown')
+        with b4:
+            default_daily_cap = max(0.0, round(float(initial_capital) * 0.015, 2))
+            daily_loss_cap = st.number_input('Daily loss lock ($, 0=off)', min_value=0.0, max_value=1000000.0, value=float(default_daily_cap), step=max(25.0, float(tick_value_calc)), key=f"fut_scalp_daily_cap_{preset['root']}")
+            max_loss_streak = st.number_input('Max consecutive losses / session', min_value=0, max_value=20, value=3, step=1, key='fut_scalp_loss_streak')
+
+        r1, r2 = st.columns(2)
+        with r1:
+            max_risk_pct = st.number_input('Maximum risk per trade (% of account)', min_value=0.10, max_value=5.0, value=1.25, step=0.05, key='fut_scalp_max_risk_pct')
+        with r2:
+            max_account_dd_pct = st.number_input('Permanent strategy kill-switch drawdown (%)', min_value=1.0, max_value=25.0, value=6.0, step=0.5, key='fut_scalp_max_account_dd_pct')
+
+        z1, z2, z3 = st.columns(3)
+        with z1:
+            cap_stop_to_budget = st.checkbox('Cap hard stop to risk budget', value=True, key='fut_scalp_cap_stop_budget', help='For 1-contract /SI, the engine tightens an oversized ATR stop so planned risk stays near the selected account-risk budget.')
+        with z2:
+            early_failure_bars = st.number_input('Early failure check (bars)', min_value=1, max_value=12, value=3, step=1, key='fut_scalp_early_fail_bars')
+            early_failure_mfe_r = st.number_input('Minimum follow-through by then (R)', min_value=0.05, max_value=1.00, value=0.30, step=0.05, key='fut_scalp_early_fail_mfe')
+        with z3:
+            post_loss_cooldown = st.number_input('Cooldown after a losing trade (bars)', min_value=0, max_value=50, value=3, step=1, key='fut_scalp_post_loss_cd')
+
+        st.markdown('##### Institutional Context Gates')
+        g1, g2, g3, g4 = st.columns(4)
+        with g1:
+            use_avwap_gate = st.checkbox('Require price above Anchored VWAP', value=True, key='fut_scalp_use_avwap')
+            avwap_anchor_date = st.date_input('AVWAP anchor date', value=(datetime.now() - timedelta(days=90)).date(), key='fut_scalp_avwap_anchor')
+        with g2:
+            use_poc_gate = st.checkbox('Require rolling POC confluence', value=True, key='fut_scalp_use_poc')
+            poc_lookback = st.number_input('POC lookback bars', min_value=20, max_value=500, value=78, step=1, key='fut_scalp_poc_lookback')
+        with g3:
+            poc_bins = st.number_input('Volume-profile bins', min_value=10, max_value=200, value=50, step=5, key='fut_scalp_poc_bins')
+            poc_tolerance_pct_ui = st.number_input('Max distance from POC (%)', min_value=0.01, max_value=5.00, value=0.30, step=0.05, key='fut_scalp_poc_tolerance')
+        with g4:
+            drawdown_lockout_dollars = st.number_input('Temporary lockout trigger ($ drawdown)', min_value=0.0, max_value=1000000.0, value=1500.0, step=max(25.0, float(tick_value_calc)), key='fut_scalp_dd_lockout_dollars')
+            drawdown_lockout_bars = st.number_input('Temporary lockout bars', min_value=0, max_value=500, value=39, step=1, key='fut_scalp_dd_lockout_bars')
+
+        c1, c2 = st.columns(2)
+        with c1:
+            commission_per_side = st.number_input('Commission + fees per side / contract ($)', min_value=0.0, max_value=1000.0, value=2.50, step=0.25, key='fut_scalp_commission')
+        with c2:
+            slippage_ticks = st.number_input('Slippage per side (ticks)', min_value=0.0, max_value=20.0, value=1.0, step=0.5, key='fut_scalp_slippage')
+
+    with st.expander('3) Robust Parameter Search', expanded=True):
+        o1, o2, o3, o4 = st.columns(4)
+        with o1:
+            optimize_mode = st.selectbox('Run mode', ['Robust Train/Holdout Optimize', 'Manual Parameters Only'], index=0, key='fut_scalp_opt_mode')
+        with o2:
+            objective = st.selectbox('Optimization objective', ['Absolute Profit + Stability', 'Loss Reduction', 'Profit Factor'], index=0, key='fut_scalp_objective')
+        with o3:
+            train_pct = st.slider('Training sample (%)', min_value=55, max_value=85, value=70, step=5, key='fut_scalp_train_pct')
+        with o4:
+            max_candidates = st.number_input('Max parameter candidates', min_value=6, max_value=80, value=30, step=2, key='fut_scalp_candidates')
+            min_trades = st.number_input('Minimum training trades', min_value=1, max_value=100, value=6, step=1, key='fut_scalp_min_trades')
+
+        run = st.button('Run Futures Scalper + Trade Log', type='primary', use_container_width=True, key='fut_scalp_run')
+
+    if run:
+        with st.spinner(f'Fetching {yahoo_symbol} and running multiplier-aware futures backtest...'):
+            raw = _fut_fetch_intraday_data(yahoo_symbol, period, interval)
+            if raw is None or raw.empty:
+                st.session_state['fut_scalper_pack'] = {'error': f'No intraday data returned for {yahoo_symbol}. Try a different Yahoo futures symbol, interval or lookback.'}
+            elif len(raw) < 100:
+                st.session_state['fut_scalper_pack'] = {'error': f'Only {len(raw)} bars returned. Increase the lookback or use a larger interval.'}
+            else:
+                spec = {
+                    'root': preset['root'], 'name': preset['name'], 'yahoo': yahoo_symbol,
+                    'multiplier': float(multiplier), 'tick_size': float(tick_size), 'tick_value': float(tick_value_calc)
+                }
+                base_params = {
+                    'fast_len': int(fast_len), 'trend_len': int(trend_len), 'atr_len': 14,
+                    'er_len': 10, 'er_min': float(er_min), 'slope_min': float(slope_min),
+                    'min_volz': -0.25, 'max_chase_atr': 2.5, 'breakout_len': int(breakout_len),
+                    'pullback_lookback': 3, 'confirm_bars': int(confirm_bars), 'slow_len': int(trend_len) * 3,
+                    'adx_min': 14.0, 'min_entry_score': 5,
+                    'stop_atr': float(stop_atr), 'min_stop_ticks': int(min_stop_ticks),
+                    'target_r': float(target_r), 'breakeven_r': float(breakeven_r),
+                    'trail_activate_r': float(trail_activate_r), 'trail_atr': float(trail_atr),
+                    'max_bars': int(max_bars), 'cooldown_bars': int(cooldown_bars),
+                    'max_risk_pct': float(max_risk_pct), 'enforce_risk_gate': False, 'max_account_dd_pct': float(max_account_dd_pct),
+                    'cap_stop_to_risk_budget': bool(cap_stop_to_budget), 'early_failure_bars': int(early_failure_bars),
+                    'early_failure_mfe_r': float(early_failure_mfe_r), 'post_loss_cooldown_bars': int(post_loss_cooldown),
+                    'regime_len': max(126, int(trend_len) * 6),
+                    'use_avwap_gate': bool(use_avwap_gate), 'avwap_anchor_date': str(avwap_anchor_date),
+                    'use_poc_gate': bool(use_poc_gate), 'poc_lookback': int(poc_lookback),
+                    'poc_bins': int(poc_bins), 'poc_tolerance_pct': float(poc_tolerance_pct_ui) / 100.0,
+                    'drawdown_lockout_dollars': float(drawdown_lockout_dollars),
+                    'drawdown_lockout_bars': int(drawdown_lockout_bars),
+                }
+
+                split_i = int(len(raw) * float(train_pct) / 100.0)
+                split_i = min(max(split_i, 80), len(raw) - 30)
+                split_time = raw.index[split_i]
+                selected_params = dict(base_params)
+                deploy_params = None
+                research_params = None
+                leaderboard = pd.DataFrame()
+
+                if optimize_mode == 'Robust Train/Holdout Optimize':
+                    train_df = raw.iloc[:split_i].copy()
+                    deploy_params, research_params, leaderboard = _fut_optimize(
+                        train_df=train_df, spec=spec, base_params=base_params,
+                        allow_short=bool(allow_short), trading_window=trading_window,
+                        contracts=int(contracts), initial_capital=float(initial_capital),
+                        commission_per_side=float(commission_per_side), slippage_ticks=float(slippage_ticks),
+                        daily_loss_cap=float(daily_loss_cap), max_consecutive_losses=int(max_loss_streak),
+                        day_trade_flat=bool(day_trade_flat), max_candidates=int(max_candidates),
+                        min_trades=int(min_trades), objective=objective
+                    )
+
+                if optimize_mode == 'Robust Train/Holdout Optimize':
+                    stability_rejected = deploy_params is None
+                    selected_params = dict(deploy_params) if deploy_params is not None else (dict(research_params) if research_params is not None else dict(base_params))
+                else:
+                    stability_rejected = False
+                    selected_params = dict(base_params)
+
+                # IMPORTANT: never delete strategy signals just because deployment validation failed.
+                # Rejected models still backtest normally and show a complete trade log; only the
+                # deployment state is disabled.
+                full_sig = _fut_generate_signals(raw, selected_params, bool(allow_short), trading_window)
+                full_bt = _fut_backtest(
+                    full_sig, spec, selected_params, int(contracts), float(initial_capital),
+                    float(commission_per_side), float(slippage_ticks), float(daily_loss_cap),
+                    int(max_loss_streak), bool(day_trade_flat)
+                )
+                oos_bt = _fut_backtest(
+                    full_sig, spec, selected_params, int(contracts), float(initial_capital),
+                    float(commission_per_side), float(slippage_ticks), float(daily_loss_cap),
+                    int(max_loss_streak), bool(day_trade_flat), trade_start_time=split_time
+                )
+
+                st.session_state['fut_scalper_pack'] = {
+                    'error': '', 'raw': raw, 'spec': spec, 'params': selected_params,
+                    'base_params': base_params, 'full': full_bt, 'oos': oos_bt,
+                    'leaderboard': leaderboard, 'split_time': split_time,
+                    'interval': interval, 'period': period, 'optimize_mode': optimize_mode,
+                    'objective': objective, 'train_pct': train_pct, 'stability_rejected': stability_rejected,
+                    'signal_counts': {
+                        'long_signals': int(full_sig['LongEntrySignal'].sum()) if 'LongEntrySignal' in full_sig.columns else 0,
+                        'short_signals': int(full_sig['ShortEntrySignal'].sum()) if 'ShortEntrySignal' in full_sig.columns else 0,
+                    },
+                }
+
+    pack = st.session_state.get('fut_scalper_pack')
+    if not pack:
+        st.info('Choose a contract and click **Run Futures Scalper + Trade Log**.')
+        return
+    if pack.get('error'):
+        st.error(pack['error'])
+        return
+
+    spec = pack['spec']
+    full = pack['full']
+    oos = pack['oos']
+    fm = full['metrics']
+    om = oos['metrics']
+
+    if pack.get('stability_rejected'):
+        st.error('🛑 DEPLOYMENT REJECTED: no parameter set passed the 3-fold profitability/stability gate. The best research candidate is still backtested below with its real trades, but it is NOT approved for deployment.')
+    elif om.get('net_pnl', 0.0) <= 0:
+        st.error('🛑 DEPLOYMENT DISABLED: the selected model failed out-of-sample. Do not treat the latest state as tradable until a new run passes OOS.')
+
+    st.write('### Live / Latest Strategy State')
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric('Current Position', fm.get('current_position', 'CASH'))
+    s2.metric('Net Strategy PnL', f"${fm.get('net_pnl', 0.0):+,.2f}")
+    s3.metric('Benchmark 1-Contract PnL', f"${fm.get('benchmark_pnl', 0.0):+,.2f}")
+    deploy_state = 'RESEARCH ONLY — STABILITY FAIL' if pack.get('stability_rejected') else ('DISABLED — OOS FAIL' if om.get('net_pnl', 0.0) <= 0 else 'PAPER-TRADE CANDIDATE')
+    s4.metric('Deployment State', deploy_state)
+    s5.metric('Max Drawdown', f"${fm.get('max_drawdown', 0.0):,.2f}")
+
+    sc = pack.get('signal_counts', {})
+    st.caption(
+        f"Opportunity funnel: {sc.get('long_signals', 0)} long + {sc.get('short_signals', 0)} short setup bars → "
+        f"{fm.get('pending_entries_created', 0)} pending entries → {fm.get('entry_attempts', 0)} execution attempts → "
+        f"{fm.get('fills', 0)} fills → {fm.get('closed_trades', 0)} closed trades. "
+        f"Risk-capped fills: {fm.get('risk_capped_fills', 0)} | Remaining risk-budget exceedances: {fm.get('risk_budget_violations', 0)}."
+    )
+    st.caption('Setup bars are raw qualifying trigger bars. Pending entries are independent opportunities that occurred while flat and outside locks/cooldowns. V7 is long-only by default, does not force a 3:00 PM exit, caps oversized stops to the selected dollar-risk budget when possible, and cuts trades that fail to produce follow-through: drawdown-limit breaches are recorded, but do not erase the rest of the backtest sample.')
+
+    with st.expander('Execution Gate Diagnostics', expanded=False):
+        gate_df = pd.DataFrame([
+            ('Setup bars', int(sc.get('long_signals', 0) + sc.get('short_signals', 0))),
+            ('Pending entries created', fm.get('pending_entries_created', 0)),
+            ('Execution attempts', fm.get('entry_attempts', 0)),
+            ('Actual fills', fm.get('fills', 0)),
+            ('Risk-capped fills', fm.get('risk_capped_fills', 0)),
+            ('Risk budget exceedances', fm.get('risk_budget_violations', 0)),
+            ('Blocked by hard risk gate', fm.get('blocked_risk', 0)),
+            ('Blocked by session clock', fm.get('blocked_clock', 0)),
+            ('Blocked by cooldown', fm.get('blocked_cooldown', 0)),
+            ('Blocked by daily loss lock', fm.get('blocked_daily', 0)),
+            ('Blocked by loss-streak lock', fm.get('blocked_loss_streak', 0)),
+            ('Blocked by temporary drawdown lockout', fm.get('blocked_temp_lockout', 0)),
+            ('Temporary drawdown lockout triggers', fm.get('temp_lockout_triggers', 0)),
+            ('Blocked by drawdown kill switch', fm.get('blocked_drawdown', 0)),
+            ('Drawdown limit breaches (research continues)', fm.get('drawdown_limit_breaches', 0)),
+        ], columns=['Execution Stage', 'Count'])
+        st.dataframe(gate_df, use_container_width=True, hide_index=True)
+        st.caption('Fixed-contract research fills are executed even when one contract exceeds the account risk budget. The trade log flags those rows as Exceeded — Research Fill. Deployment approval remains separate.')
+
+    st.write('### Full-Sample Performance')
+    p1, p2, p3, p4, p5, p6 = st.columns(6)
+    p1.metric('Closed Trades', fm.get('closed_trades', 0))
+    p2.metric('Win Rate', f"{fm.get('win_rate', 0.0):.1f}%")
+    pf_display = fm.get('profit_factor', 0.0)
+    p3.metric('Profit Factor', '∞' if pf_display >= 900 else f'{pf_display:.2f}')
+    p4.metric('Account Return', f"{fm.get('return_pct', 0.0):+.2f}%")
+    p5.metric('Max DD', f"{fm.get('max_drawdown_pct', 0.0):.2f}%")
+    p6.metric('Max Loss Streak', fm.get('max_consecutive_losses', 0))
+
+    st.write('### Holdout / Out-of-Sample Check')
+    st.caption(f"Parameters were selected before the holdout began at {_fut_fmt_ct(pack['split_time'])}. The OOS section is the harder test.")
+    q1, q2, q3, q4, q5 = st.columns(5)
+    q1.metric('OOS Net PnL', f"${om.get('net_pnl', 0.0):+,.2f}")
+    q2.metric('OOS Benchmark', f"${om.get('benchmark_pnl', 0.0):+,.2f}")
+    q3.metric('OOS Gap', f"${om.get('benchmark_gap_pnl', 0.0):+,.2f}")
+    q4.metric('OOS Win Rate', f"{om.get('win_rate', 0.0):.1f}%")
+    q5.metric('OOS Max DD', f"${om.get('max_drawdown', 0.0):,.2f}")
+
+    if (not pack.get('stability_rejected')) and om.get('net_pnl', 0.0) > 0 and om.get('profit_factor', 0.0) > 1.0 and om.get('benchmark_gap_pnl', 0.0) > 0:
+        st.success('✅ OOS PASS: profitable and ahead of the 1-contract long benchmark over the holdout window.')
+    elif (not pack.get('stability_rejected')) and om.get('net_pnl', 0.0) > 0:
+        st.warning('⚠️ OOS POSITIVE BUT BELOW BENCHMARK: useful risk control, but it did not beat continuous long exposure in the holdout.')
+    else:
+        st.error('🚫 OOS FAIL: the current parameter set lost money in the holdout. Treat this configuration as research only.')
+
+    if np.isfinite(fm.get('active_stop', np.nan)):
+        a1, a2 = st.columns(2)
+        a1.metric('Active Protective Stop', f"{fm['active_stop']:,.6f}")
+        a2.metric('Active Profit Target', f"{fm.get('active_target', np.nan):,.6f}")
+
+    st.write('### Price, VWAP, Entries & Exits')
+    sig = full['signals']
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=sig.index, open=sig['Open'], high=sig['High'], low=sig['Low'], close=sig['Close'],
+        name=spec['root'], increasing_line_color='#4ad66d', decreasing_line_color='#ff5d73'
+    ))
+    fig.add_trace(go.Scatter(x=sig.index, y=sig['VWAP'], mode='lines', name='Session VWAP', line=dict(color='#b06cff', width=2)))
+    fig.add_trace(go.Scatter(x=sig.index, y=sig['EMA_Fast'], mode='lines', name=f"EMA {pack['params']['fast_len']}", line=dict(color='#47e5ff', width=1.4)))
+    fig.add_trace(go.Scatter(x=sig.index, y=sig['EMA_Trend'], mode='lines', name=f"EMA {pack['params']['trend_len']}", line=dict(color='#f7d154', width=1.4)))
+
+    ep = full['entry_points'].dropna()
+    xp = full['exit_points'].dropna()
+    if len(ep):
+        fig.add_trace(go.Scatter(x=ep.index, y=ep.values, mode='markers', name='Entry', marker=dict(symbol='triangle-up', size=12, color='#00ff88')))
+    if len(xp):
+        fig.add_trace(go.Scatter(x=xp.index, y=xp.values, mode='markers', name='Exit', marker=dict(symbol='triangle-down', size=12, color='#ff4d6d')))
+    active_stops = full['stop_series'].dropna()
+    if len(active_stops):
+        fig.add_trace(go.Scatter(x=active_stops.index, y=active_stops.values, mode='lines', name='Active Stop', line=dict(color='#ff7b00', width=1, dash='dot')))
+
+    fig.update_layout(template='plotly_dark', height=720, hovermode='x unified', xaxis_rangeslider_visible=False,
+                      title=f"{spec['root']} {spec['name']} — Institutional Futures Scalper")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write('### Strategy Equity vs 1-Contract Benchmark')
+    eq = full['equity']
+    if len(eq):
+        bench_start = float(sig['Open'].iloc[0]) + float(slippage_ticks) * float(spec['tick_size'])
+        bench_curve = float(initial_capital) + (sig['Close'] - bench_start) * float(spec['multiplier']) * int(contracts) - 2.0 * float(commission_per_side) * int(contracts)
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(x=eq.index, y=eq.values, mode='lines', name='Strategy Equity'))
+        fig_eq.add_trace(go.Scatter(x=bench_curve.index, y=bench_curve.values, mode='lines', name='Long Benchmark Equity'))
+        fig_eq.update_layout(template='plotly_dark', height=430, hovermode='x unified', yaxis_title='Account Value ($)')
+        st.plotly_chart(fig_eq, use_container_width=True)
+
+    st.write('### Multiplier-Based Futures Trade Log')
+    trades = full['trades'].copy()
+    if trades.empty:
+        st.warning('No trades were generated with the current settings.')
+    else:
+        format_map = {
+            'Entry Price': '{:,.6f}', 'Initial Stop': '{:,.6f}', 'Initial Risk ($)': '${:,.2f}',
+            'Exit Price': '{:,.6f}', 'Points': '{:+,.6f}', 'Ticks': '{:+,.1f}',
+            'Gross PnL ($)': '${:+,.2f}', 'Costs ($)': '${:,.2f}', 'Net PnL ($)': '${:+,.2f}', 'R Multiple': '{:+.2f}R',
+            'Cumulative PnL ($)': '${:+,.2f}', 'Account Return (%)': '{:+.2f}%',
+            'MFE ($)': '${:+,.2f}', 'MAE ($)': '${:+,.2f}'
+        }
+        st.dataframe(trades.style.format(format_map), use_container_width=True, height=650)
+        st.download_button(
+            'Download Futures Trade Log CSV', trades.to_csv(index=False).encode('utf-8'),
+            file_name=f"{spec['root'].replace('/', '')}_{pack['interval']}_futures_scalper_trade_log.csv",
+            mime='text/csv', key='fut_scalp_dl_trades'
+        )
+
+    with st.expander('Selected strategy parameters', expanded=False):
+        param_df = pd.DataFrame([{'Parameter': k, 'Value': v} for k, v in pack['params'].items()])
+        st.dataframe(param_df, use_container_width=True, hide_index=True)
+
+    leaderboard = pack.get('leaderboard')
+    if isinstance(leaderboard, pd.DataFrame) and not leaderboard.empty:
+        with st.expander('Robust optimizer leaderboard (training sample only)', expanded=False):
+            st.dataframe(leaderboard.head(20), use_container_width=True, hide_index=True)
+
+    with st.expander('How the futures scalper trades', expanded=False):
+        st.markdown("""
+**Entry architecture**
+- Session VWAP is the institutional fair-value anchor.
+- Fast EMA vs trend EMA defines short-term direction.
+- Efficiency ratio removes low-quality chop.
+- The engine enters either a pullback/reclaim or a confirmed momentum breakout.
+- Signals are created at bar close and filled at the **next bar open**, including the selected slippage.
+
+**Loss control**
+- Initial ATR stop with a hard minimum number of ticks.
+- Break-even stop after a configurable favorable R multiple.
+- ATR trailing stop after the move proves itself.
+- Fixed R profit target.
+- Maximum holding time.
+- Cooldown after exits.
+- Daily dollar loss lock and consecutive-loss lock.
+- Optional forced flat rule to avoid carrying day trades into the maintenance / overnight period.
+
+**Benchmark test**
+The benchmark is one continuously long contract over the same window using the same contract count, multiplier, slippage and round-turn fee assumptions. The optimizer only sees the training sample; the later holdout is shown separately.
+        """)
+
+
 # 3. SIDEBAR CONTROLS
 # ==========================================
 with st.sidebar:
@@ -8883,12 +9912,6 @@ with st.sidebar:
     PAIR_TICKER = raw_pair + SUFFIX if (SUFFIX and raw_pair and not raw_pair.endswith(SUFFIX)) else raw_pair
     
     st.caption(f"Active Ticker: {TICKER}")
-    st.success("Live Mode default: ON with 15m. Use Enable Live Data toggle to turn OFF when needed. Institutional Trend Rail ATR multiplier: 1.35")
-
-    st.divider()
-    st.subheader("✅ Main Kalman Signal Verify")
-    main_kalman_verify_slot = st.empty()
-    main_kalman_verify_slot.info("Load the Kalman Filter tab to sync the main trade-log signal here.")
     
     # DEBUG: Temporary visualization to prove logic
     with st.expander("🛠️ Debug Info (Remove Later)", expanded=True):
@@ -8897,8 +9920,29 @@ with st.sidebar:
         st.code(f"Raw Ticker = '{raw_ticker}'")
         st.code(f"Final TICKER = '{TICKER}'")
     
-    start_date = st.date_input("Start Date", DEFAULT_NONLIVE_START)
+    st.subheader("Chart History")
+    chart_tf_label = st.selectbox(
+        "Chart Timeframe",
+        ["1 Day", "1 Week", "1 Month", "1 Hour", "30 Min", "15 Min", "5 Min", "1 Min"],
+        index=0,
+        help="TradingView-style chart timeframe. Daily/weekly/monthly use the maximum listed history by default; intraday uses Yahoo's maximum supported range."
+    )
+    chart_data_interval = _tv_interval_from_label(chart_tf_label)
     end_date = st.date_input("End Date", datetime.now())
+    chart_history_mode = st.selectbox(
+        "Chart History Mode",
+        ["Fast TradingView-style", "Full max history", "Custom anchor start date"],
+        index=0,
+        help="Fast is recommended for Streamlit speed. Full max behaves like TradingView max listed history but can be slow with heavy models."
+    )
+    use_custom_anchor = chart_history_mode == "Custom anchor start date"
+    if use_custom_anchor:
+        start_date = st.date_input("Anchor Start Date", DEFAULT_NONLIVE_START)
+    elif chart_history_mode == "Full max history":
+        start_date = _tv_max_start_for_interval(chart_data_interval, end_date)
+    else:
+        start_date = _tv_fast_start_for_interval(chart_data_interval, end_date)
+    st.caption(_tv_history_caption(chart_data_interval, use_custom_anchor, start_date, chart_history_mode))
     
     st.subheader("Model Settings")
     rf_rate = st.number_input("Risk Free Rate (%)", 0.0, 20.0, DEFAULT_RF) / 100
@@ -8950,582 +9994,18 @@ with st.sidebar:
 
     st.divider()
     st.header("⚡ Live Decision Mode")
-    live_mode = st.toggle("Enable Live Data", value=True, help="Default ON with 15m. Turn OFF when you want normal historical/daily mode. Ignored when Fast intraday-only startup is ON.")
+    live_mode = st.toggle("Enable Live Data", value=False, help="Fetches recent 1m/5m data for real-time decision support. Ignored when Fast intraday-only startup is ON.")
     if live_mode:
-        data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=2)
+        data_interval = st.selectbox("Live Interval", ["1m", "5m", "15m", "60m"], index=1)
         st.info("Live mode uses a shorter window and higher frequency data for tactical edge.")
-        kalman_fast_live_mode = st.toggle(
-            "Kalman-only fast live mode",
-            value=True,
-            help="ON skips the heavy full-dashboard models and renders only the Kalman tab for live 5/15m work. Kalman logic itself is unchanged."
-        )
         if st.button("🔄 Refresh Live Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
     else:
-        data_interval = '1d'
-        kalman_fast_live_mode = False
-
-    st.divider()
-    show_ibkr_bridge = st.checkbox("Show IBKR Paper Bridge", value=False, help="Keep this OFF unless you are testing/using IBKR Paper. No connection is attempted while OFF.")
-    if show_ibkr_bridge:
-        st.header("🔌 IBKR Paper Bridge")
-        st.caption("Safe read-only connection test. No orders are sent from this panel.")
-
-        ibkr_enable_panel = st.toggle(
-            "Show IBKR connection panel",
-            value=True,
-            help="Uses TWS/IB Gateway Paper API. Keep TWS Paper open on port 7497."
-        )
-
-        if ibkr_enable_panel:
-            ibkr_host = st.text_input("IBKR Host", value="127.0.0.1", key="ibkr_host")
-            ibkr_port = st.number_input("IBKR Paper Port", min_value=1, max_value=9999, value=7497, step=1, key="ibkr_port")
-            ibkr_client_id = st.number_input("IBKR Client ID", min_value=1, max_value=999999, value=101, step=1, key="ibkr_client_id")
-
-            st.info("Paper default: Host 127.0.0.1 | Port 7497 | Client ID 101. Keep TWS Paper open.")
-            if not IBKR_AVAILABLE:
-                st.warning("ib_insync is not available inside this app environment. Install it with: python3 -m pip install ib_insync")
-
-            if st.button("Test IBKR Paper Connection", use_container_width=True, key="test_ibkr_connection_button"):
-                result = ibkr_readonly_status(ibkr_host, int(ibkr_port), int(ibkr_client_id))
-                st.session_state["ibkr_last_connection_result"] = result
-
-            result = st.session_state.get("ibkr_last_connection_result", None)
-            if result is not None:
-                if result.get("ok"):
-                    st.success("✅ IBKR Paper connected safely in read-only mode.")
-                    st.write("Accounts:", result.get("accounts", []))
-
-                    pos_df = result.get("positions", pd.DataFrame())
-                    if isinstance(pos_df, pd.DataFrame) and not pos_df.empty:
-                        st.write("Positions")
-                        st.dataframe(pos_df, use_container_width=True)
-                    else:
-                        st.caption("No open positions found.")
-
-                    summary_df = result.get("summary", pd.DataFrame())
-                    if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
-                        show_tags = ["NetLiquidation", "TotalCashValue", "AvailableFunds", "BuyingPower", "EquityWithLoanValue"]
-                        small_summary = summary_df[summary_df["Tag"].isin(show_tags)].copy()
-                        if not small_summary.empty:
-                            st.write("Account Summary")
-                            st.dataframe(small_summary, use_container_width=True)
-                else:
-                    st.error(f"❌ IBKR connection failed: {result.get('error', 'Unknown error')}")
-
+        data_interval = chart_data_interval
 
     st.divider()
     st.header("🔔 Live Buy/Sell Alerts")
-
-    st.divider()
-    st.header("📲 Telegram Signal Alerts")
-    with st.expander("Keep Telegram settings after Streamlit Cloud reboot", expanded=False):
-        st.markdown("""
-        **Local Mac:** this app auto-saves settings to a local file.
-
-        **Streamlit Cloud/personal website:** app files can reset after reboot/redeploy.  
-        Put these in **App settings → Secrets**:
-
-        ```toml
-        TELEGRAM_BOT_TOKEN = "your_bot_token"
-        TELEGRAM_CHAT_ID = "your_chat_id"
-        ```
-
-        Then the app will prefill them even after cloud reboot.
-        """)
-    _tg_saved = load_telegram_settings()
-    try:
-        _tg_saved["enabled"] = True
-        _tg_saved["auto_kalman"] = True
-    except Exception:
-        pass
-
-    tg_alerts_on = st.checkbox(
-        "Enable Telegram Alerts",
-        value=True,
-        help="Always ON by default so Telegram notifications are active after refresh/reboot."
-    )
-    # Force ON so refresh/reboot or an old saved file cannot silently disable Telegram alerts.
-    tg_alerts_on = True
-    tg_bot_token = st.text_input(
-        "Telegram Bot Token",
-        value=_tg_saved.get("bot_token", st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else ""),
-        type="password",
-        help="Paste BotFather token here. You can save it locally below so you do not retype it."
-    )
-    tg_chat_id = st.text_input(
-        "Telegram Chat ID",
-        value=_tg_saved.get("chat_id", st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else ""),
-        help="Paste your Telegram chat ID here. You can save it locally below so you do not retype it."
-    )
-
-    if st.button("Send Test Telegram Alert", use_container_width=True):
-        test_msg = (
-            "PINEHURST QUANT TEST ALERT\n"
-            "Status: Telegram alerts are connected.\n"
-            "Mode: Notification only — no order sent."
-        )
-        ok, resp = send_telegram_alert(tg_bot_token, tg_chat_id, test_msg)
-        if ok:
-            st.success("Telegram test alert sent.")
-        else:
-            st.error(f"Telegram test failed: {resp}")
-
-    st.caption("Alerts are notification-only. No IBKR order is sent from Telegram alerts.")
-
-    auto_kalman_alerts_on = st.checkbox(
-        "Auto-alert Kalman Live BUY/SELL",
-        value=bool(_tg_saved.get("auto_kalman", True)),
-        help="Kept ON for Telegram system readiness. Actual automatic alerts are sent only by the Main Kalman Watchlist Monitor."
-    )
-
-    if st.button("Save Telegram Settings on This Mac", use_container_width=True):
-        _ok_save, _save_msg = save_telegram_settings(
-            tg_bot_token,
-            tg_chat_id,
-            True,
-            True,
-            kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
-            auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", False))),
-            auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", False))),
-        )
-        if _ok_save:
-            st.success("Telegram settings saved on this Mac. Enable Telegram Alerts will stay ON after refresh/reboot.")
-        else:
-            st.error(f"Could not save Telegram settings: {_save_msg}")
-
-    # Auto-save Telegram settings on each rerun so reboot keeps the selected options.
-    try:
-        save_telegram_settings(
-            tg_bot_token,
-            tg_chat_id,
-            True,
-            True,
-            kalman_15m_watchlist=str(locals().get("kalman_15m_watchlist", _tg_saved.get("kalman_15m_watchlist", ""))).strip(),
-            auto_kalman_15m_watchlist=bool(locals().get("auto_kalman_15m_watchlist_on", _tg_saved.get("auto_kalman_15m_watchlist", True))),
-            auto_refresh_15m=bool(locals().get("auto_refresh_15m_on", _tg_saved.get("auto_refresh_15m", True))),
-        )
-    except Exception:
-        pass
-
-    st.divider()
-    st.subheader("Main Kalman Watchlist Monitor")
-    st.info("Main Ticker is view-only. Telegram alerts come only from this watchlist monitor, after baseline. Watchlist uses the CURRENT Main Kalman controls from the sliders/settings, not a separate hardcoded logic. Auto-refresh is OFF by default.")
-    _mon_saved = _load_main_kalman_monitor_settings()
-    _watchlist_from_url = _get_query_param_value("watchlist", "")
-    _watchlist_default = str(_watchlist_from_url or _mon_saved.get("watchlist", "DELL, NBIS, PLTR, AAPL") or "DELL, NBIS, PLTR, AAPL")
-    main_kalman_monitor_watchlist = st.text_area(
-        "Stocks to monitor with Main Kalman Trade-Log model",
-        value=_watchlist_default,
-        height=70,
-        help="Add/delete tickers here. The app saves this exact list into the URL and local settings so refresh/reboot keeps it."
-    )
-    try:
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
-        _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "enabled": True,
-            "refresh": False,
-        })
-    except Exception:
-        pass
-
-    st.caption("Watchlist persistence: saved into browser URL + local settings. On Streamlit Cloud, bookmark/copy the current URL after editing.")
-
-    main_kalman_monitor_max_stocks = st.number_input(
-        "Max stocks to monitor",
-        min_value=1,
-        max_value=200,
-        value=int(_mon_saved.get("max_stocks", 50) or 50),
-        step=1,
-        help="Higher number checks more tickers but can load slower. Default 50. Increase this if you want more symbols shown in open/closed status and trade-log monitor."
-    )
-
-    # Auto-lock current watchlist on every rerun so refresh/reboot keeps your latest edits.
-    try:
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
-        _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "enabled": True,
-            "refresh": False,
-        })
-    except Exception:
-        pass
-
-    main_kalman_monitor_on = st.checkbox(
-        "Enable Main Kalman Watchlist Auto Telegram",
-        value=True,
-        help="Only watchlist tickers send Telegram. Main Ticker is view-only. First scan baselines current state; alerts only after a future change."
-    )
-    main_kalman_monitor_refresh = st.checkbox(
-        "Auto-refresh Main Kalman Monitor every 60 seconds",
-        value=False,
-        help="Default OFF. Turn ON only when you actively want the page to refresh every 60 seconds."
-    )
-    main_kalman_monitor_sell_alerts = st.checkbox(
-        "Enable Telegram SELL alerts",
-        value=False,
-        help="Default OFF to prevent false SELL blasts. BUY alerts still work. Turn ON only after the watchlist table matches your main trade logs."
-    )
-
-    # Continuously persist the FULL monitor config to disk so the standalone
-    # background scanner (telegram_watchlist_scanner.py) can run with the app
-    # closed and use the same firewall + sell-alert settings.
-    try:
-        _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "sell_alerts": bool(main_kalman_monitor_sell_alerts),
-            "enabled": bool(locals().get("main_kalman_monitor_on", True)),
-            "refresh": bool(locals().get("main_kalman_monitor_refresh", False)),
-            "kalman_use_risk_firewall": bool(st.session_state.get("kalman_use_risk_firewall", False)),
-            "kalman_trade_stop_pct": float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-            "kalman_trail_stop_pct": float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-            "kalman_equity_dd_stop_pct": float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-            "kalman_firewall_cooldown": int(st.session_state.get("kalman_firewall_cooldown", 8)),
-            "initial_cap": float(st.session_state.get("initial_cap", 10000.0)),
-            "kalman_trend_rail_distance": float(st.session_state.get("kalman_trend_rail_distance", 1.35)),
-            "kalman_strategy_cross_buffer_pct": float(st.session_state.get("kalman_strategy_cross_buffer_pct", 1.25)),
-            "kalman_strategy_confirm_bars": int(st.session_state.get("kalman_strategy_confirm_bars", 3)),
-            "kalman_strategy_min_hold": int(st.session_state.get("kalman_strategy_min_hold", 5)),
-            "kalman_strategy_cooldown": int(st.session_state.get("kalman_strategy_cooldown", 3)),
-            "kalman_strategy_slope_confirm": bool(st.session_state.get("kalman_strategy_slope_confirm", True)),
-            "kalman_strategy_atr_safety": bool(st.session_state.get("kalman_strategy_atr_safety", True)),
-            "kalman_fast_reaction": float(st.session_state.get("kalman_fast_reaction", 0.34)),
-            "kalman_slow_smoothing": float(st.session_state.get("kalman_slow_smoothing", 0.055)),
-            "kalman_polish_span": int(st.session_state.get("kalman_polish_span", 3)),
-        })
-    except Exception:
-        pass
-
-    if st.button("Save Main Kalman Monitor Settings", use_container_width=True):
-        _set_query_param_value("watchlist", str(main_kalman_monitor_watchlist).strip())
-        _ok_mon, _msg_mon = _save_main_kalman_monitor_settings({
-            "watchlist": str(main_kalman_monitor_watchlist).strip(),
-            "max_stocks": int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            "sell_alerts": bool(main_kalman_monitor_sell_alerts),
-            "enabled": True,
-            "refresh": False,
-            "kalman_use_risk_firewall": bool(st.session_state.get("kalman_use_risk_firewall", False)),
-            "kalman_trade_stop_pct": float(st.session_state.get("kalman_trade_stop_pct", 16.0)),
-            "kalman_trail_stop_pct": float(st.session_state.get("kalman_trail_stop_pct", 22.0)),
-            "kalman_equity_dd_stop_pct": float(st.session_state.get("kalman_equity_dd_stop_pct", 28.0)),
-            "kalman_firewall_cooldown": int(st.session_state.get("kalman_firewall_cooldown", 8)),
-            "initial_cap": float(st.session_state.get("initial_cap", 10000.0)),
-        })
-        if _ok_mon:
-            st.success("Watchlist saved. It is locked in the URL + local settings until you edit it again.")
-        else:
-            st.error(f"Could not save monitor settings: {_msg_mon}")
-
-
-    if st.button("Reset/Baseline Watchlist Alerts Now", use_container_width=True):
-        try:
-            _save_main_kalman_watchlist_ledger({})
-            st.success("Watchlist alert baseline cleared. Next scan will sync current guarded states without sending alerts.")
-        except Exception as _e:
-            st.error(f"Could not reset baseline: {_e}")
-
-    with st.expander("Manual ledger correction", expanded=False):
-        st.caption("Use only if the main trade log already showed an open position and a refresh wrongly removed it.")
-        _ov_ticker = st.text_input("Override ticker", value="DELL").upper()
-        _ov_entry = st.text_input("Open entry time CT", value="2026-06-11 14:30:00 CT")
-        _ov_entry_price = st.number_input("Open entry price", value=391.75, step=0.01)
-        _ov_current_price = st.number_input("Current price", value=395.58, step=0.01)
-        if st.button("Force ledger to OPEN/LONG", use_container_width=True):
-            try:
-                _ledger = _load_main_kalman_watchlist_ledger()
-                _pnl = ((_ov_current_price / _ov_entry_price) - 1.0) * 100.0 if _ov_entry_price else 0.0
-                _ledger[_ov_ticker] = {
-                    "ticker": _ov_ticker,
-                    "position": "LONG",
-                    "entry_time": _ov_entry,
-                    "exit_time": "Open",
-                    "event_time": _ov_entry,
-                    "state_key": f"{_ov_ticker}|BUY|{_ov_entry}|OPEN|{_ov_entry_price}|{_ov_current_price}",
-                    "price": round(float(_ov_current_price), 2),
-                    "entry_price": round(float(_ov_entry_price), 2),
-                    "exit_current_price": round(float(_ov_current_price), 2),
-                    "pnl_pct": round(float(_pnl), 2),
-                    "last_scan_ct": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
-                }
-                _save_main_kalman_watchlist_ledger(_ledger)
-                st.success(f"{_ov_ticker} ledger forced to OPEN/LONG. Future valid SELL only will close it.")
-            except Exception as _e:
-                st.error(f"Override failed: {_e}")
-
-    # ---- Auto-run / persistent results so you don't re-click every load ----
-    if "auto_run_main_kalman_monitor" not in st.session_state:
-        st.session_state["auto_run_main_kalman_monitor"] = False
-    auto_run_monitor = st.checkbox(
-        "Auto-run watchlist monitor on page load",
-        key="auto_run_main_kalman_monitor",
-        help="When ON, the watchlist runs automatically each time the app loads/reruns. When OFF you can run it manually with the button. Either way, the last results stay shown below until you run it again.",
-    )
-
-    if auto_run_monitor:
-        st.caption("Auto-run is ON: the watchlist runs on each page load. Turn it OFF to use Safe Load (manual) mode.")
-    else:
-        st.warning("SAFE LOAD MODE: watchlist does not auto-run on page load. Click the button below, or enable Auto-run above.")
-
-    def _render_open_closed_status(_rows, _source_label=""):
-        """Render the Open/Closed split table. Used for manual, auto, and cached results."""
-        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
-        if _source_label:
-            st.caption(_source_label)
-        try:
-            _df = pd.DataFrame(_rows)
-            if not _df.empty and "Trade Position" in _df.columns:
-                _open_df = _df[_df["Trade Position"].astype(str).str.upper().eq("LONG")].copy()
-                _closed_df = _df[_df["Trade Position"].astype(str).str.upper().ne("LONG")].copy()
-                _cols = ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal", "Status Source"]
-                c_open, c_closed = st.columns(2)
-                with c_open:
-                    st.metric("Open / Long", int(len(_open_df)))
-                    if len(_open_df):
-                        st.dataframe(_open_df[[c for c in _cols if c in _open_df.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No open Long positions.")
-                with c_closed:
-                    st.metric("Closed / Cash", int(len(_closed_df)))
-                    if len(_closed_df):
-                        st.dataframe(_closed_df[[c for c in _cols if c in _closed_df.columns]], use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No closed/cash tickers.")
-            else:
-                st.caption("No watchlist rows to show yet.")
-        except Exception as _e:
-            st.caption(f"Open/Closed status unavailable: {_e}")
-
-    def _run_monitor_and_store():
-        try:
-            _max_stocks = int(main_kalman_monitor_max_stocks)
-        except Exception:
-            _max_stocks = 50
-        try:
-            _sell_alerts = bool(main_kalman_monitor_sell_alerts)
-        except Exception:
-            _sell_alerts = False
-        _rows = run_main_kalman_watchlist_monitor(
-            main_kalman_monitor_watchlist,
-            send_telegram=bool(tg_alerts_on and main_kalman_monitor_on),
-            token=tg_bot_token,
-            chat_id=tg_chat_id,
-            show_table=True,
-            max_stocks=_max_stocks,
-            allow_sell_alerts=_sell_alerts,
-        )
-        st.session_state["last_main_kalman_monitor_rows"] = _rows
-        st.session_state["last_main_kalman_monitor_ct"] = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT")
-        return _rows
-
-    _clicked_run = st.button("Run Main Kalman Monitor Now", use_container_width=True)
-
-    with st.expander("🔁 Bulk re-optimize ALL watchlist tickers (fix the 15-trusted / 135-fallback split)", expanded=False):
-        st.caption(
-            "Right now only tickers you've personally opened in the Main Kalman tab this session get "
-            "fresh, trusted optimizer params — every other ticker in the watchlist falls back to an old "
-            "one-time batch seed that this app itself treats as untrusted. Running this once loops the "
-            "SAME optimizer over every ticker in your full watchlist, so all of them end up trusted/live-synced "
-            "— eliminating mismatches between this app and any external mirror (e.g. a Render/Telegram bot)."
-        )
-        st.caption(
-            "⚠️ Each ticker runs a full parameter grid search. **Quick** finishes far faster with a smaller "
-            "grid (good for getting all 150 tickers trusted quickly); **Thorough** uses the exact same grid "
-            "as the single-ticker tab (slower, most precise). Results are saved to disk per-ticker as it "
-            "goes, so it's always safe to stop and resume later — the next click continues where you left off."
-        )
-        _bulk_grid_choice = st.radio(
-            "Grid size", ["Quick (fast, ~10x fewer combos)", "Thorough (exact match to single-ticker tab)"],
-            index=0, horizontal=True, key="bulk_reopt_grid_choice",
-        )
-        _bulk_resume = st.checkbox(
-            "Skip tickers that already have trusted params (resume mode)",
-            value=True, key="bulk_reopt_resume",
-            help="Turn OFF only if you want to force-recompute every ticker from scratch, including ones already trusted.",
-        )
-        if st.button("🔁 Bulk Re-Optimize ALL Watchlist Tickers Now", use_container_width=True):
-            _bulk_tickers = _normalize_watchlist(main_kalman_monitor_watchlist)
-            _bulk_prog = st.progress(0.0)
-            _bulk_status = st.empty()
-
-            def _bulk_progress_cb(i, total, ticker):
-                _bulk_status.text(f"Optimizing {ticker}... ({i}/{total})")
-                _bulk_prog.progress(min(1.0, i / max(1, total)))
-
-            if _bulk_grid_choice.startswith("Quick"):
-                _bulk_kwargs = dict(
-                    buffer_grid=(0.010, 0.020, 0.040),
-                    confirm_grid=(3, 5),
-                    hold_grid=(10, 21, 55),
-                    cooldown_grid=(5, 13),
-                )
-            else:
-                _bulk_kwargs = {}
-
-            _bulk_results = bulk_reoptimize_full_watchlist(
-                _bulk_tickers, progress_callback=_bulk_progress_cb,
-                skip_if_trusted=bool(_bulk_resume), **_bulk_kwargs,
-            )
-            _bulk_ok = {k: v for k, v in _bulk_results.items() if "error" not in v and not v.get("skipped")}
-            _bulk_skipped = {k: v for k, v in _bulk_results.items() if v.get("skipped")}
-            _bulk_errs = {k: v for k, v in _bulk_results.items() if "error" in v}
-            _bulk_missing = [t for t in _bulk_tickers if t not in _bulk_results]
-            st.success(
-                f"Newly optimized {len(_bulk_ok)}, skipped {len(_bulk_skipped)} (already trusted), "
-                f"failed {len(_bulk_errs)} — out of {len(_bulk_tickers)} total tickers."
-            )
-            if _bulk_errs:
-                st.warning(f"{len(_bulk_errs)} tickers failed (data/errors) — see table below.")
-                st.dataframe(pd.DataFrame(_bulk_errs).T, use_container_width=True)
-            if _bulk_missing:
-                st.error(f"{len(_bulk_missing)} tickers returned no result at all (unexpected): {', '.join(_bulk_missing[:30])}")
-            if _bulk_ok:
-                st.dataframe(pd.DataFrame(_bulk_ok).T, use_container_width=True)
-
-    with st.expander("📤 Export bundle for Render / external Telegram bot", expanded=False):
-        st.caption(
-            "Build and download the exact JSON file your Render worker reads "
-            "(`streamlit_kalman_render_bundle.json`) — per-ticker params, watchlist ledger, "
-            "institutional trade ledger, signal lock, and a trust summary. Do this after any "
-            "bulk re-optimize or parameter change, then upload the downloaded file to Render "
-            "at the path set in `STREAMLIT_KALMAN_BUNDLE_FILE` and redeploy."
-        )
-        if st.button("🧮 Build latest bundle", use_container_width=True):
-            _bundle_now = build_render_bundle_export()
-            st.session_state["_last_render_bundle_json"] = json.dumps(_bundle_now, indent=2, default=str)
-            st.session_state["_last_render_bundle_ct"] = _bundle_now["exported_ct"]
-            _ss = _bundle_now["sync_summary"]
-            st.success(
-                f"Bundle built at {_bundle_now['exported_ct']} — {_ss['total_params']} tickers total, "
-                f"✅ {_ss['trusted_saved_params']} trusted, ⚠️ {_ss['fallback_seed_params']} still fallback."
-            )
-
-        if st.session_state.get("_last_render_bundle_json"):
-            st.caption(f"Last built: {st.session_state.get('_last_render_bundle_ct', '')}")
-            st.download_button(
-                label="⬇️ Download streamlit_kalman_render_bundle.json",
-                data=st.session_state["_last_render_bundle_json"],
-                file_name="streamlit_kalman_render_bundle.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-    if _clicked_run:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, "Just ran (manual).")
-    elif auto_run_monitor:
-        _rows_now = _run_monitor_and_store()
-        _render_open_closed_status(_rows_now, f"Auto-run on page load — {st.session_state.get('last_main_kalman_monitor_ct', '')}.")
-    elif st.session_state.get("last_main_kalman_monitor_rows"):
-        # Show the last result without re-running, so the table persists across reruns.
-        _render_open_closed_status(
-            st.session_state["last_main_kalman_monitor_rows"],
-            f"Showing last run from {st.session_state.get('last_main_kalman_monitor_ct', '')}. Click the button to refresh.",
-        )
-
-    with st.expander("📡 Background Telegram alerts (works with app CLOSED)", expanded=False):
-        st.caption(
-            "The watchlist above only sends Telegram while this app is open. To receive BUY/SELL "
-            "alerts when the app is closed, run the standalone scanner on a schedule. It reuses the "
-            "exact settings you've saved here."
-        )
-        st.markdown("**Step 1 — Save your settings** (so the scanner can read them):")
-        st.caption("Make sure you've clicked *Save Telegram Settings* and *Save Main Kalman Monitor Settings* above at least once.")
-
-        _home = str(_Path.home())
-        _script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else _home
-        _script_path = os.path.join(_script_dir, "telegram_watchlist_scanner.py")
-        _py = "python3"
-
-        st.markdown("**Step 2 — Test it** (sends one Telegram message now):")
-        st.code(f'{_py} "{_script_path}" --test', language="bash")
-
-        st.markdown("**Step 3 — Run continuously** (scan every 15 min while it stays open in a terminal):")
-        st.code(f'{_py} "{_script_path}" --loop --interval 900 --market-hours-only', language="bash")
-
-        st.markdown("**Step 4 (optional) — Auto-run via cron** (Mac/Linux; survives reboots, no terminal needed).")
-        st.caption("Runs every 15 min, 8:30am–3:00pm CT, Mon–Fri. Paste into your terminal:")
-        _cron_line = (
-            f"*/15 8-15 * * 1-5 {_py} \"{_script_path}\" --market-hours-only "
-            f">> \"{os.path.join(_script_dir, 'telegram_scanner.log')}\" 2>&1"
-        )
-        st.code(
-            "( crontab -l 2>/dev/null | grep -v telegram_watchlist_scanner.py ; "
-            f"echo '{_cron_line}' ) | crontab -",
-            language="bash",
-        )
-        st.caption(
-            "To stop it later: run `crontab -e` and delete the telegram_watchlist_scanner.py line. "
-            "Windows users: use Task Scheduler to run the Step-3 command at login instead."
-        )
-        if not os.path.exists(_script_path):
-            st.warning(
-                f"Scanner file not found next to the app at:\n{_script_path}\n"
-                "Place telegram_watchlist_scanner.py in the same folder as this app."
-            )
-
-    if False:
-        st.caption("Auto monitor disabled for safe loading. Use Run Main Kalman Monitor Now.")
-        _main_mon_rows = run_main_kalman_watchlist_monitor(
-            main_kalman_monitor_watchlist,
-            send_telegram=bool(tg_alerts_on),
-            token=tg_bot_token,
-            chat_id=tg_chat_id,
-            show_table=True,
-            max_stocks=int(locals().get("main_kalman_monitor_max_stocks", 50)),
-            allow_sell_alerts=bool(locals().get("main_kalman_monitor_sell_alerts", False)),
-        )
-
-        st.markdown("#### Open / Closed Watchlist Status — current Main Kalman controls")
-        try:
-            _mon_df = pd.DataFrame(_main_mon_rows)
-            if not _mon_df.empty:
-                _pos_col = "Trade Position" if "Trade Position" in _mon_df.columns else None
-                if _pos_col:
-                    _open_df = _mon_df[_mon_df[_pos_col].astype(str).str.upper().eq("LONG")].copy()
-                    _closed_df = _mon_df[_mon_df[_pos_col].astype(str).str.upper().ne("LONG")].copy()
-
-                    c_open, c_closed = st.columns(2)
-                    with c_open:
-                        st.metric("Open / Long", int(len(_open_df)))
-                        if len(_open_df):
-                            st.dataframe(
-                                _open_df[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _open_df.columns]],
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                        else:
-                            st.caption("No open Long positions.")
-                    with c_closed:
-                        st.metric("Closed / Cash", int(len(_closed_df)))
-                        if len(_closed_df):
-                            st.dataframe(
-                                _closed_df[[c for c in ["Ticker", "Trade Position", "Price", "Candle Close CT", "Alert Signal"] if c in _closed_df.columns]],
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                        else:
-                            st.caption("No closed/cash tickers.")
-                else:
-                    st.caption("Trade Position column not available yet.")
-            else:
-                st.caption("No monitor rows yet.")
-        except Exception as _e:
-            st.caption(f"Open/Closed status unavailable: {_e}")
-
-    if bool(main_kalman_monitor_on and main_kalman_monitor_refresh):
-        st.components.v1.html(
-            "<script>setTimeout(function(){ window.parent.location.reload(); }, 60000);</script>",
-            height=0,
-        )
-
-
-
-
     alert_enabled = st.toggle(
         "Enable live signal alerts",
         value=False,
@@ -9633,15 +10113,991 @@ elif live_mode:
     lookback_days = 7 if data_interval == '1m' else 30
     df_main = load_data(TICKER, now_rounded - timedelta(days=lookback_days), now_rounded, interval=data_interval)
 else:
-    df_main = load_data(TICKER, start_date, end_date, interval='1d')
+    df_main = load_data(TICKER, start_date, end_date, interval=data_interval)
 
 st.subheader("Asset & Macro Analysis Suite")
+try:
+    if isinstance(df_main, pd.DataFrame) and not df_main.empty:
+        st.caption(f"Loaded {len(df_main):,} bars | Interval: {data_interval} | From {df_main.index.min().date()} to {df_main.index.max().date()} | {chart_history_mode if 'chart_history_mode' in globals() else ('Custom anchor' if use_custom_anchor else 'TradingView-style')}")
+except Exception:
+    pass
 st.caption('Fast mode skips heavy model loading. Last five tabs are lazy-loaded; final tab fetches today intraday only when you click Run.')
+
+
+# ==========================================================
+# ADJUSTABLE MACD / RSI STRATEGY TABS
+# ==========================================================
+def _indicator_tab_ma(series, length, ma_type, volume=None):
+    """TradingView-style smoothing choices used only by the MACD/RSI tabs."""
+    s = pd.Series(series, copy=False).astype(float)
+    length = max(1, int(length))
+    mt = str(ma_type).upper()
+    if mt == "SMA":
+        return s.rolling(length, min_periods=length).mean()
+    if mt == "EMA":
+        return s.ewm(span=length, adjust=False).mean()
+    if mt in {"SMMA (RMA)", "RMA", "SMMA"}:
+        return s.ewm(alpha=1.0 / length, adjust=False).mean()
+    if mt == "WMA":
+        weights = np.arange(1, length + 1, dtype=float)
+        return s.rolling(length, min_periods=length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+    if mt == "VWMA" and volume is not None:
+        v = pd.Series(volume, index=s.index).astype(float)
+        return (s * v).rolling(length, min_periods=length).sum() / v.rolling(length, min_periods=length).sum().replace(0, np.nan)
+    return s.rolling(length, min_periods=length).mean()
+
+
+def _indicator_tab_rsi(series, length):
+    """Wilder RSI, matching TradingView's standard RSI calculation closely."""
+    s = pd.Series(series, copy=False).astype(float)
+    length = max(1, int(length))
+    delta = s.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.where(avg_loss != 0, 100.0)
+    return rsi.clip(0.0, 100.0)
+
+
+def _indicator_tab_closed_bars_only(df, interval, wait_for_close):
+    """Optionally remove a still-forming final bar. Used only by the new tabs."""
+    if not wait_for_close or df is None or df.empty or len(df) < 2:
+        return df
+    try:
+        out = df.copy()
+        last_ts = pd.Timestamp(out.index[-1])
+        now = pd.Timestamp.now(tz=last_ts.tz) if getattr(last_ts, 'tzinfo', None) is not None else pd.Timestamp.now()
+        iv = str(interval).lower()
+        delta_map = {
+            '1m': pd.Timedelta(minutes=1), '2m': pd.Timedelta(minutes=2),
+            '5m': pd.Timedelta(minutes=5), '15m': pd.Timedelta(minutes=15),
+            '30m': pd.Timedelta(minutes=30), '60m': pd.Timedelta(hours=1),
+            '90m': pd.Timedelta(minutes=90), '1h': pd.Timedelta(hours=1),
+            '1d': pd.Timedelta(days=1), '1wk': pd.Timedelta(days=7)
+        }
+        delta = delta_map.get(iv, pd.Timedelta(days=1))
+        if now < last_ts + delta:
+            out = out.iloc[:-1]
+        return out
+    except Exception:
+        return df
+
+
+def _indicator_tab_load_data(ticker, timeframe_choice):
+    """Load the chart timeframe or a selected timeframe without touching any other tab."""
+    try:
+        if timeframe_choice == "Chart":
+            d = df_main.copy() if isinstance(df_main, pd.DataFrame) else pd.DataFrame()
+            return d, data_interval if live_mode else '1d'
+
+        tf_map = {
+            "1 Day": "1d", "1 Week": "1wk", "1 Month": "1mo", "1 Hour": "60m",
+            "30 Min": "30m", "15 Min": "15m", "5 Min": "5m", "1 Min": "1m"
+        }
+        interval = tf_map.get(timeframe_choice, '1d')
+        now_local = datetime.now()
+        if not use_custom_anchor:
+            start_local = _tv_max_start_for_interval(interval, end_date if interval in {'1d', '1wk', '1mo'} else now_local)
+        elif interval == '1m':
+            start_local = max(pd.Timestamp(start_date).to_pydatetime(), now_local - timedelta(days=6))
+        elif interval in {'5m', '15m', '30m'}:
+            start_local = max(pd.Timestamp(start_date).to_pydatetime(), now_local - timedelta(days=59))
+        elif interval == '60m':
+            start_local = max(pd.Timestamp(start_date).to_pydatetime(), now_local - timedelta(days=729))
+        else:
+            start_local = start_date
+        d = load_data(ticker, start_local, end_date if interval in {'1d', '1wk', '1mo'} else now_local, interval=interval)
+        return d, interval
+    except Exception:
+        return pd.DataFrame(), '1d'
+
+
+def _indicator_tab_metrics_and_chart(ticker, label, prices, signals, indicator_df, initial_capital, stop_loss_pct, trailing_stop_pct):
+    """Shared metrics, price chart, indicator pane, and official trade log."""
+    bt = BacktestEngine.run_strategy(
+        prices=prices,
+        signals=signals,
+        initial_capital=float(initial_capital),
+        trailing_stop_pct=float(trailing_stop_pct),
+        stop_loss_pct=float(stop_loss_pct)
+    )
+
+    equity = bt.get('equity_curve', pd.Series(dtype=float))
+    trades_raw = bt.get('trades', pd.DataFrame()).copy()
+    returns_bt = bt.get('returns', pd.Series(dtype=float))
+
+    cum_ret = ((float(equity.iloc[-1]) / float(initial_capital)) - 1.0) * 100.0 if len(equity) else 0.0
+    total_trade_pnl = float(pd.to_numeric(trades_raw.get('PnL (%)', pd.Series(dtype=float)), errors='coerce').dropna().sum()) if not trades_raw.empty else 0.0
+    mets = BacktestEngine.calculate_metrics(returns_bt) if len(returns_bt) > 1 else {}
+    sharpe = float(mets.get('Sharpe Ratio', 0.0))
+    max_dd = float(mets.get('Max Drawdown', 0.0)) * 100.0
+    bench_ret = ((float(prices.iloc[-1]) / float(prices.iloc[0])) - 1.0) * 100.0 if len(prices) > 1 else 0.0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Cumulative Return", f"{cum_ret:+.2f}%")
+    m2.metric("Total Trade PnL", f"{total_trade_pnl:+.2f}%")
+    m3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+    m4.metric("Max Drawdown", f"{max_dd:.2f}%")
+    m5.metric("Buy & Hold Benchmark", f"{bench_ret:+.2f}%")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.72, 0.28])
+    fig.add_trace(go.Scatter(x=prices.index, y=prices.values, mode='lines', name=f'{ticker} Price', line=dict(width=2)), row=1, col=1)
+
+    if not trades_raw.empty:
+        buy_x, buy_y, sell_x, sell_y = [], [], [], []
+        for _, tr in trades_raw.iterrows():
+            ent = tr.get('Entry Date')
+            bp = pd.to_numeric(pd.Series([tr.get('Buy Price')]), errors='coerce').iloc[0]
+            if pd.notna(ent) and pd.notna(bp):
+                buy_x.append(pd.Timestamp(ent)); buy_y.append(float(bp))
+            ex = tr.get('Exit Date')
+            sp = pd.to_numeric(pd.Series([tr.get('Sell Price')]), errors='coerce').iloc[0]
+            if pd.notna(ex) and pd.notna(sp):
+                sell_x.append(pd.Timestamp(ex)); sell_y.append(float(sp))
+        if buy_x:
+            fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode='markers', name='Buy', marker=dict(symbol='triangle-up', size=11, color='#00ff66')), row=1, col=1)
+        if sell_x:
+            fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode='markers', name='Sell / Exit', marker=dict(symbol='triangle-down', size=11, color='#ff3333')), row=1, col=1)
+
+    for trace in indicator_df.get('traces', []):
+        fig.add_trace(go.Scatter(x=prices.index, y=trace['y'], mode='lines', name=trace['name'], line=dict(width=trace.get('width', 2))), row=2, col=1)
+    for h in indicator_df.get('hlines', []):
+        fig.add_hline(y=h, line_dash='dot', line_width=1, opacity=0.55, row=2, col=1)
+
+    fig.update_layout(
+        title=f"{ticker} {label} Price + Entry/Exit Markers",
+        template='plotly_dark', height=720, hovermode='x unified',
+        margin=dict(l=30, r=30, t=70, b=30),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1.0),
+        xaxis2=dict(rangeslider=dict(visible=True), type='date')
+    )
+    fig.update_xaxes(showspikes=True, spikemode='across', spikesnap='cursor', spikethickness=1)
+    fig.update_yaxes(showspikes=True, spikemode='across', spikesnap='cursor', spikethickness=1)
+    st.plotly_chart(fig, use_container_width=True, key=f"{label.lower()}_strategy_price_chart_{ticker}")
+
+    st.write("#### Trade Log")
+    if trades_raw.empty:
+        st.info("No trades generated for the current settings.")
+    else:
+        log = trades_raw.copy()
+        log = apply_trade_log_timestamp_display(log, default_bar_time="16:00")
+        log = clean_trade_log_for_display(log)
+        try:
+            log = log.iloc[::-1].reset_index(drop=True)
+        except Exception:
+            pass
+        st.dataframe(log, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Trade Log CSV",
+            data=log.to_csv(index=False).encode('utf-8'),
+            file_name=f"{ticker}_{label.lower()}_trade_log.csv",
+            mime='text/csv',
+            key=f"download_{label.lower()}_trade_log_{ticker}"
+        )
+
+
+def render_macd_strategy_tab(ticker):
+    st.header("MACD Strategy")
+    st.caption("Long-only: Buy when MACD crosses above Signal; Sell when MACD crosses below Signal.")
+
+    left, right = st.columns([1, 2.2])
+    with left:
+        st.write("### Inputs")
+        source_name = st.selectbox("Source", ["Close", "Open", "High", "Low", "HL2", "HLC3", "OHLC4"], index=0, key='macd_tab_source')
+        fast_len = st.number_input("Fast length", min_value=1, max_value=500, value=21, step=1, key='macd_tab_fast')
+        slow_len = st.number_input("Slow length", min_value=2, max_value=1000, value=55, step=1, key='macd_tab_slow')
+        signal_len = st.number_input("Signal length", min_value=1, max_value=500, value=13, step=1, key='macd_tab_signal')
+        oscillator_ma = st.selectbox("Oscillator MA type", ["EMA", "SMA"], index=0, key='macd_tab_osc_ma')
+        signal_ma = st.selectbox("Signal MA type", ["EMA", "SMA"], index=0, key='macd_tab_sig_ma')
+        st.write("### Calculation")
+        timeframe_choice = st.selectbox("Timeframe", ["Chart", "1 Day", "1 Week", "1 Month", "1 Hour", "30 Min", "15 Min", "5 Min", "1 Min"], index=0, key='macd_tab_timeframe')
+        wait_close = st.checkbox("Wait for timeframe closes", value=True, key='macd_tab_wait_close')
+
+        st.write("### Sell Logic")
+        sell_mode = st.selectbox(
+            "Sell Mode",
+            ["Hybrid Trend-Hold", "Confirmed MACD Exit", "Normal MACD Cross"],
+            index=0,
+            key='macd_tab_sell_mode',
+            help=(
+                "Hybrid Trend-Hold keeps the original MACD buy signal, but gives strong winners more room. "
+                "Confirmed MACD Exit waits for multiple bars below the signal line. Normal MACD Cross is the original behavior."
+            )
+        )
+        confirm_bars = st.number_input(
+            "Bearish confirmation bars",
+            min_value=1,
+            max_value=10,
+            value=2,
+            step=1,
+            disabled=(sell_mode == "Normal MACD Cross"),
+            key='macd_tab_exit_confirm_bars'
+        )
+
+        if sell_mode == "Hybrid Trend-Hold":
+            strong_winner_pct = st.number_input(
+                "Strong winner starts at (%)",
+                min_value=1.0,
+                max_value=500.0,
+                value=15.0,
+                step=1.0,
+                key='macd_tab_strong_winner_pct'
+            )
+            winner_giveback_pct = st.number_input(
+                "Winner max giveback (%)",
+                min_value=1.0,
+                max_value=100.0,
+                value=12.0,
+                step=1.0,
+                key='macd_tab_winner_giveback_pct'
+            )
+            trend_ema_len = st.number_input(
+                "Winner trend EMA length",
+                min_value=5,
+                max_value=500,
+                value=50,
+                step=1,
+                key='macd_tab_winner_ema_len'
+            )
+        else:
+            strong_winner_pct = 15.0
+            winner_giveback_pct = 12.0
+            trend_ema_len = 50
+
+        st.write("### Stop Loss")
+        use_stop_loss = st.toggle("Enable Stop Loss", value=True, key='macd_tab_stop_enabled')
+        stop_loss_pct_input = st.number_input(
+            "Stop Loss (%)",
+            min_value=0.1,
+            max_value=100.0,
+            value=8.0,
+            step=0.5,
+            disabled=not use_stop_loss,
+            key='macd_tab_stop_pct_visible'
+        )
+        stop_loss = float(stop_loss_pct_input) / 100.0 if use_stop_loss else 0.0
+
+        with st.expander("More risk settings", expanded=False):
+            initial_capital = st.number_input("Initial capital ($)", min_value=100.0, value=10000.0, step=1000.0, key='macd_tab_capital')
+            trailing_stop = st.number_input("Trailing stop (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key='macd_tab_trail') / 100.0
+
+    df, interval = _indicator_tab_load_data(ticker, timeframe_choice)
+    df = _indicator_tab_closed_bars_only(df, interval, wait_close)
+    if df is None or df.empty or len(df) < max(int(slow_len), int(signal_len)) + 5:
+        with right:
+            st.warning("Not enough data for the selected MACD settings/timeframe.")
+        return
+
+    source_map = {
+        'Close': df['Close'], 'Open': df['Open'], 'High': df['High'], 'Low': df['Low'],
+        'HL2': (df['High'] + df['Low']) / 2.0,
+        'HLC3': (df['High'] + df['Low'] + df['Close']) / 3.0,
+        'OHLC4': (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4.0
+    }
+    src = pd.Series(source_map[source_name], index=df.index).astype(float)
+    fast = _indicator_tab_ma(src, fast_len, oscillator_ma)
+    slow = _indicator_tab_ma(src, slow_len, oscillator_ma)
+    macd = fast - slow
+    signal = _indicator_tab_ma(macd, signal_len, signal_ma)
+    hist = macd - signal
+    entry = (macd > signal) & (macd.shift(1) <= signal.shift(1))
+    bearish_cross = (macd < signal) & (macd.shift(1) >= signal.shift(1))
+
+    # MACD-only exit engine. Entry logic stays EXACTLY the original crossover.
+    # This is causal: every decision uses only current/past bars.
+    if sell_mode == "Normal MACD Cross":
+        exit_ = bearish_cross
+        position = make_stateful_position(entry, exit_, df.index)
+    else:
+        below_signal = (macd < signal).fillna(False)
+        confirm_n = max(1, int(confirm_bars))
+        confirmed_bearish = below_signal.rolling(confirm_n, min_periods=confirm_n).sum().eq(confirm_n)
+
+        if sell_mode == "Confirmed MACD Exit":
+            exit_ = confirmed_bearish & (~confirmed_bearish.shift(1).fillna(False))
+            position = make_stateful_position(entry, exit_, df.index)
+        else:
+            # Hybrid Trend-Hold:
+            # - weak/ordinary trades exit after confirmed bearish MACD
+            # - once a trade becomes a strong winner, one weak crossover is ignored
+            # - a strong winner exits only on confirmed bearish MACD + trend damage,
+            #   or after a meaningful giveback from its own peak while MACD remains bearish
+            close_px = df['Close'].astype(float)
+            trend_ema = close_px.ewm(span=max(5, int(trend_ema_len)), adjust=False).mean()
+            position_vals = pd.Series(0.0, index=df.index)
+            in_pos = False
+            entry_px = np.nan
+            peak_px = np.nan
+            strong_winner = False
+
+            for i, idx in enumerate(df.index):
+                px = float(close_px.loc[idx])
+                if not in_pos:
+                    if bool(entry.loc[idx]):
+                        in_pos = True
+                        entry_px = px
+                        peak_px = px
+                        strong_winner = False
+                        position_vals.loc[idx] = 1.0
+                    else:
+                        position_vals.loc[idx] = 0.0
+                    continue
+
+                peak_px = max(float(peak_px), px)
+                gain_pct = ((px / float(entry_px)) - 1.0) * 100.0 if entry_px and np.isfinite(entry_px) else 0.0
+                if gain_pct >= float(strong_winner_pct):
+                    strong_winner = True
+
+                confirmed_now = bool(confirmed_bearish.loc[idx])
+                trend_broken = px < float(trend_ema.loc[idx]) if pd.notna(trend_ema.loc[idx]) else False
+                giveback_pct = ((float(peak_px) - px) / float(peak_px)) * 100.0 if peak_px and np.isfinite(peak_px) else 0.0
+                macd_bearish_now = bool(below_signal.loc[idx])
+
+                should_exit = False
+                if not strong_winner:
+                    should_exit = confirmed_now
+                else:
+                    should_exit = (
+                        (confirmed_now and trend_broken)
+                        or (giveback_pct >= float(winner_giveback_pct) and macd_bearish_now)
+                    )
+
+                if should_exit:
+                    in_pos = False
+                    entry_px = np.nan
+                    peak_px = np.nan
+                    strong_winner = False
+                    position_vals.loc[idx] = 0.0
+                else:
+                    position_vals.loc[idx] = 1.0
+
+            position = position_vals
+
+    common = df.index.intersection(macd.dropna().index).intersection(signal.dropna().index)
+    prices = df.loc[common, 'Close'].astype(float)
+    position = position.reindex(common).ffill().fillna(0.0)
+    with right:
+        st.info(f"Current MACD: {macd.loc[common].iloc[-1]:.4f} | Signal: {signal.loc[common].iloc[-1]:.4f} | Position: {'LONG' if position.iloc[-1] > 0 else 'CASH'}")
+    _indicator_tab_metrics_and_chart(
+        ticker, 'MACD', prices, position,
+        {'traces': [
+            {'name': 'MACD', 'y': macd.reindex(common)},
+            {'name': 'Signal', 'y': signal.reindex(common)},
+            {'name': 'Histogram', 'y': hist.reindex(common), 'width': 1}
+        ], 'hlines': [0.0]},
+        initial_capital, stop_loss, trailing_stop
+    )
+
+
+def render_rsi_strategy_tab(ticker):
+    st.header("RSI Strategy")
+    st.caption("Long-only: Buy when RSI crosses above its smoothing line; Sell when RSI crosses below it.")
+
+    left, right = st.columns([1, 2.2])
+    with left:
+        st.write("### RSI Settings")
+        rsi_len = st.number_input("RSI Length", min_value=1, max_value=1000, value=100, step=1, key='rsi_tab_length')
+        source_name = st.selectbox("Source", ["Close", "Open", "High", "Low", "HL2", "HLC3", "OHLC4"], index=0, key='rsi_tab_source')
+        calc_div = st.checkbox("Calculate Divergence", value=False, key='rsi_tab_divergence', help='Display-only divergence detection. It does not change trade logic.')
+        st.write("### Smoothing")
+        smooth_type = st.selectbox("Type", ["SMA", "SMA + Bollinger Bands", "EMA", "SMMA (RMA)", "WMA", "VWMA"], index=0, key='rsi_tab_smooth_type')
+        smooth_len = st.number_input("Length", min_value=1, max_value=1000, value=100, step=1, key='rsi_tab_smooth_len')
+        bb_std = st.number_input("BB StdDev", min_value=0.1, max_value=10.0, value=2.0, step=0.1, disabled=(smooth_type != "SMA + Bollinger Bands"), key='rsi_tab_bb_std')
+        st.write("### Calculation")
+        timeframe_choice = st.selectbox("Timeframe", ["Chart", "1 Day", "1 Week", "1 Month", "1 Hour", "30 Min", "15 Min", "5 Min", "1 Min"], index=0, key='rsi_tab_timeframe')
+        wait_close = st.checkbox("Wait for timeframe closes", value=True, key='rsi_tab_wait_close')
+
+        st.write("### Stop Loss")
+        use_stop_loss = st.toggle("Enable Stop Loss", value=True, key='rsi_tab_stop_enabled')
+        stop_loss_pct_input = st.number_input(
+            "Stop Loss (%)",
+            min_value=0.1,
+            max_value=100.0,
+            value=8.0,
+            step=0.5,
+            disabled=not use_stop_loss,
+            key='rsi_tab_stop_pct_visible'
+        )
+        stop_loss = float(stop_loss_pct_input) / 100.0 if use_stop_loss else 0.0
+
+        with st.expander("More risk settings", expanded=False):
+            initial_capital = st.number_input("Initial capital ($)", min_value=100.0, value=10000.0, step=1000.0, key='rsi_tab_capital')
+            trailing_stop = st.number_input("Trailing stop (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key='rsi_tab_trail') / 100.0
+
+    df, interval = _indicator_tab_load_data(ticker, timeframe_choice)
+    df = _indicator_tab_closed_bars_only(df, interval, wait_close)
+    need = max(int(rsi_len), int(smooth_len)) + 10
+    if df is None or df.empty or len(df) < need:
+        with right:
+            st.warning("Not enough data for the selected RSI settings/timeframe.")
+        return
+
+    source_map = {
+        'Close': df['Close'], 'Open': df['Open'], 'High': df['High'], 'Low': df['Low'],
+        'HL2': (df['High'] + df['Low']) / 2.0,
+        'HLC3': (df['High'] + df['Low'] + df['Close']) / 3.0,
+        'OHLC4': (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4.0
+    }
+    src = pd.Series(source_map[source_name], index=df.index).astype(float)
+    rsi = _indicator_tab_rsi(src, rsi_len)
+    base_ma_type = 'SMA' if smooth_type == 'SMA + Bollinger Bands' else smooth_type
+    smooth = _indicator_tab_ma(rsi, smooth_len, base_ma_type, volume=df.get('Volume'))
+    entry = (rsi > smooth) & (rsi.shift(1) <= smooth.shift(1))
+    exit_ = (rsi < smooth) & (rsi.shift(1) >= smooth.shift(1))
+    position = make_stateful_position(entry, exit_, df.index)
+
+    common = df.index.intersection(rsi.dropna().index).intersection(smooth.dropna().index)
+    prices = df.loc[common, 'Close'].astype(float)
+    position = position.reindex(common).ffill().fillna(0.0)
+
+    traces = [
+        {'name': 'RSI', 'y': rsi.reindex(common)},
+        {'name': f'RSI {smooth_type}', 'y': smooth.reindex(common)}
+    ]
+    if smooth_type == 'SMA + Bollinger Bands':
+        stdev = rsi.rolling(int(smooth_len), min_periods=int(smooth_len)).std()
+        traces += [
+            {'name': 'RSI BB Upper', 'y': (smooth + float(bb_std) * stdev).reindex(common), 'width': 1},
+            {'name': 'RSI BB Lower', 'y': (smooth - float(bb_std) * stdev).reindex(common), 'width': 1}
+        ]
+
+    if calc_div:
+        # Display-only, causal pivot proxy. No strategy impact.
+        piv_low = (rsi.shift(2) > rsi.shift(1)) & (rsi > rsi.shift(1))
+        piv_high = (rsi.shift(2) < rsi.shift(1)) & (rsi < rsi.shift(1))
+        div_count = int((piv_low | piv_high).reindex(common).fillna(False).sum())
+        with right:
+            st.caption(f"Display-only divergence pivot candidates detected: {div_count}")
+
+    with right:
+        st.info(f"Current RSI: {rsi.loc[common].iloc[-1]:.2f} | Smoothing: {smooth.loc[common].iloc[-1]:.2f} | Position: {'LONG' if position.iloc[-1] > 0 else 'CASH'}")
+    _indicator_tab_metrics_and_chart(
+        ticker, 'RSI', prices, position,
+        {'traces': traces, 'hlines': [30.0, 50.0, 70.0]},
+        initial_capital, stop_loss, trailing_stop
+    )
+
+
+# ==========================================================
+# CUSTOM CONCENTRATED PORTFOLIO — BROAD US UNIVERSE
+# ==========================================================
+_CUSTOM_PORTFOLIO_START = pd.Timestamp('2021-01-01')
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _cp_fetch_us_stock_universe():
+    """Fetch a broad US-listed stock universe from Nasdaq's public screener.
+
+    The screener starts with exchange-listed stocks rather than an S&P 500 list.
+    A built-in fallback is used if the endpoint is temporarily unavailable.
+    """
+    url = 'https://api.nasdaq.com/api/screener/stocks'
+    params = {
+        'tableonly': 'true', 'limit': 10000, 'offset': 0,
+        'download': 'true'
+    }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://www.nasdaq.com/'
+    }
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=25)
+        r.raise_for_status()
+        rows = (((r.json() or {}).get('data') or {}).get('rows') or [])
+        u = pd.DataFrame(rows)
+        if u.empty or 'symbol' not in u.columns:
+            raise ValueError('Nasdaq screener returned no rows')
+        rename = {
+            'symbol': 'Ticker', 'name': 'Company', 'sector': 'Sector',
+            'industry': 'Industry', 'marketCap': 'Market Cap',
+            'volume': 'Volume', 'lastsale': 'Last Sale', 'country': 'Country'
+        }
+        u = u.rename(columns=rename)
+        for c in ['Ticker', 'Company', 'Sector', 'Industry', 'Country']:
+            if c not in u.columns:
+                u[c] = ''
+        for c in ['Market Cap', 'Volume']:
+            if c not in u.columns:
+                u[c] = np.nan
+            u[c] = pd.to_numeric(u[c].astype(str).str.replace(r'[$,]', '', regex=True), errors='coerce')
+        if 'Last Sale' not in u.columns:
+            u['Last Sale'] = np.nan
+        u['Last Sale'] = pd.to_numeric(u['Last Sale'].astype(str).str.replace(r'[$,]', '', regex=True), errors='coerce')
+        u['Ticker'] = u['Ticker'].astype(str).str.strip().str.upper()
+        # Exclude obvious non-common-stock structures and malformed Yahoo symbols.
+        bad_name = u['Company'].astype(str).str.contains(
+            r'ETF|ETN|Warrant|Right|Unit|Preferred|Depositary Shares|Acquisition Corp|Blank Check',
+            case=False, regex=True, na=False
+        )
+        good_symbol = u['Ticker'].str.match(r'^[A-Z][A-Z0-9.-]{0,9}$', na=False)
+        u = u.loc[(~bad_name) & good_symbol].copy()
+        u['Ticker'] = u['Ticker'].str.replace('.', '-', regex=False)
+        u['Dollar Volume Snapshot'] = u['Last Sale'] * u['Volume']
+        u['Sector'] = u['Sector'].replace('', 'Unclassified').fillna('Unclassified')
+        u = u.drop_duplicates('Ticker')
+        return u.reset_index(drop=True), 'Nasdaq public US stock screener'
+    except Exception as exc:
+        # Broad liquid fallback across all major sectors; not restricted to SPY's top names.
+        fallback = {
+            'Technology': 'AAPL MSFT NVDA AVGO ORCL CRM AMD QCOM AMAT MU LRCX KLAC ADI TXN NOW PANW CRWD FTNT SNPS CDNS ANET DELL HPQ IBM ACN INTU ADSK TEAM DDOG NET PLTR UBER',
+            'Communication Services': 'GOOGL META NFLX DIS TMUS T CHTR WBD SPOT RBLX RDDT PINS SNAP EA TTWO',
+            'Consumer Discretionary': 'AMZN TSLA HD LOW BKNG TJX NKE SBUX CMG ORLY AZO ROST ABNB MAR GM F RIVN TOL DHI LEN',
+            'Consumer Staples': 'WMT COST PG KO PEP PM MO CL KMB MDLZ GIS KR KDP STZ MNST',
+            'Financials': 'JPM BAC WFC C GS MS SCHW BLK AXP V MA COF PGR CB ICE CME SPGI MCO AJG MMC USB TFC',
+            'Healthcare': 'LLY UNH JNJ ABBV MRK TMO ABT ISRG AMGN GILD REGN VRTX BSX SYK MDT ELV CI HCA MCK COR ZTS',
+            'Industrials': 'GE CAT RTX BA HON ETN DE UNP UPS FDX WM PH CMI EMR ITW LMT NOC GD TDG URI PWR',
+            'Energy': 'XOM CVX COP EOG SLB MPC VLO PSX OXY FANG KMI WMB LNG HAL DVN',
+            'Utilities': 'NEE SO DUK CEG VST AEP SRE EXC XEL ED PEG D',
+            'Real Estate': 'PLD AMT EQIX WELL SPG O PSA DLR CCI VICI AVB EQR',
+            'Basic Materials': 'LIN SHW APD FCX NEM NUE ECL DOW DD STLD MLM VMC',
+        }
+        rows = []
+        for sec, tickers in fallback.items():
+            for t in tickers.split():
+                rows.append({'Ticker': t, 'Company': t, 'Sector': sec, 'Industry': '',
+                             'Market Cap': np.nan, 'Volume': np.nan, 'Last Sale': np.nan,
+                             'Dollar Volume Snapshot': np.nan, 'Country': 'United States'})
+        return pd.DataFrame(rows), f'Built-in broad fallback ({exc})'
+
+
+def _cp_choose_liquid_candidates(universe, max_candidates=360, min_price=5.0,
+                                 min_market_cap=1_000_000_000, per_sector_floor=18):
+    u = universe.copy()
+    u = u[(u['Last Sale'].isna()) | (u['Last Sale'] >= float(min_price))]
+    u = u[(u['Market Cap'].isna()) | (u['Market Cap'] >= float(min_market_cap))]
+    rank_col = 'Dollar Volume Snapshot'
+    u['_rank'] = pd.to_numeric(u[rank_col], errors='coerce').fillna(0.0)
+    selected = []
+    for _, g in u.groupby('Sector', dropna=False):
+        selected.extend(g.nlargest(min(int(per_sector_floor), len(g)), '_rank')['Ticker'].tolist())
+    remaining = max(0, int(max_candidates) - len(set(selected)))
+    selected.extend(u[~u['Ticker'].isin(selected)].nlargest(remaining, '_rank')['Ticker'].tolist())
+    selected = list(dict.fromkeys(selected))[:int(max_candidates)]
+    meta = u[u['Ticker'].isin(selected)].drop(columns=['_rank'], errors='ignore').copy()
+    return selected, meta
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _cp_download_prices(tickers_tuple, start_date, end_date):
+    tickers = list(tickers_tuple)
+    if not tickers:
+        return pd.DataFrame(), pd.DataFrame()
+    close_parts, volume_parts = [], []
+    batch_size = 70
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        try:
+            raw = yf.download(batch, start=str(start_date), end=str(end_date), auto_adjust=True,
+                              progress=False, group_by='column', threads=True, timeout=25)
+            if raw is None or raw.empty:
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                if 'Close' in raw.columns.get_level_values(0):
+                    c = raw['Close'].copy()
+                    v = raw['Volume'].copy() if 'Volume' in raw.columns.get_level_values(0) else pd.DataFrame(index=raw.index)
+                else:
+                    c = raw.xs('Close', axis=1, level=-1).copy()
+                    v = raw.xs('Volume', axis=1, level=-1).copy() if 'Volume' in raw.columns.get_level_values(-1) else pd.DataFrame(index=raw.index)
+            else:
+                symbol = batch[0]
+                c = raw[['Close']].rename(columns={'Close': symbol}) if 'Close' in raw else pd.DataFrame()
+                v = raw[['Volume']].rename(columns={'Volume': symbol}) if 'Volume' in raw else pd.DataFrame(index=raw.index)
+            close_parts.append(c)
+            volume_parts.append(v)
+        except Exception:
+            continue
+    close = pd.concat(close_parts, axis=1) if close_parts else pd.DataFrame()
+    volume = pd.concat(volume_parts, axis=1) if volume_parts else pd.DataFrame()
+    close = close.loc[:, ~close.columns.duplicated()].sort_index()
+    volume = volume.loc[:, ~volume.columns.duplicated()].sort_index()
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    volume.index = pd.to_datetime(volume.index).tz_localize(None)
+    return close, volume
+
+
+def _cp_cross_sectional_z(s):
+    s = pd.to_numeric(s, errors='coerce').replace([np.inf, -np.inf], np.nan)
+    med = s.median()
+    mad = (s - med).abs().median()
+    if not np.isfinite(mad) or mad <= 1e-12:
+        sd = s.std(ddof=0)
+        return (s - s.mean()) / sd if np.isfinite(sd) and sd > 1e-12 else s * 0.0
+    return 0.6745 * (s - med) / mad
+
+
+def _cp_score_on_date(close, volume, asof, benchmark_close, min_history=252):
+    hist = close.loc[:asof].copy()
+    if len(hist) < int(min_history):
+        return pd.DataFrame()
+    px = hist.iloc[-1]
+    valid = hist.notna().sum() >= int(min_history)
+    def ret(n):
+        return px / hist.shift(n).iloc[-1] - 1.0
+    r12_1 = hist.shift(21).iloc[-1] / hist.shift(252).iloc[-1] - 1.0
+    r6 = ret(126)
+    r3 = ret(63)
+    r1 = ret(21)
+    ma50 = hist.tail(50).mean()
+    ma200 = hist.tail(200).mean()
+    daily_ret = hist.pct_change()
+    vol63 = daily_ret.tail(63).std() * np.sqrt(252)
+    downside = daily_ret.tail(126).clip(upper=0).std() * np.sqrt(252)
+    roll_max = hist.tail(252).cummax()
+    dd252 = (hist.tail(252) / roll_max - 1.0).min()
+    trend = (px / ma200 - 1.0) + 0.5 * (ma50 / ma200 - 1.0)
+    b = benchmark_close.loc[:asof]
+    b6 = (b.iloc[-1] / b.iloc[-127] - 1.0) if len(b) >= 127 else 0.0
+    b12_1 = (b.iloc[-22] / b.iloc[-253] - 1.0) if len(b) >= 253 else 0.0
+    rs = 0.6 * (r6 - b6) + 0.4 * (r12_1 - b12_1)
+    if not volume.empty:
+        vh = volume.reindex(hist.index).loc[:asof]
+        dollar_vol = (vh.tail(63) * hist.tail(63)).median()
+    else:
+        dollar_vol = pd.Series(np.nan, index=hist.columns)
+    score = (
+        0.26 * _cp_cross_sectional_z(r12_1) +
+        0.20 * _cp_cross_sectional_z(r6) +
+        0.12 * _cp_cross_sectional_z(r3) +
+        0.16 * _cp_cross_sectional_z(rs) +
+        0.13 * _cp_cross_sectional_z(trend) -
+        0.07 * _cp_cross_sectional_z(vol63) -
+        0.04 * _cp_cross_sectional_z(downside) +
+        0.02 * _cp_cross_sectional_z(dd252)
+    )
+    out = pd.DataFrame({
+        'Price': px, 'Score': score, '12-1M Momentum': r12_1,
+        '6M Momentum': r6, '3M Momentum': r3, '1M Momentum': r1,
+        'Trend': trend, 'Volatility': vol63, 'Max Drawdown 1Y': dd252,
+        'Relative Strength': rs, 'Median Dollar Volume': dollar_vol,
+        'Above 200D': px > ma200, 'Above 50D': px > ma50,
+    })
+    out = out[valid & (out['Price'] >= 5.0)]
+    out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=['Score', 'Volatility'])
+    # Require positive long-term trend; permit mild short-term weakness to avoid pure chasing.
+    out = out[out['Above 200D'] & (out['12-1M Momentum'] > -0.05)]
+    return out.sort_values('Score', ascending=False)
+
+
+def _cp_pick_diversified(score_df, metadata, n_holdings=12, max_per_sector=2, incumbent=None):
+    if score_df.empty:
+        return []
+    sector_map = metadata.drop_duplicates('Ticker').set_index('Ticker')['Sector'].to_dict() if not metadata.empty else {}
+    ranks = score_df.copy()
+    ranks['Sector'] = [sector_map.get(t, 'Unclassified') for t in ranks.index]
+    # Small continuity bonus reduces needless turnover while still allowing replacement.
+    incumbent = set(incumbent or [])
+    ranks['Adjusted Score'] = ranks['Score'] + ranks.index.to_series().isin(incumbent).astype(float) * 0.12
+    ranks = ranks.sort_values('Adjusted Score', ascending=False)
+    chosen, sec_count = [], {}
+    for t, row in ranks.iterrows():
+        sec = row['Sector']
+        if sec_count.get(sec, 0) >= int(max_per_sector):
+            continue
+        chosen.append(t)
+        sec_count[sec] = sec_count.get(sec, 0) + 1
+        if len(chosen) >= int(n_holdings):
+            break
+    # Fill only if the sector constraint prevents reaching target count.
+    if len(chosen) < int(n_holdings):
+        for t in ranks.index:
+            if t not in chosen:
+                chosen.append(t)
+            if len(chosen) >= int(n_holdings):
+                break
+    return chosen
+
+
+def _cp_inverse_vol_weights(score_df, holdings, max_weight=0.12):
+    if not holdings:
+        return pd.Series(dtype=float)
+    vols = score_df.reindex(holdings)['Volatility'].clip(lower=0.08, upper=1.50)
+    raw = 1.0 / vols
+    w = raw / raw.sum()
+    cap = float(max_weight)
+    # Iterative cap-and-redistribute.
+    for _ in range(10):
+        over = w > cap
+        if not over.any():
+            break
+        excess = (w[over] - cap).sum()
+        w[over] = cap
+        under = ~over
+        if under.any() and w[under].sum() > 0:
+            w[under] += excess * w[under] / w[under].sum()
+    return w / w.sum()
+
+
+def _cp_metrics(equity, benchmark_equity):
+    equity = equity.dropna()
+    benchmark_equity = benchmark_equity.reindex(equity.index).ffill().dropna()
+    common = equity.index.intersection(benchmark_equity.index)
+    equity, benchmark_equity = equity.loc[common], benchmark_equity.loc[common]
+    r = equity.pct_change().dropna()
+    br = benchmark_equity.pct_change().dropna()
+    years = max((equity.index[-1] - equity.index[0]).days / 365.25, 1 / 365.25)
+    cagr = equity.iloc[-1] ** (1 / years) - 1
+    bcagr = benchmark_equity.iloc[-1] ** (1 / years) - 1
+    dd = equity / equity.cummax() - 1
+    bdd = benchmark_equity / benchmark_equity.cummax() - 1
+    sharpe = np.sqrt(252) * r.mean() / r.std(ddof=0) if r.std(ddof=0) > 0 else np.nan
+    beta = r.cov(br) / br.var() if br.var() > 0 else np.nan
+    alpha = (r.mean() - beta * br.mean()) * 252 if np.isfinite(beta) else np.nan
+    return {
+        'Total Return': equity.iloc[-1] - 1, 'SPY Total Return': benchmark_equity.iloc[-1] - 1,
+        'CAGR': cagr, 'SPY CAGR': bcagr, 'Excess CAGR': cagr - bcagr,
+        'Max Drawdown': dd.min(), 'SPY Max Drawdown': bdd.min(),
+        'Sharpe': sharpe, 'Beta': beta, 'Annualized Alpha': alpha,
+    }
+
+
+def _cp_run_backtest(close, volume, metadata, benchmark_close, n_holdings=12,
+                     rebalance='Quarterly', max_per_sector=2, cost_bps=10):
+    start = _CUSTOM_PORTFOLIO_START
+    common_dates = close.index[(close.index >= start) & (close.index <= benchmark_close.index.max())]
+    if len(common_dates) < 100:
+        raise ValueError('Not enough valid price history from 2021.')
+    if rebalance == 'Monthly':
+        sched = pd.Series(common_dates, index=common_dates).groupby(common_dates.to_period('M')).first().tolist()
+    elif rebalance == 'Semiannual':
+        key = common_dates.year.astype(str) + '-H' + np.where(common_dates.month <= 6, '1', '2')
+        sched = pd.Series(common_dates, index=common_dates).groupby(key).first().tolist()
+    else:
+        sched = pd.Series(common_dates, index=common_dates).groupby(common_dates.to_period('Q')).first().tolist()
+    sched = [pd.Timestamp(d) for d in sched]
+    daily_rets = close.pct_change().replace([np.inf, -np.inf], np.nan)
+    equity = pd.Series(index=common_dates, dtype=float)
+    equity.iloc[0] = 1.0
+    event_rows, holdings_rows = [], []
+    current, current_w = [], pd.Series(dtype=float)
+    first_added = {}
+    latest_entry_date = {}
+    latest_buy_price = {}
+    score_snapshots = {}
+    sched_set = set(sched)
+    turnover_series = pd.Series(0.0, index=common_dates)
+    for i, date in enumerate(common_dates):
+        if date in sched_set:
+            # Signal date is prior trading day; execution is today's close-to-close period.
+            pos = close.index.get_loc(date)
+            signal_date = close.index[pos - 1] if isinstance(pos, (int, np.integer)) and pos > 0 else date
+            scores = _cp_score_on_date(close, volume, signal_date, benchmark_close)
+            if not scores.empty:
+                new_holdings = _cp_pick_diversified(scores, metadata, n_holdings, max_per_sector, current)
+                new_w = _cp_inverse_vol_weights(scores, new_holdings, max_weight=min(0.14, 1.65 / max(1, n_holdings)))
+                old_w = current_w.reindex(sorted(set(current) | set(new_holdings))).fillna(0)
+                aligned_new = new_w.reindex(old_w.index).fillna(0)
+                turnover = 0.5 * (aligned_new - old_w).abs().sum()
+                turnover_series.loc[date] = turnover
+                additions = [t for t in new_holdings if t not in current]
+                removals = [t for t in current if t not in new_holdings]
+                for t in additions:
+                    # The signal is formed using the prior completed trading day.
+                    # Use that close as the model entry price so stock-level P&L is causal.
+                    entry_price = close.at[signal_date, t] if t in close.columns and signal_date in close.index else np.nan
+                    first_added.setdefault(t, signal_date)
+                    latest_entry_date[t] = signal_date
+                    latest_buy_price[t] = entry_price
+                    event_rows.append({'Effective Date': date, 'Signal Date': signal_date, 'Ticker': t,
+                                       'Action': 'ADD / BUY', 'Sector': metadata.set_index('Ticker')['Sector'].to_dict().get(t, 'Unclassified'),
+                                       'Trade Price': entry_price, 'Trade Return': np.nan,
+                                       'Score': scores.at[t, 'Score'] if t in scores.index else np.nan,
+                                       'Target Weight': new_w.get(t, np.nan)})
+                for t in removals:
+                    sell_price = close.at[signal_date, t] if t in close.columns and signal_date in close.index else np.nan
+                    buy_price = latest_buy_price.get(t, np.nan)
+                    trade_return = (sell_price / buy_price - 1.0) if pd.notna(sell_price) and pd.notna(buy_price) and buy_price != 0 else np.nan
+                    event_rows.append({'Effective Date': date, 'Signal Date': signal_date, 'Ticker': t,
+                                       'Action': 'REMOVE / SELL', 'Sector': metadata.set_index('Ticker')['Sector'].to_dict().get(t, 'Unclassified'),
+                                       'Trade Price': sell_price, 'Trade Return': trade_return,
+                                       'Score': scores.at[t, 'Score'] if t in scores.index else np.nan,
+                                       'Target Weight': 0.0})
+                    latest_entry_date.pop(t, None)
+                    latest_buy_price.pop(t, None)
+                current, current_w = new_holdings, new_w
+                score_snapshots[date] = scores
+                for t in current:
+                    holdings_rows.append({'Rebalance Date': date, 'Ticker': t,
+                                          'Weight': current_w.get(t, np.nan),
+                                          'Score': scores.at[t, 'Score'] if t in scores.index else np.nan,
+                                          'Sector': metadata.set_index('Ticker')['Sector'].to_dict().get(t, 'Unclassified')})
+        if i == 0:
+            continue
+        day_ret = daily_rets.loc[date].reindex(current).fillna(0.0)
+        port_ret = float((current_w.reindex(current).fillna(0.0) * day_ret).sum()) if current else 0.0
+        cost = turnover_series.loc[date] * float(cost_bps) / 10000.0
+        equity.loc[date] = equity.iloc[i - 1] * (1.0 + port_ret - cost)
+    equity = equity.ffill().fillna(1.0)
+    b = benchmark_close.reindex(common_dates).ffill().dropna()
+    b_eq = b / b.iloc[0]
+    metrics = _cp_metrics(equity, b_eq)
+    events = pd.DataFrame(event_rows)
+    holdings_hist = pd.DataFrame(holdings_rows)
+    latest_scores = score_snapshots[max(score_snapshots)] if score_snapshots else pd.DataFrame()
+    current_table = pd.DataFrame({'Ticker': current, 'Weight': current_w.reindex(current).values})
+    if not current_table.empty:
+        meta_cols = ['Ticker', 'Company', 'Sector', 'Industry']
+        current_table = current_table.merge(metadata[[c for c in meta_cols if c in metadata.columns]].drop_duplicates('Ticker'), on='Ticker', how='left')
+        current_table['Current Price'] = [close[t].dropna().iloc[-1] if t in close and close[t].notna().any() else np.nan for t in current_table['Ticker']]
+        current_table['Buy Date'] = [latest_entry_date.get(t, pd.NaT) for t in current_table['Ticker']]
+        current_table['Buy Price'] = [latest_buy_price.get(t, np.nan) for t in current_table['Ticker']]
+        current_table['Current P&L'] = np.where(
+            current_table['Buy Price'].notna() & (current_table['Buy Price'] != 0),
+            current_table['Current Price'] / current_table['Buy Price'] - 1.0,
+            np.nan
+        )
+        current_table['Quant Score'] = [latest_scores.at[t, 'Score'] if t in latest_scores.index else np.nan for t in current_table['Ticker']]
+        current_table['12-1M Return'] = [latest_scores.at[t, '12-1M Momentum'] if t in latest_scores.index else np.nan for t in current_table['Ticker']]
+        current_table['6M Return'] = [latest_scores.at[t, '6M Momentum'] if t in latest_scores.index else np.nan for t in current_table['Ticker']]
+        current_table['Volatility'] = [latest_scores.at[t, 'Volatility'] if t in latest_scores.index else np.nan for t in current_table['Ticker']]
+        current_table['First Added'] = [first_added.get(t, pd.NaT) for t in current_table['Ticker']]
+        current_table['Conviction'] = pd.qcut(current_table['Quant Score'].rank(method='first'), 5,
+                                              labels=['★', '★★', '★★★', '★★★★', '★★★★★']).astype(str) if len(current_table) >= 5 else '★★★'
+        current_table = current_table.sort_values('Weight', ascending=False)
+    return {
+        'equity': equity, 'benchmark_equity': b_eq, 'metrics': metrics,
+        'events': events, 'holdings_history': holdings_hist,
+        'current_holdings': current_table, 'latest_scores': latest_scores,
+        'turnover': turnover_series, 'candidate_count': close.shape[1]
+    }
+
+
+def render_custom_concentrated_portfolio_tab():
+    st.header('🏆 Custom Concentrated Portfolio')
+    st.caption('Broad-universe, multi-sector, rules-based portfolio | 10–15 stocks | Backtest begins 01/01/2021')
+    st.info('The engine begins with a broad U.S.-listed stock screener, then applies investability and liquidity filters. It is not restricted to the S&P 500 or its largest ten companies.')
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        n_holdings = st.slider('Target holdings', 10, 15, 12, 1, key='cp_n_holdings')
+    with c2:
+        rebalance = st.selectbox('Rebalance frequency', ['Quarterly', 'Monthly', 'Semiannual'], index=0, key='cp_rebalance')
+    with c3:
+        max_per_sector = st.slider('Maximum stocks per sector', 1, 3, 2, 1, key='cp_sector_cap')
+    with c4:
+        max_candidates = st.selectbox('Liquid candidates downloaded', [240, 300, 360, 450], index=2, key='cp_candidates')
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        min_cap_b = st.number_input('Minimum market cap ($B)', 0.25, 20.0, 1.0, 0.25, key='cp_min_cap')
+    with c6:
+        cost_bps = st.number_input('Trading cost per turnover (bps)', 0, 50, 10, 1, key='cp_cost')
+    with c7:
+        run = st.button('Build / Refresh Portfolio', type='primary', key='cp_run')
+    st.caption('Method: trailing momentum excluding the latest month, relative strength versus SPY, 50/200-day trend, volatility, downside risk, drawdown control, liquidity, sector caps and inverse-volatility position sizing. Every signal uses only information available before the rebalance date.')
+    if run:
+        try:
+            with st.spinner('Reading the broad U.S. exchange universe and filtering liquid candidates...'):
+                universe, source = _cp_fetch_us_stock_universe()
+                candidates, meta = _cp_choose_liquid_candidates(
+                    universe, max_candidates=int(max_candidates), min_price=5.0,
+                    min_market_cap=float(min_cap_b) * 1e9,
+                    per_sector_floor=max(12, int(max_candidates / max(1, universe['Sector'].nunique()) * 0.65))
+                )
+            with st.spinner(f'Downloading adjusted history for {len(candidates)} candidates from 2020 onward...'):
+                end = (pd.Timestamp.today().normalize() + pd.Timedelta(days=1)).date()
+                close, volume = _cp_download_prices(tuple(candidates + ['SPY']), '2020-01-01', str(end))
+                if 'SPY' not in close.columns:
+                    raise ValueError('SPY benchmark data could not be downloaded.')
+                spy = close.pop('SPY').dropna()
+                volume = volume.drop(columns=['SPY'], errors='ignore')
+                # Keep stocks with enough history and current data.
+                enough = close.notna().sum() >= 252
+                recent = close.tail(10).notna().sum() >= 3
+                close = close.loc[:, enough & recent]
+                volume = volume.reindex(columns=close.columns)
+                meta = meta[meta['Ticker'].isin(close.columns)].copy()
+            with st.spinner('Running causal portfolio reconstruction from 01/01/2021...'):
+                result = _cp_run_backtest(close, volume, meta, spy, int(n_holdings), rebalance,
+                                          int(max_per_sector), int(cost_bps))
+            result['universe_source'] = source
+            result['raw_universe_count'] = len(universe)
+            st.session_state['cp_result'] = result
+        except Exception as exc:
+            st.session_state['cp_result'] = None
+            st.error(f'Custom portfolio build failed: {exc}')
+    result = st.session_state.get('cp_result')
+    if not isinstance(result, dict):
+        st.warning('Click Build / Refresh Portfolio to generate the current holdings, historical additions/removals and SPY comparison.')
+        return
+    m = result['metrics']
+    beat = m['Excess CAGR'] > 0
+    a, b, c, d, e, f = st.columns(6)
+    a.metric('Portfolio CAGR', f"{m['CAGR']:.2%}")
+    b.metric('SPY CAGR', f"{m['SPY CAGR']:.2%}")
+    c.metric('Excess CAGR', f"{m['Excess CAGR']:+.2%}")
+    d.metric('Total Return', f"{m['Total Return']:.2%}")
+    e.metric('Max Drawdown', f"{m['Max Drawdown']:.2%}")
+    f.metric('Sharpe', f"{m['Sharpe']:.2f}" if np.isfinite(m['Sharpe']) else 'N/A')
+    if beat:
+        st.success(f"This historical reconstruction beat SPY by {m['Excess CAGR']:.2%} annualized over the tested period.")
+    else:
+        st.warning(f"This historical reconstruction did not beat SPY; annualized difference was {m['Excess CAGR']:.2%}. The app reports the result honestly instead of forcing an overfit portfolio.")
+    st.caption(f"Universe source: {result.get('universe_source')} | Raw listed rows: {result.get('raw_universe_count', 0):,} | Downloaded/usable candidates: {result.get('candidate_count', 0):,}. Current-listed-universe backtests may contain survivorship bias.")
+    eq, beq = result['equity'], result['benchmark_equity']
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=eq.index, y=(eq - 1) * 100, mode='lines', name='Custom Portfolio'))
+    fig.add_trace(go.Scatter(x=beq.index, y=(beq - 1) * 100, mode='lines', name='SPY'))
+    fig.update_layout(height=520, template='plotly_dark', hovermode='x unified',
+                      title='Cumulative Return Since 01/01/2021', yaxis_title='Return (%)', xaxis_title='Date')
+    st.plotly_chart(fig, use_container_width=True)
+    st.subheader('Current 10–15 Stock Portfolio')
+    current = result['current_holdings'].copy()
+    if current.empty:
+        st.warning('No current holdings were produced.')
+    else:
+        fmt = current.copy()
+        for col in ['Weight', 'Current P&L', '12-1M Return', '6M Return', 'Volatility']:
+            if col in fmt:
+                fmt[col] = fmt[col].map(lambda x: f'{x:.2%}' if pd.notna(x) else '')
+        for price_col in ['Buy Price', 'Current Price']:
+            if price_col in fmt:
+                fmt[price_col] = fmt[price_col].map(lambda x: f'${x:,.2f}' if pd.notna(x) else '')
+        if 'Quant Score' in fmt:
+            fmt['Quant Score'] = fmt['Quant Score'].map(lambda x: f'{x:.2f}' if pd.notna(x) else '')
+        for date_col in ['Buy Date', 'First Added']:
+            if date_col in fmt:
+                fmt[date_col] = pd.to_datetime(fmt[date_col]).dt.strftime('%Y-%m-%d')
+        show_cols = ['Ticker', 'Company', 'Sector', 'Weight', 'Buy Date', 'Buy Price',
+                     'Current Price', 'Current P&L', 'Conviction', 'Quant Score',
+                     '12-1M Return', '6M Return', 'Volatility', 'First Added']
+        st.dataframe(fmt[[c for c in show_cols if c in fmt.columns]], use_container_width=True, hide_index=True)
+        st.download_button('Download current portfolio', current.to_csv(index=False).encode('utf-8'),
+                           'custom_concentrated_portfolio.csv', 'text/csv', key='cp_dl_current')
+    st.subheader('Addition and Removal History')
+    events = result['events'].copy()
+    if events.empty:
+        st.info('No additions/removals available.')
+    else:
+        events = events.sort_values(['Effective Date', 'Action'], ascending=[False, True])
+        display_events = events.copy()
+        display_events['Effective Date'] = pd.to_datetime(display_events['Effective Date']).dt.strftime('%Y-%m-%d')
+        display_events['Signal Date'] = pd.to_datetime(display_events['Signal Date']).dt.strftime('%Y-%m-%d')
+        display_events['Target Weight'] = display_events['Target Weight'].map(lambda x: f'{x:.2%}' if pd.notna(x) else '')
+        if 'Trade Price' in display_events:
+            display_events['Trade Price'] = display_events['Trade Price'].map(lambda x: f'${x:,.2f}' if pd.notna(x) else '')
+        if 'Trade Return' in display_events:
+            display_events['Trade Return'] = display_events['Trade Return'].map(lambda x: f'{x:.2%}' if pd.notna(x) else '')
+        display_events['Score'] = display_events['Score'].map(lambda x: f'{x:.2f}' if pd.notna(x) else '')
+        st.dataframe(display_events, use_container_width=True, hide_index=True)
+        st.download_button('Download complete add/remove log', events.to_csv(index=False).encode('utf-8'),
+                           'custom_portfolio_add_remove_log.csv', 'text/csv', key='cp_dl_events')
+    with st.expander('Risk, benchmark and methodology details', expanded=False):
+        details = pd.DataFrame({
+            'Metric': ['Portfolio total return', 'SPY total return', 'Portfolio CAGR', 'SPY CAGR',
+                       'Excess CAGR', 'Portfolio max drawdown', 'SPY max drawdown', 'Sharpe', 'Beta', 'Annualized alpha'],
+            'Value': [m['Total Return'], m['SPY Total Return'], m['CAGR'], m['SPY CAGR'], m['Excess CAGR'],
+                      m['Max Drawdown'], m['SPY Max Drawdown'], m['Sharpe'], m['Beta'], m['Annualized Alpha']]
+        })
+        st.dataframe(details, use_container_width=True, hide_index=True)
+        st.warning('No model can guarantee future outperformance. This is a historical, rules-based reconstruction and not investment advice. The current exchange universe can create survivorship bias because delisted companies may be absent.')
+
 
 # 5. UNIFIED TAB ARCHITECTURE
 # ==========================================
 tabs = st.tabs([
     "💡 Decision Summary",
+    "🏆 Custom Portfolio",
     "Volatility (GARCH)", 
     "Regime Switching", 
     "Stochastic (Heston/Jump)", 
@@ -9649,6 +11105,8 @@ tabs = st.tabs([
     "Macro Factors",
     "Structural",
     "Backtest",
+    "📉 MACD Strategy",
+    "📈 RSI Strategy",
     "Volatility Clustering",
     "Advanced Regime",
     "SML & Alpha",
@@ -9662,10 +11120,68 @@ tabs = st.tabs([
     "📈 Institutional VWAP",
     "🔬 Time Series Analysis",
     "🧬 Market Microstructure",
-    "⚡ 0.5% Live Capture"
+    "⚡ 0.5% Live Capture",
+    "🧲 Institutional Gamma Exposure",
+    "🌊 Institutional Liquidity Flow",
+    "⚔️ Institutional Futures Scalper"
 ])
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20, tab21 = tabs
+# Keep every existing tab variable mapped to its original feature.
+# MACD/RSI are physically placed next to Backtest but still use tab25/tab26
+# so none of the rest of the app's tab logic has to change.
+(
+    tab0, tab27, tab1, tab2, tab3, tab4, tab5, tab6, tab7,
+    tab25, tab26,
+    tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17,
+    tab18, tab19, tab20, tab21, tab22, tab23, tab24
+) = tabs
+
+try:
+    with tab27:
+        render_custom_concentrated_portfolio_tab()
+except Exception as e:
+    with tab27:
+        st.error(f'Custom Portfolio tab error: {e}')
+
+
+# Render GEX immediately after tab creation. The module itself is lazy-loaded by
+# button, so it stays available even if a later heavy legacy tab calls st.stop().
+try:
+    with tab22:
+        render_institutional_gamma_exposure_tab(TICKER, rf_rate)
+except Exception as e:
+    with tab22:
+        st.error(f'Institutional Gamma Exposure tab error: {e}')
+
+try:
+    with tab23:
+        render_institutional_liquidity_flow_tab(TICKER)
+except Exception as e:
+    with tab23:
+        st.error(f'Institutional Liquidity Flow tab error: {e}')
+
+try:
+    with tab24:
+        render_institutional_futures_scalper_tab(TICKER)
+except Exception as e:
+    with tab24:
+        st.error(f'Institutional Futures Scalper tab error: {e}')
+
+
+try:
+    with tab25:
+        render_macd_strategy_tab(TICKER)
+except Exception as e:
+    with tab25:
+        st.error(f'MACD Strategy tab error: {e}')
+
+try:
+    with tab26:
+        render_rsi_strategy_tab(TICKER)
+except Exception as e:
+    with tab26:
+        st.error(f'RSI Strategy tab error: {e}')
+
 
 
 # ==========================================================
@@ -11056,550 +12572,6 @@ if fast_intraday_mode:
 
     st.stop()
 
-
-# ==========================================================
-# FAST KALMAN-ONLY LIVE MODE
-# ==========================================================
-# Streamlit executes every tab by default. In live 5/15m Kalman work, that means
-# GARCH/Markov/Heston/scan tabs can run even when the user only needs Kalman.
-# This mode skips those heavy sections and renders only the Kalman tab.
-# Kalman math/strategy/risk logic below is the same family as the full tab.
-if bool(kalman_fast_live_mode):
-    for _t, _name in zip(
-        [tab0, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16, tab17, tab18, tab19, tab20, tab21],
-        ["Decision Summary", "GARCH", "Regime Switching", "Heston/Jump", "Macro", "Structural", "Backtest", "Vol Clustering", "Advanced Regime", "SML & Alpha", "Multi-Asset Scan", "FED", "Options", "Hurst", "Hot 10", "IV Scanner", "CVD", "VWAP", "Time Series", "Microstructure", "0.5% Live Capture"]
-    ):
-        with _t:
-            st.info(f"{_name} is paused because Kalman-only fast live mode is ON. Turn it OFF in the sidebar when you want the full dashboard.")
-
-    with tab4:
-        if df_main is None or df_main.empty:
-            st.warning("No live data loaded for Kalman fast mode.")
-        else:
-            st.write("### Kalman Filter Analysis — Fast Live Mode")
-            st.caption("Only this tab is running. Heavy GARCH/Markov/scan tabs are skipped to make 5m/15m live work load faster.")
-
-
-            kf_mode = st.radio(
-                "Analysis Mode",
-                ["Single Asset (Trend)", "Pairs Trading (Relative Value)"],
-                index=0,
-                key="kalman_analysis_mode_default_single_asset"
-            )
-
-            if kf_mode == "Pairs Trading (Relative Value)":
-                st.info("Pairs mode is available in full dashboard mode. Turn OFF Kalman-only fast live mode if you need pairs.")
-            else:
-                st.write(f"**{TICKER} Trend Detection**")
-                st.caption("Same Kalman controls/optimizer grid/risk firewall as the full tab, rendered without loading the rest of the dashboard.")
-
-                col_k1, col_k2, col_k3, col_k4 = st.columns(4)
-                with col_k1:
-                    model_mode = st.radio(
-                        "Model Type",
-                        ["Institutional Trend Rail (Default)", "Institutional Adaptive Centerline", "Zero-Lag EMA Hybrid", "Smoothed RTS (Research)", "Standard Old", "Compare All"],
-                        index=0,
-                        key="kalman_single_asset_model_type"
-                    )
-                with col_k2:
-                    fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_reaction")
-                with col_k3:
-                    slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_slow_smoothing")
-                with col_k4:
-                    polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_polish_span")
-
-                # Force default trend rail distance to 1.35. If an old session kept 1.15, reset it.
-                try:
-                    if st.session_state.get("kalman_trend_rail_distance", 1.35) == 1.15:
-                        st.session_state["kalman_trend_rail_distance"] = 1.35
-                except Exception:
-                    pass
-                rail_mult = st.slider(
-                    "Trend rail distance",
-                    0.40, 3.00, 1.35, step=0.05,
-                    key="kalman_trend_rail_distance",
-                    help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
-                )
-
-                with st.expander("Advanced old Kalman controls", expanded=False):
-                    ak1, ak2, ak3 = st.columns(3)
-                    with ak1:
-                        proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_old_proc_noise")
-                    with ak2:
-                        meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_old_meas_noise")
-                    with ak3:
-                        zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
-
-                prices = df_main["Close"].astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill().values
-                kalman_chart_x = _ct_naive_index(df_main.index)
-                kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
-
-                est_adaptive = institutional_adaptive_kalman_trend(
-                    prices,
-                    fast_gain=float(fast_gain),
-                    slow_gain=float(slow_gain),
-                    vol_window=20,
-                    polish_span=int(polish_span)
-                )
-                est_rail, est_rail_center, est_rail_state = institutional_trend_rail(
-                    prices,
-                    fast_gain=float(fast_gain),
-                    slow_gain=float(slow_gain),
-                    polish_span=int(polish_span),
-                    atr_window=14,
-                    atr_mult=float(rail_mult)
-                )
-                est_zlema = zero_lag_ema_trend(prices, span=int(zlema_span))
-                est_std, _ = kf_trend.filter(prices)
-                est_smooth, _ = kf_trend.smooth(prices)
-
-                fig_kt = go.Figure()
-                fig_kt.add_trace(go.Scatter(
-                    x=kalman_chart_x, y=prices, mode="lines",
-                    line=dict(color="white", width=1.15),
-                    opacity=0.62,
-                    name="Actual Price"
-                ))
-
-                if model_mode == "Institutional Trend Rail (Default)":
-                    active_trend_arr = est_rail
-                    active_trend_name = "Institutional Trend Rail"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name=active_trend_name))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail_center, mode="lines", line=dict(color="rgba(127,219,255,0.28)", width=1.0, dash="dot"), name="Adaptive Center Reference"))
-                elif model_mode == "Institutional Adaptive Centerline":
-                    active_trend_arr = est_adaptive
-                    active_trend_name = "Institutional Adaptive Centerline"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode="lines", line=dict(color="#7FDBFF", width=2.7), name=active_trend_name))
-                elif model_mode == "Zero-Lag EMA Hybrid":
-                    active_trend_arr = est_zlema
-                    active_trend_name = "Zero-Lag EMA Hybrid"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode="lines", line=dict(color="#7FDBFF", width=2.5), name=active_trend_name))
-                elif model_mode == "Smoothed RTS (Research)":
-                    active_trend_arr = est_smooth
-                    active_trend_name = "Smoothed RTS Research"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode="lines", line=dict(color="#7FDBFF", width=2.2), name=active_trend_name))
-                elif model_mode == "Standard Old":
-                    active_trend_arr = est_std
-                    active_trend_name = "Standard Old"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode="lines", line=dict(color="#7FDBFF", width=2.0), name=active_trend_name))
-                else:
-                    active_trend_arr = est_rail
-                    active_trend_name = "Institutional Trend Rail"
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode="lines", line=dict(color="blue", dash="dash", width=1.35), name="Old Standard"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode="lines", line=dict(color="purple", width=1.55), name="RTS Smooth Research"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode="lines", line=dict(color="#00d1ff", width=1.85), name="Zero-Lag Hybrid"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode="lines", line=dict(color="rgba(127,219,255,0.35)", width=1.6), name="Adaptive Centerline"))
-                    fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode="lines", line=dict(color="#7FDBFF", width=3.0), name="Institutional Trend Rail"))
-
-                current_trend = float(pd.Series(active_trend_arr).dropna().iloc[-1])
-                current_price = float(prices[-1])
-                diff_pct = (current_price - current_trend) / current_trend * 100.0 if current_trend else 0.0
-
-                fig_kt.update_layout(
-                    title=f"Kalman Trend: {TICKER} — Fast Live",
-                    hovermode="x unified",
-                    template="plotly_dark",
-                    height=560,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                st.plotly_chart(fig_kt, use_container_width=True)
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Current Price", f"{CURRENCY}{current_price:.2f}")
-                c2.metric("Current Trend", f"{CURRENCY}{current_trend:.2f}")
-                c3.metric("Deviation", f"{diff_pct:.2f}%", delta=f"{diff_pct:.2f}%", delta_color="inverse")
-
-                st.divider()
-                st.write("#### 📒 Kalman Trend Strategy Backtest & Trade Log")
-
-                bt_px = pd.Series(prices, index=df_main.index).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-                bt_trend = pd.Series(active_trend_arr, index=df_main.index).astype(float).reindex(bt_px.index).ffill().bfill()
-                bt_plot_x = _ct_naive_index(bt_px.index)
-                bt_plot_x_series = pd.Series(bt_plot_x, index=bt_px.index)
-
-                ks1, ks2, ks3, ks4 = st.columns(4)
-                with ks1:
-                    kalman_buffer_pct = st.slider("Cross buffer (%)", 0.00, 8.00, 1.25, step=0.25, key="kalman_strategy_cross_buffer_pct") / 100.0
-                with ks2:
-                    kalman_confirm_bars = st.slider("Confirm bars", 1, 10, 3, step=1, key="kalman_strategy_confirm_bars")
-                with ks3:
-                    kalman_min_hold = st.slider("Minimum hold bars", 1, 40, 5, step=1, key="kalman_strategy_min_hold")
-                with ks4:
-                    kalman_cooldown = st.slider("Cooldown after exit", 0, 30, 3, step=1, key="kalman_strategy_cooldown")
-
-                use_slope_confirm = st.checkbox("Require trend slope confirmation", value=True, key="kalman_strategy_slope_confirm")
-                use_atr_safety = st.checkbox("Use ATR safety exit", value=True, key="kalman_strategy_atr_safety")
-                benchmark_aware_kalman = st.checkbox("Benchmark-aware Kalman optimizer", value=True, key="kalman_benchmark_aware_optimizer")
-                kalman_fast_reuse_optimizer = st.checkbox(
-                    "Reuse last optimized Kalman settings for speed",
-                    value=True,
-                    key="kalman_fast_reuse_optimizer",
-                    disabled=True,
-                    help="LOCKED ON for live/source-of-truth mode. The optimizer runs once, then the exact chosen parameters are reused so performance stays stable and the trade log does not silently change every refresh."
-                )
-                kalman_force_reopt = st.button(
-                    "Re-run full Kalman optimizer now",
-                    key=f"kalman_force_reopt_{TICKER}_{data_interval}",
-                    help="Use when you changed market regime/ticker/timeframe and want a fresh full optimizer search."
-                )
-                kalman_max_dd_allowed = st.slider("Max drawdown allowed (%)", 10.0, 80.0, 35.0, step=5.0, key="kalman_max_dd_allowed")
-
-                use_kalman_risk_firewall = st.checkbox("Use Kalman risk firewall", value=False, key="kalman_use_risk_firewall")
-                rf1, rf2, rf3, rf4 = st.columns(4)
-                with rf1:
-                    kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
-                with rf2:
-                    kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_trail_stop_pct")
-                with rf3:
-                    kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_equity_dd_stop_pct")
-                with rf4:
-                    kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
-
-                nr1, nr2 = st.columns([3, 1])
-                with nr1:
-                    st.checkbox(
-                        "🔒 Non-repaint lock (freeze signals on completed bars)",
-                        value=True,
-                        key="kalman_non_repaint_lock",
-                        help="When ON, once a 15m bar closes its signal is frozen and never changes on later runs. "
-                             "Turn OFF only if you want signals to recompute freely (can repaint).",
-                    )
-                with nr2:
-                    if st.button("Reset lock", key="reset_signal_lock_fast", use_container_width=True,
-                                 help="Clear the frozen signal history and re-baseline from the current data. "
-                                      "Do this after changing strategy parameters."):
-                        try:
-                            _save_main_kalman_signal_lock({})
-                            st.success("Signal lock cleared. It will re-baseline on the next run.")
-                        except Exception as _e:
-                            st.error(f"Could not clear lock: {_e}")
-
-                trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
-
-                def _build_fast_kalman_signal(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
-                    close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
-                    close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
-                    if bool(slope_confirm):
-                        entry_cond_i = close_above_i & (trend_slope >= 0)
-                        exit_cond_i = close_below_i & (trend_slope <= 0)
-                    else:
-                        entry_cond_i = close_above_i
-                        exit_cond_i = close_below_i
-                    if bool(atr_safety):
-                        atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-                        exit_cond_i = exit_cond_i | (bt_px < (bt_trend - 1.25 * atr_proxy_i)).fillna(False)
-                    confirm_bars = int(confirm_bars)
-                    entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                    exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                    sig_i = pd.Series(0.0, index=bt_px.index)
-                    in_pos_i = False
-                    bars_held_i = 0
-                    cooldown_left_i = 0
-                    for _dt in bt_px.index:
-                        if cooldown_left_i > 0:
-                            cooldown_left_i -= 1
-                        if not in_pos_i:
-                            if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
-                                in_pos_i = True
-                                bars_held_i = 0
-                                sig_i.loc[_dt] = 1.0
-                        else:
-                            bars_held_i += 1
-                            if bars_held_i >= int(min_hold_bars) and bool(exit_ready_i.loc[_dt]):
-                                in_pos_i = False
-                                cooldown_left_i = int(cooldown_bars)
-                                sig_i.loc[_dt] = 0.0
-                                bars_held_i = 0
-                            else:
-                                sig_i.loc[_dt] = 1.0
-                    return sig_i.ffill().fillna(0).clip(0, 1)
-
-                # Fast live speed rule:
-                # Running the full benchmark-aware optimizer every Streamlit rerun is slow because it tests
-                # hundreds of parameter combinations. To keep the SAME chosen logic but avoid repeated work,
-                # fast mode can reuse the last optimized parameter set for the same ticker/timeframe/model/day.
-                _kalman_fast_day = None
-                try:
-                    _kalman_fast_day = str(pd.Timestamp(bt_px.index[-1]).date())
-                except Exception:
-                    _kalman_fast_day = "unknown"
-
-                _kalman_opt_key = (
-                    f"kalman_opt::{TICKER}::{data_interval}::{_kalman_fast_day}::{active_trend_name}::"
-                    f"fg{float(fast_gain):.4f}::sg{float(slow_gain):.4f}::pol{int(polish_span)}::"
-                    f"rail{float(rail_mult):.4f}::z{int(zlema_span)}::"
-                    f"slope{bool(use_slope_confirm)}::atr{bool(use_atr_safety)}::"
-                    f"fw{bool(use_kalman_risk_firewall)}::ts{float(kalman_trade_stop_pct):.2f}::"
-                    f"tr{float(kalman_trail_stop_pct):.2f}::eq{float(kalman_equity_dd_stop_pct):.2f}::"
-                    f"fwc{int(kalman_firewall_cooldown)}::dd{float(kalman_max_dd_allowed):.2f}"
-                )
-
-                if bool(kalman_force_reopt):
-                    try:
-                        st.session_state.pop(_kalman_opt_key, None)
-                    except Exception:
-                        pass
-                    try:
-                        _opt_store = _load_main_kalman_opt_params()
-                        _opt_store.pop(str(TICKER).upper(), None)
-                        _main_kalman_opt_params_path().write_text(json.dumps(_opt_store, indent=2))
-                    except Exception:
-                        pass
-
-                if bool(benchmark_aware_kalman):
-                    _cached_params = st.session_state.get(_kalman_opt_key) if bool(kalman_fast_reuse_optimizer) else None
-
-                    # Pull persistent saved optimizer params from disk after Streamlit restart.
-                    # IMPORTANT: this uses a clean V2 cache file, so old bad/manual-locked params are ignored.
-                    if _cached_params is None and bool(kalman_fast_reuse_optimizer):
-                        try:
-                            _saved_opt = _get_main_kalman_opt_params_for_ticker(TICKER)
-                            if isinstance(_saved_opt, dict):
-                                _cached_params = {
-                                    "buffer": float(_saved_opt.get("buffer_pct")),
-                                    "confirm": int(_saved_opt.get("confirm_bars")),
-                                    "hold": int(_saved_opt.get("min_hold_bars")),
-                                    "cool": int(_saved_opt.get("cooldown_bars")),
-                                }
-                                st.session_state[_kalman_opt_key] = dict(_cached_params)
-                        except Exception:
-                            _cached_params = None
-
-                    if _cached_params is not None:
-                        kalman_signal = _build_fast_kalman_signal(
-                            float(_cached_params["buffer"]),
-                            int(_cached_params["confirm"]),
-                            int(_cached_params["hold"]),
-                            int(_cached_params["cool"]),
-                            bool(use_slope_confirm),
-                            bool(use_atr_safety)
-                        )
-                        try:
-                            _save_main_kalman_opt_params_for_ticker(
-                                TICKER, float(_cached_params["buffer"]), int(_cached_params["confirm"]),
-                                int(_cached_params["hold"]), int(_cached_params["cool"]),
-                                slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                            )
-                        except Exception:
-                            pass
-                        st.caption(
-                            f"Fast mode reused optimized settings: buffer {float(_cached_params['buffer'])*100:.2f}%, "
-                            f"confirm {int(_cached_params['confirm'])}, min-hold {int(_cached_params['hold'])}, "
-                            f"cooldown {int(_cached_params['cool'])}. Click re-optimize for a fresh full grid search."
-                        )
-                    else:
-                        # Same full benchmark-aware optimizer grid as the full Kalman tab.
-                        # Runs once, then fast mode can reuse the chosen parameters on live refresh.
-                        best_pack = None
-                        bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-
-                        with st.spinner("Running full Kalman optimizer once... future live refreshes will reuse it for speed."):
-                            for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
-                                for _conf in [3, 4, 5, 7, 10]:
-                                    for _hold in [10, 15, 21, 34, 55]:
-                                        for _cool in [5, 8, 13, 21]:
-                                            _sig = _build_fast_kalman_signal(_buf, _conf, _hold, _cool, bool(use_slope_confirm), bool(use_atr_safety))
-                                            if bool(use_kalman_risk_firewall):
-                                                _sig = apply_kalman_risk_firewall(
-                                                    bt_px, _sig, bt_trend,
-                                                    max_trade_loss_pct=float(kalman_trade_stop_pct),
-                                                    trail_stop_pct=float(kalman_trail_stop_pct),
-                                                    equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                                                    cooldown_bars=int(kalman_firewall_cooldown)
-                                                )
-                                            _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
-                                            _eq = _bt.get("equity_curve", pd.Series(dtype=float))
-                                            _rets = _bt.get("returns", pd.Series(dtype=float))
-                                            _tr = _bt.get("trades", pd.DataFrame())
-                                            if _eq is None or len(_eq) < 2:
-                                                continue
-                                            _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
-                                            _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
-                                            _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
-                                            _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
-                                            _sh = float(_mets.get("Sharpe Ratio", 0.0))
-                                            _dd_abs = abs(float(_dd))
-                                            _score = (_strat - bh_reference) + 0.08 * _strat + 8.0 * _sh - 2.20 * _dd_abs - 0.45 * max(0, _trade_n - 10)
-                                            if _strat < bh_reference:
-                                                _score -= (bh_reference - _strat) * 0.85
-                                            if _dd_abs > float(kalman_max_dd_allowed):
-                                                _score -= ((_dd_abs - float(kalman_max_dd_allowed)) ** 2) * 2.0
-                                            if _dd_abs > 60:
-                                                _score -= 5000.0
-                                            if best_pack is None or _score > best_pack["score"]:
-                                                best_pack = {"score": _score, "sig": _sig, "buffer": _buf, "confirm": _conf, "hold": _hold, "cool": _cool}
-
-                        if best_pack is not None:
-                            kalman_signal = best_pack["sig"]
-                            if bool(kalman_fast_reuse_optimizer):
-                                st.session_state[_kalman_opt_key] = {
-                                    "buffer": float(best_pack["buffer"]),
-                                    "confirm": int(best_pack["confirm"]),
-                                    "hold": int(best_pack["hold"]),
-                                    "cool": int(best_pack["cool"])
-                                }
-                            try:
-                                _save_main_kalman_opt_params_for_ticker(
-                                    TICKER, float(best_pack["buffer"]), int(best_pack["confirm"]),
-                                    int(best_pack["hold"]), int(best_pack["cool"]),
-                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                                )
-                            except Exception:
-                                pass
-                            st.info(
-                                f"Fast optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
-                                f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}."
-                            )
-                        else:
-                            kalman_signal = _build_fast_kalman_signal(
-                                kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                                bool(use_slope_confirm), bool(use_atr_safety)
-                            )
-                            try:
-                                _save_main_kalman_opt_params_for_ticker(
-                                    TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
-                                    int(kalman_min_hold), int(kalman_cooldown),
-                                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                                )
-                            except Exception:
-                                pass
-                else:
-                    kalman_signal = _build_fast_kalman_signal(
-                        kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                        bool(use_slope_confirm), bool(use_atr_safety)
-                    )
-                    try:
-                        _save_main_kalman_opt_params_for_ticker(
-                            TICKER, float(kalman_buffer_pct), int(kalman_confirm_bars),
-                            int(kalman_min_hold), int(kalman_cooldown),
-                            slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                        )
-                    except Exception:
-                        pass
-
-                if bool(use_kalman_risk_firewall):
-                    kalman_signal = apply_kalman_risk_firewall(
-                        bt_px, kalman_signal, bt_trend,
-                        max_trade_loss_pct=float(kalman_trade_stop_pct),
-                        trail_stop_pct=float(kalman_trail_stop_pct),
-                        equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                        cooldown_bars=int(kalman_firewall_cooldown)
-                    )
-
-                # Non-repaint lock: freeze main-chart signal on completed bars.
-                try:
-                    if bool(st.session_state.get("kalman_non_repaint_lock", True)):
-                        _lk_int = str(locals().get("interval", "15m"))
-                        kalman_signal = _apply_signal_lock(TICKER, kalman_signal, freeze_enabled=True, interval=_lk_int)
-                except Exception:
-                    pass
-
-                kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
-                kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
-                kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
-                kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
-
-                try:
-
-                    _inst_settings = _institutional_settings_from_locals(TICKER, locals())
-
-                    _inst_enabled = bool(st.session_state.get("kalman_institutional_live_ledger", True))
-
-                    kalman_trades = _main_kalman_apply_institutional_trade_ledger(
-
-                        TICKER, kalman_trades, bt_px, _inst_settings, enabled=_inst_enabled
-
-                    )
-
-                except Exception as _inst_e:
-
-                    try:
-
-                        st.warning(f"Institutional ledger skipped: {_inst_e}")
-
-                    except Exception:
-
-                        pass
-
-                # Authoritative current position from the signal series (chart source).
-                try:
-                    _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
-                except Exception:
-                    _kalman_signal_last = None
-                try:
-                    _sync_watchlist_ledger_from_visible_main_trade_log(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                    )
-                except Exception:
-                    pass
-                try:
-                    _save_main_kalman_status_to_session(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last,
-                    )
-                except Exception:
-                    pass
-                try:
-                    _update_thesis_main_kalman_verify(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last,
-                    )
-                except Exception:
-                    pass
-                k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
-                k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-                k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
-                k_total_pnl = total_trade_pnl_return_pct(kalman_trades) if isinstance(kalman_trades, pd.DataFrame) else 0.0
-
-                km1, km2, km3, km4, km5 = st.columns(5)
-                km1.metric("Kalman Strategy Return", f"{k_strat_ret:.2f}%")
-                km2.metric("Buy & Hold", f"{k_bh_ret:.2f}%")
-                km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
-                km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
-                km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-                st.success("Source of truth: main Institutional Trend Rail graph + append-only institutional live ledger. Optimizer may change future settings, but open/closed trade rows stay locked to their entry model version.")
-
-                fig_kbt = go.Figure()
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
-                changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
-                buy_idx = changes[changes > 0].index
-                sell_idx = changes[changes < 0].index
-                if len(buy_idx):
-                    fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(buy_idx), y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
-                if len(sell_idx):
-                    fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(sell_idx), y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
-                fig_kbt.update_layout(title=f"Kalman Strategy: {TICKER} — {active_trend_name}", template="plotly_dark", height=560, hovermode="x unified")
-                st.plotly_chart(fig_kbt, use_container_width=True)
-
-                st.write("##### Main Kalman Trade Log — Source of Truth")
-                if kalman_trades is None or kalman_trades.empty:
-                    st.info("No Kalman strategy trades generated with the current confirmation settings.")
-                else:
-                    try:
-                        kalman_trades = apply_trade_log_timestamp_display(kalman_trades)
-                        kalman_trades = kalman_trades.sort_values("Entry Date", ascending=False).reset_index(drop=True)
-                    except Exception:
-                        pass
-                    st.dataframe(kalman_trades, use_container_width=True)
-                    st.download_button(
-                        "📥 Download Kalman trade log",
-                        data=_clean_trade_log_numbers(kalman_trades).to_csv(index=False).encode("utf-8"),
-                        file_name=f"{_safe_filename_part(TICKER)}_Kalman_FastLive_TradeLog.csv" if "_safe_filename_part" in globals() else f"{TICKER}_Kalman_FastLive_TradeLog.csv",
-                        mime="text/csv",
-                        key=f"download_fast_kalman_trade_log_{TICKER}"
-                    )
-    st.stop()
-
-
 if df_main is not None:
     # Initialize Report Generator
     st.session_state.report_gen = ReportGenerator(TICKER, start_date, end_date)
@@ -12033,277 +13005,265 @@ with tab2:
         switch_vol = st.checkbox("Switching Volatility", value=True,
                                   help="Uncheck to focus ONLY on Trend (ignore volatility changes)")
     
-    # ===== LAZY LOAD GATE =====
-    # Speed-only change: regime math/logic below is unchanged.
-    # It simply will not execute until you explicitly load this tab.
-    _load_regime_switching_now = st.checkbox(
-        "Load / run Regime Switching model",
-        value=False,
-        key="lazy_load_regime_switching_tab_no_logic_change",
-        help="Keeps the full app fast. Turn ON only when you want to fit the Markov regime model."
-    )
-
-    if not _load_regime_switching_now:
-        st.info("Regime Switching is ready but not running on startup. Turn ON the checkbox above to run the exact same model.")
+    # ===== PRE-FLIGHT CHECKS =====
+    warnings = []
+    if regime_window_mode == "Rolling 1-Year":
+        st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
     else:
-        # ===== PRE-FLIGHT CHECKS =====
-        warnings = []
-        if regime_window_mode == "Rolling 1-Year":
-            st.info("✅ Regime Switching is using **Rolling 1-Year** data window — best for live/current signal behavior.")
-        else:
-            if lookback_years <= 1:
-                warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
-                if regime_freq == "Weekly":
-                    warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
-                    regime_freq = "Daily"
+        if lookback_years <= 1:
+            warnings.append("⚠️ Very short history - consider 3+ years for stable historical regimes")
+            if regime_freq == "Weekly":
+                warnings.append("❌ Cannot use Weekly with <1 year. Switch to Daily.")
+                regime_freq = "Daily"
 
-            if regime_freq == "Daily" and switch_trend and lookback_years < 3:
-                warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
-                switch_trend = False
+        if regime_freq == "Daily" and switch_trend and lookback_years < 3:
+            warnings.append("⚠️ Daily + Switching Trend can be unstable with short custom history. Disabling...")
+            switch_trend = False
 
-        if warnings:
-            for w in warnings:
-                st.warning(w)
+    if warnings:
+        for w in warnings:
+            st.warning(w)
     
-        # ===== DATA PREPARATION =====
-        if regime_window_mode == "Rolling 1-Year":
-            # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
-            _regime_end_ts = pd.Timestamp(end_date)
-            start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
-        else:
-            start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
-        df_regime = load_data(TICKER, start_dt_regime, end_date)
+    # ===== DATA PREPARATION =====
+    if regime_window_mode == "Rolling 1-Year":
+        # Rolling means the model always trains on the most recent 365 days ending at the selected end date.
+        _regime_end_ts = pd.Timestamp(end_date)
+        start_dt_regime = (_regime_end_ts - pd.Timedelta(days=365)).to_pydatetime()
+    else:
+        start_dt_regime = datetime.now() - timedelta(days=lookback_years*365)
+    df_regime = load_data(TICKER, start_dt_regime, end_date)
     
-        if df_regime is None:
-            st.error("Could not load data")
+    if df_regime is None:
+        st.error("Could not load data")
+        st.stop()
+    
+    # Prepare data
+    if regime_freq == "Weekly":
+        returns = df_regime['Returns'].resample('W').sum()
+    else:
+        returns = df_regime['Returns']
+    
+    # Apply Pre-Smoothing (EWMA) if requested
+    if stability > 0:
+        returns = returns.ewm(span=stability, adjust=False).mean()
+        st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
+    
+    # FIX: Ensure data is strictly 1D Series with Float dtype
+    try:
+        model_data = returns.dropna() * 100
+        
+        # Reconstruct Series to guarantee 1D structure
+        # This handles (N,1) DataFrames, Series, etc.
+        if len(model_data) < 10:
+            st.error("Insufficient data points for modeling (>10 required).")
             st.stop()
-    
-        # Prepare data
-        if regime_freq == "Weekly":
-            returns = df_regime['Returns'].resample('W').sum()
-        else:
-            returns = df_regime['Returns']
-    
-        # Apply Pre-Smoothing (EWMA) if requested
-        if stability > 0:
-            returns = returns.ewm(span=stability, adjust=False).mean()
-            st.caption(f"ℹ️ Applied EWMA Smoothing (Span={stability}) to reduce noise.")
-    
-        # FIX: Ensure data is strictly 1D Series with Float dtype
-        try:
-            model_data = returns.dropna() * 100
-        
-            # Reconstruct Series to guarantee 1D structure
-            # This handles (N,1) DataFrames, Series, etc.
-            if len(model_data) < 10:
-                st.error("Insufficient data points for modeling (>10 required).")
-                st.stop()
             
-            model_data = pd.Series(
-                model_data.values.flatten().astype(float), 
-                index=model_data.index
-            )
+        model_data = pd.Series(
+            model_data.values.flatten().astype(float), 
+            index=model_data.index
+        )
         
-            if model_data.ndim != 1:
-                st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
-                st.stop()
+        if model_data.ndim != 1:
+            st.error(f"Data dimensionality error: {model_data.ndim}D detected.")
+            st.stop()
              
-        except Exception as e:
-            st.error(f"Data Prep Error: {e}")
-            st.stop()
+    except Exception as e:
+        st.error(f"Data Prep Error: {e}")
+        st.stop()
     
-        _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
-        st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
+    _window_label = "Rolling 1-Year" if regime_window_mode == "Rolling 1-Year" else f"Custom {lookback_years}Y"
+    st.caption(f"Modeling {len(model_data)} {regime_freq.lower()} returns from {pd.Timestamp(start_dt_regime).date()} | Window: {_window_label}")
     
-        # ===== MODEL FITTING =====
-        with st.spinner(f"Fitting {n_regimes}-regime model..."):
-            res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
+    # ===== MODEL FITTING =====
+    with st.spinner(f"Fitting {n_regimes}-regime model..."):
+        res_markov = fit_regime_model(model_data, n_regimes, switch_vol, switch_trend)
         
-        if res_markov is None:
-            st.error("Model fitting failed (fit_regime_model returned None).")
-            st.stop()
+    if res_markov is None:
+        st.error("Model fitting failed (fit_regime_model returned None).")
+        st.stop()
         
-        # Verify convergence implicitly via success return
+    # Verify convergence implicitly via success return
 
         
-        # ===== CONVERGENCE CHECKS =====
-        if not res_markov.mle_retvals['converged']:
-            st.error("⛔ Model did not converge. Try longer history or simpler model.")
-            st.stop()
+    # ===== CONVERGENCE CHECKS =====
+    if not res_markov.mle_retvals['converged']:
+        st.error("⛔ Model did not converge. Try longer history or simpler model.")
+        st.stop()
     
-        trans_matrix = np.squeeze(res_markov.regime_transition)
+    trans_matrix = np.squeeze(res_markov.regime_transition)
     
-        # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
-        if trans_matrix.ndim < 2:
-             trans_matrix = np.atleast_2d(trans_matrix)
+    # Ensure it's at least 2D (handle edge case if squeeze over-squeezed a scalar? Unlikely for matrix)
+    if trans_matrix.ndim < 2:
+         trans_matrix = np.atleast_2d(trans_matrix)
     
-        # Check for degenerate regimes
-        if np.any(trans_matrix > 0.99):
-            st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
+    # Check for degenerate regimes
+    if np.any(trans_matrix > 0.99):
+        st.warning("⚠️ Near-permanent regimes detected - consider fewer regimes")
     
-        # ===== REGIME CHARACTERIZATION =====
-        regime_stats = []
-        for i in range(n_regimes):
-            # Handle case where switching_trend=False (single 'const')
-            if f'const[{i}]' in res_markov.params:
-                mean_val = res_markov.params[f'const[{i}]']
-            else:
-                mean_val = res_markov.params.get('const', 0.0)
+    # ===== REGIME CHARACTERIZATION =====
+    regime_stats = []
+    for i in range(n_regimes):
+        # Handle case where switching_trend=False (single 'const')
+        if f'const[{i}]' in res_markov.params:
+            mean_val = res_markov.params[f'const[{i}]']
+        else:
+            mean_val = res_markov.params.get('const', 0.0)
         
-            # Handle case where switching_variance=False (single 'sigma2')
-            if f'sigma2[{i}]' in res_markov.params:
-                vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
-            else:
-                vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
+        # Handle case where switching_variance=False (single 'sigma2')
+        if f'sigma2[{i}]' in res_markov.params:
+            vol_val = np.sqrt(res_markov.params[f'sigma2[{i}]'])
+        else:
+            vol_val = np.sqrt(res_markov.params.get('sigma2', 1.0))
             
-            regime_stats.append({
-                'regime': i,
-                'mean': float(mean_val),
-                'vol': float(vol_val),
-                'persistence': float(trans_matrix[i, i])
-            })
+        regime_stats.append({
+            'regime': i,
+            'mean': float(mean_val),
+            'vol': float(vol_val),
+            'persistence': float(trans_matrix[i, i])
+        })
     
-        # Sort by mean (high to low)
-        regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
+    # Sort by mean (high to low)
+    regime_stats = sorted(regime_stats, key=lambda x: x['mean'], reverse=True)
     
-        # ===== DISPLAY REGIMES =====
-        st.write("### 📊 Identified Regimes")
+    # ===== DISPLAY REGIMES =====
+    st.write("### 📊 Identified Regimes")
     
-        cols = st.columns(n_regimes)
-        labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
+    cols = st.columns(n_regimes)
+    labels = ['🟢 Bull', '🟡 Normal', '🔴 Bear', '⚫ Crisis']
     
-        for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
-            with col:
-                st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
-                st.metric("Mean Return", f"{regime['mean']:.2f}%")
-                st.metric("Volatility", f"{regime['vol']:.2f}%")
-                st.metric("Persistence", f"{regime['persistence']:.1%}")
+    for idx, (col, regime) in enumerate(zip(cols, regime_stats)):
+        with col:
+            st.markdown(f"**{labels[idx]} (Regime {regime['regime']})**")
+            st.metric("Mean Return", f"{regime['mean']:.2f}%")
+            st.metric("Volatility", f"{regime['vol']:.2f}%")
+            st.metric("Persistence", f"{regime['persistence']:.1%}")
             
-                avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
-                st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
+            avg_duration = 1 / (1 - regime['persistence'] + 1e-10)
+            st.caption(f"Avg duration: {avg_duration:.1f} {regime_freq.lower()} periods")
     
-        safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
+    safe_report_add("Regime Statistics", pd.DataFrame(regime_stats))
     
-        # ===== CURRENT STATE =====
-        # Use .iloc[-1] to get the probabilities at the LAST time step
-        last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
-        current_regime = np.argmax(last_probs)
-        current_prob = last_probs.iloc[current_regime]
+    # ===== CURRENT STATE =====
+    # Use .iloc[-1] to get the probabilities at the LAST time step
+    last_probs = res_markov.filtered_marginal_probabilities.iloc[-1]
+    current_regime = np.argmax(last_probs)
+    current_prob = last_probs.iloc[current_regime]
     
-        regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
+    regime_label = labels[[r['regime'] for r in regime_stats].index(current_regime)]
     
-        # Conviction Logic
-        is_conviction = current_prob >= conviction_thresh
+    # Conviction Logic
+    is_conviction = current_prob >= conviction_thresh
     
-        # Calculate Stability Score (Mean Persistence)
-        stability_score = np.mean([r['persistence'] for r in regime_stats])
+    # Calculate Stability Score (Mean Persistence)
+    stability_score = np.mean([r['persistence'] for r in regime_stats])
     
-        # Display Dashboard
-        st.divider()
-        c_dash1, c_dash2, c_dash3 = st.columns(3)
+    # Display Dashboard
+    st.divider()
+    c_dash1, c_dash2, c_dash3 = st.columns(3)
     
-        with c_dash1:
-            st.caption("Current State")
-            if is_conviction:
-                st.subheader(f"{regime_label}")
-                st.success(f"High Conviction ({current_prob:.1%})")
-            else:
-                st.subheader("⚪ Mixed / Uncertain")
-                st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
+    with c_dash1:
+        st.caption("Current State")
+        if is_conviction:
+            st.subheader(f"{regime_label}")
+            st.success(f"High Conviction ({current_prob:.1%})")
+        else:
+            st.subheader("⚪ Mixed / Uncertain")
+            st.warning(f"Low Conviction ({current_prob:.1%} < {conviction_thresh:.0%})")
     
-        with c_dash2:
-            st.caption("Dominance Score (Confidence)")
-            # Spread between 1st and 2nd highest probability
-            sorted_probs = sorted(last_probs.values, reverse=True)
-            spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+    with c_dash2:
+        st.caption("Dominance Score (Confidence)")
+        # Spread between 1st and 2nd highest probability
+        sorted_probs = sorted(last_probs.values, reverse=True)
+        spread = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
         
-            st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
-            st.progress(max(0.0, min(1.0, float(spread))))
+        st.metric("Probability Spread", f"{spread:.1%}", help="Difference between top 2 regime probabilities.")
+        st.progress(max(0.0, min(1.0, float(spread))))
         
-        with c_dash3:
-            st.caption("Regime Stability Metrics")
-            st.metric("Avg Persistence", f"{stability_score:.1%}")
-            # Switch Frequency (proxy)
-            expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
-            st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
+    with c_dash3:
+        st.caption("Regime Stability Metrics")
+        st.metric("Avg Persistence", f"{stability_score:.1%}")
+        # Switch Frequency (proxy)
+        expected_switches_per_year = (1 - stability_score) * (52 if regime_freq == "Weekly" else 252)
+        st.caption(f"Exp. Switches/Year: ~{expected_switches_per_year:.1f}")
 
-        st.write(f"**As of:** {model_data.index[-1].date()}")
-        st.divider()
+    st.write(f"**As of:** {model_data.index[-1].date()}")
+    st.divider()
     
-        # ===== VISUALIZATION =====
-        st.write("### 📈 Regime Analysis (Real-time / Filtered)")
+    # ===== VISUALIZATION =====
+    st.write("### 📈 Regime Analysis (Real-time / Filtered)")
     
-        fig_m = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
-                              subplot_titles=("Returns", "Regime Probabilities (Filtered/Real-time)", "Regime-Weighted Expected Return"))
+    fig_m = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                          subplot_titles=("Returns", "Regime Probabilities (Filtered/Real-time)", "Regime-Weighted Expected Return"))
     
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=model_data, mode='lines', line=dict(color='gray', width=1), name='Return (%)'), row=1, col=1)
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=model_data, mode='lines', line=dict(color='gray', width=1), name='Return (%)'), row=1, col=1)
     
-        import matplotlib.colors as mcolors
-        for i, regime in enumerate(regime_stats):
-            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-            hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
-            probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-            # Shading regions where prob > 0.6
-            mask = probs > 0.6
-            highlight_plotly_zones(fig_m, mask, hex_color, opacity=0.15, row=1, col=1)
+    import matplotlib.colors as mcolors
+    for i, regime in enumerate(regime_stats):
+        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+        hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
+        probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+        # Shading regions where prob > 0.6
+        mask = probs > 0.6
+        highlight_plotly_zones(fig_m, mask, hex_color, opacity=0.15, row=1, col=1)
 
-        smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
+    smooth_probs = st.checkbox("Smooth Probabilities (4-period Rolling)", value=True, key="smooth_probs_check")
     
-        for i, regime in enumerate(regime_stats):
-            color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
-            hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
-            raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
-            if smooth_probs:
-                plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
-            else:
-                plot_probs = raw_probs
-            fig_m.add_trace(go.Scatter(x=model_data.index, y=plot_probs, mode='lines', line=dict(color=hex_color, width=1.5), fill='tozeroy', name=labels[i]), row=2, col=1)
+    for i, regime in enumerate(regime_stats):
+        color_idx = 1 - (i / (n_regimes - 1)) if n_regimes > 1 else 1.0
+        hex_color = mcolors.to_hex(plt.cm.RdYlGn(color_idx))
+        raw_probs = res_markov.filtered_marginal_probabilities.iloc[:, regime['regime']]
+        if smooth_probs:
+            plot_probs = raw_probs.rolling(window=4, min_periods=1).mean()
+        else:
+            plot_probs = raw_probs
+        fig_m.add_trace(go.Scatter(x=model_data.index, y=plot_probs, mode='lines', line=dict(color=hex_color, width=1.5), fill='tozeroy', name=labels[i]), row=2, col=1)
 
-        fig_m.add_hline(y=1/n_regimes, line_dash="dash", line_color="gray", opacity=0.4, row=2, col=1)
+    fig_m.add_hline(y=1/n_regimes, line_dash="dash", line_color="gray", opacity=0.4, row=2, col=1)
     
-        def get_const(i):
-            if f'const[{i}]' in res_markov.params: return float(res_markov.params[f'const[{i}]'])
-            return float(res_markov.params.get('const', 0.0))
+    def get_const(i):
+        if f'const[{i}]' in res_markov.params: return float(res_markov.params[f'const[{i}]'])
+        return float(res_markov.params.get('const', 0.0))
 
-        expected_ret = pd.Series(0.0, index=model_data.index)
-        for i in range(n_regimes):
-            prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
-            expected_ret += prob * get_const(i)
+    expected_ret = pd.Series(0.0, index=model_data.index)
+    for i in range(n_regimes):
+        prob = res_markov.filtered_marginal_probabilities.iloc[:, i]
+        expected_ret += prob * get_const(i)
     
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=expected_ret, mode='lines', line=dict(color='#00f2ff', width=2), name="Expected Return"), row=3, col=1)
-        fig_m.add_hline(y=0, line_dash="solid", line_color="white", opacity=0.3, row=3, col=1)
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=expected_ret, mode='lines', line=dict(color='#00f2ff', width=2), name="Expected Return"), row=3, col=1)
+    fig_m.add_hline(y=0, line_dash="solid", line_color="white", opacity=0.3, row=3, col=1)
     
-        # Fill Expected return green and red
-        exp_pos = expected_ret.copy()
-        exp_pos[exp_pos < 0] = 0
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_pos, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.3, name="Positive Exp Ret", showlegend=False), row=3, col=1)
+    # Fill Expected return green and red
+    exp_pos = expected_ret.copy()
+    exp_pos[exp_pos < 0] = 0
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_pos, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='green', opacity=0.3, name="Positive Exp Ret", showlegend=False), row=3, col=1)
     
-        exp_neg = expected_ret.copy()
-        exp_neg[exp_neg > 0] = 0
-        fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_neg, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.3, name="Negative Exp Ret", showlegend=False), row=3, col=1)
+    exp_neg = expected_ret.copy()
+    exp_neg[exp_neg > 0] = 0
+    fig_m.add_trace(go.Scatter(x=model_data.index, y=exp_neg, mode='lines', line=dict(width=0), fill='tozeroy', fillcolor='red', opacity=0.3, name="Negative Exp Ret", showlegend=False), row=3, col=1)
     
-        fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
-        st.plotly_chart(fig_m, use_container_width=True)
-        safe_report_add("Regime Switching Analysis", fig_m)
+    fig_m.update_layout(height=800, hovermode="x unified", template="plotly_dark", title="Regime Switching Analysis")
+    st.plotly_chart(fig_m, use_container_width=True)
+    safe_report_add("Regime Switching Analysis", fig_m)
     
-        # ===== PARAMETERS TABLE =====
-        with st.expander("📋 Technical Parameters"):
-            summary_data = {
-                "Parameter": res_markov.params.index,
-                "Value": res_markov.params.values.astype(float),
-                "Std Error": res_markov.bse.values.astype(float),
-                "P-Value": res_markov.pvalues.values.astype(float)
-            }
-            df_summary = pd.DataFrame(summary_data)
-            # Format only numeric columns to avoid error with "Parameter" string column
-            st.dataframe(df_summary.style.format({
-                "Value": "{:.4f}",
-                "Std Error": "{:.4f}",
-                "P-Value": "{:.4f}"
-            }))
+    # ===== PARAMETERS TABLE =====
+    with st.expander("📋 Technical Parameters"):
+        summary_data = {
+            "Parameter": res_markov.params.index,
+            "Value": res_markov.params.values.astype(float),
+            "Std Error": res_markov.bse.values.astype(float),
+            "P-Value": res_markov.pvalues.values.astype(float)
+        }
+        df_summary = pd.DataFrame(summary_data)
+        # Format only numeric columns to avoid error with "Parameter" string column
+        st.dataframe(df_summary.style.format({
+            "Value": "{:.4f}",
+            "Std Error": "{:.4f}",
+            "P-Value": "{:.4f}"
+        }))
         
-            st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
+        st.caption("AIC: {:.2f} | BIC: {:.2f}".format(res_markov.aic, res_markov.bic))
     
+
 
 
 # ==========================================
@@ -12611,7 +13571,7 @@ with tab4:
     else: st.info(f"🎯 **MODEL VERDICT**: Price is trading within **{abs(trend_diff):.1%}** of the Kalman Trend (Neutral/Consolidation).")
 
     
-    kf_mode = st.radio("Analysis Mode", ["Single Asset (Trend)", "Pairs Trading (Relative Value)"], index=0, key="kalman_analysis_mode_default_single_asset")
+    kf_mode = st.radio("Analysis Mode", ["Pairs Trading (Relative Value)", "Single Asset (Trend)"])
     
     if kf_mode == "Pairs Trading (Relative Value)":
         st.write(f"**{TICKER} vs {PAIR_TICKER}**")
@@ -12648,104 +13608,46 @@ with tab4:
             
     elif kf_mode == "Single Asset (Trend)":
         st.write(f"**{TICKER} Trend Detection**")
-        st.caption("Uses an adaptive Kalman-style trend line to separate trend from noise with less lag than the old fixed-Q/R Kalman.")
+        st.caption("Uses a Kalman Filter (Local Level Model) to separate the 'True' Price Trend from Market Noise.")
         st.markdown("[Reference: Time Series Analysis by State Space Methods (Durbin & Koopman)](https://global.oup.com/academic/product/time-series-analysis-by-state-space-methods-9780199641178)")
         
         # Parameters
-        st.caption("Mentor note: the old fixed-Q/R Kalman can lag badly on fast runners. Default below is a directional trend rail: it behaves more like support/resistance instead of cutting through the middle of price.")
-        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+        col_k1, col_k2, col_k3 = st.columns(3)
         with col_k1:
-            model_mode = st.radio(
-                "Model Type",
-                ["Institutional Trend Rail (Default)", "Institutional Adaptive Centerline", "Zero-Lag EMA Hybrid", "Smoothed RTS (Research)", "Standard Old", "Compare All"],
-                index=0,
-                key="kalman_single_asset_model_type"
-            )
+            proc_noise = st.select_slider("Trend Flexibility (Process Noise)", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-4)
         with col_k2:
-            fast_gain = st.slider("Fast reaction", 0.10, 0.70, 0.34, step=0.02, key="kalman_fast_reaction")
+            meas_noise = st.select_slider("Noise Tolerance (Measurement Noise)", options=[1e-3, 1e-2, 1e-1, 1.0], value=1e-2)
         with col_k3:
-            slow_gain = st.slider("Slow smoothing", 0.01, 0.20, 0.055, step=0.005, key="kalman_slow_smoothing")
-        with col_k4:
-            polish_span = st.slider("Final smooth polish", 1, 10, 3, step=1, key="kalman_polish_span")
-
-        rail_mult = st.slider(
-            "Trend rail distance",
-            0.40, 3.00, 1.35, step=0.05,
-            key="kalman_trend_rail_distance",
-            help="Higher = rail stays farther away from price and cuts through less. Lower = more responsive."
-        )
-
-        with st.expander("Advanced old Kalman controls", expanded=False):
-            ak1, ak2, ak3 = st.columns(3)
-            with ak1:
-                proc_noise = st.select_slider("Old process noise", options=[1e-5, 1e-4, 1e-3, 1e-2], value=1e-3, key="kalman_old_proc_noise")
-            with ak2:
-                meas_noise = st.select_slider("Old measurement noise", options=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], value=1e-2, key="kalman_old_meas_noise")
-            with ak3:
-                zlema_span = st.slider("Zero-lag span", 4, 40, 10, step=1, key="kalman_zlema_span")
-
+            model_mode = st.radio("Model Type", ["Smoothed (New)", "Standard (Old)", "Compare Both"])
+        
         prices = df_main['Close'].values
-        kalman_chart_x = _ct_naive_index(df_main.index)
         kf_trend = KalmanFilterTrend(process_noise=proc_noise, measurement_noise=meas_noise)
-
-        est_adaptive = institutional_adaptive_kalman_trend(
-            prices,
-            fast_gain=float(fast_gain),
-            slow_gain=float(slow_gain),
-            vol_window=20,
-            polish_span=int(polish_span)
-        )
-        est_rail, est_rail_center, est_rail_state = institutional_trend_rail(
-            prices,
-            fast_gain=float(fast_gain),
-            slow_gain=float(slow_gain),
-            polish_span=int(polish_span),
-            atr_window=14,
-            atr_mult=float(rail_mult)
-        )
-        est_zlema = zero_lag_ema_trend(prices, span=int(zlema_span))
-        est_std, _ = kf_trend.filter(prices)
-        est_smooth, _ = kf_trend.smooth(prices)
-
+        
+        # Calculate based on mode
+        if model_mode == "Standard (Old)":
+            est_trend, _ = kf_trend.filter(prices)
+            label_trend = "Kalman Trend (Standard)"
+            color_trend = "blue"
+        elif model_mode == "Smoothed (New)":
+            est_trend, _ = kf_trend.smooth(prices)
+            label_trend = "Kalman Trend (Smoothed)"
+            color_trend = "purple"
+        else: # Compare Both
+            est_trend_smooth, _ = kf_trend.smooth(prices)
+            est_trend_std, _ = kf_trend.filter(prices)
+        
         fig_kt = go.Figure()
-        fig_kt.add_trace(go.Scatter(
-            x=kalman_chart_x, y=prices, mode='lines',
-            line=dict(color='white', width=1.15),
-            opacity=0.62,
-            name='Actual Price'
-        ))
-
-        if model_mode == "Institutional Trend Rail (Default)":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail_center, mode='lines', line=dict(color='rgba(127,219,255,0.28)', width=1.0, dash='dot'), name='Adaptive Center Reference'))
-            current_trend = est_rail[-1]
-        elif model_mode == "Institutional Adaptive Centerline":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode='lines', line=dict(color='#7FDBFF', width=2.7), name='Adaptive Kalman Centerline'))
-            current_trend = est_adaptive[-1]
-        elif model_mode == "Zero-Lag EMA Hybrid":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=2.5), name='Zero-Lag EMA Hybrid'))
-            current_trend = est_zlema[-1]
-        elif model_mode == "Smoothed RTS (Research)":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode='lines', line=dict(color='purple', width=2.2), name='Smoothed RTS Research'))
-            current_trend = est_smooth[-1]
-        elif model_mode == "Standard Old":
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode='lines', line=dict(color='blue', width=2.0), name='Old Standard Kalman'))
-            current_trend = est_std[-1]
+        fig_kt.add_trace(go.Scatter(x=df_main.index, y=prices, mode='lines', line=dict(color='gray'), opacity=0.5, name='Actual Price'))
+        
+        if model_mode == "Compare Both":
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend_std, mode='lines', line=dict(color='blue', dash='dash', width=1.5), name='Standard (Causal)'))
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend_smooth, mode='lines', line=dict(color='purple', width=2), name='Smoothed (RTS)'))
+            current_trend = est_trend_smooth[-1] # Use smooth for metrics
         else:
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_std, mode='lines', line=dict(color='blue', dash='dash', width=1.35), name='Old Standard'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_smooth, mode='lines', line=dict(color='purple', width=1.55), name='RTS Smooth Research'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_zlema, mode='lines', line=dict(color='#00d1ff', width=1.85), name='Zero-Lag Hybrid'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_adaptive, mode='lines', line=dict(color='rgba(127,219,255,0.35)', width=1.6), name='Adaptive Centerline'))
-            fig_kt.add_trace(go.Scatter(x=kalman_chart_x, y=est_rail, mode='lines', line=dict(color='#7FDBFF', width=3.0), name='Institutional Trend Rail'))
-            current_trend = est_rail[-1]
-
-        fig_kt.update_layout(
-            title=f"Kalman Trend: {TICKER} — Institutional Rail / Lower Lag",
-            hovermode="x unified",
-            template="plotly_dark",
-            height=560,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
+            fig_kt.add_trace(go.Scatter(x=df_main.index, y=est_trend, mode='lines', line=dict(color=color_trend, width=2), name=label_trend))
+            current_trend = est_trend[-1]
+            
+        fig_kt.update_layout(title=f"Kalman Filter Trend: {TICKER}", hovermode="x unified", template="plotly_dark", height=500)
         st.plotly_chart(fig_kt, use_container_width=True)
         safe_report_add("Kalman Trend Analysis", fig_kt)
         
@@ -12770,611 +13672,6 @@ with tab4:
             st.success("Price significantly BELOW Trend (Potential Oversold)")
         else:
             st.info("Price near Trend (Neutral)")
-
-        # ----------------------------------------------------------
-        # Kalman Trend Strategy Backtest + Trade Log
-        # ----------------------------------------------------------
-        st.divider()
-        st.write("#### 📒 Kalman Trend Strategy Backtest & Trade Log")
-        st.caption("This adds hysteresis + confirmation so the Zero-Lag/Adaptive line does not overtrade every tiny cross.")
-
-        try:
-            # Pick the exact trend line currently selected above.
-            if model_mode == "Institutional Trend Rail (Default)":
-                active_trend_arr = est_rail
-                active_trend_name = "Institutional Trend Rail"
-            elif model_mode == "Institutional Adaptive Centerline":
-                active_trend_arr = est_adaptive
-                active_trend_name = "Institutional Adaptive Centerline"
-            elif model_mode == "Zero-Lag EMA Hybrid":
-                active_trend_arr = est_zlema
-                active_trend_name = "Zero-Lag EMA Hybrid"
-            elif model_mode == "Smoothed RTS (Research)":
-                active_trend_arr = est_smooth
-                active_trend_name = "Smoothed RTS Research"
-            elif model_mode == "Standard Old":
-                active_trend_arr = est_std
-                active_trend_name = "Standard Old"
-            else:
-                active_trend_arr = est_rail
-                active_trend_name = "Institutional Trend Rail"
-
-            bt_px = pd.Series(prices, index=df_main.index).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-            bt_trend = pd.Series(active_trend_arr, index=df_main.index).astype(float).reindex(bt_px.index).ffill().bfill()
-            bt_plot_x = _ct_naive_index(bt_px.index)
-            bt_plot_x_series = pd.Series(bt_plot_x, index=bt_px.index)
-
-            ks1, ks2, ks3, ks4 = st.columns(4)
-            with ks1:
-                kalman_buffer_pct = st.slider(
-                    "Cross buffer (%)",
-                    0.00, 8.00, 1.25, step=0.25,
-                    key="kalman_strategy_cross_buffer_pct",
-                    help="Price must clear the trend by this % before entry/exit. Higher = fewer false flips."
-                ) / 100.0
-            with ks2:
-                kalman_confirm_bars = st.slider(
-                    "Confirm bars",
-                    1, 10, 3, step=1,
-                    key="kalman_strategy_confirm_bars",
-                    help="Signal must persist for this many bars before acting."
-                )
-            with ks3:
-                kalman_min_hold = st.slider(
-                    "Minimum hold bars",
-                    1, 40, 5, step=1,
-                    key="kalman_strategy_min_hold",
-                    help="Prevents quick exit/re-entry churn."
-                )
-            with ks4:
-                kalman_cooldown = st.slider(
-                    "Cooldown after exit",
-                    0, 30, 3, step=1,
-                    key="kalman_strategy_cooldown",
-                    help="Bars to wait after an exit before allowing a new entry."
-                )
-
-            use_slope_confirm = st.checkbox(
-                "Require trend slope confirmation",
-                value=True,
-                key="kalman_strategy_slope_confirm",
-                help="Entry prefers rising trend; exit prefers falling trend. This reduces overtrading."
-            )
-            use_atr_safety = st.checkbox(
-                "Use ATR safety exit",
-                value=True,
-                key="kalman_strategy_atr_safety",
-                help="Adds a simple safety exit if price loses the trend by a volatility-based amount."
-            )
-
-            benchmark_aware_kalman = st.checkbox(
-                "Benchmark-aware Kalman optimizer",
-                value=True,
-                key="kalman_benchmark_aware_optimizer",
-                help="ON = tests safer confirmation/buffer settings and uses the one with the best return vs buy-and-hold after drawdown/trade-count penalties."
-            )
-            kalman_max_dd_allowed = st.slider(
-                "Max drawdown allowed (%)",
-                10.0, 80.0, 35.0, step=5.0,
-                key="kalman_max_dd_allowed",
-                help="Optimizer strongly rejects settings with drawdown worse than this. Your example -76% is too dangerous."
-            )
-
-            use_kalman_risk_firewall = st.checkbox(
-                "Use Kalman risk firewall",
-                value=False,
-                key="kalman_use_risk_firewall",
-                help="Keeps the same signal logic, but adds hard loss/trailing/equity drawdown protection to reduce capital damage."
-            )
-            rf1, rf2, rf3, rf4 = st.columns(4)
-            with rf1:
-                kalman_trade_stop_pct = st.slider("Trade stop (%)", 5.0, 35.0, 16.0, step=1.0, key="kalman_trade_stop_pct")
-            with rf2:
-                kalman_trail_stop_pct = st.slider("Trailing stop (%)", 8.0, 45.0, 22.0, step=1.0, key="kalman_trail_stop_pct")
-            with rf3:
-                kalman_equity_dd_stop_pct = st.slider("Equity DD circuit (%)", 10.0, 50.0, 28.0, step=2.0, key="kalman_equity_dd_stop_pct")
-            with rf4:
-                kalman_firewall_cooldown = st.slider("Firewall cooldown", 0, 40, 8, step=1, key="kalman_firewall_cooldown")
-
-            kalman_institutional_live_ledger = st.checkbox(
-                "Institutional live ledger: freeze settings per trade",
-                value=True,
-                key="kalman_institutional_live_ledger",
-                help="Production mode. Once a BUY happens, that trade keeps the exact optimizer settings until SELL. Closed rows are append-only and cannot be rewritten by a later optimizer run."
-            )
-            if st.button("Reset institutional ledger for this ticker", key=f"reset_inst_ledger_{TICKER}"):
-                try:
-                    _lg = _load_main_kalman_institutional_ledger()
-                    _lg.pop(f"{str(TICKER).upper()}|{str(locals().get('data_interval', locals().get('interval', '15m')))}", None)
-                    _save_main_kalman_institutional_ledger(_lg)
-                    st.success(f"Institutional ledger reset for {str(TICKER).upper()}.")
-                except Exception as _e:
-                    st.warning(f"Could not reset ledger: {_e}")
-
-            trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0.0)
-            def _build_kalman_signal_for_params(buffer_pct, confirm_bars, min_hold_bars, cooldown_bars, slope_confirm=True, atr_safety=True):
-                close_above_i = bt_px > bt_trend * (1.0 + float(buffer_pct))
-                close_below_i = bt_px < bt_trend * (1.0 - float(buffer_pct))
-
-                if bool(slope_confirm):
-                    entry_cond_i = close_above_i & (trend_slope >= 0)
-                    exit_cond_i = close_below_i & (trend_slope <= 0)
-                else:
-                    entry_cond_i = close_above_i
-                    exit_cond_i = close_below_i
-
-                if bool(atr_safety):
-                    atr_proxy_i = bt_px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
-                    safety_exit_i = bt_px < (bt_trend - 1.25 * atr_proxy_i)
-                    exit_cond_i = exit_cond_i | safety_exit_i.fillna(False)
-
-                confirm_bars = int(confirm_bars)
-                min_hold_bars = int(min_hold_bars)
-                cooldown_bars = int(cooldown_bars)
-
-                entry_ready_i = entry_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-                exit_ready_i = exit_cond_i.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-
-                sig_i = pd.Series(0.0, index=bt_px.index)
-                in_pos_i = False
-                bars_held_i = 0
-                cooldown_left_i = 0
-
-                for _dt in bt_px.index:
-                    if cooldown_left_i > 0:
-                        cooldown_left_i -= 1
-
-                    if not in_pos_i:
-                        if cooldown_left_i <= 0 and bool(entry_ready_i.loc[_dt]):
-                            in_pos_i = True
-                            bars_held_i = 0
-                            sig_i.loc[_dt] = 1.0
-                        else:
-                            sig_i.loc[_dt] = 0.0
-                    else:
-                        bars_held_i += 1
-                        if bars_held_i >= min_hold_bars and bool(exit_ready_i.loc[_dt]):
-                            in_pos_i = False
-                            cooldown_left_i = cooldown_bars
-                            sig_i.loc[_dt] = 0.0
-                            bars_held_i = 0
-                        else:
-                            sig_i.loc[_dt] = 1.0
-                return sig_i.ffill().fillna(0).clip(0, 1)
-
-            chosen_kalman_settings = {
-                "Buffer %": float(kalman_buffer_pct) * 100.0,
-                "Confirm Bars": int(kalman_confirm_bars),
-                "Min Hold": int(kalman_min_hold),
-                "Cooldown": int(kalman_cooldown),
-                "Optimizer": "OFF"
-            }
-
-            if bool(benchmark_aware_kalman):
-                try:
-                    bh_reference = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0
-                    best_pack = None
-                    # Risk-first grid: fewer flips, more confirmation, avoids capital death by noise.
-                    # Includes much stricter settings because high-beta names can show huge returns with unacceptable DD.
-                    for _buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
-                        for _conf in [3, 4, 5, 7, 10]:
-                            for _hold in [10, 15, 21, 34, 55]:
-                                for _cool in [5, 8, 13, 21]:
-                                    _sig = _build_kalman_signal_for_params(
-                                        _buf, _conf, _hold, _cool,
-                                        slope_confirm=bool(use_slope_confirm),
-                                        atr_safety=bool(use_atr_safety)
-                                    )
-                                    if bool(use_kalman_risk_firewall):
-                                        _sig = apply_kalman_risk_firewall(
-                                            bt_px, _sig, bt_trend,
-                                            max_trade_loss_pct=float(kalman_trade_stop_pct),
-                                            trail_stop_pct=float(kalman_trail_stop_pct),
-                                            equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                                            cooldown_bars=int(kalman_firewall_cooldown)
-                                        )
-                                    _bt = BacktestEngine.run_strategy(bt_px, _sig, initial_cap)
-                                    _eq = _bt.get("equity_curve", pd.Series(dtype=float))
-                                    _rets = _bt.get("returns", pd.Series(dtype=float))
-                                    _tr = _bt.get("trades", pd.DataFrame())
-                                    if _eq is None or len(_eq) < 2:
-                                        continue
-                                    _strat = (float(_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0
-                                    _dd = ((1 + _rets).cumprod() / (1 + _rets).cumprod().cummax() - 1).min() * 100 if isinstance(_rets, pd.Series) and len(_rets) else -99.0
-                                    _trade_n = 0 if _tr is None or _tr.empty else len(_tr)
-                                    _mets = BacktestEngine.calculate_metrics(_rets, rf_rate) if isinstance(_rets, pd.Series) and len(_rets) > 2 else {}
-                                    _sh = float(_mets.get("Sharpe Ratio", 0.0))
-
-                                    # Mentor score: must care about beating B&H, but capital protection comes first.
-                                    _dd_abs = abs(float(_dd))
-                                    _score = (
-                                        (_strat - bh_reference)
-                                        + 0.08 * _strat
-                                        + 8.0 * _sh
-                                        - 2.20 * _dd_abs
-                                        - 0.45 * max(0, _trade_n - 10)
-                                    )
-                                    # Hard penalty if it badly underperforms B&H.
-                                    if _strat < bh_reference:
-                                        _score -= (bh_reference - _strat) * 0.85
-
-                                    # Very hard penalty if drawdown violates the user's risk cap.
-                                    if _dd_abs > float(kalman_max_dd_allowed):
-                                        _score -= ((_dd_abs - float(kalman_max_dd_allowed)) ** 2) * 2.0
-
-                                    # Extra rejection for capital-destroying drawdowns like -76%.
-                                    if _dd_abs > 60:
-                                        _score -= 5000.0
-
-                                    if best_pack is None or _score > best_pack["score"]:
-                                        best_pack = {
-                                            "score": _score,
-                                            "sig": _sig,
-                                            "buffer": _buf,
-                                            "confirm": _conf,
-                                            "hold": _hold,
-                                            "cool": _cool,
-                                            "strat": _strat,
-                                            "bh": bh_reference,
-                                            "dd": _dd,
-                                            "trades": _trade_n,
-                                            "sharpe": _sh
-                                        }
-
-                    if best_pack is not None:
-                        kalman_signal = best_pack["sig"]
-                        chosen_kalman_settings = {
-                            "Buffer %": round(best_pack["buffer"] * 100.0, 2),
-                            "Confirm Bars": int(best_pack["confirm"]),
-                            "Min Hold": int(best_pack["hold"]),
-                            "Cooldown": int(best_pack["cool"]),
-                            "Optimizer": "ON",
-                            "Optimizer Score": round(best_pack["score"], 2)
-                        }
-                        st.info(
-                            f"Benchmark-aware optimizer selected: buffer {best_pack['buffer']*100:.2f}%, "
-                            f"confirm {best_pack['confirm']}, min-hold {best_pack['hold']}, cooldown {best_pack['cool']}. "
-                            f"Tested against B&H {bh_reference:.2f}% with DD/trade-count penalty."
-                        )
-                    else:
-                        kalman_signal = _build_kalman_signal_for_params(
-                            kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                            slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
-                        )
-                except Exception:
-                    kalman_signal = _build_kalman_signal_for_params(
-                        kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                        slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
-                    )
-            else:
-                kalman_signal = _build_kalman_signal_for_params(
-                    kalman_buffer_pct, kalman_confirm_bars, kalman_min_hold, kalman_cooldown,
-                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety)
-                )
-
-            # Persist the effective params for THIS ticker so the watchlist
-            # recompute reproduces the main-tab signal (optimizer or sliders).
-            try:
-                _cs = locals().get("chosen_kalman_settings", None)
-                if isinstance(_cs, dict) and "Buffer %" in _cs:
-                    _eff_buf = float(_cs["Buffer %"]) / 100.0
-                    _eff_conf = int(_cs.get("Confirm Bars", kalman_confirm_bars))
-                    _eff_hold = int(_cs.get("Min Hold", kalman_min_hold))
-                    _eff_cool = int(_cs.get("Cooldown", kalman_cooldown))
-                else:
-                    _eff_buf = float(kalman_buffer_pct)
-                    _eff_conf = int(kalman_confirm_bars)
-                    _eff_hold = int(kalman_min_hold)
-                    _eff_cool = int(kalman_cooldown)
-                _save_main_kalman_opt_params_for_ticker(
-                    TICKER, _eff_buf, _eff_conf, _eff_hold, _eff_cool,
-                    slope_confirm=bool(use_slope_confirm), atr_safety=bool(use_atr_safety),
-                )
-            except Exception:
-                pass
-
-            if bool(use_kalman_risk_firewall):
-                kalman_signal = apply_kalman_risk_firewall(
-                    bt_px, kalman_signal, bt_trend,
-                    max_trade_loss_pct=float(kalman_trade_stop_pct),
-                    trail_stop_pct=float(kalman_trail_stop_pct),
-                    equity_dd_stop_pct=float(kalman_equity_dd_stop_pct),
-                    cooldown_bars=int(kalman_firewall_cooldown)
-                )
-
-            # Non-repaint lock: freeze main-chart signal on completed bars.
-            try:
-                if bool(st.session_state.get("kalman_non_repaint_lock", True)):
-                    _lk_int = str(locals().get("interval", "15m"))
-                    kalman_signal = _apply_signal_lock(TICKER, kalman_signal, freeze_enabled=True, interval=_lk_int)
-            except Exception:
-                pass
-
-            kalman_bt = BacktestEngine.run_strategy(bt_px, kalman_signal, initial_cap)
-            kalman_eq = kalman_bt.get("equity_curve", pd.Series(dtype=float))
-            kalman_rets = kalman_bt.get("returns", pd.Series(dtype=float))
-            kalman_trades = kalman_bt.get("trades", pd.DataFrame()).copy()
-
-            try:
-
-                _inst_settings = _institutional_settings_from_locals(TICKER, locals())
-
-                _inst_enabled = bool(st.session_state.get("kalman_institutional_live_ledger", True))
-
-                kalman_trades = _main_kalman_apply_institutional_trade_ledger(
-
-                    TICKER, kalman_trades, bt_px, _inst_settings, enabled=_inst_enabled
-
-                )
-
-            except Exception as _inst_e:
-
-                try:
-
-                    st.warning(f"Institutional ledger skipped: {_inst_e}")
-
-                except Exception:
-
-                    pass
-
-            # Authoritative current position = last value of the signal series the
-            # chart uses. This is the LONG/CASH you actually see, and what the
-            # sidebar/watchlist must mirror.
-            try:
-                _kalman_signal_last = float(kalman_signal.iloc[-1]) if isinstance(kalman_signal, pd.Series) and len(kalman_signal) else None
-            except Exception:
-                _kalman_signal_last = None
-            try:
-                _sync_watchlist_ledger_from_visible_main_trade_log(
-                    TICKER,
-                    kalman_trades,
-                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                )
-            except Exception:
-                pass
-            try:
-                _update_thesis_main_kalman_verify(
-                    TICKER,
-                    kalman_trades,
-                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                    latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                    signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
-                )
-            except Exception:
-                pass
-
-            try:
-                _save_main_kalman_status_to_session(
-                    TICKER,
-                    kalman_trades,
-                    latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                    latest_time=str(bt_plot_x_series.iloc[-1]) if 'bt_plot_x_series' in locals() and len(bt_plot_x_series) else "",
-                    signal_state=_kalman_signal_last,
-                )
-            except Exception:
-                pass
-
-            k_strat_ret = (float(kalman_eq.iloc[-1]) / float(initial_cap) - 1.0) * 100.0 if isinstance(kalman_eq, pd.Series) and not kalman_eq.empty else 0.0
-            k_bh_ret = (float(bt_px.iloc[-1]) / float(bt_px.iloc[0]) - 1.0) * 100.0 if len(bt_px) else 0.0
-            k_metrics = BacktestEngine.calculate_metrics(kalman_rets, rf_rate) if isinstance(kalman_rets, pd.Series) and len(kalman_rets) > 2 else {}
-            k_total_pnl = total_trade_pnl_return_pct(kalman_trades) if isinstance(kalman_trades, pd.DataFrame) else 0.0
-
-            km1, km2, km3, km4, km5 = st.columns(5)
-            km1.metric("Kalman Strategy Return", f"{k_strat_ret:.2f}%")
-            km2.metric("Buy & Hold", f"{k_bh_ret:.2f}%")
-            km3.metric("Total Trade PnL", f"{k_total_pnl:+.2f}%")
-            km4.metric("Sharpe", f"{float(k_metrics.get('Sharpe Ratio', 0.0)):.2f}")
-            km5.metric("Max Drawdown", f"{float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}%")
-
-            try:
-                st.caption(f"Chosen Kalman settings: {chosen_kalman_settings}")
-                if bool(use_kalman_risk_firewall):
-                    st.caption(
-                        f"Risk firewall ON: trade stop {kalman_trade_stop_pct:.0f}%, "
-                        f"trailing {kalman_trail_stop_pct:.0f}%, equity circuit {kalman_equity_dd_stop_pct:.0f}%, "
-                        f"cooldown {kalman_firewall_cooldown} bars."
-                    )
-                if k_strat_ret < k_bh_ret:
-                    st.error(
-                        f"Kalman strategy is NOT beating buy-and-hold here: {k_strat_ret:.2f}% vs B&H {k_bh_ret:.2f}%. "
-                        "Do not treat this as a capital-allocation strategy for this ticker. Use Regime/Rotation or buy-and-hold instead."
-                    )
-                elif abs(float(k_metrics.get('Max Drawdown', 0.0))*100) > float(kalman_max_dd_allowed):
-                    st.error(
-                        f"Kalman drawdown is too high: {float(k_metrics.get('Max Drawdown', 0.0))*100:.2f}% "
-                        f"vs allowed {float(kalman_max_dd_allowed):.0f}%. This can blow up capital even if return looks big."
-                    )
-                else:
-                    st.success("Kalman strategy passes the basic benchmark/risk check for this selected window.")
-            except Exception:
-                pass
-
-            # Clean visual with entries/exits
-            fig_kbt = go.Figure()
-            fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_px, mode="lines", name="Price", line=dict(color="white", width=1.1), opacity=0.58))
-            fig_kbt.add_trace(go.Scatter(x=bt_plot_x, y=bt_trend, mode="lines", name=active_trend_name, line=dict(color="#7FDBFF", width=2.4)))
-
-            changes = kalman_signal.diff().fillna(kalman_signal.iloc[0])
-            buy_idx = changes[changes > 0].index
-            sell_idx = changes[changes < 0].index
-
-
-            # Main-tab direct Telegram alert removed. Watchlist monitor is the only Telegram engine.
-
-
-            # ✅ Main Kalman graph + trade log directly inside primary Kalman screen.
-            try:
-                st.markdown("### 📈 Main Kalman Graph + BUY/SELL Signals")
-                _fig_primary = go.Figure()
-                _fig_primary.add_trace(go.Scatter(
-                    x=bt_plot_x,
-                    y=bt_px,
-                    mode="lines",
-                    name=f"{TICKER} Price",
-                    line=dict(color="white", width=1.2),
-                    opacity=0.65,
-                ))
-                _fig_primary.add_trace(go.Scatter(
-                    x=bt_plot_x,
-                    y=bt_trend,
-                    mode="lines",
-                    name=active_trend_name,
-                    line=dict(color="#7FDBFF", width=2.6),
-                ))
-
-                if len(buy_idx):
-                    _fig_primary.add_trace(go.Scatter(
-                        x=bt_plot_x_series.reindex(buy_idx),
-                        y=bt_px.reindex(buy_idx),
-                        mode="markers",
-                        name="BUY",
-                        marker=dict(symbol="triangle-up", size=13, color="lime"),
-                    ))
-                if len(sell_idx):
-                    _fig_primary.add_trace(go.Scatter(
-                        x=bt_plot_x_series.reindex(sell_idx),
-                        y=bt_px.reindex(sell_idx),
-                        mode="markers",
-                        name="SELL",
-                        marker=dict(symbol="triangle-down", size=13, color="red"),
-                    ))
-
-                _fig_primary.update_layout(
-                    title=f"Main Kalman Strategy Graph: {TICKER} — {active_trend_name}",
-                    template="plotly_dark",
-                    height=620,
-                    hovermode="x unified",
-                    xaxis_title="Time",
-                    yaxis_title="Price",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    margin=dict(l=20, r=20, t=65, b=35),
-                )
-                st.plotly_chart(_fig_primary, use_container_width=True)
-
-                st.markdown(f"### 📒 Main Kalman Trade Log — {TICKER}")
-                try:
-                    _main_status_row = _save_main_kalman_status_to_session(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                        signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
-                    )
-                    if _main_status_row:
-                        st.markdown("#### ✅ Main Kalman Current Status")
-                        st.dataframe(pd.DataFrame([_main_status_row]), use_container_width=True, hide_index=True)
-                except Exception:
-                    pass
-
-                if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty:
-                    st.dataframe(_clean_trade_log_numbers(kalman_trades), use_container_width=True, hide_index=True)
-                    try:
-                        _save_main_kalman_status_to_session(
-                            TICKER,
-                            kalman_trades,
-                            latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                            latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                            signal_state=_kalman_signal_last if '_kalman_signal_last' in locals() else None,
-                        )
-                    except Exception:
-                        pass
-
-                    try:
-                        st.download_button(
-                            "Download Main Kalman Trade Log CSV",
-                            _clean_trade_log_numbers(kalman_trades).to_csv(index=False).encode("utf-8"),
-                            file_name=f"{TICKER}_main_kalman_trade_log.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                            key=f"main_kalman_trade_log_csv_{TICKER}_{data_interval}",
-                        )
-                    except Exception:
-                        pass
-                else:
-                    st.info("No Kalman trades generated for this selected window/settings.")
-            except Exception as _e:
-                st.warning(f"Main Kalman graph/trade log could not render: {_e}")
-
-                st.markdown("### ✅ Main Trade-Log Status / Telegram Source")
-                try:
-                    _main_status = _status_from_main_trade_log(
-                        TICKER,
-                        kalman_trades,
-                        latest_price=float(bt_px.iloc[-1]) if len(bt_px) else None,
-                        latest_time=str(bt_plot_x_series.iloc[-1]) if len(bt_plot_x_series) else "",
-                    )
-                    _main_status["Alert"] = "Source of truth: Main Buy/Sell Graph + Main Kalman Trade Log only"
-                    st.dataframe(pd.DataFrame([_main_status]), use_container_width=True, hide_index=True)
-
-                    # Telegram sync from exact main trade log only.
-                    if bool(tg_alerts_on and auto_kalman_15m_watchlist_on):
-                        _is_open = _trade_row_is_open(kalman_trades.iloc[-1], columns=kalman_trades.columns) if isinstance(kalman_trades, pd.DataFrame) and not kalman_trades.empty else False
-                        _sig = "BUY" if _is_open else "SELL"
-                        _event_time = str(_main_status.get("Candle Close CT", ""))
-                        _ledger = _load_kalman_alert_ledger()
-                        _key = f"{TICKER}|MAIN_LOG_EXACT|{_sig}|{_event_time}|{_main_status.get('Trade Position')}"
-                        if _ledger.get(TICKER) != _key and _main_status.get("Trade Position") in ["LONG", "CASH"]:
-                            # Mark as synced so it does not spam on reload. Future fresh changes get a new key.
-                            _ledger[TICKER] = _key
-                            _save_kalman_alert_ledger(_ledger)
-                            st.caption("Telegram ledger synced from exact main trade log.")
-                except Exception as _e:
-                    st.warning(f"Could not create synced thesis status from main trade log: {_e}")
-
-            if len(buy_idx):
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(buy_idx), y=bt_px.reindex(buy_idx), mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="lime")))
-            if len(sell_idx):
-                fig_kbt.add_trace(go.Scatter(x=bt_plot_x_series.reindex(sell_idx), y=bt_px.reindex(sell_idx), mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
-
-            fig_kbt.update_layout(
-                title=f"Kalman Strategy: {TICKER} — {active_trend_name}",
-                template="plotly_dark",
-                height=560,
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig_kbt, use_container_width=True)
-
-            st.write("##### Main Kalman Trade Log — Source of Truth")
-            if kalman_trades is None or kalman_trades.empty:
-                st.info("No Kalman strategy trades generated with the current confirmation settings.")
-            else:
-                try:
-                    kalman_trades = apply_trade_log_timestamp_display(kalman_trades)
-                    kalman_trades = kalman_trades.sort_values("Entry Date", ascending=False).reset_index(drop=True)
-                except Exception:
-                    pass
-                st.dataframe(kalman_trades.style.format({
-                    "Buy Price": "{:.2f}",
-                    "Sell Price": "{:.2f}",
-                    "PnL (%)": "{:.2f}%",
-                    "Cumulative Return (%)": "{:.2f}"
-                }), use_container_width=True)
-
-                st.download_button(
-                    "📥 Download Kalman trade log",
-                    data=_clean_trade_log_numbers(kalman_trades).to_csv(index=False).encode("utf-8"),
-                    file_name=f"{_safe_filename_part(TICKER)}_Kalman_{_safe_filename_part(active_trend_name)}_TradeLog.csv" if "_safe_filename_part" in globals() else f"{TICKER}_Kalman_TradeLog.csv",
-                    mime="text/csv",
-                    key=f"download_kalman_trade_log_{TICKER}_{active_trend_name}"
-                )
-
-            safe_report_add("Kalman Strategy Metrics", {
-                "Strategy Return %": k_strat_ret,
-                "Buy & Hold %": k_bh_ret,
-                "Total Trade PnL %": k_total_pnl,
-                "Sharpe": float(k_metrics.get("Sharpe Ratio", 0.0)),
-                "Max Drawdown %": float(k_metrics.get("Max Drawdown", 0.0))*100.0,
-                "Trend Model": active_trend_name,
-                "Risk Firewall": bool(use_kalman_risk_firewall),
-                "Trade Stop %": float(kalman_trade_stop_pct),
-                "Trailing Stop %": float(kalman_trail_stop_pct),
-                "Equity DD Circuit %": float(kalman_equity_dd_stop_pct)
-            })
-            safe_report_add("Kalman Strategy Chart", fig_kbt)
-        except Exception as _kalman_bt_err:
-            st.warning(f"Kalman strategy backtest could not run: {_kalman_bt_err}")
-
 
 # ==========================================
 # TAB 5: MACRO FACTORS
@@ -13464,161 +13761,6 @@ with tab6:
     else:
         st.warning("Insufficient data for decomposition with selected period.")
 
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def scan_regime_rotation_dashboard_cached(
-    tickers, start_date, end_date, frequency, n_regimes, smoothing,
-    switch_vol, switch_trend, signal_method, conviction, min_hold,
-    confirmed_bar, max_tickers
-):
-    """
-    Regime Rotation Dashboard:
-    Finds current Regime Long tickers and ranks which ones deserve capital first.
-
-    This is scanner/ranking logic only. It does not alter the selected ticker's
-    backtest, ledger, trade log, or performance metrics.
-    """
-    rows = []
-    tickers = list(dict.fromkeys([str(t).strip().upper().replace(".", "-") for t in tickers if str(t).strip()]))
-    tickers = tickers[:int(max_tickers)]
-
-    for tk in tickers:
-        try:
-            raw = yf.download(
-                tk,
-                start=str(start_date),
-                end=(pd.Timestamp(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False
-            )
-            if raw is None or raw.empty:
-                continue
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
-            if "Close" not in raw.columns:
-                continue
-
-            px_daily = pd.to_numeric(raw["Close"], errors="coerce").dropna()
-            if len(px_daily) < 80:
-                continue
-
-            if str(frequency) == "Weekly":
-                px = resample_to_closed_weekly_friday(px_daily)
-            else:
-                px = px_daily.copy()
-
-            px = pd.Series(px).replace([np.inf, -np.inf], np.nan).dropna()
-            if len(px) < 40:
-                continue
-
-            if int(smoothing) > 0:
-                model_px = px.ewm(span=int(smoothing), adjust=False).mean().dropna()
-            else:
-                model_px = px.copy()
-
-            rets = model_px.pct_change().dropna()
-            model_data = rets * 100.0
-            if len(model_data) < max(30, int(n_regimes) * 10):
-                continue
-
-            res = fit_regime_model(model_data, int(n_regimes), bool(switch_vol), bool(switch_trend), search_reps=2)
-            if res is None:
-                continue
-
-            sig, ctx = build_regime_backtest_signal(
-                res, model_data.index, model_px.index, int(n_regimes), str(signal_method),
-                conviction=float(conviction), min_hold=int(min_hold)
-            )
-
-            sig = apply_confirmed_bar_execution_policy(
-                sig, frequency=str(frequency), confirmed_bar=bool(confirmed_bar),
-                weekly_close_updates=True, fill_value=0.0
-            ).reindex(model_px.index).ffill().fillna(0).clip(0, 1)
-
-            if sig.empty:
-                continue
-
-            current_sig = float(sig.iloc[-1])
-            last_dt = pd.Timestamp(sig.index[-1])
-
-            # Only rank current long names; cash names are useful but not capital candidates.
-            if current_sig <= 0:
-                continue
-
-            bt = BacktestEngine.run_strategy(model_px, sig, 10000.0)
-            trades = bt.get("trades", pd.DataFrame())
-            eq = bt.get("equity_curve", pd.Series(dtype=float))
-            returns = bt.get("returns", pd.Series(dtype=float))
-
-            strat_ret = (float(eq.iloc[-1]) / 10000.0 - 1.0) * 100.0 if isinstance(eq, pd.Series) and not eq.empty else np.nan
-            bh_ret = (float(model_px.iloc[-1]) / float(model_px.iloc[0]) - 1.0) * 100.0
-            max_dd = ((1 + returns).cumprod() / (1 + returns).cumprod().cummax() - 1).min() * 100 if isinstance(returns, pd.Series) and len(returns) else np.nan
-
-            changes = sig.diff().fillna(0)
-            buy_dates = changes[changes > 0].index
-            latest_buy_dt = pd.Timestamp(buy_dates[-1]) if len(buy_dates) else pd.Timestamp(sig.index[0])
-            bars_since_buy = int((sig.index.get_loc(last_dt) - sig.index.get_loc(latest_buy_dt))) if latest_buy_dt in sig.index else np.nan
-
-            try:
-                entry_px = float(model_px.loc[latest_buy_dt])
-                open_pnl = (float(model_px.iloc[-1]) / entry_px - 1.0) * 100.0 if entry_px > 0 else np.nan
-            except Exception:
-                entry_px = np.nan
-                open_pnl = np.nan
-
-            mom_21 = (float(model_px.iloc[-1]) / float(model_px.iloc[-22]) - 1.0) * 100.0 if len(model_px) > 22 else np.nan
-            mom_63 = (float(model_px.iloc[-1]) / float(model_px.iloc[-64]) - 1.0) * 100.0 if len(model_px) > 64 else np.nan
-
-            # Score: not just return. It rewards current long, momentum, alpha vs B&H, controlled DD,
-            # and penalizes being too extended far after the signal.
-            dd_penalty = abs(float(max_dd)) if pd.notna(max_dd) else 25.0
-            age_penalty = max(0.0, float(bars_since_buy) - (8 if str(frequency) == "Weekly" else 30)) * (0.4 if str(frequency) == "Weekly" else 0.08)
-            extension_penalty = max(0.0, float(open_pnl) - 35.0) * 0.25 if pd.notna(open_pnl) else 0.0
-            rotation_score = (
-                30.0
-                + 0.35 * (float(strat_ret) if pd.notna(strat_ret) else 0.0)
-                + 0.45 * (float(mom_21) if pd.notna(mom_21) else 0.0)
-                + 0.20 * (float(mom_63) if pd.notna(mom_63) else 0.0)
-                + 0.15 * ((float(strat_ret) - float(bh_ret)) if pd.notna(strat_ret) and pd.notna(bh_ret) else 0.0)
-                - 0.65 * dd_penalty
-                - age_penalty
-                - extension_penalty
-            )
-
-            rows.append({
-                "Rank Score": round(rotation_score, 2),
-                "Ticker": tk,
-                "Current Signal": "LONG",
-                "Frequency": str(frequency),
-                "Regimes": int(n_regimes),
-                "Smoothing": int(smoothing),
-                "Last Signal Date": str(last_dt.date()),
-                "Latest Buy Date": str(latest_buy_dt.date()),
-                "Bars Since Buy": bars_since_buy,
-                "Latest Price": float(model_px.iloc[-1]),
-                "Open PnL %": open_pnl,
-                "Momentum 21 %": mom_21,
-                "Momentum 63 %": mom_63,
-                "Strategy Return %": strat_ret,
-                "Buy & Hold %": bh_ret,
-                "Alpha vs B&H %": strat_ret - bh_ret if pd.notna(strat_ret) and pd.notna(bh_ret) else np.nan,
-                "Max DD %": max_dd,
-                "Closed Trades": 0 if trades is None or trades.empty else len(trades),
-                "Why": "Current Regime LONG; ranked by trend strength, open PnL, return, DD, and signal age."
-            })
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows).sort_values("Rank Score", ascending=False).reset_index(drop=True)
-    out.insert(0, "Rank", range(1, len(out) + 1))
-    return out
-
-
 # ==========================================
 # TAB 7: BACKTEST
 # ==========================================
@@ -13629,31 +13771,56 @@ with tab7:
         st.write("### 🛠️ Strategy Backtest")
     
     # Strategy Selector
-    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "1M 5m VWAP EMA Scalper", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
+    strategy_type = st.radio("Select Strategy", ["Regime Switching (Trend Following)", "Kalman Filter (Trend Crossover)", "Momentum Hedge (EMA/SMA Cross)", "Institutional Bollinger Bands", "Composite Risk Score (CRS)", "1M 5m VWAP EMA Scalper", "VWAP/TWAP Swing Filter", "MAD Trend Modes", "Dual MA Cross", "Ehlers SuperSmoother", "Ehlers Simple Decycler", "Institutional Mean Reversion (Z-Score)", "Relative Strength Ratio (vs Benchmark)", "Implied Volatility Proxy (^VIX)", "Institutional Hurst Exponent"], horizontal=True)
     
-    # Date Selection
+    # Date / timeframe selection. Default is TradingView-style max history.
     col_b3 = st.container()
     with col_b3:
-        default_start = DEFAULT_NONLIVE_START
-        bt_start_date = st.date_input("Backtest Start", default_start)
+        bt_tf_choice = st.selectbox(
+            "Backtest Timeframe",
+            ["Chart", "1 Day", "1 Week", "1 Month", "1 Hour", "30 Min", "15 Min", "5 Min", "1 Min"],
+            index=0,
+            help="Chart = use the sidebar timeframe. Or override this backtest only."
+        )
+        bt_interval = data_interval if bt_tf_choice == "Chart" else _tv_interval_from_label(bt_tf_choice)
         bt_end_date = st.date_input("Backtest End", datetime.now())
+        bt_history_mode = st.selectbox(
+            "Backtest History Mode",
+            ["Fast TradingView-style", "Full max history", "Custom anchor start date"],
+            index=0,
+            help="Fast is recommended. Full max uses every available listed bar and can be slow. Custom anchor keeps the old manual start-date behavior."
+        )
+        bt_use_custom_anchor = bt_history_mode == "Custom anchor start date"
+        if bt_use_custom_anchor:
+            bt_start_date = st.date_input("Backtest Anchor Start", DEFAULT_NONLIVE_START)
+        elif bt_history_mode == "Full max history":
+            bt_start_date = _tv_max_start_for_interval(bt_interval, bt_end_date)
+        else:
+            bt_start_date = _tv_fast_start_for_interval(bt_interval, bt_end_date)
+        st.caption(_tv_history_caption(bt_interval, bt_use_custom_anchor, bt_start_date, bt_history_mode))
 
+    st.caption("Backtest auto-runs when settings change. Use Fast TradingView-style mode for speed; Full max history can still be slower.")
     # Data Prep
     if live_mode:
          # Use the global live data for backtest scope
          df_bt = df_main
          bt_msg = f"Live Backtest ({data_interval})"
     else:
-        if bt_start_date >= bt_end_date:
+        # Streamlit date_input returns datetime.date, while TradingView-style
+        # max-history helper returns datetime.datetime. Normalize both before
+        # comparing/loading so max-history mode works without TypeError.
+        bt_start_dt = pd.Timestamp(bt_start_date).to_pydatetime()
+        bt_end_dt = pd.Timestamp(bt_end_date).to_pydatetime()
+        if bt_start_dt >= bt_end_dt:
             st.error("Start date must be before end date.")
             st.stop()
-        df_bt = load_data(TICKER, bt_start_date, bt_end_date, interval='1d')
-        bt_msg = "Historical Backtest (1d)"
+        df_bt = load_data(TICKER, bt_start_dt, bt_end_dt, interval=bt_interval)
+        bt_msg = f"Historical Backtest ({bt_interval})"
     
     if df_bt is None or df_bt.empty:
         st.error("Could not load data for backtest. Check dates and ticker.")
         st.stop()
-        
+    
     returns_bt = df_bt['Returns']
     prices_bt = df_bt['Close']
     model_data_bt = returns_bt.dropna() * 100
@@ -13665,7 +13832,7 @@ with tab7:
     using_wfo_primary_for_metrics = False
     
     if strategy_type == "Regime Switching (Trend Following)":
-        
+    
         # Regime Parameters
         col_r1, col_r2, col_r3 = st.columns(3)
         with col_r1:
@@ -13696,7 +13863,7 @@ with tab7:
                 live_regime_overlay = lrc2.checkbox("Intraday early trigger overlay", value=True, key="bt_live_regime_overlay")
                 live_regime_sensitivity = lrc3.selectbox("Live trigger sensitivity", ["Conservative", "Balanced", "Active", "Benchmark Capture", "Live Trend Follow"], index=4, key="bt_live_regime_sensitivity")
                 st.caption("Weekly/Daily anchor = stable regime brain. Intraday overlay = live timing. Live Trend Follow is the strongest live runner mode and holds until live trend damage is real.")
-        
+    
         col_r4, col_r5 = st.columns(2)
         with col_r4:
             bt_switch_trend = st.checkbox("Switching Mean", value=True, key="bt_switch_trend")
@@ -13731,6 +13898,41 @@ with tab7:
         if st.button("Reset locked ledger for this Regime setup", key=f"reset_regime_locked_ledger_{TICKER}_{bt_freq}"):
             _removed = reset_regime_locked_ledger_for_key(regime_lock_key)
             st.warning(f"Reset locked ledger for this setup. Removed {_removed} saved signal rows. Run the backtest again to rebuild the ledger.")
+
+        # REGIME ONLY: one surgical protection rule. No entry filters, drawdown breaker,
+        # cooldown, trailing exit, or winner cap.
+        with st.expander("🛡️ Regime Surgical Rescue", expanded=True):
+            enable_regime_surgical_rescue = st.checkbox(
+                "Enable surgical Regime loss rescue",
+                value=False,
+                key="bt_regime_surgical_rescue_v2",
+                help="Only cuts a failing trade and blocks repeated re-entry into the same stale LONG regime. It does not filter normal entries or cap winners."
+            )
+            regime_surgical_max_loss_pct = st.number_input(
+                "Max failed Regime trade loss (%)",
+                min_value=3.0,
+                max_value=15.0,
+                value=8.0,
+                step=0.5,
+                key="bt_regime_surgical_max_loss_v1"
+            )
+            st.caption("After a protective exit, the same stale LONG regime is quarantined until the original Regime resets through CASH or price fully reclaims the failed entry. Winning trades are untouched.")
+
+        # WEEKLY REGIME ONLY: one narrow fix for the exact failure pattern where a
+        # huge winner peaks, clearly rolls over, but smoothing keeps the slow regime
+        # LONG far too long. Normal trades are not changed.
+        with st.expander("🏁 Major Winner Rollover Exit", expanded=True):
+            enable_regime_major_winner_rollover = st.checkbox(
+                "Enable major-winner rollover exit",
+                value=True,
+                key="bt_regime_major_winner_rollover_v1",
+                help="Weekly Regime only. After a trade has at least doubled, use raw daily closes to detect a confirmed major rollover so a parabolic winner is not held all the way through a collapse."
+            )
+            st.caption(
+                "Only after the trade has at least doubled (+100%): exit on the first closed daily bar that is 20% below the highest close since entry. "
+                "No EMA delay. After that, wait for the ORIGINAL Weekly Regime to go CASH and later produce a fresh LONG before re-entering. "
+                "Entries, smoothing, probabilities, minimum hold, and normal Regime exits stay unchanged."
+            )
 
         weekly_close_same_bar = True
         if str(bt_freq) == "Weekly":
@@ -13806,78 +14008,6 @@ with tab7:
                         mime="text/csv"
                     )
 
-        with st.expander("🔁 Regime Rotation Dashboard — where should capital go now?", expanded=False):
-            st.caption("Ranks all tickers that are currently Regime LONG. This helps avoid randomly moving money away from the stock that is about to run.")
-            rr1, rr2, rr3, rr4 = st.columns(4)
-            rotation_universe = rr1.selectbox(
-                "Rotation universe",
-                ["Current ticker", "Nasdaq 100", "S&P 500", "S&P 500 + Nasdaq 100", "Custom list"],
-                index=1,
-                key="regime_rotation_universe"
-            )
-            rotation_max = rr2.number_input("Max tickers", min_value=1, max_value=1000, value=75, step=25, key="regime_rotation_max")
-            rotation_topn = rr3.number_input("Show top N", min_value=1, max_value=50, value=10, step=1, key="regime_rotation_topn")
-            rotation_freq = rr4.selectbox("Rotation frequency", ["Daily", "Weekly"], index=0 if bt_freq == "Daily" else 1, key="regime_rotation_freq")
-
-            rotation_custom_text = ""
-            if rotation_universe == "Custom list":
-                rotation_custom_text = st.text_area(
-                    "Custom rotation tickers separated by comma / space / new line",
-                    value=TICKER,
-                    key="regime_rotation_custom"
-                )
-
-            st.caption(f"Uses current Regime settings: regimes={bt_n_regimes}, smoothing={bt_stability}, method={signal_method}, conviction={conviction}, min-hold={min_hold_period}.")
-
-            if st.button("Run Regime Rotation Ranking", key="run_regime_rotation_ranking", use_container_width=True):
-                if rotation_universe == "Current ticker":
-                    rotation_tickers = [TICKER]
-                elif rotation_universe == "Nasdaq 100":
-                    rotation_tickers = get_nasdaq100()
-                elif rotation_universe == "S&P 500":
-                    rotation_tickers = get_sp500()
-                elif rotation_universe == "S&P 500 + Nasdaq 100":
-                    rotation_tickers = sorted(set(get_sp500() + get_nasdaq100()))
-                else:
-                    rotation_tickers = [x.strip().upper() for x in rotation_custom_text.replace(',', ' ').replace('\n', ' ').split() if x.strip()]
-
-                with st.spinner(f"Ranking current Regime LONG names from {min(len(rotation_tickers), int(rotation_max))} tickers..."):
-                    rotation_df = scan_regime_rotation_dashboard_cached(
-                        tuple(rotation_tickers), str(bt_start_date), str(bt_end_date), str(rotation_freq),
-                        int(bt_n_regimes), int(bt_stability), bool(bt_switch_vol), bool(bt_switch_trend),
-                        str(signal_method), float(conviction), int(min_hold_period), bool(confirmed_regime_bar),
-                        int(rotation_max)
-                    )
-
-                if rotation_df is None or rotation_df.empty:
-                    st.warning("No current Regime LONG candidates found in this universe with the selected settings.")
-                else:
-                    top_rotation = rotation_df.head(int(rotation_topn)).copy()
-                    st.success(f"Found {len(rotation_df)} current Regime LONG candidates. Showing top {len(top_rotation)}.")
-                    st.dataframe(
-                        top_rotation.style.format({
-                            "Rank Score": "{:.2f}",
-                            "Latest Price": "{:.2f}",
-                            "Open PnL %": "{:.2f}%",
-                            "Momentum 21 %": "{:.2f}%",
-                            "Momentum 63 %": "{:.2f}%",
-                            "Strategy Return %": "{:.2f}%",
-                            "Buy & Hold %": "{:.2f}%",
-                            "Alpha vs B&H %": "{:.2f}%",
-                            "Max DD %": "{:.2f}%"
-                        }),
-                        use_container_width=True
-                    )
-                    st.download_button(
-                        "📥 Download Regime Rotation Ranking",
-                        rotation_df.to_csv(index=False).encode("utf-8"),
-                        file_name=f"Regime_Rotation_{_safe_filename_part(rotation_freq)}_Regimes{bt_n_regimes}_Smooth{bt_stability}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        key=f"download_regime_rotation_{rotation_freq}_{bt_n_regimes}_{bt_stability}"
-                    )
-
-                    st.info("Mentor rule: put capital first into the highest-ranked names where Weekly/Daily context agrees and the open PnL is not already extremely extended.")
-
 
         if signal_method == "Regime Weighted Expected Return":
             st.markdown("**Strategy:** Long when expected return is positive **and** Bull Probability is above the conviction threshold.")
@@ -13899,7 +14029,7 @@ with tab7:
                     loc_model_data = loc_returns.ewm(span=bt_stability, adjust=False).mean().dropna() * 100
                 else:
                     loc_model_data = loc_returns.dropna() * 100
-                
+            
                 for n in [2, 3, 4]:
                     r = fit_regime_model(loc_model_data, n, bt_switch_vol, bt_switch_trend)
                     if r:
@@ -13909,7 +14039,7 @@ with tab7:
                             m_val = r.params[f'const[{i}]'] if f'const[{i}]' in r.params else r.params.get('const', 0.0)
                             r_means.append((i, m_val))
                         bull_idx = sorted(r_means, key=lambda x: x[1], reverse=True)[0][0]
-                        
+                    
                         # 2. Generate Signals with conviction/min-hold logic
                         sigs, _ = build_regime_backtest_signal(
                             r,
@@ -13928,370 +14058,459 @@ with tab7:
                         # 3. Run Backtest
                         common_idx = loc_prices.index.intersection(sigs.index)
                         bt_res = BacktestEngine.run_strategy(loc_prices.loc[common_idx], sigs.loc[common_idx], initial_cap, trailing_stop, stop_loss)
-                        
+                    
                         comp_results.append({
                             "Regimes": n, 
                             "AIC": r.aic, 
                             "BIC": r.bic, 
                             "Total Return %": (bt_res['equity_curve'].iloc[-1] / initial_cap - 1) * 100
                         })
-                
+            
                 if comp_results:
                     comp_df = pd.DataFrame(comp_results)
                     best_aic = comp_df.loc[comp_df['AIC'].idxmin(), 'Regimes']
                     best_bic = comp_df.loc[comp_df['BIC'].idxmin(), 'Regimes']
                     best_pnl = comp_df.loc[comp_df['Total Return %'].idxmax(), 'Regimes']
-                    
+                
                     st.write("#### Comparison Results")
                     st.table(comp_df.style.highlight_min(subset=['AIC', 'BIC'], color='lightgreen')
                                        .highlight_max(subset=['Total Return %'], color='lightgreen'))
-                    
+                
                     c_fit, c_perf = st.columns(2)
                     with c_fit:
                         st.success(f"⚖️ **Robustness**: {best_bic} Regimes (Best BIC)")
                     with c_perf:
                         st.success(f"🚀 **Performance**: {best_pnl} Regimes (Best PnL)")
-                    
+                
                     if best_bic != best_pnl:
                         st.warning(f"⚠️ **Conflict**: Statistical health prefers **{best_bic}**, but historical PnL was higher with **{best_pnl}**. Be careful fitting to the highest return—it often leads to overfitting!")
 
 
-        # ===== SPEED GATE FOR REGIME BACKTEST =====
-        # Speed-only change: all Regime Switching math below is unchanged.
-        # It simply will not run until you click this button.
-        _run_regime_backtest_now = st.button(
-            "▶️ Run Regime Switching Backtest",
-            key=f"run_regime_backtest_now_{TICKER}_{bt_freq}_{bt_n_regimes}_{bt_stability}_{signal_method}",
-            type="primary",
-            use_container_width=True,
-            help="Prevents Markov/WFO regime fitting from running on every Streamlit rerun. Click only when you want to compute/update this backtest."
-        )
+        try:
+            regime_run_precise_now
+        except NameError:
+            regime_run_precise_now = False
 
-        if not _run_regime_backtest_now:
-            st.info("Regime Switching Backtest is ready but not running. Click **Run Regime Switching Backtest** to fit the model and build the trade log.")
-            signals = None
-        else:
+        # Resample if Weekly
+        regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
+        live_execution_prices_for_regime = prices_bt.dropna().copy()
+        regime_source_prices = prices_bt.dropna().copy()
+        regime_model_freq = bt_freq
+
+        if regime_live_hybrid_enabled:
             try:
-                regime_run_precise_now
-            except NameError:
-                regime_run_precise_now = False
-
-            # Resample if Weekly
-            regime_live_hybrid_enabled = bool(live_mode and use_live_regime_hybrid)
-            live_execution_prices_for_regime = prices_bt.dropna().copy()
-            regime_source_prices = prices_bt.dropna().copy()
-            regime_model_freq = bt_freq
-
-            if regime_live_hybrid_enabled:
-                try:
-                    # Use longer 1D history for the regime brain so live mode does not fit
-                    # Markov states on only a noisy 7-30 day intraday window.
-                    anchor_df = load_data(TICKER, start_date, datetime.now(), interval='1d')
-                    if anchor_df is not None and not anchor_df.empty and len(anchor_df) >= 80:
-                        regime_source_prices = anchor_df['Close'].dropna().copy()
-                        regime_model_freq = str(live_regime_anchor_freq)
-                        st.caption(f"ℹ️ Live Regime Stabilizer ON: fitting regime brain on {regime_model_freq} historical 1D data, then mapping to live {data_interval} candles.")
-                    else:
-                        st.warning("Live Regime Stabilizer could not load enough historical anchor data. Falling back to normal live intraday regime fitting.")
-                        regime_live_hybrid_enabled = False
-                except Exception as e:
-                    st.warning(f"Live Regime Stabilizer failed to load anchor data: {e}. Falling back to normal live intraday regime fitting.")
+                # Use longer 1D history for the regime brain so live mode does not fit
+                # Markov states on only a noisy 7-30 day intraday window.
+                anchor_df = load_data(TICKER, start_date, datetime.now(), interval='1d')
+                if anchor_df is not None and not anchor_df.empty and len(anchor_df) >= 80:
+                    regime_source_prices = anchor_df['Close'].dropna().copy()
+                    regime_model_freq = str(live_regime_anchor_freq)
+                    st.caption(f"ℹ️ Live Regime Stabilizer ON: fitting regime brain on {regime_model_freq} historical 1D data, then mapping to live {data_interval} candles.")
+                else:
+                    st.warning("Live Regime Stabilizer could not load enough historical anchor data. Falling back to normal live intraday regime fitting.")
                     regime_live_hybrid_enabled = False
+            except Exception as e:
+                st.warning(f"Live Regime Stabilizer failed to load anchor data: {e}. Falling back to normal live intraday regime fitting.")
+                regime_live_hybrid_enabled = False
 
-            if regime_model_freq == "Weekly":
-                # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
-                prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
-                try:
-                    if len(prices_bt_resampled):
-                        st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
-                except Exception:
-                    pass
-            else:
-                prices_bt_resampled = regime_source_prices.dropna()
+        if regime_model_freq == "Weekly":
+            # Resample Prices to true closed Friday weekly bars. Partial current weeks are ignored.
+            prices_bt_resampled = resample_to_closed_weekly_friday(regime_source_prices)
+            try:
+                if len(prices_bt_resampled):
+                    st.caption(f"ℹ️ Weekly regime model latest CLOSED weekly bar: {pd.Timestamp(prices_bt_resampled.index[-1]).date()}")
+            except Exception:
+                pass
+        else:
+            prices_bt_resampled = regime_source_prices.dropna()
 
-            # Apply smoothing consistently to prices first, then calculate returns from those same prices.
-            # This fixes the old mismatch where model data was smoothed but execution prices were raw.
-            if bt_stability > 0:
-                prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
-                st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
-            else:
-                prices_bt_model = prices_bt_resampled.copy()
+        # Apply smoothing consistently to prices first, then calculate returns from those same prices.
+        # This fixes the old mismatch where model data was smoothed but execution prices were raw.
+        if bt_stability > 0:
+            prices_bt_model = prices_bt_resampled.ewm(span=bt_stability, adjust=False).mean().dropna()
+            st.caption(f"ℹ️ Regime smoothing applied consistently to price and model returns (span={bt_stability}).")
+        else:
+            prices_bt_model = prices_bt_resampled.copy()
 
-            strat_prices = prices_bt_model
-            returns_bt_resampled = prices_bt_model.pct_change().dropna()
-            model_data_bt = returns_bt_resampled.dropna() * 100
+        strat_prices = prices_bt_model
+        returns_bt_resampled = prices_bt_model.pct_change().dropna()
+        model_data_bt = returns_bt_resampled.dropna() * 100
 
-            # FIX: Robust 1D Series reconstruction
-            if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
-                model_data_bt = pd.Series(
-                    model_data_bt.values.flatten().astype(float),
-                    index=model_data_bt.index
-                )
-        
-            if len(model_data_bt) < 10:
-                 st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
-                 st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
-                 if live_mode and bt_freq == "Weekly":
-                     st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
-                 elif not live_mode:
-                     st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
-            else:
-                with st.spinner("Fitting Regime Model..."):
-                    # Fit Model
-                    res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
+        # FIX: Robust 1D Series reconstruction
+        if len(model_data_bt) > 5: # Slightly lower threshold for very recent live data
+            model_data_bt = pd.Series(
+                model_data_bt.values.flatten().astype(float),
+                index=model_data_bt.index
+            )
+    
+        if len(model_data_bt) < 10:
+             st.error(f"❌ **Backtest Error: Insufficient data found for model.** (Points: {len(model_data_bt)})")
+             st.info(f"The Markov Regime model needs at least 15-20 data points to converge. Currently, your dataset has only {len(model_data_bt)} points after resampling/smoothing.")
+             if live_mode and bt_freq == "Weekly":
+                 st.warning("💡 **Hint**: You are using 'Weekly' frequency on intraday data. Switch back to 'Daily' (Raw Intraday) to use all live candles for the model.")
+             elif not live_mode:
+                 st.warning("💡 **Hint**: Try increasing your backtest date range in the sidebar.")
+        else:
+            with st.spinner("Fitting Regime Model..."):
+                # Fit Model
+                res_bt = fit_regime_model(model_data_bt, bt_n_regimes, bt_switch_vol, bt_switch_trend)
+            
+                if res_bt:
+                    # --- DISPLAY FITNESS METRICS ---
+                    fit_col1, fit_col2 = st.columns(2)
+                    with fit_col1:
+                        st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
+                    with fit_col2:
+                        st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
+                    st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
                 
-                    if res_bt:
-                        # --- DISPLAY FITNESS METRICS ---
-                        fit_col1, fit_col2 = st.columns(2)
-                        with fit_col1:
-                            st.caption(f"Model Fitness (AIC): **{res_bt.aic:.1f}**")
-                        with fit_col2:
-                            st.caption(f"Model Fitness (BIC): **{res_bt.bic:.1f}**")
-                        st.caption("Lower is better. Compare these across 2, 3, or 4 regimes to find the mathematical 'Best Fit'.")
-                    
-                        # Build selected-method full-history signal using conviction + min-hold logic
-                        signals, regime_context = build_regime_backtest_signal(
-                            res_bt,
-                            model_data_bt.index,
-                            strat_prices.index,
-                            int(bt_n_regimes),
-                            signal_method,
-                            conviction=float(conviction),
-                            min_hold=int(min_hold_period)
-                        )
+                    # Build selected-method full-history signal using conviction + min-hold logic
+                    signals, regime_context = build_regime_backtest_signal(
+                        res_bt,
+                        model_data_bt.index,
+                        strat_prices.index,
+                        int(bt_n_regimes),
+                        signal_method,
+                        conviction=float(conviction),
+                        min_hold=int(min_hold_period)
+                    )
 
-                        # Price trend override for strong runners
-                        price_override = get_price_trend_override(
-                            strat_prices.index,
-                            model_data_bt.index,
-                            strat_prices
-                        )
-                        signals = pd.Series(
-                            np.maximum(signals.values, price_override.reindex(signals.index).fillna(0).values),
-                            index=signals.index
-                        ).clip(0, 1)
+                    # Price trend override for strong runners
+                    price_override = get_price_trend_override(
+                        strat_prices.index,
+                        model_data_bt.index,
+                        strat_prices
+                    )
+                    signals = pd.Series(
+                        np.maximum(signals.values, price_override.reindex(signals.index).fillna(0).values),
+                        index=signals.index
+                    ).clip(0, 1)
 
-                        signals = apply_confirmed_bar_execution_policy(
-                            signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
-                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
-                        )
+                    signals = apply_confirmed_bar_execution_policy(
+                        signals, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                        weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                    )
 
-                        # --- Walk-forward validation / primary signal ---
-                        if enable_regime_wfo:
-                            with st.spinner("Running Regime Walk-Forward Optimization..."):
-                                wf_regime = walk_forward_regime_selection(
-                                    strat_prices,
-                                    returns_bt_resampled,
-                                    n_regimes="Auto" if bool(auto_wfo_regimes) else int(bt_n_regimes),
-                                    switch_vol=bool(bt_switch_vol),
-                                    switch_trend=bool(bt_switch_trend),
-                                    train_window=int(regime_wf_train),
-                                    forward_window=int(regime_wf_forward),
-                                    conviction=float(conviction),
-                                    min_hold=int(min_hold_period),
-                                    initial_capital=initial_cap,
-                                    trailing_stop_pct=trailing_stop,
-                                    stop_loss_pct=stop_loss,
-                                    confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
-                                    use_strong_runner_override=bool(use_regime_runner_override),
-                                    activity_mode=str(regime_activity_mode),
-                                    use_return_booster=bool(use_regime_return_booster),
-                                    return_booster_mode=str(regime_return_booster_mode)
-                                )
+                    # --- Walk-forward validation / primary signal ---
+                    if enable_regime_wfo:
+                        with st.spinner("Running Regime Walk-Forward Optimization..."):
+                            wf_regime = walk_forward_regime_selection(
+                                strat_prices,
+                                returns_bt_resampled,
+                                n_regimes="Auto" if bool(auto_wfo_regimes) else int(bt_n_regimes),
+                                switch_vol=bool(bt_switch_vol),
+                                switch_trend=bool(bt_switch_trend),
+                                train_window=int(regime_wf_train),
+                                forward_window=int(regime_wf_forward),
+                                conviction=float(conviction),
+                                min_hold=int(min_hold_period),
+                                initial_capital=initial_cap,
+                                trailing_stop_pct=trailing_stop,
+                                stop_loss_pct=stop_loss,
+                                confirmed_bar=bool(confirmed_regime_bar and not (str(regime_model_freq).lower().startswith('week') and bool(weekly_close_same_bar))),
+                                use_strong_runner_override=bool(use_regime_runner_override),
+                                activity_mode=str(regime_activity_mode),
+                                use_return_booster=bool(use_regime_return_booster),
+                                return_booster_mode=str(regime_return_booster_mode)
+                            )
 
-                            st.write("#### 🧭 Regime Walk-Forward Result")
-                            if wf_regime is None or wf_regime.get("overall") is None:
-                                st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
-                                using_wfo_primary_for_metrics = False
+                        st.write("#### 🧭 Regime Walk-Forward Result")
+                        if wf_regime is None or wf_regime.get("overall") is None:
+                            st.warning("Regime WFO could not generate a valid out-of-sample result for this data window. Showing the selected full-history regime signal below so the tab does not go blank. Treat it as research, not WFO-validated.")
+                            using_wfo_primary_for_metrics = False
+                        else:
+                            wf_overall = wf_regime["overall"]
+                            eff_train = wf_regime.get("effective_train_window", regime_wf_train)
+                            eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
+                            if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
+                                st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
+                            full_bh = buy_hold_return_pct(strat_prices)
+                            wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
+                            wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
+                            wfc2.metric("WF Test Benchmark", f"{wf_overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample WFO test window.")
+                            wfc3.metric("Full Benchmark", f"{full_bh:.2f}%" if pd.notna(full_bh) else "N/A", help="Buy & hold over the full selected period. Reference only.")
+                            wfc4.metric("WF Difference", f"{wf_overall['Difference %']:+.2f}%")
+                            wfc5.metric("WF Stability", f"{wf_regime['stability_score']:.0f}/100")
+
+                            if wf_overall['Difference %'] > 0 and wf_regime['stability_score'] >= 60:
+                                st.success("Regime WFO is positive and reasonably stable.")
+                            elif wf_overall['Difference %'] > 0:
+                                st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
                             else:
-                                wf_overall = wf_regime["overall"]
-                                eff_train = wf_regime.get("effective_train_window", regime_wf_train)
-                                eff_forward = wf_regime.get("effective_forward_window", regime_wf_forward)
-                                if int(eff_train) != int(regime_wf_train) or int(eff_forward) != int(regime_wf_forward):
-                                    st.caption(f"ℹ️ WFO auto-adjusted to Train={int(eff_train)} bars / Forward={int(eff_forward)} bars because the selected data window was shorter than requested.")
-                                full_bh = buy_hold_return_pct(strat_prices)
-                                wfc1, wfc2, wfc3, wfc4, wfc5 = st.columns(5)
-                                wfc1.metric("WF Strategy Return", f"{wf_overall['Strategy Return %']:.2f}%")
-                                wfc2.metric("WF Test Benchmark", f"{wf_overall['Buy & Hold Return %']:.2f}%", help="Buy & hold only over the out-of-sample WFO test window.")
-                                wfc3.metric("Full Benchmark", f"{full_bh:.2f}%" if pd.notna(full_bh) else "N/A", help="Buy & hold over the full selected period. Reference only.")
-                                wfc4.metric("WF Difference", f"{wf_overall['Difference %']:+.2f}%")
-                                wfc5.metric("WF Stability", f"{wf_regime['stability_score']:.0f}/100")
+                                st.warning("Regime WFO did not beat buy & hold on unseen windows. If the benchmark is extremely high, the stock is a strong runner and defensive regime exits may still lag buy-and-hold.")
 
-                                if wf_overall['Difference %'] > 0 and wf_regime['stability_score'] >= 60:
-                                    st.success("Regime WFO is positive and reasonably stable.")
-                                elif wf_overall['Difference %'] > 0:
-                                    st.warning("Regime WFO beat its test benchmark, but stability is not strong. Use confirmation.")
+                            wf_rows = wf_regime["rows"].copy()
+                            if not wf_rows.empty:
+                                for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
+                                    wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
+                                st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
+
+                            if use_regime_wfo:
+                                first_forward_start = wf_regime["first_forward_start"]
+                                full_wfo_prices = strat_prices.copy()
+
+                                if bool(regime_full_benchmark_mode):
+                                    # Full-benchmark mode: compare the strategy against buy & hold from the
+                                    # selected start date, not only after the WFO training window.
+                                    # WFO cannot produce a model-selected signal before the first forward period,
+                                    # so the pre-WFO section uses a causal trend bridge. This is clearly labeled
+                                    # as a bridge, not as out-of-sample WFO validation.
+                                    wf_only_signal = wf_regime["signal"].reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                    bridge_signal = benchmark_aware_trend_participation_signal(
+                                        full_wfo_prices, mode=str(regime_return_booster_mode)
+                                    ).reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
+                                    if bool(confirmed_regime_bar):
+                                        bridge_signal = bridge_signal.shift(1).ffill().fillna(0).clip(0, 1)
+
+                                    signals = wf_only_signal.copy()
+                                    pre_wfo_mask = signals.index < first_forward_start
+                                    signals.loc[pre_wfo_mask] = bridge_signal.loc[pre_wfo_mask]
+                                    strat_prices = full_wfo_prices
+                                    benchmark_label_for_metrics = "Full Benchmark"
+                                    full_period_benchmark_pct_for_metrics = full_bh
+                                    using_wfo_primary_for_metrics = True
+                                    try:
+                                        st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
+                                    except Exception:
+                                        pass
                                 else:
-                                    st.warning("Regime WFO did not beat buy & hold on unseen windows. If the benchmark is extremely high, the stock is a strong runner and defensive regime exits may still lag buy-and-hold.")
-
-                                wf_rows = wf_regime["rows"].copy()
-                                if not wf_rows.empty:
-                                    for col in ["Train Start", "Train End", "Forward Start", "Forward End"]:
-                                        wf_rows[col] = pd.to_datetime(wf_rows[col]).dt.date
-                                    st.dataframe(wf_rows.sort_values("Period", ascending=False), use_container_width=True)
-
-                                if use_regime_wfo:
-                                    first_forward_start = wf_regime["first_forward_start"]
-                                    full_wfo_prices = strat_prices.copy()
-
-                                    if bool(regime_full_benchmark_mode):
-                                        # Full-benchmark mode: compare the strategy against buy & hold from the
-                                        # selected start date, not only after the WFO training window.
-                                        # WFO cannot produce a model-selected signal before the first forward period,
-                                        # so the pre-WFO section uses a causal trend bridge. This is clearly labeled
-                                        # as a bridge, not as out-of-sample WFO validation.
-                                        wf_only_signal = wf_regime["signal"].reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
-                                        bridge_signal = benchmark_aware_trend_participation_signal(
-                                            full_wfo_prices, mode=str(regime_return_booster_mode)
-                                        ).reindex(full_wfo_prices.index).ffill().fillna(0).clip(0, 1)
-                                        if bool(confirmed_regime_bar):
-                                            bridge_signal = bridge_signal.shift(1).ffill().fillna(0).clip(0, 1)
-
-                                        signals = wf_only_signal.copy()
-                                        pre_wfo_mask = signals.index < first_forward_start
-                                        signals.loc[pre_wfo_mask] = bridge_signal.loc[pre_wfo_mask]
-                                        strat_prices = full_wfo_prices
-                                        benchmark_label_for_metrics = "Full Benchmark"
-                                        full_period_benchmark_pct_for_metrics = full_bh
-                                        using_wfo_primary_for_metrics = True
-                                        try:
-                                            st.caption(f"ℹ️ Full-benchmark mode ON: {int(pre_wfo_mask.sum())} pre-WFO bars use causal trend bridge; later bars use WFO-selected signal.")
-                                        except Exception:
-                                            pass
-                                    else:
-                                        # Pure WFO-test mode: compare only over the out-of-sample forward-test window.
-                                        strat_prices = strat_prices.loc[first_forward_start:]
-                                        signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                        benchmark_label_for_metrics = "WFO Test Benchmark"
-                                        full_period_benchmark_pct_for_metrics = full_bh
-                                        using_wfo_primary_for_metrics = True
-
-                                    # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
-                                    # Previous versions could show identical results because the booster was only
-                                    # a WFO candidate or overlay inside each block. If WFO selected the same
-                                    # base regime exposure, the final BacktestEngine.run_strategy() still received
-                                    # the old signal. This block applies the booster to the exact `signals` series
-                                    # used by the performance metrics and trade log below.
-                                    if bool(use_regime_return_booster):
-                                        try:
-                                            booster_full = benchmark_aware_trend_participation_signal(
-                                                strat_prices, mode=str(regime_return_booster_mode)
-                                            ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                            booster_full = apply_confirmed_bar_execution_policy(
-                                                booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
-                                                weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
-                                            )
-
-                                            mode_l = str(regime_return_booster_mode or "Balanced").lower()
-                                            original_signals = signals.copy()
-                                            if ("optimized" in mode_l) or ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
-                                                # Full Benchmark Capture / Maximum Capture must become the primary
-                                                # final signal, otherwise the WFO signal can still keep returns far
-                                                # below the full buy-and-hold benchmark.
-                                                signals = booster_full
-                                            elif mode_l == "conservative":
-                                                # Conservative only adds high-confidence exposure.
-                                                high_conf = booster_full.where(booster_full >= 0.75, 0.0)
-                                                signals = pd.concat([signals, high_conf], axis=1).max(axis=1).clip(0, 1)
-                                            else:
-                                                # Balanced: combine WFO regime signal with benchmark-aware trend hold.
-                                                signals = pd.concat([signals, booster_full], axis=1).max(axis=1).clip(0, 1)
-
-                                                # If the max overlay is still identical, force the booster as the
-                                                # final signal because the user explicitly enabled the return booster.
-                                                # This prevents the exact same metrics problem.
-                                                changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
-                                                if changed_bars == 0:
-                                                    signals = booster_full
-                                                    st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
-                                                else:
-                                                    st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
-
-                                            signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                            try:
-                                                st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
-                                            except Exception:
-                                                pass
-                                        except Exception as e:
-                                            st.warning(f"Return booster final overlay could not be applied: {e}")
-
-                                    # benchmark_label_for_metrics / full_period_benchmark_pct_for_metrics
-                                    # are set above depending on whether full-benchmark mode is ON.
+                                    # Pure WFO-test mode: compare only over the out-of-sample forward-test window.
+                                    strat_prices = strat_prices.loc[first_forward_start:]
+                                    signals = wf_regime["signal"].reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                    benchmark_label_for_metrics = "WFO Test Benchmark"
+                                    full_period_benchmark_pct_for_metrics = full_bh
                                     using_wfo_primary_for_metrics = True
 
-                        # Live Regime Hybrid final mapping
-                        # Keeps the stable daily/weekly regime brain but lets live mode update on intraday candles.
-                        if bool(regime_live_hybrid_enabled):
-                            try:
-                                anchor_signal_for_live = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                live_px_for_regime = pd.Series(live_execution_prices_for_regime).replace([np.inf, -np.inf], np.nan).dropna()
-                                if not live_px_for_regime.empty:
-                                    signals = build_live_regime_hybrid_signal(
-                                        anchor_signal_for_live,
-                                        strat_prices,
-                                        live_px_for_regime,
-                                        enable_overlay=bool(live_regime_overlay),
-                                        mode=str(live_regime_sensitivity)
-                                    )
-                                    strat_prices = live_px_for_regime.reindex(signals.index).ffill().dropna()
-                                    signals = signals.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
-                                    benchmark_label_for_metrics = f"Live {data_interval} Benchmark"
-                                    using_wfo_primary_for_metrics = False
-                                    st.caption(f"ℹ️ Live hybrid mapped stable regime signal to {len(signals)} live candles. Current live exposure: {signals.iloc[-1]*100:.0f}%")
-                            except Exception as e:
-                                st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
+                                # DIRECT RETURN-BOOSTER APPLICATION TO THE FINAL METRIC SIGNAL
+                                # Previous versions could show identical results because the booster was only
+                                # a WFO candidate or overlay inside each block. If WFO selected the same
+                                # base regime exposure, the final BacktestEngine.run_strategy() still received
+                                # the old signal. This block applies the booster to the exact `signals` series
+                                # used by the performance metrics and trade log below.
+                                if bool(use_regime_return_booster):
+                                    try:
+                                        booster_full = benchmark_aware_trend_participation_signal(
+                                            strat_prices, mode=str(regime_return_booster_mode)
+                                        ).reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        booster_full = apply_confirmed_bar_execution_policy(
+                                            booster_full, frequency=str(regime_model_freq), confirmed_bar=bool(confirmed_regime_bar),
+                                            weekly_close_updates=bool(weekly_close_same_bar), fill_value=0.0
+                                        )
 
-                        # TRUE NON-REPAINT LEDGER
-                        # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
-                        # cannot rewrite already recorded signals for this ticker/frequency/settings.
+                                        mode_l = str(regime_return_booster_mode or "Balanced").lower()
+                                        original_signals = signals.copy()
+                                        if ("optimized" in mode_l) or ("full benchmark" in mode_l) or ("maximum" in mode_l) or (mode_l == "aggressive"):
+                                            # Full Benchmark Capture / Maximum Capture must become the primary
+                                            # final signal, otherwise the WFO signal can still keep returns far
+                                            # below the full buy-and-hold benchmark.
+                                            signals = booster_full
+                                        elif mode_l == "conservative":
+                                            # Conservative only adds high-confidence exposure.
+                                            high_conf = booster_full.where(booster_full >= 0.75, 0.0)
+                                            signals = pd.concat([signals, high_conf], axis=1).max(axis=1).clip(0, 1)
+                                        else:
+                                            # Balanced: combine WFO regime signal with benchmark-aware trend hold.
+                                            signals = pd.concat([signals, booster_full], axis=1).max(axis=1).clip(0, 1)
+
+                                            # If the max overlay is still identical, force the booster as the
+                                            # final signal because the user explicitly enabled the return booster.
+                                            # This prevents the exact same metrics problem.
+                                            changed_bars = int((signals.round(6) != original_signals.round(6)).sum())
+                                            if changed_bars == 0:
+                                                signals = booster_full
+                                                st.caption("ℹ️ Return booster matched the WFO signal, so the booster was used as the final signal to make the mode actually affect trades/metrics.")
+                                            else:
+                                                st.caption(f"ℹ️ Return booster changed {changed_bars} bars in the final backtest signal.")
+
+                                        signals = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                        try:
+                                            st.caption(f"ℹ️ Return booster final average exposure: {signals.mean()*100:.1f}%")
+                                        except Exception:
+                                            pass
+                                    except Exception as e:
+                                        st.warning(f"Return booster final overlay could not be applied: {e}")
+
+                                # benchmark_label_for_metrics / full_period_benchmark_pct_for_metrics
+                                # are set above depending on whether full-benchmark mode is ON.
+                                using_wfo_primary_for_metrics = True
+
+                    # Live Regime Hybrid final mapping
+                    # Keeps the stable daily/weekly regime brain but lets live mode update on intraday candles.
+                    if bool(regime_live_hybrid_enabled):
                         try:
-                            if bool(lock_regime_ledger):
-                                signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
-                                    signals, regime_lock_key, enabled=True
+                            anchor_signal_for_live = pd.Series(signals, index=strat_prices.index).ffill().fillna(0).clip(0, 1)
+                            live_px_for_regime = pd.Series(live_execution_prices_for_regime).replace([np.inf, -np.inf], np.nan).dropna()
+                            if not live_px_for_regime.empty:
+                                signals = build_live_regime_hybrid_signal(
+                                    anchor_signal_for_live,
+                                    strat_prices,
+                                    live_px_for_regime,
+                                    enable_overlay=bool(live_regime_overlay),
+                                    mode=str(live_regime_sensitivity)
                                 )
-                                if _ledger_ok:
-                                    st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
-                                else:
-                                    st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
-                        except Exception as _lock_e:
-                            st.warning(f"Locked Regime Ledger failed: {_lock_e}")
+                                strat_prices = live_px_for_regime.reindex(signals.index).ffill().dropna()
+                                signals = signals.reindex(strat_prices.index).ffill().fillna(0).clip(0, 1)
+                                benchmark_label_for_metrics = f"Live {data_interval} Benchmark"
+                                using_wfo_primary_for_metrics = False
+                                st.caption(f"ℹ️ Live hybrid mapped stable regime signal to {len(signals)} live candles. Current live exposure: {signals.iloc[-1]*100:.0f}%")
+                        except Exception as e:
+                            st.warning(f"Live Regime Hybrid mapping failed, using original regime signal: {e}")
 
-                        # Plot Context
-                        with st.expander("See Strategy Context"):
-                            fig_ctx = go.Figure()
-                            if signal_method == "Regime Weighted Expected Return" and "expected_ret" in regime_context:
-                                expected_ret = regime_context["expected_ret"].reindex(strat_prices.index).ffill()
-                                fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
-                                fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
-                                highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.2)
-                                highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.2)
-                                fig_ctx.update_layout(title="Regime-Weighted Expected Return + Conviction Filter", hovermode="x unified", template="plotly_dark", height=400)
+                    # TRUE NON-REPAINT LEDGER
+                    # Final Regime signal is frozen per closed Daily/Weekly bar. Future refits
+                    # cannot rewrite already recorded signals for this ticker/frequency/settings.
+                    try:
+                        if bool(lock_regime_ledger):
+                            signals, _locked_rows, _new_locked_rows, _ledger_ok = apply_regime_locked_signal_ledger(
+                                signals, regime_lock_key, enabled=True
+                            )
+                            if _ledger_ok:
+                                st.caption(f"🔒 Locked Regime Ledger ON: {_locked_rows} prior bars reused, {_new_locked_rows} new bars locked. Old signals will not be rewritten by future refits.")
                             else:
-                                bull_probs = regime_context.get("bull_probs", pd.Series(dtype=float)).reindex(strat_prices.index).ffill()
-                                fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=bull_probs, mode='lines', line=dict(color='green', width=1.5), name='Bull Probability'))
-                                fig_ctx.add_hline(y=float(conviction), line_dash="dash", line_color="white", annotation_text="Min Bull Probability")
-                                highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.15)
-                                fig_ctx.update_layout(title=f"{signal_method} (Conviction={conviction:.0%}, Min Hold={int(min_hold_period)})", hovermode="x unified", template="plotly_dark", height=400)
-                            st.plotly_chart(fig_ctx, use_container_width=True)
+                                st.warning("Locked Regime Ledger could not be written. Signals are still confirmed-bar, but not permanently locked.")
+                    except Exception as _lock_e:
+                        st.warning(f"Locked Regime Ledger failed: {_lock_e}")
 
-                        # Debug Dataframe
-                        with st.expander("🔍 Debug: Signal Details"):
-                            debug_df = pd.DataFrame({
-                                "Price": strat_prices,
-                                "Alert Signal": signals
-                            }).dropna()
-                            st.dataframe(debug_df.style.format({
-                                "Price": "{:.2f}",
-                                "Signal": "{:.0f}"
-                            }), use_container_width=True)
-                        
-                    else:
-                        st.error("Regime model fitting failed.")
+                    # Preserve the untouched locked Regime signal for the one narrow
+                    # major-winner overlay. This prevents any stop-loss/rescue series from
+                    # becoming the "Regime brain" and creating repeated re-entry churn.
+                    _original_regime_signal_for_overlays = pd.Series(signals).copy()
+                    _original_regime_prices_for_overlays = pd.Series(strat_prices).copy()
 
+                    # WEEKLY REGIME MAJOR-WINNER ROLLOVER EXIT
+                    # Main fix only: after a trade has doubled, protect 80% of the peak
+                    # value on the first closed daily bar reaching a 20% giveback.
+                    # No EMA wait and no re-entry into the same stale Weekly LONG.
+                    try:
+                        if (
+                            bool(enable_regime_major_winner_rollover)
+                            and str(bt_freq) == "Weekly"
+                            and not bool(regime_live_hybrid_enabled)
+                        ):
+                            _rollover_daily_px = (
+                                pd.Series(prices_bt)
+                                .replace([np.inf, -np.inf], np.nan)
+                                .dropna()
+                                .astype(float)
+                                .sort_index()
+                            )
+                            _roll_sig, _roll_px, _roll_meta = apply_regime_major_winner_rollover_exit(
+                                _rollover_daily_px,
+                                _original_regime_signal_for_overlays,
+                                original_prices=_original_regime_prices_for_overlays,
+                                arm_profit_pct=1.00,
+                                peak_drawdown_pct=0.20,
+                            )
+
+                            if bool((_roll_meta or {}).get("applied", False)):
+                                signals = (
+                                    pd.Series(_roll_sig)
+                                    .replace([np.inf, -np.inf], np.nan)
+                                    .ffill()
+                                    .fillna(0.0)
+                                    .clip(0.0, 1.0)
+                                )
+                                strat_prices = (
+                                    pd.Series(_roll_px)
+                                    .replace([np.inf, -np.inf], np.nan)
+                                    .dropna()
+                                    .astype(float)
+                                )
+                                signals = signals.reindex(strat_prices.index).ffill().fillna(0.0).clip(0.0, 1.0)
+                                benchmark_label_for_metrics = "Daily Buy & Hold Benchmark"
+
+                                _roll_exits = int((_roll_meta or {}).get("exit_count", 0) or 0)
+                                _roll_dates = (_roll_meta or {}).get("exit_dates", []) or []
+                                _roll_prices = (_roll_meta or {}).get("exit_prices", []) or []
+                                _last_roll = ""
+                                if _roll_dates and _roll_prices:
+                                    _last_roll = f" | latest: {pd.Timestamp(_roll_dates[-1]).date()} at ${float(_roll_prices[-1]):.2f}"
+                                st.success(
+                                    "🏁 Major Winner Rollover acted: the trade first doubled, then the first closed daily bar reached a 20% peak giveback. "
+                                    f"Protected exits: {_roll_exits}{_last_roll}. No EMA delay and no stale-regime re-entry."
+                                )
+                            else:
+                                st.caption(
+                                    "🏁 Major Winner Rollover checked: no qualifying doubled-trade 20% peak giveback occurred, so the original Regime signal and price basis were left unchanged."
+                                )
+                    except Exception as _rollover_e:
+                        st.warning(f"Major Winner Rollover could not run; original Regime signals remain unchanged: {_rollover_e}")
+
+                    # OPTIONAL REGIME SURGICAL RESCUE
+                    # OFF by default. The user is evaluating the main Regime model and
+                    # major-winner behavior without an 8% stop-loss layer.
+                    try:
+                        if bool(enable_regime_surgical_rescue) and not bool(regime_live_hybrid_enabled):
+                            _regime_daily_px = pd.Series(prices_bt).replace([np.inf, -np.inf], np.nan).dropna().sort_index()
+                            _regime_daily_sig = (
+                                pd.Series(signals, index=signals.index)
+                                .reindex(pd.Index(signals.index).union(_regime_daily_px.index))
+                                .sort_index()
+                                .ffill()
+                                .reindex(_regime_daily_px.index)
+                                .ffill()
+                                .fillna(0.0)
+                                .clip(0.0, 1.0)
+                            )
+                            _rescued = apply_regime_surgical_rescue(
+                                _regime_daily_px,
+                                _regime_daily_sig,
+                                max_trade_loss_pct=float(regime_surgical_max_loss_pct) / 100.0,
+                            )
+                            _rescue_stats = dict(_rescued.attrs.get("rescue_stats", {}))
+                            signals = _rescued.reindex(_regime_daily_px.index).ffill().fillna(0.0).clip(0.0, 1.0)
+                            strat_prices = _regime_daily_px.reindex(signals.index).dropna()
+                            signals = signals.reindex(strat_prices.index).fillna(0.0).clip(0.0, 1.0)
+                            benchmark_label_for_metrics = "Daily Buy & Hold Benchmark"
+                            st.success(
+                                f"🛡️ Optional Surgical Regime Rescue ON: {float(regime_surgical_max_loss_pct):.1f}% failed-trade limit."
+                            )
+                            if _rescue_stats:
+                                st.caption(
+                                    "Rescue actions — "
+                                    f"protective exits: {int(_rescue_stats.get('protective_exits', 0))}, "
+                                    f"quarantine bars: {int(_rescue_stats.get('quarantine_bars', 0))}, "
+                                    f"regime-reset re-entries: {int(_rescue_stats.get('regime_reset_reentries', 0))}, "
+                                    f"price-reclaim re-entries: {int(_rescue_stats.get('price_reclaim_reentries', 0))}."
+                                )
+                    except Exception as _regime_rescue_e:
+                        st.warning(f"Optional Surgical Regime Rescue could not be applied; using the Regime signals unchanged: {_regime_rescue_e}")
+
+                    # Plot Context
+                    with st.expander("See Strategy Context"):
+                        fig_ctx = go.Figure()
+                        if signal_method == "Regime Weighted Expected Return" and "expected_ret" in regime_context:
+                            expected_ret = regime_context["expected_ret"].reindex(strat_prices.index).ffill()
+                            fig_ctx.add_trace(go.Scatter(x=expected_ret.index, y=expected_ret, mode='lines', line=dict(color='purple', width=1.5), name='Expected Return'))
+                            fig_ctx.add_hline(y=0, line_dash="dash", line_color="white")
+                            highlight_plotly_zones(fig_ctx, expected_ret > 0, 'green', opacity=0.2)
+                            highlight_plotly_zones(fig_ctx, expected_ret < 0, 'red', opacity=0.2)
+                            fig_ctx.update_layout(title="Regime-Weighted Expected Return + Conviction Filter", hovermode="x unified", template="plotly_dark", height=400)
+                        else:
+                            bull_probs = regime_context.get("bull_probs", pd.Series(dtype=float)).reindex(strat_prices.index).ffill()
+                            fig_ctx.add_trace(go.Scatter(x=bull_probs.index, y=bull_probs, mode='lines', line=dict(color='green', width=1.5), name='Bull Probability'))
+                            fig_ctx.add_hline(y=float(conviction), line_dash="dash", line_color="white", annotation_text="Min Bull Probability")
+                            highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.15)
+                            fig_ctx.update_layout(title=f"{signal_method} (Conviction={conviction:.0%}, Min Hold={int(min_hold_period)})", hovermode="x unified", template="plotly_dark", height=400)
+                        st.plotly_chart(fig_ctx, use_container_width=True)
+
+                    # Debug Dataframe
+                    with st.expander("🔍 Debug: Signal Details"):
+                        debug_df = pd.DataFrame({
+                            "Price": strat_prices,
+                            "Signal": signals
+                        }).dropna()
+                        st.dataframe(debug_df.style.format({
+                            "Price": "{:.2f}",
+                            "Signal": "{:.0f}"
+                        }), use_container_width=True)
+                    
+                else:
+                    st.error("Regime model fitting failed.")
 
     elif strategy_type == "Kalman Filter (Trend Crossover)":
         st.markdown("**Strategy:** Long when Price crosses **ABOVE** Kalman Trend. Sell when Price crosses **BELOW**.")
-        
+    
         col_k1, col_k2 = st.columns(2)
         with col_k1:
             kf_noise = st.select_slider("Trend Sensitivity", options=[1e-5, 1e-4, 1e-3], value=1e-4, 
@@ -14304,15 +14523,15 @@ with tab7:
             kf = KalmanFilterTrend(process_noise=kf_noise, measurement_noise=1e-2)
             trend_est, _ = kf.filter(prices_bt.values)
             trend_series = pd.Series(trend_est, index=prices_bt.index)
-            
+        
             # Generate Signals with Confirmation Logic
             sig_list = []
             position = 0
-            
+        
             # Counters for consecutive days
             days_above = 0
             days_below = 0
-            
+        
             for price, trend in zip(prices_bt, trend_series):
                 if price > trend:
                     days_above += 1
@@ -14320,7 +14539,7 @@ with tab7:
                 else:
                     days_below += 1
                     days_above = 0
-                
+            
                 # Trading Logic
                 if position == 0:
                     if days_above >= confirm_days:
@@ -14328,51 +14547,51 @@ with tab7:
                 elif position == 1:
                     if days_below >= confirm_days:
                         position = 0 # Sell
-                        
+                    
                 sig_list.append(position)
-            
+        
             signals = pd.Series(sig_list, index=prices_bt.index)
-            
+        
             # Plot Strategy Context
             with st.expander("See Strategy Context"):
                 fig_ctx = go.Figure()
                 fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
                 fig_ctx.add_trace(go.Scatter(x=trend_series.index, y=trend_series, mode='lines', line=dict(color='blue'), name='Kalman Trend'))
-                
+            
                 highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-                
+            
                 fig_ctx.update_layout(title="Strategy Context", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Momentum Hedge (EMA/SMA Cross)":
         st.markdown("**Strategy:** Long when **Short EMA > Med SMA**. Cash/Hedge when **Short EMA < Med SMA**.")
-        
+    
         c_h1, c_h2 = st.columns(2)
         with c_h1:
             short_len = st.slider("Short EMA Length", 5, 50, 20)
         with c_h2:
             med_len = st.slider("Medium SMA Length", 20, 200, 60)
-            
+        
         with st.spinner("Calculating Momentum Hedge Signals..."):
             # Calculate Indicators
             short_ema = prices_bt.ewm(span=short_len, adjust=False).mean()
             med_sma = prices_bt.rolling(window=med_len).mean()
-            
+        
             # Generate Signals
             # Logic: Flag = 1 when Short < Med (Hedge active). So Long Signal = 1 when Not Flagged (Short >= Med).
             # To match exactly: flag = shortMA < medMA ? 1.0 : 0.0
             signals = (short_ema >= med_sma).astype(int)
-            
+        
             # Plot Context
             with st.expander("See Strategy Context"):
                 fig_ctx = go.Figure()
                 fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
                 fig_ctx.add_trace(go.Scatter(x=short_ema.index, y=short_ema, mode='lines', line=dict(color='orange', width=1.5), name=f'Short EMA ({short_len})'))
                 fig_ctx.add_trace(go.Scatter(x=med_sma.index, y=med_sma, mode='lines', line=dict(color='blue', width=1.5), name=f'Med SMA ({med_len})'))
-                
+            
                 highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
                 highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
-                
+            
                 fig_ctx.update_layout(title="Momentum Hedge Signal (EMA/SMA Cross)", hovermode="x unified", template="plotly_dark", height=400)
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
@@ -14585,7 +14804,7 @@ with tab7:
                     "Volume OK": volume_ok,
                     "Entry": entry_marks,
                     "Exit": exit_marks,
-                    "Alert Signal": signals
+                    "Signal": signals
                 })
                 st.dataframe(diag_scalp.tail(150), use_container_width=True)
 
@@ -15018,7 +15237,7 @@ with tab7:
                     "Flip Count": flip_count,
                     "Long Condition": long_cond,
                     "Exit/Avoid Condition": exit_cond,
-                    "Alert Signal": signals
+                    "Signal": signals
                 })
                 st.dataframe(diag.tail(120), use_container_width=True)
 
@@ -15030,9 +15249,9 @@ with tab7:
             ma_type = st.selectbox("MA Type", ["EMA", "SMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"])
         with col_m2:
             mad_len = st.number_input("MAD Length", 5, 100, 25)
-            
-        mad_params = {'signal_mode': sig_mode, 'bb_ma_type': ma_type, 'bb_len': mad_len}
         
+        mad_params = {'signal_mode': sig_mode, 'bb_ma_type': ma_type, 'bb_len': mad_len}
+    
         if sig_mode == "Bollinger Bands":
             col_bb1, col_bb2 = st.columns(2)
             with col_bb1:
@@ -15040,7 +15259,7 @@ with tab7:
             with col_bb2:
                 mult_n = st.number_input("- Multiplier", 0.1, 5.0, 1.0)
             mad_params.update({'bb_mult_p': mult_p, 'bb_mult_n': mult_n})
-            
+        
         elif sig_mode == "For Loop":
             col_fl1, col_fl2, col_fl3 = st.columns(3)
             with col_fl1:
@@ -15075,21 +15294,21 @@ with tab7:
 
         # Auto-run MAD Trend Backtest
         signals = MADTrendModes.get_signals(df_bt, mad_params)
-        
+    
         # Plot Context
         with st.expander("See Strategy Context", expanded=True):
             fig_ctx = go.Figure()
             fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
-            
+        
             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-            
+        
             fig_ctx.update_layout(title=f"MAD Trend Modes Signal ({sig_mode})", hovermode="x unified", template="plotly_dark", height=400)
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Dual MA Cross":
         st.markdown("### 🔀 Dual Moving Average Cross Settings")
         ma_options = ["SMA", "EMA", "WMA", "HMA", "RMA", "ALMA", "LSMA"]
-        
+    
         c_ma1, c_ma2 = st.columns(2)
         with c_ma1:
             st.subheader("Fast MA (Short-term)")
@@ -15099,90 +15318,90 @@ with tab7:
             st.subheader("Slow MA (Long-term)")
             s_ma_type = st.selectbox("Slow MA Type", ma_options, index=0) # Default SMA
             s_ma_len = st.number_input("Slow MA Length", 1, 250, 50)
-            
+        
         if f_ma_len >= s_ma_len:
             st.warning("Fast MA length is typically shorter than Slow MA length. Results may be inverted.")
-            
+        
         # Auto-run Dual MA
         # Calculate MAs
         fast_ma = MADTrendModes.ma_switch(prices_bt, f_ma_len, f_ma_type)
         slow_ma = MADTrendModes.ma_switch(prices_bt, s_ma_len, s_ma_type)
-        
+    
         # Generate Signals: Long when Fast > Slow, Cash when Fast < Slow
         # Using stateful ffill logic for consistency
         long_cond = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
         short_cond = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
-        
+    
         def get_stateful_ma_signal(l_cond, s_cond, index):
             sig = pd.Series(np.nan, index=index)
             sig.loc[l_cond] = 1
             sig.loc[s_cond] = 0
             return sig.ffill().fillna(0)
-        
+    
         signals = get_stateful_ma_signal(long_cond, short_cond, prices_bt.index)
-        
+    
         # Plot Context
         with st.expander("See Strategy Context", expanded=True):
             fig_ctx = go.Figure()
             fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
             fig_ctx.add_trace(go.Scatter(x=fast_ma.index, y=fast_ma, mode='lines', line=dict(color='orange'), opacity=0.8, name=f'Fast {f_ma_type} ({f_ma_len})'))
             fig_ctx.add_trace(go.Scatter(x=slow_ma.index, y=slow_ma, mode='lines', line=dict(color='blue'), opacity=0.8, name=f'Slow {s_ma_type} ({s_ma_len})'))
-            
+        
             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
-            
+        
             fig_ctx.update_layout(title=f"Dual MA Cross: {f_ma_type}({f_ma_len}) / {s_ma_type}({s_ma_len})", hovermode="x unified", template="plotly_dark", height=400)
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Ehlers SuperSmoother":
         st.markdown("### 🌊 Ehlers SuperSmoother Settings")
         st.markdown("Filters high frequency noise to create a zero-lag trendline.")
-        
+    
         ss_period = st.slider("SuperSmoother Period", 5, 252, 15)
-        
+    
         # Auto-run SuperSmoother
         ss_series = EhlersFilters.super_smoother(prices_bt, ss_period)
-        
+    
         # Signal logic: Long when Price > SuperSmoother, else Hedge (0)
         signals = (prices_bt > ss_series).astype(int)
-        
+    
         with st.expander("See Strategy Context", expanded=True):
             fig_ctx = go.Figure()
             fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
             fig_ctx.add_trace(go.Scatter(x=ss_series.index, y=ss_series, mode='lines', line=dict(color='magenta', width=2), name=f'SuperSmoother ({ss_period})'))
-            
+        
             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
             highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
-            
+        
             fig_ctx.update_layout(title="Ehlers SuperSmoother Signal", hovermode="x unified", template="plotly_dark", height=400)
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Ehlers Simple Decycler":
         st.markdown("### 🧲 Ehlers Simple Decycler Settings")
         st.markdown("Isolates the underlying low-frequency trend by removing market cycles.")
-        
+    
         dec_period = st.slider("Decycler High-Pass Period", 20, 252, 60)
-        
+    
         # Auto-run Decycler
         decycler_series = EhlersFilters.simple_decycler(prices_bt, dec_period)
-        
+    
         # Signal logic: Long when Price > Decycler, else Hedge (0)
         signals = (prices_bt > decycler_series).astype(int)
-        
+    
         with st.expander("See Strategy Context", expanded=True):
             fig_ctx = go.Figure()
             fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.5, name='Price'))
             fig_ctx.add_trace(go.Scatter(x=decycler_series.index, y=decycler_series, mode='lines', line=dict(color='orange', width=2), name=f'Decycler ({dec_period})'))
-            
+        
             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1)
             highlight_plotly_zones(fig_ctx, signals == 0, 'red', opacity=0.1)
-            
+        
             fig_ctx.update_layout(title="Ehlers Simple Decycler Signal", hovermode="x unified", template="plotly_dark", height=400)
             st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Institutional Mean Reversion (Z-Score)":
         st.markdown("### 📉 Institutional Mean Reversion (Z-Score) Settings")
         st.markdown("Statistical arbitrage approach: Buy when asset is significantly oversold relative to its rolling mean, and exit when it reverts.")
-        
+    
         col_mr1, col_mr2, col_mr3 = st.columns(3)
         with col_mr1:
             mr_lookback = st.slider("Lookback Window", 5, 252, 20)
@@ -15190,76 +15409,76 @@ with tab7:
             mr_entry_z = st.number_input("Entry Z-Score (Long)", 0.1, 5.0, 2.0, step=0.1)
         with col_mr3:
             mr_exit_z = st.number_input("Exit Z-Score (Close Long)", -2.0, 2.0, 0.0, step=0.1)
-            
+        
         with st.spinner("Calculating Z-Scores..."):
             # Calculate rolling stats
             mr_ma = prices_bt.rolling(window=mr_lookback).mean()
             mr_std = prices_bt.rolling(window=mr_lookback).std()
             mr_z = (prices_bt - mr_ma) / (mr_std + 1e-9)
-            
+        
             # Generate Signals: Long when Z < -entry_z, Exit when Z > -exit_z
             long_cond = mr_z < -mr_entry_z
             exit_cond = mr_z > -mr_exit_z
-            
+        
             # Stateful logic
             def get_stateful_mr_signal(l_cond, e_cond, index):
                 sig = pd.Series(np.nan, index=index)
                 sig.loc[l_cond] = 1
                 sig.loc[e_cond] = 0
                 return sig.ffill().fillna(0)
-            
+        
             signals = get_stateful_mr_signal(long_cond, exit_cond, prices_bt.index)
-            
+        
             # Dynamic bands for context plot
             upper_band = mr_ma + (mr_std * mr_entry_z)
             lower_band = mr_ma - (mr_std * mr_entry_z)
             exit_band = mr_ma - (mr_std * mr_exit_z)
-            
+        
             # Plot Context
             with st.expander("See Strategy Context", expanded=True):
                 fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
-                
+            
                 # Top Chart: Price and Bands
                 fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
                 fig_ctx.add_trace(go.Scatter(x=mr_ma.index, y=mr_ma, mode='lines', line=dict(color='blue', dash='dash'), name=f'Mean ({mr_lookback})'), row=1, col=1)
                 fig_ctx.add_trace(go.Scatter(x=lower_band.index, y=lower_band, mode='lines', line=dict(color='green', width=1), opacity=0.5, name=f'Entry Band (-{mr_entry_z}σ)'), row=1, col=1)
                 fig_ctx.add_trace(go.Scatter(x=exit_band.index, y=exit_band, mode='lines', line=dict(color='yellow', width=1), opacity=0.5, name=f'Exit Band (-{mr_exit_z}σ)'), row=1, col=1)
-                
+            
                 # Bottom Chart: Z-Score
                 fig_ctx.add_trace(go.Scatter(x=mr_z.index, y=mr_z, mode='lines', line=dict(color='orange'), name='Z-Score'), row=2, col=1)
                 fig_ctx.add_hline(y=-mr_entry_z, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Entry")
                 fig_ctx.add_hline(y=-mr_exit_z, line_dash="dash", line_color="yellow", row=2, col=1, annotation_text="Exit")
                 fig_ctx.add_hline(y=0, line_color="white", opacity=0.3, row=2, col=1)
-                
+            
                 highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
                 highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
-                
+            
                 fig_ctx.update_layout(title="Institutional Mean Reversion (Z-Score) Signal", hovermode="x unified", template="plotly_dark", height=600)
                 st.plotly_chart(fig_ctx, use_container_width=True)
 
     elif strategy_type == "Relative Strength Ratio (vs Benchmark)":
         st.markdown("### ⚖️ Relative Strength Ratio (vs Benchmark) Settings")
         st.markdown("Momentum strategy: Long when the asset is gaining relative strength against a benchmark, Cash when losing.")
-        
+    
         col_rs1, col_rs2 = st.columns(2)
         with col_rs1:
             bench_ticker = st.text_input("Benchmark Ticker", "SPY")
         with col_rs2:
             rs_ma_len = st.slider("RS Smoothing MA Length", 5, 200, 50)
-            
+        
         with st.spinner(f"Fetching Benchmark Data ({bench_ticker})..."):
             try:
                 if live_mode:
                     bench_df = load_data(bench_ticker, start_date, end_date, interval=data_interval)
                 else:
                     bench_df = load_data(bench_ticker, bt_start_date, bt_end_date, interval='1d')
-                    
+                
                 if bench_df is None or bench_df.empty:
                     st.error("Could not fetch benchmark data. Please check ticker.")
                     signals = None
                 else:
                     bench_prices = bench_df['Close']
-                    
+                
                     # Align indices
                     common_idx = prices_bt.index.intersection(bench_prices.index)
                     if len(common_idx) < rs_ma_len:
@@ -15268,33 +15487,33 @@ with tab7:
                     else:
                         aligned_prices = prices_bt.loc[common_idx]
                         aligned_bench = bench_prices.loc[common_idx]
-                        
+                    
                         # Calculate RS Ratio and MA
                         rs_ratio = aligned_prices / aligned_bench
                         rs_ma = rs_ratio.rolling(window=rs_ma_len).mean()
-                        
+                    
                         # Signal: Long when RS Ratio > RS MA
                         signals_aligned = (rs_ratio > rs_ma).astype(int)
-                        
+                    
                         # Re-index back to full bt_prices length, ffill signals
                         signals = pd.Series(np.nan, index=prices_bt.index)
                         signals.loc[common_idx] = signals_aligned
                         signals = signals.ffill().fillna(0)
-                        
+                    
                         # Plot Context
                         with st.expander("See Strategy Context", expanded=True):
                             fig_ctx = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
-                            
+                        
                             # Top Chart: Price
                             fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
-                            
+                        
                             # Bottom Chart: RS Ratio
                             fig_ctx.add_trace(go.Scatter(x=rs_ratio.index, y=rs_ratio, mode='lines', line=dict(color='magenta'), name=f'RS Ratio vs {bench_ticker}'), row=2, col=1)
                             fig_ctx.add_trace(go.Scatter(x=rs_ma.index, y=rs_ma, mode='lines', line=dict(color='blue', dash='dash'), name=f'RS MA ({rs_ma_len})'), row=2, col=1)
-                            
+                        
                             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=1, col=1)
                             highlight_plotly_zones(fig_ctx, signals == 1, 'green', opacity=0.1, row=2, col=1)
-                            
+                        
                             fig_ctx.update_layout(title=f"Relative Strength Ratio ({TICKER} vs {bench_ticker})", hovermode="x unified", template="plotly_dark", height=500)
                             st.plotly_chart(fig_ctx, use_container_width=True)
             except Exception as e:
@@ -15305,7 +15524,7 @@ with tab7:
         st.markdown("### 🎲 Robust Implied Volatility Proxy Lab (^VIX)")
         st.markdown("Instead of one fixed VIX rule, this tests several VIX + price confirmation rules and selects the strongest one for the selected history.")
         st.caption("Goal: avoid weak noisy VIX exits, reduce whipsaws, and only go risk-off when VIX stress is confirmed by price weakness.")
-        
+    
         col_vx1, col_vx2, col_vx3, col_vx4 = st.columns(4)
         with col_vx1:
             vix_ma_len = st.number_input("IV Proxy Baseline Length", min_value=5, max_value=200, value=20, step=1)
@@ -15361,7 +15580,20 @@ with tab7:
             with gd7:
                 iv_guard_equity_action = st.selectbox("Equity DD Action", ["Soft Throttle", "Hard Cash"], index=0, key="iv_guard_equity_action")
             st.caption("Soft Throttle = reduces exposure after account DD stress without fully missing strong runners. Hard Cash = exits fully to cash until recovery.")
-            
+
+            st.markdown("**IV-only trade loss protection**")
+            lg1, lg2 = st.columns(2)
+            with lg1:
+                enable_iv_trade_loss_guard = st.checkbox(
+                    "Enable IV Trade Loss Guard", value=True, key="iv_enable_trade_loss_guard",
+                    help="IV Proxy only. Cuts a losing trade before it drifts into a double-digit loss and waits briefly before re-entry."
+                )
+            with lg2:
+                iv_max_trade_loss_pct = st.number_input(
+                    "Max IV Trade Loss Guard (%)", min_value=2.0, max_value=15.0, value=6.0, step=0.5, key="iv_max_trade_loss_guard_pct"
+                )
+            st.caption("Default 6%: exits earlier around 65% of the limit when the trade is already losing and the short/medium trend is weak. This is applied only inside the Implied Volatility Proxy subtab.")
+        
         with st.spinner("Fetching ^VIX data and testing robust IV proxy rules..."):
             try:
                 proxy_prices, proxy_label = load_iv_proxy_data_for_backtest(
@@ -15390,7 +15622,7 @@ with tab7:
                             st.caption(f"Live IV proxy source: {proxy_label}. Proxy values are forward-filled to match stock candle timestamps when exact timestamps differ.")
                         else:
                             st.caption(f"IV proxy source: {proxy_label}.")
-                        
+                    
                         # Core VIX/IV proxy features
                         vix_ma = aligned_vix.rolling(window=int(vix_ma_len)).mean()
                         vix_std = aligned_vix.rolling(window=int(vix_ma_len)).std()
@@ -15400,7 +15632,7 @@ with tab7:
                         vix_ema_fast = aligned_vix.ewm(span=5, adjust=False).mean()
                         vix_ema_slow = aligned_vix.ewm(span=20, adjust=False).mean()
                         vix_slope_down = vix_ema_fast < vix_ema_slow
-                        
+                    
                         # Asset confirmation features
                         asset_sma20 = asset_prices.rolling(window=20).mean()
                         asset_sma50 = asset_prices.rolling(window=50).mean()
@@ -15408,26 +15640,26 @@ with tab7:
                         asset_ret_5 = asset_prices.pct_change(5)
                         asset_vol_20 = asset_prices.pct_change().rolling(20).std()
                         asset_vol_med = asset_vol_20.rolling(100, min_periods=20).median()
-                        
+                    
                         def confirmed(cond, bars=None):
                             bars = int(confirm_bars if bars is None else bars)
                             cond = pd.Series(cond, index=common_idx).fillna(False)
                             if bars <= 1:
                                 return cond
                             return cond.rolling(bars).sum().fillna(0) >= bars
-                        
+                    
                         def stateful(entry, exit_, start_long=True):
                             pos = pd.Series(np.nan, index=common_idx, dtype=float)
                             pos.loc[pd.Series(entry, index=common_idx).fillna(False)] = 1.0
                             pos.loc[pd.Series(exit_, index=common_idx).fillna(False)] = 0.0
                             pos = pos.ffill()
                             return pos.fillna(1.0 if start_long else 0.0).clip(0, 1)
-                        
+                    
                         # -------------------------------
                         # Strategy candidates
                         # -------------------------------
                         candidates = []
-                        
+                    
                         # 1. Original but cleaner: VIX spike exits only when asset also weak; capitulation can reset long.
                         orig_pos = []
                         current_state = 1.0
@@ -15453,7 +15685,7 @@ with tab7:
                             "Long by default. Exit when VIX spikes above the upper band and price is below the 50-SMA. Re-enter when VIX cools below baseline or capitulation appears.",
                             pd.Series(orig_pos, index=common_idx)
                         ))
-                        
+                    
                         # 2. Crash shield: designed to avoid big drawdowns, not overtrade.
                         crash_exit = confirmed((vix_zscore > vix_z) & (asset_prices < asset_sma50) & (asset_ret_5 < 0))
                         crash_entry = (vix_zscore < 0.25) | ((asset_prices > asset_sma20) & vix_slope_down)
@@ -15462,7 +15694,7 @@ with tab7:
                             "Exit only when VIX stress is high AND price trend is weak. Re-enter after VIX cools or price recovers above short trend.",
                             stateful(crash_entry, crash_exit, start_long=True)
                         ))
-                        
+                    
                         # 3. Risk-on only: lower whipsaw by requiring calm VIX and price trend.
                         risk_on_entry = (vix_zscore < 0.75) & (asset_prices > asset_sma50)
                         risk_on_exit = confirmed((vix_zscore > vix_z) | (asset_prices < asset_sma50))
@@ -15471,7 +15703,7 @@ with tab7:
                             "Long only when VIX is not stressed and price is above the 50-SMA. Cash when either VIX stress or price weakness is confirmed.",
                             stateful(risk_on_entry, risk_on_exit, start_long=False)
                         ))
-                        
+                    
                         # 4. Vol compression breakout: good when lower implied vol supports trend continuation.
                         compression_entry = (aligned_vix < vix_ma) & (vix_ema_fast < vix_ema_slow) & (asset_prices > asset_sma20) & (asset_prices > asset_sma50)
                         compression_exit = confirmed((aligned_vix > vix_upper) | (asset_prices < asset_sma20))
@@ -15480,7 +15712,7 @@ with tab7:
                             "Long when VIX is falling below baseline and price is stacked above 20/50-SMA. Exit on VIX spike or loss of 20-SMA.",
                             stateful(compression_entry, compression_exit, start_long=False)
                         ))
-                        
+                    
                         # 5. Panic reset: handles extreme VIX spikes as potential washout, but demands price recovery.
                         panic_exit = confirmed((vix_zscore > vix_z) & (asset_prices < asset_sma50))
                         panic_entry = ((vix_zscore > vix_cap_z) & (asset_ret_5 > -0.03)) | ((vix_zscore < 0) & (asset_prices > asset_sma20))
@@ -15489,7 +15721,7 @@ with tab7:
                             "Exit confirmed stress. Re-enter after extreme panic if price stabilizes, or after VIX falls below baseline and price reclaims 20-SMA.",
                             stateful(panic_entry, panic_exit, start_long=True)
                         ))
-                        
+                    
                         # 6. Multi-factor IV score: avoids binary/noisy signal by requiring a score threshold.
                         score = pd.Series(0.0, index=common_idx)
                         score += (vix_zscore < 0.5).astype(float)
@@ -15504,7 +15736,7 @@ with tab7:
                             "Combines VIX calmness, falling VIX trend, price trend, and realized-vol filter. Long only when the total score is healthy.",
                             stateful(score_entry, score_exit, start_long=False)
                         ))
-                        
+                    
                         # 7. Long-term trend override: do not fight strong uptrends unless VIX stress is serious.
                         trend_override_entry = (asset_prices > asset_sma200) & ((vix_zscore < vix_z) | vix_slope_down)
                         trend_override_exit = confirmed((asset_prices < asset_sma200) & (vix_zscore > 1.0)) | confirmed(vix_zscore > vix_cap_z + 0.5, bars=1)
@@ -15560,7 +15792,25 @@ with tab7:
                                     guarded_sig
                                 ))
                             candidates = guarded_candidates
-                        
+                    
+                        # IV-only trade loss protection. Applied before ranking/WFO so every
+                        # displayed IV result and trade log uses the same protected signal.
+                        if bool(enable_iv_trade_loss_guard):
+                            loss_guarded_candidates = []
+                            for cname, clogic, csig in candidates:
+                                protected_sig = apply_iv_trade_loss_guard(
+                                    asset_prices,
+                                    csig,
+                                    max_trade_loss_pct=float(iv_max_trade_loss_pct) / 100.0,
+                                    cooldown_bars=5
+                                )
+                                loss_guarded_candidates.append((
+                                    cname,
+                                    clogic + f" IV trade-loss guard applied: max {float(iv_max_trade_loss_pct):.1f}% with earlier weak-trend exit and 5-bar cooldown.",
+                                    protected_sig
+                                ))
+                            candidates = loss_guarded_candidates
+
                         # Rank all candidates on the same selected history.
                         ranking_rows = []
                         scored_candidates = []
@@ -15577,7 +15827,7 @@ with tab7:
                                 "Max DD %": round(score_res['Max DD %'], 2),
                                 "Trades": score_res['Trades']
                             })
-                        
+                    
                         if not scored_candidates:
                             st.warning("No IV proxy candidates could be scored.")
                             signals = None
@@ -15585,7 +15835,7 @@ with tab7:
                             rank_df = pd.DataFrame(ranking_rows).sort_values(['Difference %', 'Strategy Return %'], ascending=False).reset_index(drop=True)
                             best_name = rank_df.iloc[0]['Rule']
                             best_name, best_logic, best_sig, best_score = next(x for x in scored_candidates if x[0] == best_name)
-                            
+                        
                             st.write("#### 🧠 Robust IV Proxy Strategy Ranking")
                             st.caption("In-sample ranking is now a reference table. You can also manually choose any IV rule below and view its own trade log.")
                             st.dataframe(rank_df, use_container_width=True)
@@ -15607,7 +15857,7 @@ with tab7:
                                 )
                                 best_name, best_logic, best_sig, best_score = next(x for x in scored_candidates if x[0] == manual_iv_choice)
                                 st.info(f"Manual IV strategy mode: main metrics and trade log will use **{best_name}**. Auto/WFO results remain reference only.")
-                            
+                        
                             wf_result = None
                             if enable_iv_walk_forward:
                                 st.write("#### 🚶 Walk-Forward IV Proxy Validation")
@@ -15691,7 +15941,7 @@ with tab7:
                                         "Best Rule Rank": rank_pos,
                                         "Difference %": round(best_diff_sub, 2) if pd.notna(best_diff_sub) else np.nan
                                     })
-                            
+                        
                             stability_score = 0
                             if stable_checks:
                                 stability_score = round(100 * ((positive_windows / len(stable_checks)) * 0.55 + (top2_windows / len(stable_checks)) * 0.45), 0)
@@ -15710,6 +15960,8 @@ with tab7:
 
                             if bool(enable_iv_risk_guard):
                                 st.success(f"IV Sharpe/DD Guard is ON: {iv_guard_mode} mode, {float(iv_guard_dd):.0f}% price-DD guard, account-DD guard {float(iv_guard_equity_dd):.0f}% {'ON' if bool(iv_guard_equity_dd_on) else 'OFF'}, volatility throttle {'ON' if bool(iv_guard_vol) else 'OFF'}.")
+                            if bool(enable_iv_trade_loss_guard):
+                                st.success(f"IV Trade Loss Guard is ON: {float(iv_max_trade_loss_pct):.1f}% max-loss limit with earlier weak-trend exit and 5-bar cooldown.")
 
                             if manual_iv_strategy_override:
                                 st.info(f"Chosen manual IV proxy rule: **{best_name}** — {best_logic}")
@@ -15718,7 +15970,7 @@ with tab7:
                                 st.caption(f"In-sample reference winner: {best_name} — {best_logic}")
                             else:
                                 st.info(f"Chosen IV proxy rule: **{best_name}** — {best_logic}")
-                            
+                        
                             # Re-index selected signal back to the shared backtest engine.
                             # IMPORTANT: when WFO is enabled, make the main performance metrics use ONLY
                             # the out-of-sample walk-forward segment, not the training/history segment.
@@ -15748,19 +16000,19 @@ with tab7:
                                 signals.loc[common_idx] = best_sig
                                 signals = signals.ffill().fillna(1).clip(0, 1)
                             signals = signals.ffill().fillna(0 if using_wfo_primary else 1).clip(0, 1)
-                            
+                        
                             with st.expander("See Robust IV Proxy Context", expanded=True):
                                 fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.45, 0.35, 0.20], vertical_spacing=0.05)
-                                
+                            
                                 fig_ctx.add_trace(go.Scatter(x=asset_prices.index, y=asset_prices, mode='lines', line=dict(color='gray'), opacity=0.85, name='Asset Price'), row=1, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=asset_sma20.index, y=asset_sma20, mode='lines', line=dict(color='cyan', dash='dot'), opacity=0.55, name='20-SMA'), row=1, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=asset_sma50.index, y=asset_sma50, mode='lines', line=dict(color='yellow', dash='dot'), opacity=0.55, name='50-SMA'), row=1, col=1)
-                                
+                            
                                 fig_ctx.add_trace(go.Scatter(x=aligned_vix.index, y=aligned_vix, mode='lines', line=dict(color='purple'), name='IV Proxy'), row=2, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=vix_ma.index, y=vix_ma, mode='lines', line=dict(color='orange', dash='dot'), name=f'IV Proxy Baseline ({vix_ma_len})'), row=2, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=vix_upper.index, y=vix_upper, mode='lines', line=dict(color='red', dash='dash'), name=f'Risk-Off Band (+{vix_z}σ)'), row=2, col=1)
                                 fig_ctx.add_trace(go.Scatter(x=vix_cap.index, y=vix_cap, mode='lines', line=dict(color='green', dash='dashdot'), name=f'Capitulation Band (+{vix_cap_z}σ)'), row=2, col=1)
-                                
+                            
                                 if enable_iv_walk_forward and use_wf_signal and wf_result is not None:
                                     chosen_aligned = wf_result['signal'].reindex(common_idx).ffill().fillna(0).clip(0, 1)
                                     exposure_label = 'WFO Selected Exposure (%)'
@@ -15768,24 +16020,332 @@ with tab7:
                                     chosen_aligned = pd.Series(best_sig, index=common_idx).reindex(common_idx).ffill().fillna(0).clip(0, 1)
                                     exposure_label = 'Chosen Exposure (%)'
                                 fig_ctx.add_trace(go.Scatter(x=chosen_aligned.index, y=chosen_aligned * 100, mode='lines', line=dict(color='#00f2ff'), fill='tozeroy', name=exposure_label), row=3, col=1)
-                                
+                            
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 1, 'green', opacity=0.10, row=1, col=1)
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 0, 'red', opacity=0.08, row=1, col=1)
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 1, 'green', opacity=0.08, row=2, col=1)
                                 highlight_plotly_zones(fig_ctx, chosen_aligned == 0, 'red', opacity=0.08, row=2, col=1)
-                                
+                            
                                 fig_ctx.update_layout(title=f"Robust IV Proxy Context — Selected Rule: {best_name}", hovermode="x unified", template="plotly_dark", height=760)
                                 fig_ctx.update_yaxes(title_text="Exposure", row=3, col=1, range=[0, 105])
                                 st.plotly_chart(fig_ctx, use_container_width=True)
-                            
+                        
             except Exception as e:
                 st.error(f"Error loading or testing ^VIX data: {str(e)}")
                 signals = None
 
+    elif strategy_type == "Institutional Bollinger Bands":
+        st.markdown("### 🧿 Institutional Bollinger Bands Trading")
+        st.caption("Long-only. Adaptive Bollinger engine: trend breakouts + controlled mean-reversion bounces. All rules are causal and adjustable.")
+
+        bb_c1, bb_c2, bb_c3 = st.columns(3)
+        with bb_c1:
+            bb_source_name = st.selectbox("Source", ["Close", "Open", "High", "Low", "HL2", "HLC3", "OHLC4"], index=0, key="bt_bb_source")
+            bb_len = st.number_input("Basis Length", min_value=5, max_value=300, value=20, step=1, key="bt_bb_len")
+            bb_ma_type = st.selectbox("Basis MA Type", ["SMA", "EMA", "WMA", "VWMA"], index=1, key="bt_bb_ma")
+        with bb_c2:
+            bb_mult = st.number_input("Band StdDev", min_value=0.5, max_value=5.0, value=2.0, step=0.1, key="bt_bb_mult")
+            bb_mode = st.selectbox("Signal Mode", ["Adaptive: Breakout + Mean Reversion", "Breakout Trend Only", "Mean Reversion Only"], index=0, key="bt_bb_mode")
+            bb_confirm = st.number_input("Exit Confirmation Bars", min_value=1, max_value=5, value=2, step=1, key="bt_bb_confirm")
+        with bb_c3:
+            bb_use_trend = st.checkbox("Use Institutional Trend Filter", value=True, key="bt_bb_trend_filter")
+            bb_trend_len = st.number_input("Trend EMA Length", min_value=20, max_value=500, value=200, step=5, key="bt_bb_trend_len")
+            bb_use_squeeze = st.checkbox("Prefer Squeeze Expansion Breakouts", value=True, key="bt_bb_squeeze")
+
+        with st.expander("Advanced Bollinger controls", expanded=False):
+            bb_squeeze_len = st.number_input("Bandwidth Percentile Lookback", min_value=50, max_value=500, value=125, step=5, key="bt_bb_sq_len")
+            bb_squeeze_pct = st.number_input("Squeeze Percentile Max (%)", min_value=5.0, max_value=80.0, value=45.0, step=1.0, key="bt_bb_sq_pct")
+            bb_mid_exit = st.checkbox("Exit on confirmed close below basis", value=True, key="bt_bb_mid_exit")
+            bb_use_atr_trail = st.checkbox("Use ATR winner protection", value=True, key="bt_bb_atr_on")
+            bb_atr_len = st.number_input("ATR Length", min_value=5, max_value=100, value=14, step=1, key="bt_bb_atr_len")
+            bb_atr_mult = st.number_input("ATR Trail Multiplier", min_value=1.0, max_value=10.0, value=4.0, step=0.25, key="bt_bb_atr_mult")
+            bb_min_gain_for_trail = st.number_input("Start ATR trail after gain (%)", min_value=0.0, max_value=200.0, value=12.0, step=1.0, key="bt_bb_trail_gain")
+
+        try:
+            bb_df = df_bt.copy()
+            src_map = {
+                "Close": bb_df["Close"],
+                "Open": bb_df["Open"],
+                "High": bb_df["High"],
+                "Low": bb_df["Low"],
+                "HL2": (bb_df["High"] + bb_df["Low"]) / 2.0,
+                "HLC3": (bb_df["High"] + bb_df["Low"] + bb_df["Close"]) / 3.0,
+                "OHLC4": (bb_df["Open"] + bb_df["High"] + bb_df["Low"] + bb_df["Close"]) / 4.0,
+            }
+            bb_src = pd.Series(src_map[bb_source_name], index=bb_df.index).astype(float)
+            bb_len_i = max(2, int(bb_len))
+
+            if bb_ma_type == "EMA":
+                bb_basis = bb_src.ewm(span=bb_len_i, adjust=False).mean()
+            elif bb_ma_type == "WMA":
+                weights = np.arange(1, bb_len_i + 1)
+                bb_basis = bb_src.rolling(bb_len_i).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+            elif bb_ma_type == "VWMA":
+                vol = bb_df.get("Volume", pd.Series(1.0, index=bb_df.index)).replace(0, np.nan).fillna(1.0)
+                bb_basis = (bb_src * vol).rolling(bb_len_i).sum() / vol.rolling(bb_len_i).sum()
+            else:
+                bb_basis = bb_src.rolling(bb_len_i).mean()
+
+            bb_std = bb_src.rolling(bb_len_i).std()
+            bb_upper = bb_basis + float(bb_mult) * bb_std
+            bb_lower = bb_basis - float(bb_mult) * bb_std
+            bb_bandwidth = ((bb_upper - bb_lower) / (bb_basis.abs() + 1e-9)).replace([np.inf, -np.inf], np.nan)
+            bw_rank = bb_bandwidth.rolling(int(bb_squeeze_len), min_periods=max(20, int(bb_squeeze_len)//3)).rank(pct=True) * 100.0
+
+            close_px = bb_df["Close"].astype(float)
+            ema50 = close_px.ewm(span=50, adjust=False).mean()
+            ema_trend = close_px.ewm(span=int(bb_trend_len), adjust=False).mean()
+            trend_ok = (close_px > ema_trend) & (ema50 >= ema_trend)
+            if not bb_use_trend:
+                trend_ok = pd.Series(True, index=bb_df.index)
+
+            squeeze_ok = (bw_rank.shift(1) <= float(bb_squeeze_pct)) & (bb_bandwidth > bb_bandwidth.shift(1))
+            if not bb_use_squeeze:
+                squeeze_ok = pd.Series(True, index=bb_df.index)
+
+            breakout_entry = (close_px > bb_upper) & (close_px.shift(1) <= bb_upper.shift(1)) & trend_ok & squeeze_ok
+            # Mean-reversion entry is intentionally conservative: price must reclaim the lower band,
+            # and the major trend cannot be structurally broken unless the user disabled the filter.
+            mr_reclaim = (close_px > bb_lower) & (close_px.shift(1) <= bb_lower.shift(1))
+            mr_context = (close_px >= ema_trend) | (close_px > bb_basis)
+            meanrev_entry = mr_reclaim & trend_ok & mr_context
+
+            if bb_mode == "Breakout Trend Only":
+                entry_sig = breakout_entry
+            elif bb_mode == "Mean Reversion Only":
+                entry_sig = meanrev_entry
+            else:
+                entry_sig = breakout_entry | meanrev_entry
+
+            tr1 = (bb_df["High"] - bb_df["Low"]).abs()
+            tr2 = (bb_df["High"] - close_px.shift(1)).abs()
+            tr3 = (bb_df["Low"] - close_px.shift(1)).abs()
+            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = true_range.rolling(int(bb_atr_len), min_periods=int(bb_atr_len)).mean()
+
+            below_basis = (close_px < bb_basis).fillna(False)
+            basis_exit_confirmed = below_basis.rolling(int(bb_confirm), min_periods=int(bb_confirm)).sum().eq(int(bb_confirm))
+            emergency_exit = (close_px < bb_lower) & (close_px.shift(1) >= bb_lower.shift(1))
+
+            signals = pd.Series(0.0, index=bb_df.index)
+            in_pos = False
+            entry_px = np.nan
+            peak_px = np.nan
+            for idx in bb_df.index:
+                px = float(close_px.loc[idx]) if pd.notna(close_px.loc[idx]) else np.nan
+                if not np.isfinite(px):
+                    signals.loc[idx] = 1.0 if in_pos else 0.0
+                    continue
+                if not in_pos:
+                    if bool(entry_sig.loc[idx]):
+                        in_pos = True
+                        entry_px = px
+                        peak_px = px
+                        signals.loc[idx] = 1.0
+                    else:
+                        signals.loc[idx] = 0.0
+                    continue
+
+                peak_px = max(float(peak_px), px)
+                gain_pct = ((px / float(entry_px)) - 1.0) * 100.0 if np.isfinite(entry_px) and entry_px > 0 else 0.0
+                atr_stop_hit = False
+                if bb_use_atr_trail and gain_pct >= float(bb_min_gain_for_trail) and pd.notna(atr.loc[idx]):
+                    atr_stop_hit = px < (float(peak_px) - float(bb_atr_mult) * float(atr.loc[idx]))
+                mid_exit_hit = bool(basis_exit_confirmed.loc[idx]) if bb_mid_exit else False
+                should_exit = bool(emergency_exit.loc[idx]) or mid_exit_hit or atr_stop_hit
+                if should_exit:
+                    in_pos = False
+                    entry_px = np.nan
+                    peak_px = np.nan
+                    signals.loc[idx] = 0.0
+                else:
+                    signals.loc[idx] = 1.0
+
+            signals = signals.reindex(prices_bt.index).ffill().fillna(0.0)
+            strat_prices = prices_bt
+
+            with st.expander("Bollinger strategy context", expanded=True):
+                fig_bb = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.58, 0.22, 0.20], vertical_spacing=0.04)
+                fig_bb.add_trace(go.Scatter(x=close_px.index, y=close_px, mode="lines", name=f"{TICKER} Close"), row=1, col=1)
+                fig_bb.add_trace(go.Scatter(x=bb_upper.index, y=bb_upper, mode="lines", name="Upper Band", line=dict(width=1)), row=1, col=1)
+                fig_bb.add_trace(go.Scatter(x=bb_basis.index, y=bb_basis, mode="lines", name="Basis", line=dict(width=1)), row=1, col=1)
+                fig_bb.add_trace(go.Scatter(x=bb_lower.index, y=bb_lower, mode="lines", name="Lower Band", line=dict(width=1)), row=1, col=1)
+                fig_bb.add_trace(go.Scatter(x=ema_trend.index, y=ema_trend, mode="lines", name=f"Trend EMA {int(bb_trend_len)}", line=dict(width=1)), row=1, col=1)
+                fig_bb.add_trace(go.Scatter(x=bb_bandwidth.index, y=bb_bandwidth, mode="lines", name="Bandwidth"), row=2, col=1)
+                fig_bb.add_trace(go.Scatter(x=bw_rank.index, y=bw_rank, mode="lines", name="Bandwidth Percentile"), row=2, col=1)
+                fig_bb.add_trace(go.Scatter(x=signals.index, y=signals * 100, mode="lines", name="Exposure %", fill="tozeroy"), row=3, col=1)
+                fig_bb.update_layout(title=f"{TICKER} Institutional Bollinger Bands Context", template="plotly_dark", hovermode="x unified", height=760)
+                fig_bb.update_yaxes(title_text="Price", row=1, col=1)
+                fig_bb.update_yaxes(title_text="Band", row=2, col=1)
+                fig_bb.update_yaxes(title_text="Exposure", row=3, col=1, range=[0, 105])
+                st.plotly_chart(fig_bb, use_container_width=True)
+                st.caption("Default logic: breakout after squeeze expansion in a healthy trend, or conservative lower-band reclaim. Exit uses confirmed basis break, lower-band emergency exit, and optional ATR winner protection.")
+
+        except Exception as e:
+            st.error(f"Error calculating Institutional Bollinger Bands: {e}")
+            signals = None
+
+    elif strategy_type == "Composite Risk Score (CRS)":
+        st.markdown("### 🧠 Composite Risk Score (CRS) — Quality + Momentum")
+        st.caption("Price-data version of the WisdomTree-style CRS idea: 50% quality proxy + 50% risk-adjusted momentum. It is designed as a stock-risk filter, not a perfect fundamentals replica.")
+
+        col_crs1, col_crs2, col_crs3 = st.columns(3)
+        with col_crs1:
+            crs_quality_weight = st.slider("Quality Weight (%)", 0, 100, 50, step=5, key="bt_crs_quality_weight")
+            crs_trend_len = st.number_input("Quality Trend Length", min_value=20, max_value=300, value=200, step=10, key="bt_crs_trend_len")
+            crs_vol_len = st.number_input("Volatility Lookback", min_value=10, max_value=126, value=63, step=5, key="bt_crs_vol_len")
+        with col_crs2:
+            crs_mom_fast = st.number_input("Fast Momentum Bars", min_value=10, max_value=252, value=126, step=5, key="bt_crs_mom_fast", help="About 6 months on daily data; automatically represents bars on the selected timeframe.")
+            crs_mom_slow = st.number_input("Slow Momentum Bars", min_value=20, max_value=504, value=252, step=10, key="bt_crs_mom_slow", help="About 12 months on daily data; automatically represents bars on the selected timeframe.")
+            crs_confirm_bars = st.number_input("Confirmation Bars", min_value=1, max_value=10, value=2, step=1, key="bt_crs_confirm_bars")
+        with col_crs3:
+            crs_buy_th = st.slider("Buy CRS Threshold", 40, 90, 60, step=1, key="bt_crs_buy_threshold")
+            crs_sell_th = st.slider("Sell CRS Threshold", 10, 70, 45, step=1, key="bt_crs_sell_threshold")
+            crs_use_benchmark = st.checkbox("Show SPY relative strength context", value=True, key="bt_crs_show_spy")
+
+        if crs_sell_th >= crs_buy_th:
+            st.warning("Sell threshold should be below Buy threshold to avoid constant flipping.")
+
+        try:
+            px = prices_bt.copy().replace([np.inf, -np.inf], np.nan).dropna()
+            rets = px.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+            def _pct_rank_rolling(series, window):
+                """Rolling percentile rank of the latest value inside its own window, scaled 0-100."""
+                window = int(max(5, window))
+                def _rank_last(x):
+                    x = pd.Series(x).dropna()
+                    if len(x) == 0:
+                        return np.nan
+                    return float((x <= x.iloc[-1]).mean() * 100.0)
+                return series.rolling(window, min_periods=max(5, int(window * 0.35))).apply(_rank_last, raw=False)
+
+            # -------------------------
+            # QUALITY PROXY — 50% default
+            # -------------------------
+            trend_len = int(crs_trend_len)
+            vol_len = int(crs_vol_len)
+            ema_trend = px.ewm(span=trend_len, adjust=False).mean()
+            ema_slope = ema_trend.pct_change(max(1, min(20, trend_len // 10))).fillna(0.0)
+
+            price_vs_trend_score = ((px / (ema_trend + 1e-12) - 1.0) * 500.0 + 50.0).clip(0, 100)
+            trend_slope_score = (ema_slope * 2000.0 + 50.0).clip(0, 100)
+
+            rolling_high = px.rolling(trend_len, min_periods=max(10, trend_len // 4)).max()
+            drawdown = (px / (rolling_high + 1e-12) - 1.0).fillna(0.0)
+            drawdown_quality = (100.0 + drawdown * 250.0).clip(0, 100)
+
+            realized_vol = rets.rolling(vol_len, min_periods=max(5, vol_len // 3)).std()
+            vol_rank = _pct_rank_rolling(realized_vol, max(50, vol_len * 4))
+            volatility_quality = (100.0 - vol_rank).clip(0, 100)
+
+            quality_score = pd.concat([
+                price_vs_trend_score.rename("Price vs trend"),
+                trend_slope_score.rename("Trend slope"),
+                drawdown_quality.rename("Drawdown quality"),
+                volatility_quality.rename("Volatility quality")
+            ], axis=1).mean(axis=1).clip(0, 100)
+
+            # -------------------------
+            # MOMENTUM PROXY — 50% default
+            # -------------------------
+            mom_fast = int(crs_mom_fast)
+            mom_slow = int(crs_mom_slow)
+
+            fast_ret = px.pct_change(mom_fast)
+            slow_ret = px.pct_change(mom_slow)
+            fast_vol = rets.rolling(mom_fast, min_periods=max(10, mom_fast // 3)).std() * np.sqrt(max(1, mom_fast))
+            slow_vol = rets.rolling(mom_slow, min_periods=max(10, mom_slow // 3)).std() * np.sqrt(max(1, mom_slow))
+
+            fast_ra_mom = fast_ret / (fast_vol + 1e-9)
+            slow_ra_mom = slow_ret / (slow_vol + 1e-9)
+            fast_mom_score = _pct_rank_rolling(fast_ra_mom, max(50, mom_slow))
+            slow_mom_score = _pct_rank_rolling(slow_ra_mom, max(50, mom_slow))
+            momentum_score = pd.concat([fast_mom_score.rename("Fast risk-adj momentum"), slow_mom_score.rename("Slow risk-adj momentum")], axis=1).mean(axis=1).clip(0, 100)
+
+            q_w = float(crs_quality_weight) / 100.0
+            m_w = 1.0 - q_w
+            crs_score = (quality_score * q_w + momentum_score * m_w).replace([np.inf, -np.inf], np.nan)
+            crs_score = crs_score.ffill().fillna(0.0).clip(0, 100)
+
+            raw_buy = crs_score >= float(crs_buy_th)
+            raw_sell = crs_score <= float(crs_sell_th)
+            conf_n = int(crs_confirm_bars)
+            buy_cond = raw_buy.astype(int).rolling(conf_n, min_periods=conf_n).sum().eq(conf_n)
+            sell_cond = raw_sell.astype(int).rolling(conf_n, min_periods=conf_n).sum().eq(conf_n)
+
+            crs_signal = pd.Series(np.nan, index=px.index)
+            crs_signal.loc[buy_cond] = 1.0
+            crs_signal.loc[sell_cond] = 0.0
+            signals = crs_signal.ffill().fillna(0.0).reindex(prices_bt.index).ffill().fillna(0.0)
+            strat_prices = prices_bt
+
+            with st.expander("See CRS Components", expanded=True):
+                fig_crs = make_subplots(
+                    rows=3,
+                    cols=1,
+                    shared_xaxes=True,
+                    row_heights=[0.48, 0.28, 0.24],
+                    vertical_spacing=0.05,
+                    subplot_titles=("Price + CRS exposure", "Composite Risk Score", "Quality and Momentum components")
+                )
+                fig_crs.add_trace(go.Scatter(x=px.index, y=px, mode="lines", name=f"{TICKER} Price", line=dict(color="gray")), row=1, col=1)
+                fig_crs.add_trace(go.Scatter(x=ema_trend.index, y=ema_trend, mode="lines", name=f"EMA {trend_len} quality trend", line=dict(color="orange")), row=1, col=1)
+                highlight_plotly_zones(fig_crs, signals.reindex(px.index).fillna(0).eq(1), "green", opacity=0.10, row=1, col=1)
+
+                fig_crs.add_trace(go.Scatter(x=crs_score.index, y=crs_score, mode="lines", name="CRS", line=dict(color="cyan", width=2)), row=2, col=1)
+                fig_crs.add_hline(y=float(crs_buy_th), line_dash="dash", line_color="green", row=2, col=1, annotation_text="Buy threshold")
+                fig_crs.add_hline(y=float(crs_sell_th), line_dash="dash", line_color="red", row=2, col=1, annotation_text="Sell threshold")
+
+                fig_crs.add_trace(go.Scatter(x=quality_score.index, y=quality_score, mode="lines", name="Quality proxy", line=dict(color="royalblue")), row=3, col=1)
+                fig_crs.add_trace(go.Scatter(x=momentum_score.index, y=momentum_score, mode="lines", name="Risk-adjusted momentum", line=dict(color="lime")), row=3, col=1)
+                fig_crs.update_yaxes(range=[0, 100], row=2, col=1)
+                fig_crs.update_yaxes(range=[0, 100], row=3, col=1)
+                fig_crs.update_layout(title=f"{TICKER} Composite Risk Score — {int(crs_quality_weight)}% Quality / {100-int(crs_quality_weight)}% Momentum", template="plotly_dark", hovermode="x unified", height=820)
+                st.plotly_chart(fig_crs, use_container_width=True)
+
+                latest_crs = float(crs_score.iloc[-1]) if len(crs_score) else np.nan
+                latest_q = float(quality_score.iloc[-1]) if len(quality_score) else np.nan
+                latest_m = float(momentum_score.iloc[-1]) if len(momentum_score) else np.nan
+                st.metric("Latest CRS", f"{latest_crs:.1f}/100")
+                st.caption(f"Latest quality proxy: {latest_q:.1f}/100 | Latest risk-adjusted momentum: {latest_m:.1f}/100")
+
+                if crs_use_benchmark:
+                    try:
+                        spy = load_data("SPY", pd.Timestamp(px.index[0]).to_pydatetime(), pd.Timestamp(px.index[-1]).to_pydatetime(), interval=bt_interval)
+                        if spy is not None and not spy.empty and "Close" in spy.columns:
+                            spy_close = spy["Close"].reindex(px.index).ffill()
+                            rs_line = (px / px.iloc[0]) / (spy_close / spy_close.iloc[0]) * 100.0
+                            fig_rs = go.Figure()
+                            fig_rs.add_trace(go.Scatter(x=rs_line.index, y=rs_line, mode="lines", name=f"{TICKER} vs SPY relative strength"))
+                            fig_rs.add_hline(y=100, line_dash="dash", line_color="gray")
+                            fig_rs.update_layout(title="Relative Strength Context", template="plotly_dark", hovermode="x unified", height=320)
+                            st.plotly_chart(fig_rs, use_container_width=True)
+                    except Exception as rs_e:
+                        st.caption(f"SPY relative strength context unavailable: {rs_e}")
+
+                crs_diag = pd.DataFrame({
+                    "Close": px,
+                    "CRS": crs_score,
+                    "Quality Proxy": quality_score,
+                    "Risk-Adjusted Momentum": momentum_score,
+                    "Price vs Trend Score": price_vs_trend_score,
+                    "Trend Slope Score": trend_slope_score,
+                    "Drawdown Quality": drawdown_quality,
+                    "Volatility Quality": volatility_quality,
+                    "Signal": signals.reindex(px.index).fillna(0)
+                })
+                st.dataframe(crs_diag.tail(150), use_container_width=True)
+                st.caption("CRS interpretation: higher = cleaner quality/momentum profile; lower = riskier/weakening profile. This is a technical proxy because ordinary OHLCV backtests do not contain full historical ROE/ROA/cash-flow data.")
+
+        except Exception as e:
+            st.error(f"Error calculating Composite Risk Score: {e}")
+            signals = None
+
     elif strategy_type == "Institutional Hurst Exponent":
         st.markdown("### 🎲 Institutional Hurst Exponent (Trend vs Mean-Reversion)")
         st.markdown("Trade the asset based on its mathematical persistence. \n* **Trending Regime (H > 0.55):** Buy via Momentum (EMA Cross).\n* **Mean-Reverting Regime (H < 0.45):** Buy via Mean Reversion (Bollinger Bands).\n* **Dead Zone:** Stay in CASH between 0.45 and 0.55. Uses 5-bar confirmation to kill whipsaws.")
-        
+    
         col_h1, col_h2 = st.columns(2)
         with col_h1:
             hurst_window = st.number_input("Rolling Window", min_value=20, max_value=500, value=50, step=10)
@@ -15794,18 +16354,18 @@ with tab7:
         with col_h2:
             st.write("Regime Parameters")
             st.caption("Dead Zone: 0.45 to 0.55\nConfirmation: 3 Consecutive Bars\nSizing: Continuous Vol-Targeting")
-            
+        
         with st.spinner("Calculating Institutional Hurst & Volatility Targeting..."):
             try:
                 hurst_series = rolling_hurst(prices_bt, window=int(hurst_window))
-                
+            
                 # 1. Trend Signal (Slow EMA trend filter)
                 # Cleaner than EMA-fast/EMA-slow cross for this Hurst allocator:
                 # long only when price is above the slow trend filter.
                 ema_fast = prices_bt.ewm(span=20, adjust=False).mean()
                 ema_slow = prices_bt.ewm(span=50, adjust=False).mean()
                 trend_signal = (prices_bt > ema_slow).astype(float)
-                
+            
                 # 2. Mean Reversion Signal (Bollinger Bands)
                 bb_ma = prices_bt.rolling(window=20).mean()
                 bb_std = prices_bt.rolling(window=20).std()
@@ -15814,26 +16374,26 @@ with tab7:
                 mr_sig.loc[prices_bt < bb_lower] = 1.0
                 mr_sig.loc[prices_bt > bb_ma] = 0.0
                 mr_signal = mr_sig.ffill().fillna(0.0)
-                
+            
                 # 3. Regime Allocator (3-Bar Confirmation + Dead Zone)
                 cond_trend = (hurst_series > 0.55)
                 cond_mr = (hurst_series < 0.45)
                 cond_cash = (hurst_series >= 0.45) & (hurst_series <= 0.55)
-                
+            
                 conf_trend = cond_trend.astype(int).rolling(3, min_periods=3).sum().eq(3).fillna(False)
                 conf_mr = cond_mr.astype(int).rolling(3, min_periods=3).sum().eq(3).fillna(False)
                 conf_cash = cond_cash.astype(int).rolling(3, min_periods=3).sum().eq(3).fillna(False)
-                
+            
                 state = pd.Series(np.nan, index=prices_bt.index)
                 state.loc[conf_trend] = 1 # 1 = TREND
                 state.loc[conf_mr] = -1   # -1 = MR
                 state.loc[conf_cash] = 0  # 0 = CASH
                 state = state.ffill().fillna(0)
-                
+            
                 raw_signals = pd.Series(0.0, index=prices_bt.index)
                 raw_signals.loc[state == 1] = trend_signal.loc[state == 1]
                 raw_signals.loc[state == -1] = mr_signal.loc[state == -1]
-                
+            
                 # 4. Optional Volatility Targeting Capital Sizing
                 # OFF = clean 0/1 strategy signal.
                 # ON  = scale exposure by GARCH volatility, capped between 0% and 100%.
@@ -15861,29 +16421,29 @@ with tab7:
                         signals = raw_signals.fillna(0.0)
                 else:
                     signals = raw_signals.fillna(0.0)
-                
+            
                 with st.expander("See Strategy Context", expanded=True):
                     fig_ctx = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.4, 0.3, 0.3], vertical_spacing=0.05)
-                    
+                
                     fig_ctx.add_trace(go.Scatter(x=prices_bt.index, y=prices_bt, mode='lines', line=dict(color='gray'), opacity=0.8, name='Price'), row=1, col=1)
-                    
+                
                     fig_ctx.add_trace(go.Scatter(x=hurst_series.index, y=hurst_series, mode='lines', line=dict(color='cyan'), name='Hurst (H)'), row=2, col=1)
                     fig_ctx.add_hline(y=0.55, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Trend (>0.55)")
                     fig_ctx.add_hline(y=0.45, line_dash="dash", line_color="red", row=2, col=1, annotation_text="Mean Reversion (<0.45)")
-                    
+                
                     # Plot Capital Allocation
                     fig_ctx.add_trace(go.Scatter(x=signals.index, y=signals * 100, mode='lines', line=dict(color='green'), fill='tozeroy', name='Capital Exposure (%)'), row=3, col=1)
-                    
+                
                     # Highlight regimes
                     highlight_plotly_zones(fig_ctx, state == 1, 'green', opacity=0.1, row=1, col=1)
                     highlight_plotly_zones(fig_ctx, state == -1, 'orange', opacity=0.1, row=1, col=1)
                     highlight_plotly_zones(fig_ctx, state == 1, 'green', opacity=0.1, row=2, col=1)
                     highlight_plotly_zones(fig_ctx, state == -1, 'orange', opacity=0.1, row=2, col=1)
-                    
+                
                     fig_ctx.update_layout(title=f"Institutional Hurst Regime (Dead Zone + {'Vol Targeting' if use_vol_target else 'Raw 0/1 Exposure'})", hovermode="x unified", template="plotly_dark", height=700)
                     fig_ctx.update_yaxes(title_text="Capital (%)", row=3, col=1, range=[0, 105])
                     st.plotly_chart(fig_ctx, use_container_width=True)
-                    
+                
             except Exception as e:
                 st.error(f"Error calculating Hurst Exponent: {str(e)}")
                 signals = None
@@ -15893,7 +16453,8 @@ with tab7:
         # Keep original weekly model price/signal series for execution so returns,
         # PnL, stops, equity curve, and metrics remain EXACTLY the same.
         # Only the trade-log dates are mapped to actual raw trading dates for display.
-        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, stop_loss)
+        _strategy_stop_loss_for_run = 0.0 if strategy_type == "Regime Switching (Trend Following)" else stop_loss
+        bt_results = BacktestEngine.run_strategy(strat_prices, signals, initial_cap, trailing_stop, _strategy_stop_loss_for_run)
 
         # --- STRATEGY SIGNAL BANNER ---
         last_sig = signals.iloc[-1]
@@ -15915,7 +16476,7 @@ with tab7:
             alert_config=alert_config,
             extra_note=f"Backtest tab strategy: {strategy_type}"
         )
-        
+    
         # For weekly Regime Switching in live/current week, the trade log may mark an
         # open position to the latest raw/live price for display. Keep the original
         # strategy logic intact, but make the displayed performance metrics use that
@@ -15944,41 +16505,50 @@ with tab7:
         strat_metrics = BacktestEngine.calculate_metrics(bt_results['returns'], rf_rate)
         bench_metrics = BacktestEngine.calculate_metrics(strat_prices.pct_change().dropna(), rf_rate)
         total_pnl_return_pct = total_trade_pnl_return_pct(bt_results.get('trades', pd.DataFrame()))
-        
+
+        metric_cumulative_return_pct = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
+        metric_total_pnl_return_pct = total_pnl_return_pct
+        try:
+            if strategy_type == "Regime Switching (Trend Following)":
+                _metric_log = recalc_trade_log_cumulative_from_pnl(bt_results.get('trades', pd.DataFrame()).copy())
+                if _metric_log is not None and not _metric_log.empty:
+                    if "PnL (%)" in _metric_log.columns:
+                        _metric_pnl_vals = pd.to_numeric(_metric_log["PnL (%)"], errors="coerce").dropna()
+                        if len(_metric_pnl_vals):
+                            metric_total_pnl_return_pct = float(_metric_pnl_vals.sum())
+
+                    if "Cumulative Return (%)" in _metric_log.columns:
+                        _entry_col_metric = "Entry Date" if "Entry Date" in _metric_log.columns else ("Entry CT" if "Entry CT" in _metric_log.columns else None)
+                        if _entry_col_metric:
+                            def _metric_sort_entry(v):
+                                try:
+                                    s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                                    if s.lower() in {"", "open", "nan", "nat", "none", "intraday unavailable"}:
+                                        return pd.NaT
+                                    ts = pd.Timestamp(s)
+                                    if getattr(ts, "tzinfo", None) is not None:
+                                        ts = ts.tz_convert(None)
+                                    return ts
+                                except Exception:
+                                    return pd.NaT
+                            _metric_log["__metric_entry_sort__"] = _metric_log[_entry_col_metric].apply(_metric_sort_entry)
+                            _metric_log = _metric_log.sort_values("__metric_entry_sort__", ascending=True, na_position="last", kind="mergesort")
+                        _metric_cum_vals = pd.to_numeric(_metric_log["Cumulative Return (%)"], errors="coerce").dropna()
+                        if len(_metric_cum_vals):
+                            metric_cumulative_return_pct = float(_metric_cum_vals.iloc[-1])
+        except Exception:
+            pass
+
+    
         # Display Metrics
-        st.write("#### 📊 Performance Metrics")
+        # IMPORTANT FIX:
+        # The metric cards are rendered into this placeholder AFTER the final visible
+        # trade log is built. This guarantees:
+        #   Cumulative Return metric == final visible trade-log cumulative return
+        #   Total Trade PnL metric == sum of final visible trade-log PnL values
+        # while keeping this section visually in the same location.
         current_benchmark_pct = (bt_results['benchmark_curve'].iloc[-1]/initial_cap - 1)*100
-        if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
-            met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
-            with met_col1:
-                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
-            with met_col2:
-                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
-            with met_col3:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
-            with met_col4:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
-            with met_col5:
-                help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
-                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
-            with met_col6:
-                strategy_pct_now = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
-                if benchmark_label_for_metrics == "Full Benchmark":
-                    st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
-                else:
-                    st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
-        else:
-            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
-            with met_col1:
-                st.metric("Cumulative Return", f"{(bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100:.2f}%", help="Compounded strategy/account return.")
-            with met_col2:
-                st.metric("Total Trade PnL", f"{total_pnl_return_pct:+.2f}%", help="Non-cumulative sum of each trade PnL %. This does not compound.")
-            with met_col3:
-                st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
-            with met_col4:
-                st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
-            with met_col5:
-                st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
+        _perf_metrics_placeholder = st.empty()
 
         def _latest_display_price_and_time_for_regime():
             """Get the freshest available close for display-only marking."""
@@ -16201,7 +16771,7 @@ with tab7:
         if strategy_type == "Regime Switching (Trend Following)":
             st.markdown("<div style='height:28px'></div><hr style='margin-top:0;margin-bottom:22px;'>", unsafe_allow_html=True)
             st.write("#### 📈 Regime Switching Price Graph")
-            st.caption("Default view is the asset price with small buy/sell markers. Use Plotly tools to zoom, pan, crosshair-hover, and draw lines.")
+            st.caption("Default view is the asset price with small buy/sell markers. Markers are built from the SAME finalized trade log displayed below, so graph and table match.")
 
             pgc1, pgc2, pgc3 = st.columns(3)
             with pgc1:
@@ -16226,7 +16796,7 @@ with tab7:
                     "Precise intraday times for old trades",
                     value=True,
                     key=f"regime_precise_old_trade_times_{TICKER}_{bt_freq}",
-                    help="Keeps the option OFF by default. For speed, exact mapping only runs when you click the button below."
+                    help="Keeps the option ON by default. For speed, exact mapping only runs when you click the button below."
                 )
                 regime_precise_time_rows = st.number_input(
                     "Precise-time rows to process",
@@ -16263,8 +16833,68 @@ with tab7:
                         pass
                 try:
                     plot_trades_df = _mark_latest_regime_trade_open_if_signal_long(plot_trades_df)
-                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
-                    plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+                    # Match the exact table logic: do NOT overwrite natural intraday Daily rows
+                    # with latest/daily reconciliation when the precise intraday button was used.
+                    if not (strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now)):
+                        plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
+                except Exception:
+                    pass
+
+                # FINAL DISPLAY NORMALIZATION FOR THE GRAPH:
+                # The chart markers must use the SAME finalized trade log as the table below.
+                # Previously, the graph used semi-processed plot_trades_df while the table
+                # later applied sorting, overlap cleanup, timestamp formatting, final regime
+                # display cleanup, and daily reconciliation. That caused marker/log mismatch.
+                try:
+                    if plot_trades_df is not None and not plot_trades_df.empty:
+                        if 'Entry Date' in plot_trades_df.columns:
+                            try:
+                                def _entry_sort_key_for_graph_display(v):
+                                    try:
+                                        if v is None:
+                                            return pd.NaT
+                                        s = str(v).replace(' CT', '').replace(' CST', '').replace(' CDT', '').strip()
+                                        if s.lower() in {'', 'nan', 'nat', 'none', 'open'}:
+                                            return pd.NaT
+                                        ts = pd.Timestamp(s)
+                                        if pd.isna(ts):
+                                            return pd.NaT
+                                        if getattr(ts, 'tzinfo', None) is not None:
+                                            ts = ts.tz_convert(None)
+                                        return ts
+                                    except Exception:
+                                        return pd.NaT
+                                plot_trades_df['__entry_sort_key__'] = plot_trades_df['Entry Date'].apply(_entry_sort_key_for_graph_display)
+                                plot_trades_df = (
+                                    plot_trades_df.sort_values('__entry_sort_key__', ascending=False, na_position='last')
+                                                  .drop(columns=['__entry_sort_key__'], errors='ignore')
+                                                  .reset_index(drop=True)
+                                )
+                            except Exception:
+                                plot_trades_df = plot_trades_df.reset_index(drop=True)
+
+                        plot_trades_df = clean_overlapping_duplicate_trades(plot_trades_df)
+                        plot_trades_df = apply_trade_log_timestamp_display(plot_trades_df)
+
+                        if strategy_type == "Regime Switching (Trend Following)" and bt_freq in ["Weekly", "Daily"]:
+                            plot_trades_df = finalize_regime_trade_time_display(plot_trades_df)
+                            try:
+                                if bt_freq == "Daily":
+                                    plot_trades_df = _reconcile_latest_daily_regime_exit_price(plot_trades_df)
+                            except Exception:
+                                pass
+
+                        plot_trades_df = plot_trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
+
+                        if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now):
+                            for _col in ["Entry Date", "Exit Date"]:
+                                if _col in plot_trades_df.columns:
+                                    _mask_3pm = plot_trades_df[_col].astype(str).str.contains("15:00:00 CT", na=False)
+                                    plot_trades_df.loc[_mask_3pm, _col] = "Intraday unavailable"
+
+                        # Keep graph-side trade data internally consistent:
+                        # Cumulative Return (%) is compounded from the same PnL (%) values.
+                        plot_trades_df = recalc_trade_log_cumulative_from_pnl(plot_trades_df)
                 except Exception:
                     pass
 
@@ -16900,6 +17530,14 @@ with tab7:
                     config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"]}
                 )
                 safe_report_add("Backtest Performance", fig_bt)
+        elif strategy_type == "Implied Volatility Proxy (^VIX)":
+            render_iv_price_trade_chart_like_regime(
+                ticker=TICKER,
+                prices=strat_prices,
+                trades_df=bt_results.get('trades', pd.DataFrame()),
+                bt_results=bt_results,
+                benchmark_label=benchmark_label_for_metrics
+            )
         else:
             # Equity Curve Plot
             st.write("#### 📈 Equity Curve")
@@ -16930,6 +17568,11 @@ with tab7:
                     trades_df = apply_weekly_live_trigger_display_overrides(
                         trades_df, df_bt, signals, ticker=TICKER, strategy_name=strategy_type
                     )
+                    # DISPLAY ONLY: keep the strategy logic intact, but make visible
+                    # Buy/Sell Price match the actual raw-market Close for the displayed
+                    # Entry/Exit Date. This removes synthetic stop/trailing-stop prices
+                    # from the trade log for tickers like APTV.
+                    trades_df = apply_regime_trade_log_raw_close_prices_display(trades_df, df_bt)
                     try:
                         _precise_ok = bool(regime_precise_old_times)
                     except Exception:
@@ -16994,7 +17637,7 @@ with tab7:
                         trades_df = _reconcile_latest_daily_regime_exit_price(trades_df)
                 except Exception:
                     pass
-            
+        
             trades_df = trades_df.drop(columns=["Latest Price Reconciliation"], errors="ignore")
             try:
                 if strategy_type == "Regime Switching (Trend Following)" and bt_freq == "Daily" and bool(regime_run_precise_now):
@@ -17005,49 +17648,146 @@ with tab7:
             except Exception:
                 pass
 
+            # FIX: left PnL (%) = single trade return; right Cumulative Return (%)
+            # = compounded from those PnL values, oldest-to-newest.
+            trades_df = recalc_trade_log_cumulative_from_pnl(trades_df)
+            trades_df = clean_trade_log_for_display(trades_df)
+
+            # Render performance metrics from the EXACT SAME final visible trade log.
+            # This fixes the mismatch where trade log showed 69.17% but the metric
+            # still showed 100.99% from the earlier/raw internal trade set.
+            try:
+                metric_cumulative_return_pct = (bt_results['equity_curve'].iloc[-1]/initial_cap - 1)*100
+                metric_total_pnl_return_pct = total_pnl_return_pct
+
+                if strategy_type == "Regime Switching (Trend Following)" and trades_df is not None and not trades_df.empty:
+                    if "PnL (%)" in trades_df.columns:
+                        _final_pnl_vals = pd.to_numeric(trades_df["PnL (%)"], errors="coerce").dropna()
+                        if len(_final_pnl_vals):
+                            metric_total_pnl_return_pct = float(_final_pnl_vals.sum())
+
+                    if "Cumulative Return (%)" in trades_df.columns:
+                        _final_metric_log = trades_df.copy()
+                        _entry_col_metric = "Entry Date" if "Entry Date" in _final_metric_log.columns else ("Entry CT" if "Entry CT" in _final_metric_log.columns else None)
+                        if _entry_col_metric:
+                            def _final_metric_sort_entry(v):
+                                try:
+                                    s = str(v).replace(" CT", "").replace(" CST", "").replace(" CDT", "").strip()
+                                    if s.lower() in {"", "open", "nan", "nat", "none", "intraday unavailable"}:
+                                        return pd.NaT
+                                    ts = pd.Timestamp(s)
+                                    if getattr(ts, "tzinfo", None) is not None:
+                                        ts = ts.tz_convert(None)
+                                    return ts
+                                except Exception:
+                                    return pd.NaT
+                            _final_metric_log["__final_metric_entry_sort__"] = _final_metric_log[_entry_col_metric].apply(_final_metric_sort_entry)
+                            _final_metric_log = _final_metric_log.sort_values("__final_metric_entry_sort__", ascending=True, na_position="last", kind="mergesort")
+                        _final_cum_vals = pd.to_numeric(_final_metric_log["Cumulative Return (%)"], errors="coerce").dropna()
+                        if len(_final_cum_vals):
+                            metric_cumulative_return_pct = float(_final_cum_vals.iloc[-1])
+
+                with _perf_metrics_placeholder.container():
+                    st.write("#### 📊 Performance Metrics")
+                    if using_wfo_primary_for_metrics and pd.notna(full_period_benchmark_pct_for_metrics):
+                        met_col1, met_col2, met_col3, met_col4, met_col5, met_col6 = st.columns(6)
+                        with met_col1:
+                            st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Matches the final visible trade-log cumulative return.")
+                        with met_col2:
+                            st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Sum of the final visible trade-log PnL values. This does not compound.")
+                        with met_col3:
+                            st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                        with met_col4:
+                            st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                        with met_col5:
+                            help_txt = "Buy & hold over the same period used by the displayed strategy metrics."
+                            st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%", help=help_txt)
+                        with met_col6:
+                            strategy_pct_now = metric_cumulative_return_pct
+                            if benchmark_label_for_metrics == "Full Benchmark":
+                                st.metric("Gap vs Full", f"{strategy_pct_now - current_benchmark_pct:+.2f}%", help="Strategy minus full-period buy & hold.")
+                            else:
+                                st.metric("Full Benchmark", f"{full_period_benchmark_pct_for_metrics:.2f}%", help="Buy & hold over the full selected chart period, including the WFO training window. Reference only.")
+                    else:
+                        met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
+                        with met_col1:
+                            st.metric("Cumulative Return", f"{metric_cumulative_return_pct:.2f}%", help="Matches the final visible trade-log cumulative return.")
+                        with met_col2:
+                            st.metric("Total Trade PnL", f"{metric_total_pnl_return_pct:+.2f}%", help="Sum of the final visible trade-log PnL values. This does not compound.")
+                        with met_col3:
+                            st.metric("Sharpe Ratio", f"{strat_metrics.get('Sharpe Ratio', 0):.2f}")
+                        with met_col4:
+                            st.metric("Max Drawdown", f"{strat_metrics.get('Max Drawdown', 0)*100:.2f}%")
+                        with met_col5:
+                            st.metric(benchmark_label_for_metrics, f"{current_benchmark_pct:.2f}%")
+            except Exception:
+                pass
+
             st.dataframe(trades_df.style.format({
                 "Buy Price": "{:.2f}",
                 "Sell Price": "{:.2f}",
                 "PnL (%)": "{:.2f}%",
-                "Cumulative Return (%)": "{:.2f}"
-            }), use_container_width=True)
+                "Cumulative Return (%)": "{:.2f}%"
+            }), use_container_width=True, hide_index=True)
 
-            # Downloadable trade log with verification info section.
+            # Downloadable regime trade log with ticker + full model/settings context.
+            # Display stays clean; exported CSV becomes audit-ready.
             try:
-                _trade_info = {
-                    "Ticker": TICKER,
-                    "Strategy": strategy_type,
-                    "Frequency": bt_freq if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Number of Regimes": bt_n_regimes if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Signal Stability / Smoothing": bt_stability if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Signal Method": signal_method if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Start Date": bt_start_date,
-                    "End Date": bt_end_date,
-                    "Confirmed-Bar Execution": confirmed_regime_bar if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Locked Non-Repaint Ledger": lock_regime_ledger if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Ledger Setup Key": regime_lock_key if strategy_type == "Regime Switching (Trend Following)" else "N/A",
-                    "Exported At": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                _freq_part = _safe_filename_part(bt_freq if strategy_type == "Regime Switching (Trend Following)" else "NA")
-                _regime_part = _safe_filename_part(bt_n_regimes if strategy_type == "Regime Switching (Trend Following)" else "NA")
-                _smooth_part = _safe_filename_part(bt_stability if strategy_type == "Regime Switching (Trend Following)" else "NA")
-                _strategy_part = _safe_filename_part(strategy_type.replace("(Trend Following)", "").replace("/", "_"))
-                _ticker_part = _safe_filename_part(TICKER)
-                _csv_name = f"{_ticker_part}_{_strategy_part}_{_freq_part}_Regimes{_regime_part}_Smooth{_smooth_part}_TradeLog.csv"
-                st.download_button(
-                    "📥 Download trade log CSV with setup info",
-                    data=build_trade_log_csv_with_info(trades_df, _trade_info),
-                    file_name=_csv_name,
-                    mime="text/csv",
-                    key=f"download_trade_log_with_info_{_ticker_part}_{_strategy_part}_{_freq_part}_{_regime_part}_{_smooth_part}"
-                )
-            except Exception:
-                st.download_button(
-                    "📥 Download trade log CSV",
-                    data=trades_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{_safe_filename_part(TICKER)}_TradeLog.csv",
-                    mime="text/csv"
-                )
+                if strategy_type == "Regime Switching (Trend Following)":
+                    _regime_export_meta = {
+                        "Ticker": str(TICKER).upper(),
+                        "Exported At CT": pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d %I:%M %p CT"),
+                        "Downloaded From": "Regime Switching subtab",
+                        "Strategy Used": str(strategy_type),
+                        "Signal Method": str(signal_method),
+                        "Timeframe": str(bt_freq),
+                        "Smoothing Used": f"EWMA span {int(bt_stability)}" if int(bt_stability) > 0 else "No smoothing",
+                        "Number of Regimes": int(bt_n_regimes),
+                        "Switching Mean": bool(bt_switch_trend),
+                        "Switching Volatility": bool(bt_switch_vol),
+                        "Min Bull Probability": float(conviction),
+                        "Minimum Hold Period": int(min_hold_period),
+                        "Confirmed-bar Execution": bool(confirmed_regime_bar),
+                        "Weekly Signal Updates Friday Close": bool(weekly_close_same_bar) if str(bt_freq) == "Weekly" else "N/A",
+                        "Locked Signal Ledger": bool(lock_regime_ledger),
+                        "Model Frequency": str(regime_model_freq) if "regime_model_freq" in locals() else str(bt_freq),
+                        "Live Regime Hybrid Enabled": bool(regime_live_hybrid_enabled) if "regime_live_hybrid_enabled" in locals() else False,
+                        "Live Regime Anchor": str(live_regime_anchor_freq) if "live_regime_anchor_freq" in locals() else "N/A",
+                        "Live Regime Overlay": bool(live_regime_overlay) if "live_regime_overlay" in locals() else False,
+                        "Live Regime Sensitivity": str(live_regime_sensitivity) if "live_regime_sensitivity" in locals() else "N/A",
+                        "Regime WFO Enabled": bool(use_regime_wfo) if "use_regime_wfo" in locals() else False,
+                        "Use WFO Signal For Backtest": bool(use_regime_wfo_signal) if "use_regime_wfo_signal" in locals() else False,
+                        "Auto-select Regime Count": bool(auto_regime_count_wfo) if "auto_regime_count_wfo" in locals() else False,
+                        "Benchmark-aware Runner Override": bool(use_regime_runner_override) if "use_regime_runner_override" in locals() else False,
+                        "Benchmark-aware Return Booster": bool(use_regime_return_booster) if "use_regime_return_booster" in locals() else False,
+                        "Return Booster Mode": str(regime_return_booster_mode) if "regime_return_booster_mode" in locals() else "N/A",
+                        "Compare/Trade From Full Start Date": bool(regime_full_benchmark_mode) if "regime_full_benchmark_mode" in locals() else False,
+                        "Backtest Start": str(bt_start_date),
+                        "Backtest End": str(bt_end_date),
+                        "Initial Capital": float(initial_cap),
+                        "Trailing Stop Enabled": bool(use_trailing_stop) if "use_trailing_stop" in locals() else False,
+                        "Trailing Stop %": float(trailing_stop * 100.0) if "trailing_stop" in locals() else 0.0,
+                        "Hard Stop Enabled": bool(use_stop_loss) if "use_stop_loss" in locals() else False,
+                        "Hard Stop %": float(stop_loss * 100.0) if "stop_loss" in locals() else 0.0,
+                        "Benchmark Label": str(benchmark_label_for_metrics),
+                        "Source Note": "Metadata is listed vertically at the top; trade log starts below the blank separator row.",
+                    }
+                    _regime_export_csv = build_regime_trade_log_export_csv(trades_df, _regime_export_meta)
+                    # Short filename; full strategy/timeframe/smoothing metadata stays INSIDE the CSV.
+                    _fname = (
+                        f"{_safe_filename_piece(str(TICKER).upper())}_"
+                        f"RegLog_"
+                        f"{pd.Timestamp.now(tz='America/Chicago').strftime('%Y%m%d')}.csv"
+                    )
+                    st.download_button(
+                        "📥 Download Regime Trade Log CSV",
+                        _regime_export_csv.encode("utf-8"),
+                        file_name=_fname,
+                        mime="text/csv",
+                        key=f"regime_trade_log_download_{str(TICKER).upper()}_{str(bt_freq)}_{str(signal_method)}"
+                    )
+            except Exception as _regime_export_err:
+                st.warning(f"Regime trade-log export metadata could not be prepared: {_regime_export_err}")
         else:
             st.info("No closed trades generated by the strategy.")
 
@@ -18937,26 +19677,82 @@ def _build_intraday_runner_signals(d, sensitivity='Balanced', require_vwap=False
     }, index=idx)
     return long_entry.astype(bool), short_entry.astype(bool), features
 
-def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_exit_signal=None, target_pct=0.0075, stop_pct=0.0035, trail_pct=0.0040,
-                          min_hold_bars=3, max_hold_bars=45, max_trades=8, max_day_loss=0.025,
-                          let_winners_run=True, allow_shorts=False, cooldown_after_loss=12, max_consecutive_losses=2,
-                          quality_score=None, reentry_quality_boost=8.0, session_profit_target_pct=0.05,
-                          auction_ok=None, drift_risk=None):
-    """Risk-first single-position intraday engine. Long-only by default.
+DEFAULT_TARGET_ATR_MULT = 1.2
+DEFAULT_STOP_ATR_MULT = 0.6
+DEFAULT_TRAIL_ATR_MULT = 0.7
 
-    Capital protection upgrades:
-    - no short selling unless explicitly allowed by caller
-    - cooldown after a losing trade
-    - disables engine after max consecutive losses
-    - disables engine at max session loss
-    """
+
+def _compute_intraday_atr(d, window=14):
+    """Causal intraday ATR using only information available through each bar."""
+    high = d['High'].astype(float)
+    low = d['Low'].astype(float)
     close = d['Close'].astype(float)
+    prev_close = close.shift(1).fillna(close)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(int(window), min_periods=3).mean()
+    # No backward-fill: bfill would leak future volatility into early bars.
+    fallback = float((high - low).expanding(min_periods=1).mean().iloc[-1]) if len(d) else 0.01
+    fallback = fallback if np.isfinite(fallback) and fallback > 0 else 0.01
+    atr = atr.ffill().fillna((high - low).expanding(min_periods=1).mean()).fillna(fallback)
+    return atr
+
+
+def _run_intraday_capture(
+    d,
+    long_entry_signal,
+    short_entry_signal=None,
+    long_exit_signal=None,
+    target_pct=0.0075,
+    stop_pct=0.0035,
+    trail_pct=0.0040,
+    min_hold_bars=3,
+    max_hold_bars=45,
+    max_trades=8,
+    max_day_loss=0.025,
+    let_winners_run=True,
+    allow_shorts=False,
+    cooldown_after_loss=12,
+    max_consecutive_losses=2,
+    quality_score=None,
+    reentry_quality_boost=8.0,
+    session_profit_target_pct=0.05,
+    auction_ok=None,
+    drift_risk=None,
+    use_atr_sizing=True,
+    atr_window=14,
+    target_atr_mult=DEFAULT_TARGET_ATR_MULT,
+    stop_atr_mult=DEFAULT_STOP_ATR_MULT,
+    trail_atr_mult=DEFAULT_TRAIL_ATR_MULT,
+):
+    """Risk-first single-position intraday engine with causal next-bar execution.
+
+    Entry and signal exits are decided at bar i close and filled at bar i+1 open.
+    Per-trade target/stop/trail distances are frozen from ATR at entry.
+    """
+    if d is None or len(d) == 0:
+        return pd.DataFrame(), pd.Series(dtype=float), {
+            'Strategy Return %': np.nan, 'Buy & Hold Return %': np.nan,
+            'Max Drawdown %': np.nan, 'Trades': 0, 'Long Trades': 0,
+            'Short Trades': 0, 'Daily Guard Hit': False,
+            'Disabled Reason': 'No data', 'Consecutive Losses': 0,
+            'Adaptive Edge Mode': 'ON (next-bar fill, ATR-sized)'
+        }
+
+    close = d['Close'].astype(float)
+    open_ = d['Open'].astype(float) if 'Open' in d.columns else close
     high = d['High'].astype(float) if 'High' in d.columns else close
     low = d['Low'].astype(float) if 'Low' in d.columns else close
+    atr = _compute_intraday_atr(d, window=atr_window) if use_atr_sizing else None
+
     if short_entry_signal is None:
         short_entry_signal = pd.Series(False, index=close.index)
-    short_entry_signal = pd.Series(short_entry_signal, index=close.index).fillna(False).astype(bool)
-    long_entry_signal = pd.Series(long_entry_signal, index=close.index).fillna(False).astype(bool)
+    short_entry_signal = pd.Series(short_entry_signal, index=close.index).reindex(close.index).fillna(False).astype(bool)
+    long_entry_signal = pd.Series(long_entry_signal, index=close.index).reindex(close.index).fillna(False).astype(bool)
+
     if quality_score is None:
         quality_score = pd.Series(100.0, index=close.index)
     else:
@@ -18971,7 +19767,7 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
         drift_risk = pd.Series(drift_risk, index=close.index).reindex(close.index).ffill().fillna(False).astype(bool)
     if long_exit_signal is None:
         long_exit_signal = pd.Series(False, index=close.index)
-    long_exit_signal = pd.Series(long_exit_signal, index=close.index).fillna(False).astype(bool)
+    long_exit_signal = pd.Series(long_exit_signal, index=close.index).reindex(close.index).fillna(False).astype(bool)
 
     initial = 10000.0
     equity = initial
@@ -18990,115 +19786,140 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
     trades = []
     eq_vals = []
 
+    trade_stop_dist = 0.0
+    trade_target_dist = 0.0
+    trade_trail_dist = 0.0
+
+    pending_action = None
+    pending_exit_reason = None
+    n = len(close)
+
     def open_return(px):
         if not in_pos or entry_price <= 0:
             return 0.0
         return (px / entry_price - 1.0) if side == 'Long' else (entry_price / px - 1.0)
 
     for i, ts in enumerate(close.index):
-        px = float(close.iloc[i])
-        hi = float(high.iloc[i])
-        lo = float(low.iloc[i])
+        fill_px = float(open_.iloc[i])
 
-        if cooldown_bars > 0:
-            cooldown_bars -= 1
-
-        if in_pos:
-            bars_held += 1
-            exit_reason = None
-            exit_price = px
-
-            if side == 'Long':
-                best_price = max(best_price, hi, px)
-                if bars_held >= int(min_hold_bars):
-                    if lo <= entry_price * (1 - stop_pct):
-                        exit_price = entry_price * (1 - stop_pct)
-                        exit_reason = 'Long stop hit'
-                    elif bool(long_exit_signal.iloc[i]):
-                        exit_price = px
-                        exit_reason = 'VWAP/Kalman snapback exit'
-                    elif let_winners_run and best_price >= entry_price * (1 + target_pct):
-                        trail_stop_price = best_price * (1 - trail_pct)
-                        if lo <= trail_stop_price:
-                            exit_price = max(trail_stop_price, entry_price * (1 + target_pct * 0.35))
-                            exit_reason = 'Long runner trailing exit'
-                    elif (not let_winners_run) and hi >= entry_price * (1 + target_pct):
-                        exit_price = entry_price * (1 + target_pct)
-                        exit_reason = 'Long target hit'
-                    elif bars_held >= int(max_hold_bars):
-                        exit_price = px
-                        exit_reason = 'Long max hold exit'
-            else:
-                best_price = min(best_price, lo, px)
-                if bars_held >= int(min_hold_bars):
-                    if hi >= entry_price * (1 + stop_pct):
-                        exit_price = entry_price * (1 + stop_pct)
-                        exit_reason = 'Short stop hit'
-                    elif let_winners_run and best_price <= entry_price * (1 - target_pct):
-                        trail_stop_price = best_price * (1 + trail_pct)
-                        if hi >= trail_stop_price:
-                            exit_price = min(trail_stop_price, entry_price * (1 - target_pct * 0.35))
-                            exit_reason = 'Short runner trailing exit'
-                    elif (not let_winners_run) and lo <= entry_price * (1 - target_pct):
-                        exit_price = entry_price * (1 - target_pct)
-                        exit_reason = 'Short target hit'
-                    elif bars_held >= int(max_hold_bars):
-                        exit_price = px
-                        exit_reason = 'Short max hold exit'
-
-            if exit_reason:
-                trade_ret = (exit_price / entry_price - 1.0) if side == 'Long' else (entry_price / exit_price - 1.0)
-                equity = entry_equity * (1 + trade_ret)
-                trades.append({
-                    'Side': side,
-                    'Entry Date': entry_time,
-                    'Exit Date': ts,
-                    'Buy Price' if side == 'Long' else 'Short Price': round(entry_price, 4),
-                    'Sell Price' if side == 'Long' else 'Cover Price': round(exit_price, 4),
-                    'PnL (%)': round(trade_ret * 100, 3),
-                    'Cumulative Return (%)': round((equity / initial - 1) * 100, 3),
-                    'Bars Held': int(bars_held),
-                    'Status': 'Closed',
-                    'Reason': exit_reason,
-                })
-                if trade_ret < 0:
-                    consecutive_losses += 1
-                    cooldown_bars = int(cooldown_after_loss)
-
-                    # Adaptive reset: one loss does not kill the whole day.
-                    # But the next entry must pass a higher quality score gate.
-                    if consecutive_losses >= int(max_consecutive_losses):
-                        disabled = True
-                        disabled_reason = f'Adaptive stop: {consecutive_losses} consecutive losses hit'
-                else:
-                    consecutive_losses = 0
-                    cooldown_bars = 2
-                    if int(max_trades) <= 1:
-                        disabled = True
-                        disabled_reason = 'One completed trade limit reached'
-                in_pos = False
-                side = None
-                entry_price = 0.0
-                entry_time = None
-                bars_held = 0
-                best_price = 0.0
+        # 1) Execute order decided on previous bar.
+        if pending_action == 'exit' and in_pos:
+            exit_price = fill_px
+            trade_ret = (exit_price / entry_price - 1.0) if side == 'Long' else (entry_price / exit_price - 1.0)
+            equity = entry_equity * (1 + trade_ret)
+            trades.append({
+                'Side': side,
+                'Entry Date': entry_time,
+                'Exit Date': ts,
+                'Buy Price' if side == 'Long' else 'Short Price': round(entry_price, 4),
+                'Sell Price' if side == 'Long' else 'Cover Price': round(exit_price, 4),
+                'PnL (%)': round(trade_ret * 100, 3),
+                'Cumulative Return (%)': round((equity / initial - 1) * 100, 3),
+                'Bars Held': int(bars_held),
+                'Status': 'Closed',
+                'Reason': pending_exit_reason or 'Next-bar exit',
+            })
+            if trade_ret < 0:
+                consecutive_losses += 1
+                cooldown_bars = int(cooldown_after_loss)
                 if consecutive_losses >= int(max_consecutive_losses):
                     disabled = True
                     disabled_reason = f'Max consecutive losses hit ({consecutive_losses})'
-                if (equity / initial - 1.0) <= -float(max_day_loss):
+            else:
+                consecutive_losses = 0
+                cooldown_bars = 2
+                if int(max_trades) <= 1:
                     disabled = True
-                    disabled_reason = f'Max session loss guard hit ({max_day_loss*100:.2f}%)'
-                if (equity / initial - 1.0) >= float(session_profit_target_pct):
-                    disabled = True
-                    disabled_reason = f'Session profit target reached ({session_profit_target_pct*100:.2f}%)'
+                    disabled_reason = 'One completed trade limit reached'
 
-        if (not in_pos) and (not disabled) and cooldown_bars == 0 and trades_today < int(max_trades):
+            in_pos = False
+            side = None
+            entry_price = 0.0
+            entry_time = None
+            bars_held = 0
+            best_price = 0.0
+            pending_action = None
+            pending_exit_reason = None
+
+            if (equity / initial - 1.0) <= -float(max_day_loss):
+                disabled = True
+                disabled_reason = f'Max session loss guard hit ({max_day_loss*100:.2f}%)'
+            if (equity / initial - 1.0) >= float(session_profit_target_pct):
+                disabled = True
+                disabled_reason = f'Session profit target reached ({session_profit_target_pct*100:.2f}%)'
+
+        elif pending_action in ('enter_long', 'enter_short') and (not in_pos) and (not disabled):
+            in_pos = True
+            side = 'Long' if pending_action == 'enter_long' else 'Short'
+            entry_price = fill_px
+            entry_time = ts
+            entry_equity = equity
+            best_price = entry_price
+            bars_held = 0
+            trades_today += 1
+
+            if use_atr_sizing and atr is not None:
+                atr_here = float(atr.iloc[i]) if i < len(atr) else float(atr.iloc[-1])
+                if not np.isfinite(atr_here) or atr_here <= 0:
+                    atr_here = entry_price * float(stop_pct)
+                atr_pct = atr_here / entry_price if entry_price > 0 else float(stop_pct)
+                trade_stop_dist = max(atr_pct * float(stop_atr_mult), float(stop_pct) * 0.5)
+                trade_target_dist = max(atr_pct * float(target_atr_mult), trade_stop_dist * 1.5)
+                trade_trail_dist = max(atr_pct * float(trail_atr_mult), trade_stop_dist * 0.6)
+            else:
+                trade_stop_dist = float(stop_pct)
+                trade_target_dist = float(target_pct)
+                trade_trail_dist = float(trail_pct)
+
+            pending_action = None
+
+        # 2) Manage open position. A trigger on this bar schedules next-bar-open exit.
+        exit_reason_now = None
+        if in_pos:
+            bars_held += 1
+            hi = float(high.iloc[i])
+            lo = float(low.iloc[i])
+            px_close = float(close.iloc[i])
+
+            if side == 'Long':
+                best_price = max(best_price, hi, px_close)
+                if bars_held >= int(min_hold_bars):
+                    if lo <= entry_price * (1 - trade_stop_dist):
+                        exit_reason_now = 'Long stop triggered — next-bar exit'
+                    elif bool(long_exit_signal.iloc[i]):
+                        exit_reason_now = 'VWAP/Kalman snapback exit'
+                    elif let_winners_run and best_price >= entry_price * (1 + trade_target_dist):
+                        trail_stop_price = best_price * (1 - trade_trail_dist)
+                        if lo <= trail_stop_price:
+                            exit_reason_now = 'Long runner trailing exit'
+                    elif (not let_winners_run) and hi >= entry_price * (1 + trade_target_dist):
+                        exit_reason_now = 'Long target triggered — next-bar exit'
+                    elif bars_held >= int(max_hold_bars):
+                        exit_reason_now = 'Long max hold exit'
+            else:
+                best_price = min(best_price, lo, px_close)
+                if bars_held >= int(min_hold_bars):
+                    if hi >= entry_price * (1 + trade_stop_dist):
+                        exit_reason_now = 'Short stop triggered — next-bar exit'
+                    elif let_winners_run and best_price <= entry_price * (1 - trade_target_dist):
+                        trail_stop_price = best_price * (1 + trade_trail_dist)
+                        if hi >= trail_stop_price:
+                            exit_reason_now = 'Short runner trailing exit'
+                    elif (not let_winners_run) and lo <= entry_price * (1 - trade_target_dist):
+                        exit_reason_now = 'Short target triggered — next-bar exit'
+                    elif bars_held >= int(max_hold_bars):
+                        exit_reason_now = 'Short max hold exit'
+
+            if exit_reason_now is not None:
+                pending_action = 'exit'
+                pending_exit_reason = exit_reason_now
+
+        # 3) Decide new entry on current close; fill next bar open.
+        if (not in_pos) and (pending_action is None) and (not disabled) and cooldown_bars == 0 and trades_today < int(max_trades):
             q_now = float(quality_score.iloc[i]) if i < len(quality_score) else 0.0
             auction_now = bool(auction_ok.iloc[i]) if i < len(auction_ok) else False
             drift_now = bool(drift_risk.iloc[i]) if i < len(drift_risk) else True
 
-            # After a loss, do not buy the next random bounce.
-            # Re-entry must be a clean auction again and not a lower-high/lower-low drift.
             min_q_after_loss = 88.0 + float(reentry_quality_boost) if consecutive_losses > 0 else 0.0
             quality_reentry_ok = (consecutive_losses == 0) or (q_now >= min_q_after_loss)
             auction_reentry_ok = auction_now and (not drift_now)
@@ -19106,18 +19927,16 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
             go_long = bool(long_entry_signal.iloc[i]) and bool(quality_reentry_ok) and bool(auction_reentry_ok)
             go_short = bool(short_entry_signal.iloc[i]) and bool(allow_shorts)
             if go_long or go_short:
-                in_pos = True
-                side = 'Short' if go_short and not go_long else 'Long'
-                entry_price = px
-                entry_time = ts
-                entry_equity = equity
-                best_price = px
-                bars_held = 0
-                trades_today += 1
+                pending_action = 'enter_short' if (go_short and not go_long) else 'enter_long'
 
-        mark_equity = entry_equity * (1 + open_return(px)) if in_pos and entry_price > 0 else equity
+        if cooldown_bars > 0:
+            cooldown_bars -= 1
+
+        mark_px = float(close.iloc[i])
+        mark_equity = entry_equity * (1 + open_return(mark_px)) if in_pos and entry_price > 0 else equity
         eq_vals.append(mark_equity)
 
+    # If a pending exit remains on the final bar, close at final close because no next open exists.
     if in_pos and entry_price > 0:
         px = float(close.iloc[-1])
         mark_equity = entry_equity * (1 + open_return(px))
@@ -19132,7 +19951,7 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
             'Cumulative Return (%)': round((mark_equity / initial - 1) * 100, 3),
             'Bars Held': int(bars_held),
             'Status': 'Open',
-            'Reason': 'Open runner mark-to-market'
+            'Reason': 'Open runner mark-to-market',
         })
         if eq_vals:
             eq_vals[-1] = mark_equity
@@ -19154,7 +19973,7 @@ def _run_intraday_capture(d, long_entry_signal, short_entry_signal=None, long_ex
         'Daily Guard Hit': disabled,
         'Disabled Reason': disabled_reason,
         'Consecutive Losses': consecutive_losses,
-        'Adaptive Edge Mode': 'ON'
+        'Adaptive Edge Mode': 'ON (next-bar fill, ATR-sized)' if use_atr_sizing else 'ON (next-bar fill)',
     }
 
 
@@ -22605,6 +23424,7 @@ try:
         st.caption('Long-only intraday execution tab. It captures upside momentum or bounce waves after red-day panic; it does not short sell.')
 except Exception as e:
     _safe_last_tab_error(tab21, 'Intraday Live Capture tab', e)
+
 
 st.markdown('---')
 st.caption('Generated via Quant Thesis Dashboard | Auction-quality long-only rebuild')
